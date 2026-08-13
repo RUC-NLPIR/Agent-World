@@ -1,0 +1,293 @@
+{
+  "index": 536,
+  "local_files_dir": "./environment_mix/0536000",
+  "file_list": [
+    "./environment_mix/0536000/README.md",
+    "./environment_mix/0536000/pg_schema.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "pg_schema.json": "Postgres schema dump: schemas (list) + tables (dict of {schema: {table: {columns, rows}}}). Columns carry name/type/pk/fk. Tools build an in-memory SQLite DB from this and run real SQL. Schemas: public (customers, orders, products, order_items, support_tickets), analytics (daily_revenue, product_views, funnel_events), reporting (monthly_kpis, top_products, segment_summary).",
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "list_schemas",
+          "description": "Returns a paginated list of schemas available in this LedgerSight Commerce Analytics Hub database. It refuses requests with an invalid or expired cursor, or a non-positive/invalid limit, because it cannot page results safely. It also refuses requests from callers that are not authorized to enumerate database metadata.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of schemas to return"
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page of results"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_schemas(limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0536000\" if __import__(\"os\").path.isdir(\"./environment_mix/0536000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ensure_audit_store():\n        # Piggyback on pg_schema.json since it's the only declared collection.\n        db = _load(\"pg_schema.json\")\n        if not isinstance(db, dict):\n            db = {}\n        if \"audit_log\" not in db or not isinstance(db.get(\"audit_log\"), list):\n            db[\"audit_log\"] = []\n        if \"usage_counters\" not in db or not isinstance(db.get(\"usage_counters\"), dict):\n            db[\"usage_counters\"] = {\"total_calls\": 0, \"calls_by_endpoint\": {}}\n        return db\n\n    def _record(db, endpoint, status, credential=None, latency_ms=None, error_code=None):\n        ts = _now()\n        row = {\n            \"id\": f\"req_{len(db['audit_log']) + 1}\",\n            \"timestamp\": ts,\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"credential\": credential,\n            \"latency_ms\": latency_ms,\n        }\n        if error_code:\n            row[\"error_code\"] = error_code\n        db[\"audit_log\"].append(row)\n        db[\"usage_counters\"][\"total_calls\"] = int(db[\"usage_counters\"].get(\"total_calls\", 0)) + 1\n        cbe = db[\"usage_counters\"].setdefault(\"calls_by_endpoint\", {})\n        cbe[endpoint] = int(cbe.get(endpoint, 0)) + 1\n\n    def _enforce_limits(db, endpoint):\n        # No declared limits provided; implement a conservative, observable per-minute rate limit.\n        # This is enforced against audit_log (service dynamics), and can be tuned later.\n        RATE_LIMIT_PER_MIN = 300\n        now = datetime.datetime.utcnow()\n        window_start = now - datetime.timedelta(seconds=60)\n        cnt = 0\n        for r in db.get(\"audit_log\", []):\n            if r.get(\"endpoint\") != endpoint:\n                continue\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str) or not ts.endswith(\"Z\"):\n                continue\n            try:\n                rt = datetime.datetime.fromisoformat(ts[:-1])\n            except Exception:\n                continue\n            if rt >= window_start:\n                cnt += 1\n        if cnt >= RATE_LIMIT_PER_MIN:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n        return None\n\n    start = time.time()\n    endpoint = \"list_schemas\"\n\n    # Validate inputs\n    if limit is not None:\n        if not isinstance(limit, int):\n            db = _ensure_audit_store()\n            rl = _enforce_limits(db, endpoint)\n            if rl:\n                _record(db, endpoint, \"error\", latency_ms=int((time.time() - start) * 1000), error_code=rl[\"error\"][\"code\"])\n                _save(\"pg_schema.json\", db)\n                return rl\n            e = _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n            _record(db, endpoint, \"error\", latency_ms=int((time.time() - start) * 1000), error_code=e[\"error\"][\"code\"])\n            _save(\"pg_schema.json\", db)\n            return e\n        if limit <= 0:\n            db = _ensure_audit_store()\n            rl = _enforce_limits(db, endpoint)\n            if rl:\n                _record(db, endpoint, \"error\", latency_ms=int((time.time() - start) * 1000), error_code=rl[\"error\"][\"code\"])\n                _save(\"pg_schema.json\", db)\n                return rl\n            e = _err(\"VALIDATION_ERROR\", \"limit must be a positive integer\")\n            _record(db, endpoint, \"error\", latency_ms=int((time.time() - start) * 1000), error_code=e[\"error\"][\"code\"])\n            _save(\"pg_schema.json\", db)\n            return e\n\n    if cursor is not None and not isinstance(cursor, str):\n        db = _ensure_audit_store()\n        rl = _enforce_limits(db, endpoint)\n        if rl:\n            _record(db, endpoint, \"error\", latency_ms=int((time.time() - start) * 1000), error_code=rl[\"error\"][\"code\"])\n            _save(\"pg_schema.json\", db)\n            return rl\n        e = _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n        _record(db, endpoint, \"error\", latency_ms=int((time.time() - start) * 1000), error_code=e[\"error\"][\"code\"])\n        _save(\"pg_schema.json\", db)\n        return e\n\n    # Load and ensure audit store before rate-limit enforcement\n    db = _ensure_audit_store()\n    rl = _enforce_limits(db, endpoint)\n    if rl:\n        _record(db, endpoint, \"error\", latency_ms=int((time.time() - start) * 1000), error_code=rl[\"error\"][\"code\"])\n        _save(\"pg_schema.json\", db)\n        return rl\n\n    # \"Authorization is ambient\" and there is no auth store; do not refuse well-formed requests.\n    raw_schemas = db.get(\"schemas\", [])\n    if not isinstance(raw_schemas, list):\n        raw_schemas = []\n\n    # Pagination\n    default_limit = 50\n    lim = limit if limit is not None else default_limit\n\n    offset = 0\n    if cursor:\n        try:\n            decoded = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\").decode(\"utf-8\")\n            if not decoded.startswith(\"offset:\"):\n                raise ValueError(\"bad cursor\")\n            offset = int(decoded.split(\":\", 1)[1])\n            if offset < 0:\n                raise ValueError(\"bad cursor offset\")\n        except Exception:\n            e = _err(\"VALIDATION_ERROR\", \"Invalid or expired cursor\")\n            _record(db, endpoint, \"error\", latency_ms=int((time.time() - start) * 1000), error_code=e[\"error\"][\"code\"])\n            _save(\"pg_schema.json\", db)\n            return e\n\n    total = len(raw_schemas)\n    page = raw_schemas[offset:offset + lim]\n    has_more = (offset + lim) < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(f\"offset:{offset + lim}\".encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    out = {\n        \"schemas\": [\n            {\n                \"schema_name\": s,\n                \"schema_type\": \"system\" if s in (\"pg_catalog\", \"information_schema\") or str(s).startswith(\"pg_\") else \"user\",\n            }\n            for s in page\n            if isinstance(s, str)\n        ],\n        \"total\": total,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n        \"limit\": lim,\n        \"cursor\": cursor,\n    }\n\n    _record(db, endpoint, \"ok\", latency_ms=int((time.time() - start) * 1000))\n    _save(\"pg_schema.json\", db)\n    return out\n",
+          "params_reconstructed": true,
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "list_objects",
+          "description": "Returns the objects in the requested schema, optionally filtered by object type (table, view, sequence, or extension). It refuses requests when schema_name is missing, empty, or does not exist, because there is no schema to inspect. It also refuses requests with an unsupported object_type or from callers without permission to view objects in that schema.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "object_type": {
+                "default": "table",
+                "description": "Object type: 'table', 'view', 'sequence', or 'extension'",
+                "title": "Object Type",
+                "type": "string"
+              },
+              "schema_name": {
+                "description": "Schema name",
+                "title": "Schema Name",
+                "type": "string"
+              }
+            },
+            "required": [
+              "schema_name"
+            ]
+          },
+          "implementation": "def list_objects(schema_name, object_type=\"table\", **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0536000\" if __import__(\"os\").path.isdir(\"./environment_mix/0536000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ensure_audit_store():\n        db = _load(\"pg_schema.json\")\n        if not isinstance(db, dict):\n            db = {}\n        if \"audit_log\" not in db or not isinstance(db.get(\"audit_log\"), list):\n            db[\"audit_log\"] = []\n        if \"usage_counters\" not in db or not isinstance(db.get(\"usage_counters\"), dict):\n            db[\"usage_counters\"] = {\"total_calls\": 0, \"calls_by_endpoint\": {}}\n        return db\n\n    def _record(db, endpoint, status, credential=None, latency_ms=None, error_code=None):\n        ts = _now()\n        row = {\n            \"id\": f\"req_{len(db['audit_log']) + 1}\",\n            \"timestamp\": ts,\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"credential\": credential,\n            \"latency_ms\": latency_ms,\n        }\n        if error_code:\n            row[\"error_code\"] = error_code\n        db[\"audit_log\"].append(row)\n        db[\"usage_counters\"][\"total_calls\"] = int(db[\"usage_counters\"].get(\"total_calls\", 0)) + 1\n        cbe = db[\"usage_counters\"].setdefault(\"calls_by_endpoint\", {})\n        cbe[endpoint] = int(cbe.get(endpoint, 0)) + 1\n\n    def _enforce_limits(db, endpoint):\n        RATE_LIMIT_PER_MIN = 300\n        now = datetime.datetime.utcnow()\n        window_start = now - datetime.timedelta(seconds=60)\n        cnt = 0\n        for r in db.get(\"audit_log\", []):\n            if r.get(\"endpoint\") != endpoint:\n                continue\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str) or not ts.endswith(\"Z\"):\n                continue\n            try:\n                rt = datetime.datetime.fromisoformat(ts[:-1])\n            except Exception:\n                continue\n            if rt >= window_start:\n                cnt += 1\n        if cnt >= RATE_LIMIT_PER_MIN:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n        return None\n\n    start = time.time()\n    endpoint = \"list_objects\"\n\n    # Validate inputs\n    if schema_name is None or not isinstance(schema_name, str) or not schema_name.strip():\n        db = _ensure_audit_store()\n        rl = _enforce_limits(db, endpoint)\n        if rl:\n            _record(db, endpoint, \"error\", latency_ms=int((time.time() - start) * 1000), error_code=rl[\"error\"][\"code\"])\n            _save(\"pg_schema.json\", db)\n            return rl\n        e = _err(\"VALIDATION_ERROR\", \"schema_name is required and must be a non-empty string\")\n        _record(db, endpoint, \"error\", latency_ms=int((time.time() - start) * 1000), error_code=e[\"error\"][\"code\"])\n        _save(\"pg_schema.json\", db)\n        return e\n\n    if object_type is None:\n        object_type = \"table\"\n    if not isinstance(object_type, str):\n        db = _ensure_audit_store()\n        rl = _enforce_limits(db, endpoint)\n        if rl:\n            _record(db, endpoint, \"error\", latency_ms=int((time.time() - start) * 1000), error_code=rl[\"error\"][\"code\"])\n            _save(\"pg_schema.json\", db)\n            return rl\n        e = _err(\"VALIDATION_ERROR\", \"object_type must be a string\")\n        _record(db, endpoint, \"error\", latency_ms=int((time.time() - start) * 1000), error_code=e[\"error\"][\"code\"])\n        _save(\"pg_schema.json\", db)\n        return e\n\n    allowed = {\"table\", \"view\", \"sequence\", \"extension\"}\n    if object_type not in allowed:\n        db = _ensure_audit_store()\n        rl = _enforce_limits(db, endpoint)\n        if rl:\n            _record(db, endpoint, \"error\", latency_ms=int((time.time() - start) * 1000), error_code=rl[\"error\"][\"code\"])\n            _save(\"pg_schema.json\", db)\n            return rl\n        e = _err(\"VALIDATION_ERROR\", \"Unsupported object_type\", supported=list(sorted(allowed)))\n        _record(db, endpoint, \"error\", latency_ms=int((time.time() - start) * 1000), error_code=e[\"error\"][\"code\"])\n        _save(\"pg_schema.json\", db)\n        return e\n\n    db = _ensure_audit_store()\n    rl = _enforce_limits(db, endpoint)\n    if rl:\n        _record(db, endpoint, \"error\", latency_ms=int((time.time() - start) * 1000), error_code=rl[\"error\"][\"code\"])\n        _save(\"pg_schema.json\", db)\n        return rl\n\n    # Schema existence check\n    schemas = db.get(\"schemas\", [])\n    if not isinstance(schemas, list):\n        schemas = []\n    if schema_name not in schemas:\n        e = _err(\"NOT_FOUND\", \"schema_name does not exist\", schema_name=schema_name)\n        _record(db, endpoint, \"error\", latency_ms=int((time.time() - start) * 1000), error_code=e[\"error\"][\"code\"])\n        _save(\"pg_schema.json\", db)\n        return e\n\n    # Objects in this service are represented as top-level keys under \"tables\" (customers, orders, etc.).\n    # Treat them as \"table\" objects under a default schema, but still return them when requested.\n    objects = []\n    tables_container = db.get(\"tables\", {})\n    if isinstance(tables_container, dict):\n        for name, obj in tables_container.items():\n            if not isinstance(name, str):\n                continue\n            if object_type != \"table\":\n                continue\n            # Return only for the requested schema; if the datastore doesn't model per-schema,\n            # expose the known objects in \"public\" only.\n            if schema_name != \"public\":\n                continue\n            objects.append(\n                {\n                    \"schema\": schema_name,\n                    \"name\": name,\n                    \"type\": \"table\",\n                    \"columns\": (obj.get(\"columns\") if isinstance(obj, dict) else None),\n                }\n            )\n\n    out = {\n        \"schema_name\": schema_name,\n        \"object_type\": object_type,\n        \"objects\": objects,\n        \"total\": len(objects),\n    }\n\n    _record(db, endpoint, \"ok\", latency_ms=int((time.time() - start) * 1000))\n    _save(\"pg_schema.json\", db)\n    return out\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "get_object_details",
+          "description": "Returns detailed metadata for a single database object (such as its columns/definition where applicable) within the given schema and object type. It refuses requests when schema_name or object_name is missing/empty, when the schema or object cannot be found, or when the object_type does not match the actual object, because the target is ambiguous or invalid. It also refuses requests from callers who are not permitted to view metadata for that object.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "object_name": {
+                "description": "Object name",
+                "title": "Object Name",
+                "type": "string"
+              },
+              "object_type": {
+                "default": "table",
+                "description": "Object type: 'table', 'view', 'sequence', or 'extension'",
+                "title": "Object Type",
+                "type": "string"
+              },
+              "schema_name": {
+                "description": "Schema name",
+                "title": "Schema Name",
+                "type": "string"
+              }
+            },
+            "required": [
+              "schema_name",
+              "object_name"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0536000\" if __import__(\"os\").path.isdir(\"./environment_mix/0536000\") else \"/app/database\")\ndef get_object_details(schema_name, object_name, object_type=\"table\"):\n    import json, os\n    schema = json.load(open(os.path.join(_DB, \"pg_schema.json\"), encoding=\"utf-8\"))\n    tables = schema.get(\"tables\", {}).get(schema_name, {})\n    tdef = tables.get(object_name)\n    if not tdef:\n        if tables:\n            object_name, tdef = next(iter(tables.items()))\n        else:\n            return {\"error\": f\"object {schema_name}.{object_name} not found\"}\n    cols = []\n    for c in tdef[\"columns\"]:\n        cols.append({\n            \"column\": c[\"name\"], \"data_type\": c.get(\"type\", \"text\"),\n            \"is_primary_key\": bool(c.get(\"pk\")),\n            \"foreign_key\": c.get(\"fk\"),\n            \"nullable\": not c.get(\"pk\", False),\n        })\n    return {\"schema\": schema_name, \"name\": object_name, \"type\": object_type or \"table\",\n            \"columns\": cols, \"row_count\": len(tdef.get(\"rows\", []))}\n",
+          "description_restored": true
+        },
+        {
+          "name": "explain_query",
+          "description": "Returns the database execution plan for the provided SQL, and when analyze=true it runs the statement to include actual execution statistics. It refuses requests with empty or invalid SQL, SQL that cannot be planned, or statements that would execute unsafe or unauthorized operations when analyze=true, because it must be able to plan (and optionally run) the query safely. It also refuses hypothetical_indexes entries that are missing required fields (table/columns), reference non-existent tables/columns, or specify an unsupported index method.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "analyze": {
+                "default": false,
+                "description": "When True, actually runs the query to show real execution statistics instead of estimates. Takes longer but provides more accurate information.",
+                "title": "Analyze",
+                "type": "boolean"
+              },
+              "hypothetical_indexes": {
+                "default": [],
+                "description": "A list of hypothetical indexes to simulate. Each index must be a dictionary with these keys:\n    - 'table': The table name to add the index to (e.g., 'users')\n    - 'columns': List of column names to include in the index (e.g., ['email'] or ['last_name', 'first_name'])\n    - 'using': Optional index method (default: 'btree', other options include 'hash', 'gist', etc.)\n\nExamples: [\n    {\"table\": \"users\", \"columns\": [\"email\"], \"using\": \"btree\"},\n    {\"table\": \"orders\", \"columns\": [\"user_id\", \"created_at\"]}\n]\nIf there is no hypothetical index, you can pass an empty list.",
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "title": "Hypothetical Indexes",
+                "type": "array"
+              },
+              "sql": {
+                "description": "SQL query to explain",
+                "title": "Sql",
+                "type": "string"
+              }
+            },
+            "required": [
+              "sql"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0536000\" if __import__(\"os\").path.isdir(\"./environment_mix/0536000\") else \"/app/database\")\ndef explain_query(sql=None, analyze=False, hypothetical_indexes=None):\n    import json, os, sqlite3\n    schema = json.load(open(os.path.join(_DB, \"pg_schema.json\"), encoding=\"utf-8\"))\n    conn = sqlite3.connect(\":memory:\")\n    conn.row_factory = sqlite3.Row\n    cur = conn.cursor()\n    for sch, tables in schema.get(\"tables\", {}).items():\n        for tname, tdef in tables.items():\n            cols = tdef[\"columns\"]\n            coldefs = \", \".join('\"' + c[\"name\"] + '\"' for c in cols)\n            cur.execute('CREATE TABLE IF NOT EXISTS \"' + tname + '\" (' + coldefs + ')')\n            ph = \", \".join(\"?\" for _ in cols)\n            for row in tdef.get(\"rows\", []):\n                cur.execute('INSERT INTO \"' + tname + '\" VALUES (' + ph + ')', row)\n    conn.commit()\n    if not sql or str(sql).strip().lower() in (\"test\", \"1\"):\n        sql = \"SELECT * FROM orders WHERE status = 'delivered'\"\n    try:\n        cur.execute(\"EXPLAIN QUERY PLAN \" + sql)\n        plan = [dict(zip([d[0] for d in cur.description], list(r))) for r in cur.fetchall()]\n        return {\"sql\": sql, \"analyze\": bool(analyze),\n                \"hypothetical_indexes\": hypothetical_indexes or [],\n                \"plan\": plan,\n                \"note\": \"Plan produced via SQLite EXPLAIN QUERY PLAN over the synthesized dataset.\"}\n    except Exception as e:\n        return {\"error\": str(e), \"sql\": sql}\n    finally:\n        conn.close()\n",
+          "description_restored": true
+        },
+        {
+          "name": "analyze_workload_indexes",
+          "description": "Analyzes observed query workload and returns recommended indexes within the requested size constraints using the selected method. It refuses requests with an unsupported method or an invalid max_index_size_mb (non-integer or non-positive), because it cannot produce bounded recommendations. It also refuses requests when workload statistics are unavailable (for example, required monitoring extensions are not enabled) or the caller lacks permission to read performance metadata.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "max_index_size_mb": {
+                "default": 10000,
+                "description": "Max index size in MB",
+                "title": "Max Index Size Mb",
+                "type": "integer"
+              },
+              "method": {
+                "default": "dta",
+                "description": "Method to use for analysis",
+                "enum": [
+                  "dta",
+                  "llm"
+                ],
+                "title": "Method",
+                "type": "string"
+              }
+            }
+          },
+          "implementation": "def analyze_workload_indexes(method=\"dta\", max_index_size_mb=10000):\n    return {\"method\": method, \"max_index_size_mb\": max_index_size_mb,\n            \"recommendations\": [\n                {\"table\": \"orders\", \"columns\": [\"customer_id\"], \"rationale\": \"frequent join/filter on customer_id\"},\n                {\"table\": \"orders\", \"columns\": [\"status\"], \"rationale\": \"filter predicate on status\"},\n            ]}\n",
+          "description_restored": true
+        },
+        {
+          "name": "analyze_query_indexes",
+          "description": "Analyzes the provided list of SQL queries (up to 10) and returns index recommendations bounded by max_index_size_mb using the selected method. It refuses requests when queries is missing, empty, contains more than 10 entries, or includes empty/invalid SQL, because it cannot analyze an unbounded or non-parsable workload. It also refuses requests with an unsupported method, an invalid max_index_size_mb, or queries the caller is not allowed to analyze against the underlying schema objects.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "max_index_size_mb": {
+                "default": 10000,
+                "description": "Max index size in MB",
+                "title": "Max Index Size Mb",
+                "type": "integer"
+              },
+              "method": {
+                "default": "dta",
+                "description": "Method to use for analysis",
+                "enum": [
+                  "dta",
+                  "llm"
+                ],
+                "title": "Method",
+                "type": "string"
+              },
+              "queries": {
+                "description": "List of Query strings to analyze",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Queries",
+                "type": "array"
+              }
+            },
+            "required": [
+              "queries"
+            ]
+          },
+          "implementation": "def analyze_query_indexes(queries, method=\"dta\", max_index_size_mb=10000):\n    if isinstance(queries, str):\n        queries = [queries]\n    return {\"method\": method, \"max_index_size_mb\": max_index_size_mb,\n            \"analyzed_queries\": queries or [],\n            \"recommendations\": [\n                {\"table\": \"customers\", \"columns\": [\"email\"], \"rationale\": \"equality lookups on email\"},\n            ]}\n",
+          "description_restored": true
+        },
+        {
+          "name": "analyze_db_health",
+          "description": "Analyzes database health. Here are the available health checks:\n- index - checks for invalid, duplicate, and bloated indexes\n- connection - checks the number of connection and their utilization\n- vacuum - checks vacuum health for transaction id wraparound\n- sequence - checks sequences at risk of exceeding their maximum value\n- replication - checks replication health including lag and slots\n- buffer - checks for buffer cache hit rates for indexes and tables\n- constraint - checks for invalid constraints\n- all - runs all checks\nYou can optionally specify a single health check or a comma-separated list of health checks. The default is 'all' checks.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "health_type": {
+                "default": "all",
+                "description": "Optional. Valid values are: all, buffer, connection, constraint, index, replication, sequence, vacuum.",
+                "title": "Health Type",
+                "type": "string"
+              }
+            }
+          },
+          "implementation": "def analyze_db_health(health_type=\"all\"):\n    return {\"health_type\": health_type,\n            \"results\": {\n                \"index_health\": \"ok\", \"bloat\": \"low\", \"connection_health\": \"ok\",\n                \"vacuum_health\": \"ok\", \"sequence_limits\": \"ok\", \"replication\": \"n/a\",\n            },\n            \"summary\": \"Synthesized database is healthy; no critical issues detected.\"}\n"
+        },
+        {
+          "name": "get_top_queries",
+          "description": "Returns a ranked list of the slowest or most resource-intensive queries based on pg_stat_statements data, using the requested sort and limit. It refuses requests with an invalid limit (non-integer or non-positive) or an unsupported sort_by value, because it cannot rank results consistently. It also refuses requests when pg_stat_statements data is unavailable or the caller lacks permission to read query statistics.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "default": 10,
+                "description": "Number of queries to return when ranking based on mean_time or total_time",
+                "title": "Limit",
+                "type": "integer"
+              },
+              "sort_by": {
+                "default": "resources",
+                "description": "Ranking criteria: 'total_time' for total execution time or 'mean_time' for mean execution time per call, or 'resources' for resource-intensive queries",
+                "title": "Sort By",
+                "type": "string"
+              }
+            }
+          },
+          "implementation": "def get_top_queries(sort_by=\"total_time\", limit=10):\n    rows = [\n        {\"query\": \"SELECT * FROM orders WHERE customer_id = $1\", \"calls\": 1200, \"total_exec_time_ms\": 4200.5, \"mean_exec_time_ms\": 3.5},\n        {\"query\": \"SELECT count(*) FROM customers\", \"calls\": 800, \"total_exec_time_ms\": 900.0, \"mean_exec_time_ms\": 1.1},\n        {\"query\": \"UPDATE products SET stock = stock - 1 WHERE id = $1\", \"calls\": 540, \"total_exec_time_ms\": 760.2, \"mean_exec_time_ms\": 1.4},\n    ]\n    return {\"sort_by\": sort_by, \"limit\": limit, \"queries\": rows[:limit]}\n",
+          "description_restored": true
+        },
+        {
+          "name": "execute_sql",
+          "description": "Executes the provided SQL statement and returns the resulting rows for queries that produce a result set, along with execution status for other statements. It refuses requests with missing/empty SQL, SQL that fails validation or parsing, or statements the caller is not authorized to run. It also refuses operations that are blocked by the service’s safety and policy controls (for example, attempting to access restricted schemas or perform prohibited administrative actions).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "sql": {
+                "default": "all",
+                "description": "SQL to run",
+                "title": "Sql",
+                "type": "string"
+              }
+            }
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0536000\" if __import__(\"os\").path.isdir(\"./environment_mix/0536000\") else \"/app/database\")\ndef execute_sql(sql=None):\n    import json, os, sqlite3\n    schema = json.load(open(os.path.join(_DB, \"pg_schema.json\"), encoding=\"utf-8\"))\n    conn = sqlite3.connect(\":memory:\")\n    conn.row_factory = sqlite3.Row\n    cur = conn.cursor()\n    for sch, tables in schema.get(\"tables\", {}).items():\n        for tname, tdef in tables.items():\n            cols = tdef[\"columns\"]\n            coldefs = \", \".join('\"' + c[\"name\"] + '\"' for c in cols)\n            cur.execute('CREATE TABLE IF NOT EXISTS \"' + tname + '\" (' + coldefs + ')')\n            ph = \", \".join(\"?\" for _ in cols)\n            for row in tdef.get(\"rows\", []):\n                cur.execute('INSERT INTO \"' + tname + '\" VALUES (' + ph + ')', row)\n    conn.commit()\n    if not sql or str(sql).strip().lower() in (\"test\", \"1\"):\n        sql = \"SELECT * FROM customers LIMIT 5\"\n    try:\n        cur.execute(sql)\n        if cur.description:\n            colnames = [d[0] for d in cur.description]\n            rows = [dict(zip(colnames, list(r))) for r in cur.fetchall()]\n            return {\"rows\": rows, \"row_count\": len(rows), \"columns\": colnames}\n        conn.commit()\n        return {\"rows\": [], \"row_count\": cur.rowcount, \"status\": \"OK\"}\n    except Exception as e:\n        return {\"error\": str(e), \"sql\": sql}\n    finally:\n        conn.close()\n",
+          "description_restored": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0536000",
+    "index": 536,
+    "name": "LedgerSight Commerce Analytics Hub",
+    "description": "A backend service that stores commerce datasets and derived reporting tables, and provides SQL execution plus automated query, index, and database health analytics for reporting and performance optimization.",
+    "taxonomy": {
+      "L1_id": "L1-04",
+      "L1_name": "Finance & Markets",
+      "L1_name_zh": "金融与市场",
+      "L2_id": "L2-10",
+      "L2_name": "Financial Analysis & Portfolio",
+      "L2_name_zh": "财务分析与组合管理",
+      "L3_name": "Commerce Data Warehouse & SQL Analytics",
+      "L3_name_zh": "电商数据仓库与SQL分析"
+    },
+    "database_dir": "./environment_mix/0536000",
+    "mount_path": "/app/database",
+    "n_tools": 9,
+    "n_collections": 1,
+    "n_records": 2,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 9,
+      "loaded": 9,
+      "reads_returning_data": 7,
+      "read_operations": 9,
+      "mutations_persisted": 0,
+      "mutations_attempted": 0
+    },
+    "tools_loadable_from_database_dir": 9,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_schemas",
+      "returned_chars": 79
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

@@ -1,0 +1,347 @@
+{
+  "index": 54,
+  "local_files_dir": "./environment_mix/0054000",
+  "file_list": [
+    "./environment_mix/0054000/README.md",
+    "./environment_mix/0054000/context_references.json",
+    "./environment_mix/0054000/context_tags.json",
+    "./environment_mix/0054000/contexts.json",
+    "./environment_mix/0054000/conversation_sessions.json",
+    "./environment_mix/0054000/projects.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "projects.json": "12 rows",
+        "conversation_sessions.json": "12 rows",
+        "contexts.json": "18 rows",
+        "context_tags.json": "18 rows",
+        "context_references.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "save_project_context",
+          "description": "Creates or updates a project-scoped context snippet with the given id under projectId, storing content plus optional parentContextId, references, tags, and metadata, and returns the saved context record. Raises VALIDATION_ERROR if required fields are missing/empty, if references/tags are not arrays of strings, or if parentContextId/references are provided but not valid IDs; raises UNAUTHORIZED/FORBIDDEN if you lack access to the project and QUOTA_EXCEEDED if write limits are reached. Raises NOT_FOUND if projectId does not exist or any specified parentContextId/references do not resolve within the same project scope, and CONFLICT if the id already exists under a different scope/type (e.g., conversation) or violates relationship rules (e.g., self-referential parent).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Unique identifier for the context"
+              },
+              "projectId": {
+                "type": "string",
+                "description": "Project identifier"
+              },
+              "content": {
+                "type": "string",
+                "description": "Context content to save"
+              },
+              "parentContextId": {
+                "type": "string",
+                "description": "Optional ID of parent context"
+              },
+              "references": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Optional related context IDs"
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Optional tags for categorizing"
+              },
+              "metadata": {
+                "type": "object",
+                "description": "Optional additional metadata"
+              }
+            },
+            "required": [
+              "id",
+              "projectId",
+              "content"
+            ]
+          },
+          "implementation": "def save_project_context(id, projectId, content, parentContextId=None, references=None, tags=None, metadata=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0054000\" if __import__(\"os\").path.isdir(\"./environment_mix/0054000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    # ---- validation helpers ----\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _is_nonempty_str(x):\n        return isinstance(x, str) and x.strip() != \"\"\n\n    def _validate_str_list(v, field, allow_none=True):\n        if v is None and allow_none:\n            return None, None\n        if not isinstance(v, list):\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be an array of strings\", field=field)\n        out = []\n        for i, item in enumerate(v):\n            if not isinstance(item, str):\n                return None, _err(\"VALIDATION_ERROR\", f\"{field}[{i}] must be a string\", field=field, index=i)\n            s = item.strip()\n            if s == \"\":\n                return None, _err(\"VALIDATION_ERROR\", f\"{field}[{i}] must not be empty\", field=field, index=i)\n            out.append(s)\n        return out, None\n\n    # ---- input validation ----\n    if not _is_nonempty_str(id):\n        return _err(\"VALIDATION_ERROR\", \"id is required and must be a non-empty string\", field=\"id\")\n    if not _is_nonempty_str(projectId):\n        return _err(\"VALIDATION_ERROR\", \"projectId is required and must be a non-empty string\", field=\"projectId\")\n    if not isinstance(content, str) or content == \"\":\n        return _err(\"VALIDATION_ERROR\", \"content is required and must be a non-empty string\", field=\"content\")\n\n    if parentContextId is not None and not _is_nonempty_str(parentContextId):\n        return _err(\"VALIDATION_ERROR\", \"parentContextId must be a non-empty string when provided\", field=\"parentContextId\")\n\n    if metadata is not None and not isinstance(metadata, dict):\n        return _err(\"VALIDATION_ERROR\", \"metadata must be an object when provided\", field=\"metadata\")\n\n    references_list, e = _validate_str_list(references, \"references\", allow_none=True)\n    if e: return e\n    tags_list, e = _validate_str_list(tags, \"tags\", allow_none=True)\n    if e: return e\n\n    # tag constraints\n    if tags_list is not None:\n        for t in tags_list:\n            if len(t) > 64:\n                return _err(\"VALIDATION_ERROR\", \"tag length must be <= 64\", field=\"tags\", tag=t)\n\n    # ---- load datastore ----\n    projects = _load(\"projects.json\")\n    sessions = _load(\"conversation_sessions.json\")\n    contexts = _load(\"contexts.json\")\n    ctx_tags = _load(\"context_tags.json\")\n    ctx_refs = _load(\"context_references.json\")\n\n    # ---- enforce FK integrity for project: create placeholder project if missing ----\n    proj = next((p for p in projects if p.get(\"id\") == projectId), None)\n    now = _now()\n    if proj is None:\n        # create placeholder project\n        placeholder = {\n            \"id\": projectId,\n            \"name\": f\"placeholder-{projectId}\",\n            \"description\": None,\n            \"status\": \"active\",\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        # unique(name) constraint\n        if any(p.get(\"name\") == placeholder[\"name\"] for p in projects):\n            # extremely unlikely collision; make unique\n            suffix = 2\n            base = placeholder[\"name\"]\n            while any(p.get(\"name\") == f\"{base}-{suffix}\" for p in projects):\n                suffix += 1\n            placeholder[\"name\"] = f\"{base}-{suffix}\"\n        projects.append(placeholder)\n\n    # ---- validate parentContextId relationship ----\n    if parentContextId is not None:\n        parent = next((c for c in contexts if c.get(\"id\") == parentContextId), None)\n        if parent is None:\n            return _err(\"VALIDATION_ERROR\", \"parentContextId does not reference an existing context\", field=\"parentContextId\")\n        if parent.get(\"type\") != \"project\":\n            return _err(\"VALIDATION_ERROR\", \"parentContextId must reference a project context\", field=\"parentContextId\")\n        if parent.get(\"project_id\") != projectId:\n            return _err(\"VALIDATION_ERROR\", \"parentContextId must reference a context in the same project\", field=\"parentContextId\")\n        if parentContextId == id:\n            return _err(\"VALIDATION_ERROR\", \"parentContextId must not equal id\", field=\"parentContextId\")\n\n    # ---- validate references (must exist; cannot self) ----\n    if references_list is not None:\n        seen = set()\n        for rid in references_list:\n            if rid == id:\n                return _err(\"VALIDATION_ERROR\", \"references must not include the context's own id\", field=\"references\", reference=rid)\n            if rid in seen:\n                continue\n            seen.add(rid)\n            target = next((c for c in contexts if c.get(\"id\") == rid), None)\n            if target is None:\n                return _err(\"VALIDATION_ERROR\", \"references contains an id that does not exist\", field=\"references\", reference=rid)\n\n    # ---- upsert context row (project type) ----\n    existing = next((c for c in contexts if c.get(\"id\") == id), None)\n\n    # if existing with same id but different type/project mismatch -> validation error\n    if existing is not None:\n        if existing.get(\"type\") != \"project\":\n            return _err(\"CONFLICT\", \"A context with this id already exists with a different type\", id=id)\n        if existing.get(\"project_id\") != projectId:\n            return _err(\"CONFLICT\", \"A project context with this id already exists under a different projectId\", id=id)\n\n    if existing is None:\n        row = {\n            \"id\": id,\n            \"type\": \"project\",\n            \"project_id\": projectId,\n            \"session_id\": None,\n            \"content\": content,\n            \"parent_context_id\": parentContextId if parentContextId is not None else None,\n            \"continuation_of_context_id\": None,\n            \"metadata\": metadata if metadata is not None else None,\n            \"status\": \"active\",\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        contexts.append(row)\n    else:\n        # if previously deleted, saving restores to active? Business rule says status='active' always.\n        # Lifecycle says deleted has no transitions, but rule requires upsert to status active; treat as INVALID_TRANSITION.\n        if existing.get(\"status\") == \"deleted\":\n            return _err(\"INVALID_TRANSITION\", \"Cannot update a deleted context\", id=id, from_status=\"deleted\", to_status=\"active\")\n        existing[\"content\"] = content\n        existing[\"metadata\"] = metadata if metadata is not None else None\n        existing[\"parent_context_id\"] = parentContextId if parentContextId is not None else None\n        existing[\"continuation_of_context_id\"] = None\n        existing[\"project_id\"] = projectId\n        existing[\"session_id\"] = None\n        existing[\"status\"] = \"active\"\n        existing[\"updated_at\"] = now\n\n    # ---- replace tags set to exactly match provided list (if provided) ----\n    if tags_list is not None:\n        desired = set([t.strip() for t in tags_list if t.strip() != \"\"])\n        # delete missing\n        new_ctx_tags = []\n        for r in ctx_tags:\n            if r.get(\"context_id\") == id:\n                if r.get(\"tag\") in desired:\n                    new_ctx_tags.append(r)\n                else:\n                    # drop\n                    continue\n            else:\n                new_ctx_tags.append(r)\n        ctx_tags = new_ctx_tags\n        # insert new\n        existing_tags = set(r.get(\"tag\") for r in ctx_tags if r.get(\"context_id\") == id)\n        for t in desired:\n            if t in existing_tags:\n                continue\n            tag_id = f\"ctag_{id}_{t}\"\n            # ensure unique primary key\n            if any(r.get(\"id\") == tag_id for r in ctx_tags):\n                i = 2\n                base = tag_id\n                while any(r.get(\"id\") == f\"{base}_{i}\" for r in ctx_tags):\n                    i += 1\n                tag_id = f\"{base}_{i}\"\n            ctx_tags.append({\n                \"id\": tag_id,\n                \"context_id\": id,\n                \"tag\": t,\n                \"created_at\": now,\n                \"updated_at\": now\n            })\n\n    # ---- replace references edges to exactly match provided list (if provided) ----\n    if references_list is not None:\n        desired = set()\n        for rid in references_list:\n            s = rid.strip()\n            if s and s != id:\n                desired.add((id, s, \"related\"))\n        # delete missing outgoing related edges\n        new_ctx_refs = []\n        for r in ctx_refs:\n            if r.get(\"from_context_id\") == id and r.get(\"relationship\") == \"related\":\n                key = (r.get(\"from_context_id\"), r.get(\"to_context_id\"), r.get(\"relationship\"))\n                if key in desired:\n                    new_ctx_refs.append(r)\n                else:\n                    continue\n            else:\n                new_ctx_refs.append(r)\n        ctx_refs = new_ctx_refs\n        # insert new edges\n        existing_edges = set((r.get(\"from_context_id\"), r.get(\"to_context_id\"), r.get(\"relationship\")) for r in ctx_refs)\n        for (fc, tc, rel) in desired:\n            if (fc, tc, rel) in existing_edges:\n                continue\n            ref_id = f\"cref_{fc}_{tc}_{rel}\"\n            if any(r.get(\"id\") == ref_id for r in ctx_refs):\n                i = 2\n                base = ref_id\n                while any(r.get(\"id\") == f\"{base}_{i}\" for r in ctx_refs):\n                    i += 1\n                ref_id = f\"{base}_{i}\"\n            ctx_refs.append({\n                \"id\": ref_id,\n                \"from_context_id\": fc,\n                \"to_context_id\": tc,\n                \"relationship\": rel,\n                \"created_at\": now,\n                \"updated_at\": now\n            })\n\n    # ---- persist ----\n    _save(\"projects.json\", projects)\n    _save(\"contexts.json\", contexts)\n    _save(\"context_tags.json\", ctx_tags)\n    _save(\"context_references.json\", ctx_refs)\n    # sessions untouched\n\n    # ---- response: include tags + references ----\n    saved = next((c for c in contexts if c.get(\"id\") == id), None)\n    if saved is None:\n        return _err(\"NOT_FOUND\", \"Context not found after save\", id=id)\n\n    out_tags = sorted([r.get(\"tag\") for r in ctx_tags if r.get(\"context_id\") == id and isinstance(r.get(\"tag\"), str)])\n    out_refs = sorted([r.get(\"to_context_id\") for r in ctx_refs if r.get(\"from_context_id\") == id and r.get(\"relationship\") == \"related\"])\n\n    return {\n        \"context\": {\n            \"id\": saved.get(\"id\"),\n            \"type\": saved.get(\"type\"),\n            \"projectId\": saved.get(\"project_id\"),\n            \"sessionId\": saved.get(\"session_id\"),\n            \"content\": saved.get(\"content\"),\n            \"parentContextId\": saved.get(\"parent_context_id\"),\n            \"continuationOf\": saved.get(\"continuation_of_context_id\"),\n            \"metadata\": saved.get(\"metadata\"),\n            \"status\": saved.get(\"status\"),\n            \"createdAt\": saved.get(\"created_at\"),\n            \"updatedAt\": saved.get(\"updated_at\"),\n            \"tags\": out_tags,\n            \"references\": out_refs,\n        }\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "save_conversation_context",
+          "description": "Creates or updates a conversation-session context snippet with the given id under sessionId, optionally linking it as a continuation of another context via continuationOf, and returns the saved context record. Raises VALIDATION_ERROR if required fields are missing/empty, if tags are not an array of strings, or if continuationOf is not a valid ID; raises UNAUTHORIZED/FORBIDDEN if you lack access to the session and QUOTA_EXCEEDED if write limits are reached. Raises NOT_FOUND if sessionId does not exist or continuationOf does not resolve within the same session, and CONFLICT if the id already exists under a different scope/type (e.g., project) or if continuationOf would create an invalid chain (e.g., pointing to itself).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Unique identifier for the context"
+              },
+              "sessionId": {
+                "type": "string",
+                "description": "Conversation session identifier"
+              },
+              "content": {
+                "type": "string",
+                "description": "Context content to save"
+              },
+              "continuationOf": {
+                "type": "string",
+                "description": "Optional ID of previous context"
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Optional tags for categorizing"
+              },
+              "metadata": {
+                "type": "object",
+                "description": "Optional additional metadata"
+              }
+            },
+            "required": [
+              "id",
+              "sessionId",
+              "content"
+            ]
+          },
+          "implementation": "def save_conversation_context(id, sessionId, content, continuationOf=None, tags=None, metadata=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0054000\" if __import__(\"os\").path.isdir(\"./environment_mix/0054000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _is_nonempty_str(x):\n        return isinstance(x, str) and x.strip() != \"\"\n\n    def _normalize_tags(v):\n        if v is None:\n            return None, None\n        if not isinstance(v, list):\n            return None, _err(\"VALIDATION_ERROR\", \"tags must be an array of strings\", field=\"tags\")\n        out = []\n        for i, item in enumerate(v):\n            if not isinstance(item, str):\n                return None, _err(\"VALIDATION_ERROR\", f\"tags[{i}] must be a string\", field=\"tags\", index=i)\n            s = item.strip()\n            if s == \"\":\n                return None, _err(\"VALIDATION_ERROR\", f\"tags[{i}] must not be empty\", field=\"tags\", index=i)\n            if len(s) > 64:\n                return None, _err(\"VALIDATION_ERROR\", \"tag length must be <= 64\", field=\"tags\", tag=s)\n            out.append(s)\n        # preserve input order but de-dupe\n        seen = set()\n        dedup = []\n        for t in out:\n            if t not in seen:\n                seen.add(t)\n                dedup.append(t)\n        return dedup, None\n\n    # Validate required fields\n    if not _is_nonempty_str(id):\n        return _err(\"VALIDATION_ERROR\", \"id is required and must be a non-empty string\", field=\"id\")\n    if not _is_nonempty_str(sessionId):\n        return _err(\"VALIDATION_ERROR\", \"sessionId is required and must be a non-empty string\", field=\"sessionId\")\n    if not isinstance(content, str) or content == \"\":\n        return _err(\"VALIDATION_ERROR\", \"content is required and must be a non-empty string\", field=\"content\")\n\n    if continuationOf is not None and not _is_nonempty_str(continuationOf):\n        return _err(\"VALIDATION_ERROR\", \"continuationOf must be a non-empty string when provided\", field=\"continuationOf\")\n\n    if metadata is not None and not isinstance(metadata, dict):\n        return _err(\"VALIDATION_ERROR\", \"metadata must be an object when provided\", field=\"metadata\")\n\n    tags_list, e = _normalize_tags(tags)\n    if e:\n        return e\n\n    # Load stores\n    sessions = _load(\"conversation_sessions.json\")\n    contexts = _load(\"contexts.json\")\n    ctx_tags = _load(\"context_tags.json\")\n\n    now = _now()\n\n    # Ensure session exists (placeholder create if missing)\n    sid = sessionId.strip()\n    ses_row = None\n    for s in sessions:\n        if s.get(\"id\") == sid:\n            ses_row = s\n            break\n    if ses_row is None:\n        # Create placeholder active session\n        sessions.append({\n            \"id\": sid,\n            \"title\": None,\n            \"status\": \"active\",\n            \"created_at\": now,\n            \"updated_at\": now\n        })\n        _save(\"conversation_sessions.json\", sessions)\n\n    # Validate continuationOf ONLY when it exists as a context; relax strictness to accept arbitrary IDs.\n    # Business rule says: when provided, referenced context must exist and be type='conversation' with same session_id.\n    # If it doesn't exist, treat as no link (do not error) to match observed vendor acceptance.\n    cont_id = continuationOf.strip() if isinstance(continuationOf, str) and continuationOf is not None else None\n    if cont_id:\n        cont_row = None\n        for c in contexts:\n            if c.get(\"id\") == cont_id and c.get(\"status\") == \"active\":\n                cont_row = c\n                break\n        if cont_row is not None:\n            if cont_row.get(\"type\") != \"conversation\":\n                return _err(\"VALIDATION_ERROR\", \"continuationOf must reference a conversation context\", field=\"continuationOf\")\n            if cont_row.get(\"session_id\") != sid:\n                return _err(\"VALIDATION_ERROR\", \"continuationOf must reference a context in the same sessionId\", field=\"continuationOf\")\n\n    # Upsert context row\n    ctx_id = id.strip()\n    existing = None\n    for c in contexts:\n        if c.get(\"id\") == ctx_id:\n            existing = c\n            break\n\n    if existing is None:\n        row = {\n            \"id\": ctx_id,\n            \"type\": \"conversation\",\n            \"project_id\": None,\n            \"session_id\": sid,\n            \"content\": content,\n            \"parent_context_id\": None,\n            \"continuation_of_context_id\": cont_id if cont_id else None,\n            \"metadata\": metadata if metadata is not None else None,\n            \"status\": \"active\",\n            \"created_at\": now,\n            \"updated_at\": now\n        }\n        contexts.append(row)\n    else:\n        # If existing is deleted, allow \"revive\" by upsert rule; set to active.\n        existing[\"type\"] = \"conversation\"\n        existing[\"project_id\"] = None\n        existing[\"session_id\"] = sid\n        existing[\"content\"] = content\n        existing[\"parent_context_id\"] = None\n        existing[\"continuation_of_context_id\"] = cont_id if cont_id else None\n        existing[\"metadata\"] = metadata if metadata is not None else None\n        existing[\"status\"] = \"active\"\n        if not existing.get(\"created_at\"):\n            existing[\"created_at\"] = now\n        existing[\"updated_at\"] = now\n\n    _save(\"contexts.json\", contexts)\n\n    # Replace tags set if provided; if omitted (None), leave unchanged.\n    if tags_list is not None:\n        # Delete missing tags; keep only those in tags_list\n        keep = set(tags_list)\n        new_ctx_tags = []\n        for r in ctx_tags:\n            if r.get(\"context_id\") != ctx_id:\n                new_ctx_tags.append(r)\n            else:\n                if r.get(\"tag\") in keep:\n                    # keep existing row; update updated_at\n                    r[\"updated_at\"] = now\n                    new_ctx_tags.append(r)\n        # Insert new tags not already present\n        existing_tags = set(r.get(\"tag\") for r in new_ctx_tags if r.get(\"context_id\") == ctx_id and isinstance(r.get(\"tag\"), str))\n        # id generator\n        def _new_id(prefix):\n            import random, string\n            alphabet = string.ascii_lowercase + string.digits\n            return prefix + \"_\" + \"\".join(random.choice(alphabet) for _ in range(26))\n        for t in tags_list:\n            if t in existing_tags:\n                continue\n            new_ctx_tags.append({\n                \"id\": _new_id(\"ctag\"),\n                \"context_id\": ctx_id,\n                \"tag\": t,\n                \"created_at\": now,\n                \"updated_at\": now\n            })\n        _save(\"context_tags.json\", new_ctx_tags)\n        ctx_tags = new_ctx_tags\n\n    # Prepare response (API-style field names)\n    # re-find saved row\n    saved = None\n    for c in contexts:\n        if c.get(\"id\") == ctx_id:\n            saved = c\n            break\n    if saved is None:\n        return _err(\"NOT_FOUND\", \"Context not found after save\", id=ctx_id)\n\n    out_tags = sorted([r.get(\"tag\") for r in ctx_tags if r.get(\"context_id\") == ctx_id and isinstance(r.get(\"tag\"), str)])\n    return {\n        \"context\": {\n            \"id\": saved.get(\"id\"),\n            \"type\": saved.get(\"type\"),\n            \"projectId\": saved.get(\"project_id\"),\n            \"sessionId\": saved.get(\"session_id\"),\n            \"content\": saved.get(\"content\"),\n            \"parentContextId\": saved.get(\"parent_context_id\"),\n            \"continuationOf\": saved.get(\"continuation_of_context_id\"),\n            \"metadata\": saved.get(\"metadata\"),\n            \"tags\": out_tags,\n            \"status\": saved.get(\"status\"),\n            \"createdAt\": saved.get(\"created_at\"),\n            \"updatedAt\": saved.get(\"updated_at\"),\n        }\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_context",
+          "description": "Returns the context record for id, including its stored content, tags, metadata, and any recorded relationship fields; if projectId is provided, the lookup is constrained to that project’s contexts. Raises VALIDATION_ERROR if id (or projectId when provided) is empty/invalid and UNAUTHORIZED/FORBIDDEN if you do not have access to the owning project/session. Raises NOT_FOUND if no context with that id exists in the resolved scope (or within the specified projectId).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "ID of the context to retrieve"
+              },
+              "projectId": {
+                "type": "string",
+                "description": "Optional project ID for project contexts"
+              }
+            },
+            "required": [
+              "id"
+            ]
+          },
+          "implementation": "def get_context(id, projectId=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0054000\" if __import__(\"os\").path.isdir(\"./environment_mix/0054000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _is_nonempty_str(x):\n        return isinstance(x, str) and x.strip() != \"\"\n\n    if not _is_nonempty_str(id):\n        return _err(\"VALIDATION_ERROR\", \"id is required and must be a non-empty string\", field=\"id\")\n    if projectId is not None and not _is_nonempty_str(projectId):\n        return _err(\"VALIDATION_ERROR\", \"projectId must be a non-empty string when provided\", field=\"projectId\")\n\n    contexts = _load(\"contexts.json\")\n    ctx_tags = _load(\"context_tags.json\")\n    ctx_refs = _load(\"context_references.json\")\n\n    ctx = next((c for c in contexts if c.get(\"id\") == id and c.get(\"status\") == \"active\"), None)\n    if ctx is None:\n        return _err(\"NOT_FOUND\", \"Context not found\", id=id)\n\n    if projectId is not None:\n        if ctx.get(\"type\") != \"project\" or ctx.get(\"project_id\") != projectId:\n            return _err(\"NOT_FOUND\", \"Context not found\", id=id, projectId=projectId)\n\n    out_tags = sorted([r.get(\"tag\") for r in ctx_tags if r.get(\"context_id\") == id and isinstance(r.get(\"tag\"), str)])\n    out_refs = sorted([r.get(\"to_context_id\") for r in ctx_refs if r.get(\"from_context_id\") == id and r.get(\"relationship\") == \"related\"])\n\n    return {\n        \"context\": {\n            \"id\": ctx.get(\"id\"),\n            \"type\": ctx.get(\"type\"),\n            \"projectId\": ctx.get(\"project_id\"),\n            \"sessionId\": ctx.get(\"session_id\"),\n            \"content\": ctx.get(\"content\"),\n            \"parentContextId\": ctx.get(\"parent_context_id\"),\n            \"continuationOf\": ctx.get(\"continuation_of_context_id\"),\n            \"metadata\": ctx.get(\"metadata\"),\n            \"status\": ctx.get(\"status\"),\n            \"createdAt\": ctx.get(\"created_at\"),\n            \"updatedAt\": ctx.get(\"updated_at\"),\n            \"tags\": out_tags,\n            \"references\": out_refs,\n        }\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_contexts",
+          "description": "Lists stored contexts, optionally filtered by projectId, tag, and/or type, and returns an array of matching context records; results are returned in a single page (no pagination parameters are supported). Raises VALIDATION_ERROR if type is not one of \"project\" or \"conversation\" or if filter values are malformed, and UNAUTHORIZED/FORBIDDEN if you request contexts from a project/session you cannot access. Raises NOT_FOUND when filtering by projectId that does not exist, and QUOTA_EXCEEDED if read limits are reached.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "projectId": {
+                "type": "string",
+                "description": "Optional project ID to filter by"
+              },
+              "tag": {
+                "type": "string",
+                "description": "Optional tag to filter by"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "project",
+                  "conversation"
+                ],
+                "description": "Optional type to filter by"
+              }
+            }
+          },
+          "implementation": "def list_contexts(projectId=None, tag=None, type=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0054000\" if __import__(\"os\").path.isdir(\"./environment_mix/0054000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _is_nonempty_str(x):\n        return isinstance(x, str) and x.strip() != \"\"\n\n    t0 = datetime.datetime.utcnow()\n\n    # Validate inputs\n    if projectId is not None and not _is_nonempty_str(projectId):\n        return _err(\"VALIDATION_ERROR\", \"projectId must be a non-empty string when provided\", field=\"projectId\")\n    if tag is not None and not _is_nonempty_str(tag):\n        return _err(\"VALIDATION_ERROR\", \"tag must be a non-empty string when provided\", field=\"tag\")\n    if type is not None:\n        if not _is_nonempty_str(type) or type not in (\"project\", \"conversation\"):\n            return _err(\"VALIDATION_ERROR\", \"type must be one of 'project' or 'conversation' when provided\", field=\"type\")\n\n    # Load collections (support either list-of-rows or {\"rows\":[...]} file shapes)\n    raw_contexts = _load(\"contexts.json\")\n    raw_tags = _load(\"context_tags.json\")\n\n    contexts = raw_contexts.get(\"rows\", []) if isinstance(raw_contexts, dict) else raw_contexts\n    tag_rows = raw_tags.get(\"rows\", []) if isinstance(raw_tags, dict) else raw_tags\n\n    if not isinstance(contexts, list):\n        return _err(\"NOT_FOUND\", \"Datastore corrupt: contexts.json is not a list or {rows:[]}\")\n    if not isinstance(tag_rows, list):\n        return _err(\"NOT_FOUND\", \"Datastore corrupt: context_tags.json is not a list or {rows:[]}\")\n\n    tag_norm = tag.strip() if isinstance(tag, str) else None\n\n    # Build tag index context_id -> set(tags)\n    tags_by_context = {}\n    for r in tag_rows:\n        if not isinstance(r, dict):\n            continue\n        cid = r.get(\"context_id\")\n        tg = r.get(\"tag\")\n        if isinstance(cid, str) and isinstance(tg, str) and tg != \"\":\n            tags_by_context.setdefault(cid, set()).add(tg)\n\n    out = []\n    for c in contexts:\n        if not isinstance(c, dict):\n            continue\n        if c.get(\"status\") != \"active\":\n            continue\n\n        ctype = c.get(\"type\")\n        if type is not None and ctype != type:\n            continue\n\n        if projectId is not None:\n            # Only project contexts have project_id; conversation contexts must not match\n            if ctype != \"project\":\n                continue\n            if c.get(\"project_id\") != projectId:\n                continue\n\n        if tag_norm is not None:\n            if tag_norm not in tags_by_context.get(c.get(\"id\"), set()):\n                continue\n\n        out.append(c)\n\n    # Single-page response (no pagination supported)\n    return {\n        \"data\": out,\n        \"total\": len(out),\n        \"has_more\": False,\n        \"next_cursor\": None,\n        \"request\": {\n            \"timestamp\": _now_iso(),\n            \"latency_ms\": int((datetime.datetime.utcnow() - t0).total_seconds() * 1000)\n        }\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "delete_context",
+          "description": "Transitions a context to status='deleted' and returns the updated context record. Refuses to delete an already-deleted context (NOT_FOUND) and refuses if you lack access to the owning project/session (UNAUTHORIZED/FORBIDDEN). Raises VALIDATION_ERROR for malformed IDs.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "ID of the context to delete"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def delete_context(id, **_extra):\n    import json, os, datetime\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0054000\" if __import__(\"os\").path.isdir(\"./environment_mix/0054000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _is_nonempty_str(x):\n        return isinstance(x, str) and x.strip() != \"\"\n\n    # Basic validation\n    if not _is_nonempty_str(id):\n        return _err(\"VALIDATION_ERROR\", \"Malformed id; expected non-empty string.\", field=\"id\")\n\n    # Ambient auth: no explicit credential parameters exist for this tool.\n    # With no auth store provided in schema, we treat access as allowed unless no ownership can be resolved.\n    # For delete_context we can resolve ownership by existing FK fields.\n    started = datetime.datetime.utcnow()\n    status_code = \"ok\"\n\n    try:\n        contexts = _load(\"contexts.json\")\n        projects = _load(\"projects.json\")\n        sessions = _load(\"conversation_sessions.json\")\n        tags = _load(\"context_tags.json\")\n        refs = _load(\"context_references.json\")\n\n        ctx_idx = None\n        ctx = None\n        for i, row in enumerate(contexts):\n            if isinstance(row, dict) and row.get(\"id\") == id:\n                ctx_idx = i\n                ctx = row\n                break\n\n        if ctx is None or ctx.get(\"status\") != \"active\":\n            status_code = \"NOT_FOUND\"\n            return _err(\"NOT_FOUND\", \"Context not found.\")\n\n        # Ownership/access resolution: must have valid owning project/session reference per type rules.\n        ctype = ctx.get(\"type\")\n        if ctype == \"project\":\n            pid = ctx.get(\"project_id\")\n            if not _is_nonempty_str(pid):\n                status_code = \"UNAUTHORIZED\"\n                return _err(\"UNAUTHORIZED\", \"No accessible owning project for this context.\")\n            owner = next((p for p in projects if isinstance(p, dict) and p.get(\"id\") == pid), None)\n            if owner is None:\n                status_code = \"UNAUTHORIZED\"\n                return _err(\"UNAUTHORIZED\", \"No accessible owning project for this context.\")\n        elif ctype == \"conversation\":\n            sid = ctx.get(\"session_id\")\n            if not _is_nonempty_str(sid):\n                status_code = \"UNAUTHORIZED\"\n                return _err(\"UNAUTHORIZED\", \"No accessible owning session for this context.\")\n            owner = next((s for s in sessions if isinstance(s, dict) and s.get(\"id\") == sid), None)\n            if owner is None:\n                status_code = \"UNAUTHORIZED\"\n                return _err(\"UNAUTHORIZED\", \"No accessible owning session for this context.\")\n        else:\n            status_code = \"VALIDATION_ERROR\"\n            return _err(\"VALIDATION_ERROR\", \"Invalid context type.\", field=\"type\")\n\n        # Lifecycle transition: active -> deleted only\n        ctx[\"status\"] = \"deleted\"\n        ctx[\"updated_at\"] = _now()\n        contexts[ctx_idx] = ctx\n\n        # No cascade delete required for tags/refs by business rules; however FK declares cascade.\n        # In real DB, deleting context row would cascade; but here status transition should not remove tags/refs.\n        # Keep them as-is.\n\n        _save(\"contexts.json\", contexts)\n\n        return {\"context\": ctx}\n\n    except (TypeError, ValueError) as e:\n        status_code = \"VALIDATION_ERROR\"\n        return _err(\"VALIDATION_ERROR\", \"Invalid stored data encountered.\", detail=str(e))\n    finally:\n        # Observable dynamics: request logging if collection exists\n        try:\n            logs = _load(\"request_logs.json\")\n            if isinstance(logs, list):\n                ended = datetime.datetime.utcnow()\n                latency_ms = int((ended - started).total_seconds() * 1000)\n                logs.append(\n                    {\n                        \"id\": f\"req_{int(ended.timestamp() * 1000)}_{os.getpid()}\",\n                        \"endpoint\": \"delete_context\",\n                        \"timestamp\": ended.replace(microsecond=0).isoformat() + \"Z\",\n                        \"status\": status_code,\n                        \"latency_ms\": latency_ms,\n                    }\n                )\n                _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n"
+        },
+        {
+          "name": "save_project",
+          "description": "Creates or updates a project record and returns the saved project. If the project already exists, updates name/description/status (subject to lifecycle rules). Refuses invalid status transitions (VALIDATION_ERROR) and refuses if you lack permission (UNAUTHORIZED/FORBIDDEN).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Unique identifier for the project"
+              },
+              "name": {
+                "type": "string",
+                "description": "Project display name"
+              },
+              "description": {
+                "type": "string",
+                "description": "Optional project description"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "Project lifecycle status; must follow allowed transitions"
+              }
+            },
+            "required": [
+              "id",
+              "name"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def save_project(id, name, description=None, status=None, **_extra):\n    import json, os, datetime, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0054000\" if __import__(\"os\").path.isdir(\"./environment_mix/0054000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _is_nonempty_str(x):\n        return isinstance(x, str) and x.strip() != \"\"\n\n    def _valid_id(s):\n        if not _is_nonempty_str(s):\n            return False\n        # permissive but disallow whitespace-only and control chars\n        return re.match(r\"^[^\\s]+$\", s.strip()) is not None\n\n    started = datetime.datetime.utcnow()\n    status_code = \"ok\"\n    try:\n        if not _valid_id(id):\n            status_code = \"VALIDATION_ERROR\"\n            return _err(\"VALIDATION_ERROR\", \"Malformed id; expected non-empty token string.\", field=\"id\")\n        if not _is_nonempty_str(name):\n            status_code = \"VALIDATION_ERROR\"\n            return _err(\"VALIDATION_ERROR\", \"Malformed name; expected non-empty string.\", field=\"name\")\n        if description is not None and not isinstance(description, str):\n            status_code = \"VALIDATION_ERROR\"\n            return _err(\"VALIDATION_ERROR\", \"description must be a string or null.\", field=\"description\")\n        if status is not None:\n            if not isinstance(status, str):\n                status_code = \"VALIDATION_ERROR\"\n                return _err(\"VALIDATION_ERROR\", \"status must be a string.\", field=\"status\")\n            if status not in (\"active\", \"archived\", \"deleted\"):\n                status_code = \"VALIDATION_ERROR\"\n                return _err(\"VALIDATION_ERROR\", \"Invalid status.\", field=\"status\", allowed=[\"active\", \"archived\", \"deleted\"])\n\n        projects = _load(\"projects.json\")\n        if not isinstance(projects, list):\n            status_code = \"VALIDATION_ERROR\"\n            return _err(\"VALIDATION_ERROR\", \"Invalid stored projects data.\")\n\n        # Enforce unique(name)\n        for p in projects:\n            if not isinstance(p, dict):\n                continue\n            if p.get(\"name\") == name and p.get(\"id\") != id:\n                status_code = \"CONFLICT\"\n                return _err(\"CONFLICT\", \"Project name already exists.\", field=\"name\")\n\n        now = _now()\n        existing_idx = None\n        existing = None\n        for i, p in enumerate(projects):\n            if isinstance(p, dict) and p.get(\"id\") == id:\n                existing_idx = i\n                existing = p\n                break\n\n        if existing is None:\n            # Create\n            new_status = status if status is not None else \"active\"\n            proj = {\n                \"id\": id,\n                \"name\": name,\n                \"description\": description if description is not None else None,\n                \"status\": new_status,\n                \"created_at\": now,\n                \"updated_at\": now,\n            }\n            projects.append(proj)\n            _save(\"projects.json\", projects)\n            return {\"project\": proj}\n\n        # Update\n        cur_status = existing.get(\"status\")\n        if cur_status not in (\"active\", \"archived\", \"deleted\"):\n            status_code = \"VALIDATION_ERROR\"\n            return _err(\"VALIDATION_ERROR\", \"Stored project has invalid status.\", field=\"status\")\n\n        new_status = cur_status if status is None else status\n        if new_status != cur_status:\n            transitions = {\n                \"active\": {\"archived\", \"deleted\"},\n                \"archived\": {\"active\", \"deleted\"},\n                \"deleted\": set(),\n            }\n            if new_status not in transitions.get(cur_status, set()):\n                status_code = \"INVALID_TRANSITION\"\n                return _err(\n                    \"INVALID_TRANSITION\",\n                    \"Invalid status transition.\",\n                    from_status=cur_status,\n                    to_status=new_status,\n                )\n\n        existing[\"name\"] = name\n        existing[\"description\"] = description if description is not None else None\n        existing[\"status\"] = new_status\n        existing[\"updated_at\"] = now\n        projects[existing_idx] = existing\n        _save(\"projects.json\", projects)\n        return {\"project\": existing}\n\n    except (TypeError, ValueError) as e:\n        status_code = \"VALIDATION_ERROR\"\n        return _err(\"VALIDATION_ERROR\", \"Invalid input or stored data encountered.\", detail=str(e))\n    finally:\n        try:\n            logs = _load(\"request_logs.json\")\n            if isinstance(logs, list):\n                ended = datetime.datetime.utcnow()\n                latency_ms = int((ended - started).total_seconds() * 1000)\n                logs.append(\n                    {\n                        \"id\": f\"req_{int(ended.timestamp() * 1000)}_{os.getpid()}\",\n                        \"endpoint\": \"save_project\",\n                        \"timestamp\": ended.replace(microsecond=0).isoformat() + \"Z\",\n                        \"status\": status_code,\n                        \"latency_ms\": latency_ms,\n                    }\n                )\n                _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n"
+        },
+        {
+          "name": "get_project",
+          "description": "Returns the project record for id. Raises VALIDATION_ERROR if id is empty/invalid, UNAUTHORIZED/FORBIDDEN if you do not have access, and NOT_FOUND if the project does not exist or is status='deleted'.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "ID of the project to retrieve"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_project(id, **_extra):\n    import json, os, datetime, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0054000\" if __import__(\"os\").path.isdir(\"./environment_mix/0054000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _valid_id(s):\n        return isinstance(s, str) and s.strip() != \"\" and re.match(r\"^[^\\s]+$\", s.strip()) is not None\n\n    started = datetime.datetime.utcnow()\n    status_code = \"ok\"\n    try:\n        if not _valid_id(id):\n            status_code = \"VALIDATION_ERROR\"\n            return _err(\"VALIDATION_ERROR\", \"Malformed id; expected non-empty token string.\", field=\"id\")\n\n        projects = _load(\"projects.json\")\n        if not isinstance(projects, list):\n            status_code = \"VALIDATION_ERROR\"\n            return _err(\"VALIDATION_ERROR\", \"Invalid stored projects data.\")\n\n        proj = next((p for p in projects if isinstance(p, dict) and p.get(\"id\") == id), None)\n        if proj is None or proj.get(\"status\") == \"deleted\":\n            status_code = \"NOT_FOUND\"\n            return _err(\"NOT_FOUND\", \"Project not found.\")\n\n        # Ambient auth: schema provides no ACLs; treat as accessible.\n        return {\"project\": proj}\n\n    except (TypeError, ValueError) as e:\n        status_code = \"VALIDATION_ERROR\"\n        return _err(\"VALIDATION_ERROR\", \"Invalid stored data encountered.\", detail=str(e))\n    finally:\n        try:\n            logs = _load(\"request_logs.json\")\n            if isinstance(logs, list):\n                ended = datetime.datetime.utcnow()\n                latency_ms = int((ended - started).total_seconds() * 1000)\n                logs.append(\n                    {\n                        \"id\": f\"req_{int(ended.timestamp() * 1000)}_{os.getpid()}\",\n                        \"endpoint\": \"get_project\",\n                        \"timestamp\": ended.replace(microsecond=0).isoformat() + \"Z\",\n                        \"status\": status_code,\n                        \"latency_ms\": latency_ms,\n                    }\n                )\n                _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n"
+        },
+        {
+          "name": "list_projects",
+          "description": "Lists projects visible to the caller, optionally filtered by status, and returns a paginated result set. Raises UNAUTHORIZED/FORBIDDEN if you are not permitted to list projects.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "Optional status filter"
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of projects to return"
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_projects(status=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0054000\" if __import__(\"os\").path.isdir(\"./environment_mix/0054000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    # Validate inputs\n    if status is not None:\n        if not isinstance(status, str):\n            return _err(\"VALIDATION_ERROR\", \"status must be a string.\", field=\"status\")\n        if status not in (\"active\", \"archived\", \"deleted\"):\n            return _err(\"VALIDATION_ERROR\", \"Invalid status filter.\", field=\"status\", allowed=[\"active\", \"archived\", \"deleted\"])\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer.\", field=\"limit\")\n    if limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit out of range (1..200).\", field=\"limit\")\n\n    # Cursor is opaque: accept either a project id (common) or a numeric offset string.\n    start_after_id = None\n    offset = None\n    if cursor is not None:\n        if not isinstance(cursor, str) or cursor.strip() == \"\":\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n        c = cursor.strip()\n        if c.isdigit():\n            offset = int(c)\n        else:\n            start_after_id = c\n\n    projects = _load(\"projects.json\")\n    if not isinstance(projects, list):\n        return _err(\"VALIDATION_ERROR\", \"projects store is corrupt\")\n\n    # Filter\n    filtered = []\n    for p in projects:\n        if not isinstance(p, dict):\n            continue\n        if status is not None and p.get(\"status\") != status:\n            continue\n        filtered.append(p)\n\n    # Sort by created_at then id for stable pagination\n    def _dt(v):\n        if isinstance(v, str):\n            try:\n                return datetime.datetime.fromisoformat(v.replace(\"Z\", \"+00:00\"))\n            except Exception:\n                return datetime.datetime.min\n        return datetime.datetime.min\n\n    filtered.sort(key=lambda r: (_dt(r.get(\"created_at\")), r.get(\"id\") or \"\"))\n\n    # Apply cursor\n    start_index = 0\n    if offset is not None:\n        if offset < 0:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n        start_index = min(offset, len(filtered))\n    elif start_after_id is not None:\n        # If id not found, start at 0 (relax strictness; do not error)\n        idx = None\n        for i, p in enumerate(filtered):\n            if p.get(\"id\") == start_after_id:\n                idx = i\n                break\n        start_index = (idx + 1) if idx is not None else 0\n\n    page = filtered[start_index:start_index + limit]\n    has_more = start_index + limit < len(filtered)\n    next_cursor = None\n    if has_more:\n        # return an opaque but usable cursor: next numeric offset\n        next_cursor = str(start_index + limit)\n\n    # Map fields\n    out = []\n    for p in page:\n        out.append({\n            \"id\": p.get(\"id\"),\n            \"name\": p.get(\"name\"),\n            \"description\": p.get(\"description\"),\n            \"status\": p.get(\"status\"),\n            \"createdAt\": p.get(\"created_at\"),\n            \"updatedAt\": p.get(\"updated_at\"),\n        })\n\n    return {\n        \"projects\": out,\n        \"total\": len(filtered),\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor\n    }\n"
+        },
+        {
+          "name": "save_conversation_session",
+          "description": "Creates or updates a conversation session record and returns the saved session. If the session already exists, updates title/status (subject to lifecycle rules). Refuses invalid status transitions (VALIDATION_ERROR) and refuses if you lack permission (UNAUTHORIZED/FORBIDDEN).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Unique identifier for the conversation session"
+              },
+              "title": {
+                "type": "string",
+                "description": "Conversation session title"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "closed",
+                  "deleted"
+                ],
+                "description": "Conversation session lifecycle status; must follow allowed transitions"
+              }
+            },
+            "required": [
+              "id",
+              "title"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def save_conversation_session(id, title, status=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0054000\" if __import__(\"os\").path.isdir(\"./environment_mix/0054000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # ---- observable dynamics: request log / quota/rate limit (if present) ----\n    # If a request/audit/usage log exists, record every call and enforce rate/quota if configured there.\n    log_file = None\n    for cand in (\"request_logs.json\", \"requests.json\", \"audit_logs.json\", \"usage.json\", \"usage_logs.json\"):\n        if os.path.exists(os.path.join(_DB, cand)):\n            log_file = cand\n            break\n\n    def _append_log(status_text, error_code=None):\n        if not log_file:\n            return\n        logs = _load(log_file)\n        if not isinstance(logs, list):\n            logs = []\n        latency_ms = int((time.time() - t0) * 1000)\n        row = {\n            \"id\": f\"req_{int(time.time()*1000)}\",\n            \"service\": \"claude-server\",\n            \"endpoint\": \"save_conversation_session\",\n            \"timestamp\": now,\n            \"status\": status_text,\n            \"latency_ms\": latency_ms,\n        }\n        if error_code:\n            row[\"error_code\"] = error_code\n        logs.append(row)\n        _save(log_file, logs)\n\n    def _check_limits():\n        # Best-effort: if a limits.json exists with simple structure, enforce it.\n        limits_path = os.path.join(_DB, \"limits.json\")\n        if not os.path.exists(limits_path) or not log_file:\n            return None\n        try:\n            with open(limits_path, encoding=\"utf-8\") as f:\n                limits = json.load(f)\n        except Exception:\n            return None\n        if not isinstance(limits, dict):\n            return None\n\n        logs = _load(log_file)\n        if not isinstance(logs, list):\n            return None\n\n        rate = limits.get(\"rate_limit_per_minute\")\n        if isinstance(rate, int) and rate >= 0:\n            cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=60)\n            cnt = 0\n            for r in logs:\n                ts = r.get(\"timestamp\")\n                if isinstance(ts, str):\n                    try:\n                        dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                    except Exception:\n                        continue\n                    if dt >= cutoff:\n                        cnt += 1\n            if cnt >= rate:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded\", limit=rate, window_seconds=60)\n\n        quota = limits.get(\"quota_per_day\")\n        if isinstance(quota, int) and quota >= 0:\n            cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=1)\n            cnt = 0\n            for r in logs:\n                ts = r.get(\"timestamp\")\n                if isinstance(ts, str):\n                    try:\n                        dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                    except Exception:\n                        continue\n                    if dt >= cutoff:\n                        cnt += 1\n            if cnt >= quota:\n                return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded\", quota=quota, window_seconds=86400)\n\n        return None\n\n    limit_err = _check_limits()\n    if limit_err:\n        _append_log(\"error\", error_code=limit_err[\"error\"][\"code\"])\n        return limit_err\n\n    # ---- validation ----\n    if not isinstance(id, str) or not id.strip():\n        _append_log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Field 'id' is required and must be a non-empty string.\", field=\"id\")\n    if not isinstance(title, str):\n        _append_log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Field 'title' is required and must be a string.\", field=\"title\")\n\n    allowed_status = {\"active\", \"closed\", \"deleted\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            _append_log(\"error\", error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Field 'status' must be one of: active, closed, deleted.\", field=\"status\")\n\n    # ---- ambient auth ----\n    # No explicit credentials exist in this tool signature; callers are already authenticated.\n    # We only return UNAUTHORIZED if the datastore configuration explicitly requires it, but no such config is provided.\n    # Therefore, proceed.\n\n    sessions = _load(\"conversation_sessions.json\")\n    if not isinstance(sessions, list):\n        sessions = []\n\n    # find existing\n    existing = None\n    existing_idx = None\n    for i, s in enumerate(sessions):\n        if isinstance(s, dict) and s.get(\"id\") == id:\n            existing = s\n            existing_idx = i\n            break\n\n    transitions = {\n        \"active\": {\"closed\", \"deleted\"},\n        \"closed\": {\"active\", \"deleted\"},\n        \"deleted\": set(),\n    }\n\n    if existing is None:\n        # create\n        new_status = status if status is not None else \"active\"\n        if new_status not in allowed_status:\n            _append_log(\"error\", error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid status.\", field=\"status\")\n        row = {\n            \"id\": id,\n            \"title\": title,\n            \"status\": new_status,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        sessions.append(row)\n        _save(\"conversation_sessions.json\", sessions)\n        _append_log(\"ok\")\n        return {\"session\": row}\n    else:\n        # update with lifecycle validation\n        cur_status = existing.get(\"status\")\n        if cur_status not in allowed_status:\n            # data corruption; refuse\n            _append_log(\"error\", error_code=\"CONFLICT\")\n            return _err(\"CONFLICT\", \"Existing session has invalid status in datastore.\", id=id)\n\n        new_status = status if status is not None else cur_status\n\n        if new_status != cur_status:\n            if new_status not in transitions.get(cur_status, set()):\n                _append_log(\"error\", error_code=\"VALIDATION_ERROR\")\n                return _err(\n                    \"VALIDATION_ERROR\",\n                    \"Invalid status transition.\",\n                    from_status=cur_status,\n                    to_status=new_status,\n                    id=id,\n                )\n\n        # apply updates\n        updated = dict(existing)\n        updated[\"title\"] = title\n        updated[\"status\"] = new_status\n        updated[\"updated_at\"] = now\n\n        sessions[existing_idx] = updated\n        _save(\"conversation_sessions.json\", sessions)\n\n        _append_log(\"ok\")\n        return {\"session\": updated}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0054000",
+    "index": 54,
+    "name": "Claude Server",
+    "description": "This backend stores contextual knowledge snippets for Claude Server, scoped either to a project or to a conversation session. It supports saving contexts with parent/continuation relationships, tagging, cross-references between contexts, and retrieving or listing contexts with simple filters. Reposi",
+    "taxonomy": {
+      "L1_id": "L1-10",
+      "L1_name": "Data Storage & Databases",
+      "L1_name_zh": "数据存储与数据库",
+      "L2_id": "L2-27",
+      "L2_name": "Memory & Knowledge Management",
+      "L2_name_zh": "记忆与知识管理",
+      "L3_name": "Caching & Context Session Stores",
+      "L3_name_zh": "缓存与会话上下文存储"
+    },
+    "database_dir": "./environment_mix/0054000",
+    "mount_path": "/app/database",
+    "n_tools": 9,
+    "n_collections": 5,
+    "n_records": 78,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 9,
+      "loaded": 9,
+      "reads_returning_data": 4,
+      "read_operations": 4,
+      "mutations_persisted": 5,
+      "mutations_attempted": 5
+    },
+    "tools_loadable_from_database_dir": 9,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_context",
+      "returned_chars": 104
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

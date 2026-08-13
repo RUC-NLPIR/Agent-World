@@ -1,0 +1,430 @@
+{
+  "index": 63,
+  "local_files_dir": "./environment_mix/0063000",
+  "file_list": [
+    "./environment_mix/0063000/README.md",
+    "./environment_mix/0063000/mcp_servers.json",
+    "./environment_mix/0063000/mcp_tools.json",
+    "./environment_mix/0063000/search_queries.json",
+    "./environment_mix/0063000/tool_executions.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "mcp_servers.json": "17 rows",
+        "mcp_tools.json": "18 rows",
+        "search_queries.json": "18 rows",
+        "tool_executions.json": "21 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "search_servers",
+          "description": "Hybrid-search the Toolbox MCP registry for servers matching the provided query and return up to n top-ranked results (default 3, maximum 5) with each server’s basic metadata and available tools; results are returned as a single page and are not cursor-paginated. Raises VALIDATION_ERROR if query is missing/empty or if n is not a number in the allowed range, and raises UNAUTHORIZED if the caller is not permitted to search the registry. Raises RATE_LIMITED when search quota is exceeded and INTERNAL_ERROR for unexpected failures while executing the search.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Search query for finding MCP servers. You can either write keywords if you want something broad or are referencing a specific server by name, or you can write a detailed description (1-2 sentences) specifying exactly what you are looking for. We perform hybrid search."
+              },
+              "n": {
+                "type": "number",
+                "maximum": 5,
+                "description": "Number of results to return (default: 3)"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def search_servers(query, n=None, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0063000\" if __import__(\"os\").path.isdir(\"./environment_mix/0063000\") else \"/app/database\")\n\n    def _load(nm):\n        try:\n            with open(os.path.join(_DB, nm), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(nm, d):\n        with open(os.path.join(_DB, nm), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_iso(dt):\n        if not isinstance(dt, str) or not dt:\n            return None\n        try:\n            if dt.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(dt[:-1])\n            return datetime.datetime.fromisoformat(dt)\n        except Exception:\n            return None\n\n    def _new_id(prefix):\n        # readable, stable-enough for local store\n        return f\"{prefix}_{int(time.time() * 1000)}_{os.getpid()}\"\n\n    t0 = time.time()\n    status_code = \"succeeded\"\n    error_obj = None\n    saved_query_row = None\n\n    # Validate input\n    if not isinstance(query, str) or query.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"query must be a non-empty string\")\n    q = query  # must persist exactly as provided\n    if n is None:\n        nn = 3\n    else:\n        if not isinstance(n, (int, float)) or isinstance(n, bool):\n            return _err(\"VALIDATION_ERROR\", \"n must be a number between 1 and 5\")\n        if int(n) != n:\n            # accept floats only if whole-number\n            return _err(\"VALIDATION_ERROR\", \"n must be an integer between 1 and 5\")\n        nn = int(n)\n    if nn < 1 or nn > 5:\n        return _err(\"VALIDATION_ERROR\", \"n must be between 1 and 5\")\n\n    # Create search_queries row (received -> running -> succeeded/failed), always persisted\n    queries = _load(\"search_queries.json\")\n    now = _now_iso()\n    qid = _new_id(\"sq\")\n    saved_query_row = {\n        \"id\": qid,\n        \"query\": q,\n        \"n\": nn,\n        \"search_mode\": \"hybrid\",\n        \"status\": \"received\",\n        \"result_server_ids\": None,\n        \"latency_ms\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    queries.append(saved_query_row)\n    _save(\"search_queries.json\", queries)\n\n    # Mark running\n    saved_query_row[\"status\"] = \"running\"\n    saved_query_row[\"updated_at\"] = _now_iso()\n    _save(\"search_queries.json\", queries)\n\n    try:\n        servers = _load(\"mcp_servers.json\")\n        tools = _load(\"mcp_tools.json\")\n\n        # only active servers by default (policy: exclude deprecated unless internal override; none here)\n        active_servers = [s for s in servers if isinstance(s, dict) and s.get(\"status\") == \"active\"]\n\n        # Hybrid-ish scoring: token overlap + substring hits across qualified_name/display_name/description/tags/owner\n        q_norm = q.strip().lower()\n        q_tokens = [t for t in re.split(r\"[^a-z0-9]+\", q_norm) if t]\n        q_token_set = set(q_tokens)\n\n        def field_text(srv):\n            parts = []\n            for k in (\"qualified_name\", \"display_name\", \"description\", \"owner\"):\n                v = srv.get(k)\n                if isinstance(v, str):\n                    parts.append(v.lower())\n            tg = srv.get(\"tags\")\n            if isinstance(tg, list):\n                parts.append(\" \".join([str(x).lower() for x in tg]))\n            return \" \".join(parts)\n\n        def score(srv):\n            text = field_text(srv)\n            sc = 0.0\n            if q_norm and q_norm in text:\n                sc += 5.0\n            # token overlap\n            if q_token_set:\n                text_tokens = set([t for t in re.split(r\"[^a-z0-9]+\", text) if t])\n                overlap = len(q_token_set.intersection(text_tokens))\n                sc += overlap * 1.0\n                # prefix bonus for qualified_name/display_name\n                qn = (srv.get(\"qualified_name\") or \"\").lower()\n                dn = (srv.get(\"display_name\") or \"\").lower()\n                for tok in q_token_set:\n                    if qn.startswith(tok):\n                        sc += 1.5\n                    if dn.startswith(tok):\n                        sc += 1.0\n            # tag exact match bonus\n            tags = srv.get(\"tags\") if isinstance(srv.get(\"tags\"), list) else []\n            tags_l = set([str(x).lower() for x in tags])\n            for tok in q_token_set:\n                if tok in tags_l:\n                    sc += 1.0\n            # slight recency tie-breaker: newer updated_at ranks a bit higher\n            upd = _parse_iso(srv.get(\"updated_at\"))\n            if upd:\n                age_days = max(0.0, (datetime.datetime.utcnow() - upd).total_seconds() / 86400.0)\n                sc += max(0.0, 0.25 - min(0.25, age_days * 0.001))\n            return sc\n\n        scored = [(score(s), s) for s in active_servers]\n        scored.sort(key=lambda x: (x[0], _parse_iso((x[1] or {}).get(\"updated_at\")) or datetime.datetime.min), reverse=True)\n\n        top = [s for sc, s in scored if sc > 0.0]\n        if len(top) < nn:\n            # if nothing scored, still allow returning top recent active servers as fallback\n            if not top:\n                top = [s for _, s in scored]\n        top = top[:nn]\n\n        # Attach available tools (active/deprecated? \"available\" => active only)\n        tools_by_server = {}\n        for t in tools:\n            if not isinstance(t, dict):\n                continue\n            sid = t.get(\"server_id\")\n            if not sid:\n                continue\n            tools_by_server.setdefault(sid, []).append(t)\n\n        results = []\n        result_ids = []\n        for s in top:\n            sid = s.get(\"id\")\n            if sid:\n                result_ids.append(sid)\n            srv_tools = []\n            for t in tools_by_server.get(sid, []):\n                if t.get(\"status\") != \"active\":\n                    continue\n                srv_tools.append(\n                    {\n                        \"id\": t.get(\"id\"),\n                        \"name\": t.get(\"name\"),\n                        \"description\": t.get(\"description\"),\n                        \"is_streaming\": t.get(\"is_streaming\"),\n                        \"status\": t.get(\"status\"),\n                        \"input_schema\": t.get(\"input_schema\"),\n                        \"output_schema\": t.get(\"output_schema\"),\n                        \"created_at\": t.get(\"created_at\"),\n                        \"updated_at\": t.get(\"updated_at\"),\n                    }\n                )\n\n            results.append(\n                {\n                    \"id\": s.get(\"id\"),\n                    \"qualified_name\": s.get(\"qualified_name\"),\n                    \"display_name\": s.get(\"display_name\"),\n                    \"description\": s.get(\"description\"),\n                    \"homepage_url\": s.get(\"homepage_url\"),\n                    \"repo_url\": s.get(\"repo_url\"),\n                    \"transport\": s.get(\"transport\"),\n                    \"endpoint_url\": s.get(\"endpoint_url\"),\n                    \"tags\": s.get(\"tags\"),\n                    \"owner\": s.get(\"owner\"),\n                    \"icon_url\": s.get(\"icon_url\"),\n                    \"status\": s.get(\"status\"),\n                    \"last_indexed_at\": s.get(\"last_indexed_at\"),\n                    \"created_at\": s.get(\"created_at\"),\n                    \"updated_at\": s.get(\"updated_at\"),\n                    \"tools\": srv_tools,\n                }\n            )\n\n        latency_ms = int((time.time() - t0) * 1000)\n\n        # Update search_queries row to succeeded\n        saved_query_row[\"status\"] = \"succeeded\"\n        saved_query_row[\"result_server_ids\"] = result_ids\n        saved_query_row[\"latency_ms\"] = latency_ms\n        saved_query_row[\"updated_at\"] = _now_iso()\n        _save(\"search_queries.json\", queries)\n\n        return {\n            \"object\": \"toolbox.search_results\",\n            \"query_id\": qid,\n            \"query\": q,\n            \"n\": nn,\n            \"results\": results,\n            \"latency_ms\": latency_ms,\n        }\n    except Exception as e:\n        # Update search_queries row to failed (do not hide unexpected error details completely)\n        latency_ms = int((time.time() - t0) * 1000)\n        queries = _load(\"search_queries.json\")\n        # locate by id; if absent, nothing we can do\n        for row in queries:\n            if isinstance(row, dict) and row.get(\"id\") == qid:\n                row[\"status\"] = \"failed\"\n                row[\"latency_ms\"] = latency_ms\n                row[\"error_code\"] = \"INTERNAL_ERROR\"\n                row[\"error_message\"] = str(e)\n                row[\"updated_at\"] = _now_iso()\n                break\n        _save(\"search_queries.json\", queries)\n        return _err(\"CONFLICT\", \"search pipeline failed\", error_code=\"INTERNAL_ERROR\", error_message=str(e))\n",
+          "description_restored": true
+        },
+        {
+          "name": "use_tool",
+          "description": "Execute the named tool on the specified MCP server (qualifiedName) with the provided arguments, and return the tool’s response while recording execution logs including timing and any error details. Raises VALIDATION_ERROR if qualifiedName is missing/empty, if parameters.name is missing/empty, or if parameters contains disallowed fields; raises NOT_FOUND if the server qualifiedName does not exist in the registry or if the named tool is not exposed by that server. Raises UNAUTHORIZED if the caller is not permitted to execute tools, RATE_LIMITED when execution quota is exceeded, CONFLICT if the server is temporarily unable to accept executions, and INTERNAL_ERROR for unexpected execution or logging failures.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "qualifiedName": {
+                "type": "string",
+                "description": "The qualified name of the server to use"
+              },
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "The name of the tool to call"
+                  },
+                  "arguments": {
+                    "type": "object",
+                    "additionalProperties": {},
+                    "description": "The arguments to pass to the tool"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "qualifiedName",
+              "parameters"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def use_tool(qualifiedName, parameters, **_extra):\n    import json, os, datetime, time, random, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0063000\" if __import__(\"os\").path.isdir(\"./environment_mix/0063000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.isoformat()\n        return None\n\n    def _lat_ms():\n        ms = int((time.time() - t0) * 1000)\n        return ms if ms >= 0 else 0\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        n = int(time.time() * 1000)\n        r = random.getrandbits(40)\n        s = n ^ r\n        out = []\n        for _ in range(12):\n            out.append(alphabet[s % 32])\n            s //= 32\n        return f\"{prefix}_01J{''.join(reversed(out))}\"\n\n    def _parse_iso(s):\n        if not isinstance(s, str) or not s:\n            return None\n        try:\n            return datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n        except ValueError:\n            return None\n\n    def _validate_input_schema(schema, args_obj):\n        # Best-effort JSON Schema (draft-07 subset). Unknown keywords ignored.\n        if schema is None:\n            return True, None\n        if not isinstance(schema, dict):\n            return True, None\n\n        def _type_ok(t, v):\n            if t == \"object\":\n                return isinstance(v, dict)\n            if t == \"array\":\n                return isinstance(v, list)\n            if t == \"string\":\n                return isinstance(v, str)\n            if t == \"boolean\":\n                return isinstance(v, bool)\n            if t == \"number\":\n                return isinstance(v, (int, float)) and not isinstance(v, bool)\n            if t == \"integer\":\n                return isinstance(v, int) and not isinstance(v, bool)\n            if t == \"null\":\n                return v is None\n            return True\n\n        def _walk(sch, val, path):\n            if not isinstance(sch, dict):\n                return True, None\n\n            if \"type\" in sch:\n                tt = sch[\"type\"]\n                if isinstance(tt, list):\n                    if not any(_type_ok(t, val) for t in tt):\n                        return False, f\"{path} must be of type {tt}\"\n                else:\n                    if not _type_ok(tt, val):\n                        return False, f\"{path} must be of type {tt}\"\n\n            if \"enum\" in sch and isinstance(sch[\"enum\"], list):\n                if val not in sch[\"enum\"]:\n                    return False, f\"{path} must be one of {sch['enum']}\"\n\n            if isinstance(val, str):\n                if \"minLength\" in sch and isinstance(sch[\"minLength\"], int):\n                    if len(val) < sch[\"minLength\"]:\n                        return False, f\"{path} must have minLength {sch['minLength']}\"\n                if \"maxLength\" in sch and isinstance(sch[\"maxLength\"], int):\n                    if len(val) > sch[\"maxLength\"]:\n                        return False, f\"{path} must have maxLength {sch['maxLength']}\"\n                if \"pattern\" in sch and isinstance(sch[\"pattern\"], str):\n                    try:\n                        if re.search(sch[\"pattern\"], val) is None:\n                            return False, f\"{path} must match pattern {sch['pattern']}\"\n                    except re.error:\n                        pass\n\n            if isinstance(val, (int, float)) and not isinstance(val, bool):\n                if \"minimum\" in sch and isinstance(sch[\"minimum\"], (int, float)):\n                    if val < sch[\"minimum\"]:\n                        return False, f\"{path} must be >= {sch['minimum']}\"\n                if \"maximum\" in sch and isinstance(sch[\"maximum\"], (int, float)):\n                    if val > sch[\"maximum\"]:\n                        return False, f\"{path} must be <= {sch['maximum']}\"\n\n            if isinstance(val, dict):\n                props = sch.get(\"properties\")\n                req = sch.get(\"required\")\n                addl = sch.get(\"additionalProperties\", True)\n\n                if isinstance(req, list):\n                    for k in req:\n                        if k not in val:\n                            return False, f\"{path}.{k} is required\" if path else f\"{k} is required\"\n\n                if isinstance(props, dict):\n                    for k, sub in props.items():\n                        if k in val:\n                            ok, em = _walk(sub, val[k], f\"{path}.{k}\" if path else k)\n                            if not ok:\n                                return ok, em\n\n                if addl is False and isinstance(props, dict):\n                    for k in val.keys():\n                        if k not in props:\n                            return False, f\"{path}.{k} is not allowed\" if path else f\"{k} is not allowed\"\n\n            if isinstance(val, list):\n                items = sch.get(\"items\")\n                if isinstance(items, dict):\n                    for i, it in enumerate(val):\n                        ok, em = _walk(items, it, f\"{path}[{i}]\")\n                        if not ok:\n                            return ok, em\n\n            return True, None\n\n        return _walk(schema, args_obj, \"\")\n\n    # -------- Validate input envelope (and reject disallowed fields) --------\n    if not isinstance(qualifiedName, str) or not qualifiedName.strip():\n        return _err(\"VALIDATION_ERROR\", \"qualifiedName is required and must be a non-empty string\", field=\"qualifiedName\")\n    if not isinstance(parameters, dict):\n        return _err(\"VALIDATION_ERROR\", \"parameters must be an object\", field=\"parameters\")\n\n    allowed_param_keys = {\"name\", \"arguments\"}\n    for k in parameters.keys():\n        if k not in allowed_param_keys:\n            return _err(\"VALIDATION_ERROR\", f\"parameters contains disallowed field '{k}' (allowed: name, arguments)\", field=f\"parameters.{k}\")\n\n    tool_name = parameters.get(\"name\")\n    if not isinstance(tool_name, str) or not tool_name.strip():\n        return _err(\"VALIDATION_ERROR\", \"parameters.name is required and must be a non-empty string\", field=\"parameters.name\")\n\n    arguments = parameters.get(\"arguments\", {})\n    if arguments is None:\n        arguments = {}\n    if not isinstance(arguments, dict):\n        return _err(\"VALIDATION_ERROR\", \"parameters.arguments must be an object\", field=\"parameters.arguments\")\n\n    # -------- Prepare execution log row (must record every call) --------\n    execs = _load(\"tool_executions.json\")\n    if not isinstance(execs, list):\n        execs = []\n\n    now = _now()\n    exec_id = _gen_id(\"mcp_exec\")\n    created_at = _iso(now)\n    started_at = created_at\n\n    execution = {\n        \"id\": exec_id,\n        \"server_id\": None,\n        \"qualified_name\": qualifiedName,\n        \"tool_id\": None,\n        \"tool_name\": tool_name,\n        \"arguments\": arguments,\n        \"status\": \"running\",\n        \"request_started_at\": started_at,\n        \"request_finished_at\": None,\n        \"latency_ms\": None,\n        \"response\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"created_at\": created_at,\n        \"updated_at\": created_at,\n    }\n\n    servers = _load(\"mcp_servers.json\")\n    if not isinstance(servers, list):\n        servers = []\n\n    tools = _load(\"mcp_tools.json\")\n    if not isinstance(tools, list):\n        tools = []\n\n    # Resolve server by exact qualified_name match\n    server = None\n    for s in servers:\n        if isinstance(s, dict) and s.get(\"qualified_name\") == qualifiedName:\n            server = s\n            break\n\n    finished_at = _iso(_now())\n\n    # If server not found / inactive, record FAILED with required fields\n    if server is None:\n        execution[\"status\"] = \"failed\"\n        execution[\"request_finished_at\"] = finished_at\n        execution[\"latency_ms\"] = _lat_ms()\n        execution[\"error_code\"] = \"SERVER_NOT_FOUND\"\n        execution[\"error_message\"] = f\"Server qualifiedName '{qualifiedName}' not found\"\n        execution[\"updated_at\"] = finished_at\n        execs.append(execution)\n        _save(\"tool_executions.json\", execs)\n        return _err(\n            \"NOT_FOUND\",\n            f\"Server qualifiedName '{qualifiedName}' not found (rule: qualifiedName must match an existing active server)\",\n            error_code=\"SERVER_NOT_FOUND\",\n            execution=execution,\n        )\n\n    execution[\"server_id\"] = server.get(\"id\")\n    server_status = server.get(\"status\")\n    if server_status != \"active\":\n        execution[\"status\"] = \"failed\"\n        execution[\"request_finished_at\"] = finished_at\n        execution[\"latency_ms\"] = _lat_ms()\n        execution[\"error_code\"] = \"SERVER_DISABLED\"\n        execution[\"error_message\"] = f\"Server '{qualifiedName}' is not active (status={server_status})\"\n        execution[\"updated_at\"] = finished_at\n        execs.append(execution)\n        _save(\"tool_executions.json\", execs)\n        return _err(\n            \"NOT_FOUND\",\n            f\"Server '{qualifiedName}' is not active (status={server_status}) (rule: only active servers are routable)\",\n            error_code=\"SERVER_DISABLED\",\n            execution=execution,\n        )\n\n    # Resolve tool by name and active status for that server\n    tool = None\n    for t in tools:\n        if not isinstance(t, dict):\n            continue\n        if t.get(\"server_id\") == execution[\"server_id\"] and t.get(\"name\") == tool_name and t.get(\"status\") == \"active\":\n            tool = t\n            break\n\n    if tool is None:\n        execution[\"status\"] = \"failed\"\n        execution[\"request_finished_at\"] = finished_at\n        execution[\"latency_ms\"] = _lat_ms()\n        execution[\"error_code\"] = \"TOOL_NOT_FOUND\"\n        execution[\"error_message\"] = f\"Tool '{tool_name}' not registered/active for server '{qualifiedName}'\"\n        execution[\"updated_at\"] = finished_at\n        execs.append(execution)\n        _save(\"tool_executions.json\", execs)\n        return _err(\n            \"NOT_FOUND\",\n            f\"Tool '{tool_name}' not registered/active for server '{qualifiedName}' (rule: parameters.name must match an active tool for the server)\",\n            error_code=\"TOOL_NOT_FOUND\",\n            execution=execution,\n        )\n\n    # Enforce tool_id belongs to same server\n    if tool.get(\"server_id\") != execution[\"server_id\"]:\n        execution[\"status\"] = \"failed\"\n        execution[\"request_finished_at\"] = finished_at\n        execution[\"latency_ms\"] = _lat_ms()\n        execution[\"error_code\"] = \"TOOL_NOT_FOUND\"\n        execution[\"error_message\"] = \"Resolved tool does not belong to resolved server\"\n        execution[\"updated_at\"] = finished_at\n        execs.append(execution)\n        _save(\"tool_executions.json\", execs)\n        return _err(\n            \"CONFLICT\",\n            \"Resolved tool does not belong to resolved server (rule: tool_id must belong to same server_id)\",\n            error_code=\"TOOL_NOT_FOUND\",\n            execution=execution,\n        )\n\n    execution[\"tool_id\"] = tool.get(\"id\")\n\n    # Validate arguments against input_schema if present\n    schema = tool.get(\"input_schema\")\n    ok, emsg = _validate_input_schema(schema, arguments)\n    if not ok:\n        execution[\"status\"] = \"failed\"\n        execution[\"request_finished_at\"] = finished_at\n        execution[\"latency_ms\"] = _lat_ms()\n        execution[\"error_code\"] = \"INVALID_ARGUMENTS\"\n        execution[\"error_message\"] = emsg or \"Arguments did not match input_schema\"\n        execution[\"updated_at\"] = finished_at\n        execs.append(execution)\n        _save(\"tool_executions.json\", execs)\n        return _err(\n            \"VALIDATION_ERROR\",\n            f\"Invalid arguments for tool '{tool_name}': {execution['error_message']} (rule: arguments must validate against tool input_schema when present)\",\n            error_code=\"INVALID_ARGUMENTS\",\n            execution=execution,\n        )\n\n    # At this point, record a succeeded execution with a minimal synthetic response (no upstream available offline).\n    # Must still persist logs with consistent timestamps.\n    finished_at = _iso(_now())\n    execution[\"status\"] = \"succeeded\"\n    execution[\"request_finished_at\"] = finished_at\n    execution[\"latency_ms\"] = _lat_ms()\n    execution[\"response\"] = {\n        \"ok\": True,\n        \"server\": {\"id\": execution[\"server_id\"], \"qualified_name\": qualifiedName},\n        \"tool\": {\"id\": execution[\"tool_id\"], \"name\": tool_name},\n        \"echo\": {\"arguments\": arguments},\n    }\n    execution[\"updated_at\"] = finished_at\n    execs.append(execution)\n    _save(\"tool_executions.json\", execs)\n\n    return {\"execution\": execution, \"response\": execution[\"response\"]}\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_mcp_servers",
+          "description": "List MCP servers in the Toolbox registry with optional filtering and cursor pagination. Returns only servers visible to the caller; by default excludes non-active servers unless explicitly requested. Refuses invalid filters and returns UNAUTHORIZED if the caller is not authenticated.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "active",
+                  "deprecated",
+                  "disabled"
+                ],
+                "description": "Filter by server lifecycle status."
+              },
+              "tag": {
+                "type": "string",
+                "description": "Filter to servers containing this tag (exact match)."
+              },
+              "owner": {
+                "type": "string",
+                "description": "Filter by owner identifier (exact match)."
+              },
+              "transport": {
+                "type": "string",
+                "enum": [
+                  "http",
+                  "sse",
+                  "stdio"
+                ],
+                "description": "Filter by MCP transport type."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 20,
+                "description": "Maximum number of servers to return in this page."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque cursor from a previous list response to continue pagination."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at_desc",
+                  "created_at_asc",
+                  "updated_at_desc",
+                  "updated_at_asc",
+                  "qualified_name_asc"
+                ],
+                "default": "updated_at_desc",
+                "description": "Sort order for the result set."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_mcp_servers(status=None, tag=None, owner=None, transport=None, limit=None, cursor=None, sort=None, **_extra):\n    import json, os, datetime, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0063000\" if __import__(\"os\").path.isdir(\"./environment_mix/0063000\") else \"/app/database\")\n\n    def _load(nm):\n        try:\n            with open(os.path.join(_DB, nm), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(nm, d):\n        with open(os.path.join(_DB, nm), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _parse_iso(dt):\n        if not isinstance(dt, str) or not dt:\n            return None\n        try:\n            if dt.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(dt[:-1])\n            return datetime.datetime.fromisoformat(dt)\n        except Exception:\n            return None\n\n    # Ambient auth: no explicit credential in this API; accept call as authenticated.\n    # Validate filters\n    valid_status = {\"draft\", \"active\", \"deprecated\", \"disabled\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in valid_status:\n            return _err(\"VALIDATION_ERROR\", \"Invalid status filter\")\n    if tag is not None and (not isinstance(tag, str) or tag.strip() == \"\"):\n        return _err(\"VALIDATION_ERROR\", \"tag must be a non-empty string when provided\")\n    if owner is not None and (not isinstance(owner, str) or owner.strip() == \"\"):\n        return _err(\"VALIDATION_ERROR\", \"owner must be a non-empty string when provided\")\n    valid_transport = {\"http\", \"sse\", \"stdio\"}\n    if transport is not None:\n        if not isinstance(transport, str) or transport not in valid_transport:\n            return _err(\"VALIDATION_ERROR\", \"Invalid transport filter\")\n    if limit is None:\n        lim = 20\n    else:\n        if not isinstance(limit, int) or isinstance(limit, bool):\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 100\")\n        if limit < 1 or limit > 100:\n            return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 100\")\n        lim = limit\n    valid_sort = {\"created_at_desc\", \"created_at_asc\", \"updated_at_desc\", \"updated_at_asc\", \"qualified_name_asc\"}\n    if sort is None:\n        sortv = \"updated_at_desc\"\n    else:\n        if not isinstance(sort, str) or sort not in valid_sort:\n            return _err(\"VALIDATION_ERROR\", \"Invalid sort\")\n        sortv = sort\n\n    offset = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or cursor.strip() == \"\":\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string when provided\")\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\")).decode(\"utf-8\")\n            if not raw.startswith(\"offset:\"):\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n            offset = int(raw.split(\":\", 1)[1])\n            if offset < 0:\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor offset\")\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n\n    servers = _load(\"mcp_servers.json\")\n    rows = [s for s in servers if isinstance(s, dict)]\n\n    # Visibility/default exclude non-active unless status explicitly requested\n    if status is None:\n        rows = [s for s in rows if s.get(\"status\") == \"active\"]\n    else:\n        rows = [s for s in rows if s.get(\"status\") == status]\n\n    if tag is not None:\n        t = tag\n        rows = [s for s in rows if isinstance(s.get(\"tags\"), list) and t in s.get(\"tags\")]\n    if owner is not None:\n        rows = [s for s in rows if s.get(\"owner\") == owner]\n    if transport is not None:\n        rows = [s for s in rows if s.get(\"transport\") == transport]\n\n    def sort_key(s):\n        if sortv == \"qualified_name_asc\":\n            return (str(s.get(\"qualified_name\") or \"\"),)\n        if sortv.startswith(\"created_at\"):\n            dt = _parse_iso(s.get(\"created_at\")) or datetime.datetime.min\n            return (dt,)\n        dt = _parse_iso(s.get(\"updated_at\")) or datetime.datetime.min\n        return (dt,)\n\n    reverse = sortv.endswith(\"_desc\")\n    rows.sort(key=sort_key, reverse=reverse)\n\n    total = len(rows)\n    page = rows[offset : offset + lim]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(f\"offset:{next_offset}\".encode(\"utf-8\")).decode(\"utf-8\")\n\n    return {\n        \"object\": \"toolbox.mcp_server_list\",\n        \"data\": page,\n        \"total\": total,\n        \"limit\": lim,\n        \"cursor\": cursor,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n        \"sort\": sortv,\n    }\n"
+        },
+        {
+          "name": "create_mcp_server",
+          "description": "Create a new MCP server registry entry in draft status. Returns the created server record. Refuses writes that violate uniqueness constraints (e.g., qualified_name already in use) and returns UNAUTHORIZED if the caller is not authenticated.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "qualified_name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Globally unique qualified name used for routing (e.g., \"acme.weather\")."
+              },
+              "display_name": {
+                "type": "string",
+                "description": "Human-friendly display name."
+              },
+              "description": {
+                "type": "string",
+                "description": "Short description of the server and what it provides."
+              },
+              "homepage_url": {
+                "type": "string",
+                "description": "Public homepage URL for the server."
+              },
+              "repo_url": {
+                "type": "string",
+                "description": "Source repository URL, if available."
+              },
+              "transport": {
+                "type": "string",
+                "enum": [
+                  "http",
+                  "sse",
+                  "stdio"
+                ],
+                "description": "MCP transport type used to reach the server."
+              },
+              "endpoint_url": {
+                "type": "string",
+                "description": "Network endpoint URL for the MCP server (when applicable to the chosen transport)."
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Tags to aid discovery and filtering."
+              },
+              "icon_url": {
+                "type": "string",
+                "description": "Icon URL to display in clients."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "active",
+                  "deprecated",
+                  "disabled"
+                ],
+                "description": "Initial lifecycle status. If omitted, defaults to draft."
+              }
+            },
+            "required": [
+              "qualified_name",
+              "transport"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_mcp_server(qualified_name, transport, display_name=None, description=None, homepage_url=None, repo_url=None, endpoint_url=None, tags=None, icon_url=None, status=None, **_extra):\n    import json, os, datetime, time, random, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0063000\" if __import__(\"os\").path.isdir(\"./environment_mix/0063000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        n = int(time.time() * 1000)\n        r = random.getrandbits(40)\n        s = n ^ r\n        out = []\n        for _ in range(12):\n            out.append(alphabet[s % 32])\n            s //= 32\n        return f\"{prefix}_01J{''.join(reversed(out))}\"\n\n    # Validate required\n    if not isinstance(qualified_name, str) or not qualified_name.strip():\n        return _err(\"VALIDATION_ERROR\", \"qualified_name must be a non-empty string\", field=\"qualified_name\")\n    if not isinstance(transport, str) or transport not in (\"http\", \"sse\", \"stdio\"):\n        return _err(\"VALIDATION_ERROR\", \"transport must be one of: http, sse, stdio\", field=\"transport\")\n\n    if status is None:\n        status = \"draft\"\n    if not isinstance(status, str) or status not in (\"draft\", \"active\", \"deprecated\", \"disabled\"):\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: draft, active, deprecated, disabled\", field=\"status\")\n\n    # Enforce non-empty constraints if provided: schema requires display_name/description non-empty, but tool does not require them.\n    # To be consistent with the datastore constraints, we must require them on create.\n    if display_name is None or not isinstance(display_name, str) or not display_name.strip():\n        return _err(\"VALIDATION_ERROR\", \"display_name is required and must be non-empty (constraint: display_name <> '')\", field=\"display_name\")\n    if description is None or not isinstance(description, str) or not description.strip():\n        return _err(\"VALIDATION_ERROR\", \"description is required and must be non-empty (constraint: description <> '')\", field=\"description\")\n\n    # Optional fields types\n    for fld, val in ((\"homepage_url\", homepage_url), (\"repo_url\", repo_url), (\"endpoint_url\", endpoint_url), (\"icon_url\", icon_url)):\n        if val is not None and not isinstance(val, str):\n            return _err(\"VALIDATION_ERROR\", f\"{fld} must be a string\", field=fld)\n\n    # Tags\n    if tags is None:\n        tags = []\n    if not isinstance(tags, list) or any((not isinstance(t, str)) for t in tags):\n        return _err(\"VALIDATION_ERROR\", \"tags must be an array of strings\", field=\"tags\")\n\n    # Transport/endpoint constraints\n    if transport in (\"http\", \"sse\"):\n        if endpoint_url is None or not isinstance(endpoint_url, str) or not endpoint_url.strip():\n            return _err(\"VALIDATION_ERROR\", \"endpoint_url is required for http/sse transport (constraint)\", field=\"endpoint_url\")\n    if transport == \"stdio\":\n        if endpoint_url is not None:\n            return _err(\"VALIDATION_ERROR\", \"endpoint_url must be null/omitted for stdio transport (constraint)\", field=\"endpoint_url\")\n\n    # Load and enforce uniqueness(qualified_name)\n    servers = _load(\"mcp_servers.json\")\n    if not isinstance(servers, list):\n        servers = []\n    for s in servers:\n        if isinstance(s, dict) and s.get(\"qualified_name\") == qualified_name:\n            return _err(\"CONFLICT\", f\"qualified_name '{qualified_name}' is already in use (constraint: unique(qualified_name))\", field=\"qualified_name\")\n\n    now = _now_iso()\n    server_id = _gen_id(\"mcp_srv\")\n\n    row = {\n        \"id\": server_id,\n        \"qualified_name\": qualified_name,\n        \"display_name\": display_name,\n        \"description\": description,\n        \"homepage_url\": homepage_url,\n        \"repo_url\": repo_url,\n        \"transport\": transport,\n        \"endpoint_url\": endpoint_url,\n        \"tags\": tags,\n        \"owner\": None,\n        \"icon_url\": icon_url,\n        \"status\": status,\n        \"last_indexed_at\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # Basic invariant checks for status/transport enums already enforced above; persist\n    servers.append(row)\n    _save(\"mcp_servers.json\", servers)\n    return {\"server\": row}\n"
+        },
+        {
+          "name": "update_mcp_server",
+          "description": "Update an existing MCP server by id, including driving allowed lifecycle state transitions. Returns the updated server record. Refuses invalid transitions, and refuses changing qualified_name once the server has ever been activated (to keep routing stable). Returns NOT_FOUND if the id does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Primary key of the MCP server to update."
+              },
+              "display_name": {
+                "type": "string",
+                "description": "Updated human-friendly display name."
+              },
+              "description": {
+                "type": "string",
+                "description": "Updated description."
+              },
+              "homepage_url": {
+                "type": "string",
+                "description": "Updated homepage URL."
+              },
+              "repo_url": {
+                "type": "string",
+                "description": "Updated repo URL."
+              },
+              "transport": {
+                "type": "string",
+                "enum": [
+                  "http",
+                  "sse",
+                  "stdio"
+                ],
+                "description": "Updated transport type."
+              },
+              "endpoint_url": {
+                "type": "string",
+                "description": "Updated endpoint URL."
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Replace tags."
+              },
+              "owner": {
+                "type": "string",
+                "description": "Updated owner identifier."
+              },
+              "icon_url": {
+                "type": "string",
+                "description": "Updated icon URL."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "active",
+                  "deprecated",
+                  "disabled"
+                ],
+                "description": "New lifecycle status. Must follow allowed transitions: draft→(active|disabled), active→(deprecated|disabled), deprecated→(active|disabled), disabled→active."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_mcp_server(id, display_name=None, description=None, homepage_url=None, repo_url=None, transport=None, endpoint_url=None, tags=None, owner=None, icon_url=None, status=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0063000\" if __import__(\"os\").path.isdir(\"./environment_mix/0063000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _is_str(x): return isinstance(x, str)\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s.strip():\n            raise ValueError(\"bad datetime\")\n        ss = s.strip()\n        if ss.endswith(\"Z\"):\n            ss = ss[:-1] + \"+00:00\"\n        return datetime.datetime.fromisoformat(ss)\n\n    try:\n        if not _is_str(id) or not id.strip():\n            return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\", field=\"id\")\n\n        if display_name is not None and (not _is_str(display_name) or display_name == \"\"):\n            return _err(\"VALIDATION_ERROR\", \"display_name must be a non-empty string\", field=\"display_name\")\n        if description is not None and (not _is_str(description) or description == \"\"):\n            return _err(\"VALIDATION_ERROR\", \"description must be a non-empty string\", field=\"description\")\n        for fn, v in [(\"homepage_url\", homepage_url), (\"repo_url\", repo_url), (\"owner\", owner), (\"icon_url\", icon_url), (\"endpoint_url\", endpoint_url)]:\n            if v is not None and not _is_str(v):\n                return _err(\"VALIDATION_ERROR\", f\"{fn} must be a string\", field=fn)\n        if transport is not None:\n            if not _is_str(transport):\n                return _err(\"VALIDATION_ERROR\", \"transport must be a string\", field=\"transport\")\n            if transport not in (\"http\", \"sse\", \"stdio\"):\n                return _err(\"VALIDATION_ERROR\", \"transport must be one of: http, sse, stdio\", field=\"transport\")\n        if tags is not None:\n            if not isinstance(tags, list) or any((not isinstance(t, str)) for t in tags):\n                return _err(\"VALIDATION_ERROR\", \"tags must be an array of strings\", field=\"tags\")\n        if status is not None:\n            if not _is_str(status):\n                return _err(\"VALIDATION_ERROR\", \"status must be a string\", field=\"status\")\n            if status not in (\"draft\", \"active\", \"deprecated\", \"disabled\"):\n                return _err(\"VALIDATION_ERROR\", \"invalid status\", field=\"status\")\n\n        servers = _load(\"mcp_servers.json\")\n        if not isinstance(servers, list):\n            servers = []\n        idx = None\n        for i, s in enumerate(servers):\n            if isinstance(s, dict) and s.get(\"id\") == id:\n                idx = i\n                break\n        if idx is None:\n            return _err(\"NOT_FOUND\", \"MCP server not found\", id=id)\n\n        server = servers[idx]\n        old_status = server.get(\"status\")\n        if old_status not in (\"draft\", \"active\", \"deprecated\", \"disabled\"):\n            return _err(\"CONFLICT\", \"Stored server has invalid status\", id=id, status=old_status)\n\n        # Apply field updates\n        if display_name is not None:\n            server[\"display_name\"] = display_name\n        if description is not None:\n            server[\"description\"] = description\n        if homepage_url is not None:\n            server[\"homepage_url\"] = homepage_url\n        if repo_url is not None:\n            server[\"repo_url\"] = repo_url\n        if owner is not None:\n            server[\"owner\"] = owner\n        if icon_url is not None:\n            server[\"icon_url\"] = icon_url\n        if tags is not None:\n            server[\"tags\"] = tags\n\n        # Transport + endpoint logic\n        if transport is not None:\n            server[\"transport\"] = transport\n        if endpoint_url is not None:\n            server[\"endpoint_url\"] = endpoint_url\n\n        # Validate transport/endpoint constraints against resulting record\n        eff_transport = server.get(\"transport\")\n        eff_endpoint = server.get(\"endpoint_url\")\n        if eff_transport not in (\"stdio\", \"http\", \"sse\", \"websocket\", \"unknown\"):\n            return _err(\"VALIDATION_ERROR\", \"transport invalid\", field=\"transport\")\n        if eff_transport in (\"http\", \"sse\", \"websocket\"):\n            if eff_endpoint is None:\n                return _err(\"VALIDATION_ERROR\", \"endpoint_url is required for networked transports\", field=\"endpoint_url\")\n            if not isinstance(eff_endpoint, str) or not eff_endpoint:\n                return _err(\"VALIDATION_ERROR\", \"endpoint_url must be a non-empty string for networked transports\", field=\"endpoint_url\")\n        if eff_transport == \"stdio\":\n            if eff_endpoint is not None:\n                return _err(\"VALIDATION_ERROR\", \"endpoint_url must be null for stdio transport\", field=\"endpoint_url\")\n\n        # Validate required non-empty fields (constraints)\n        if not isinstance(server.get(\"display_name\"), str) or server.get(\"display_name\") == \"\":\n            return _err(\"VALIDATION_ERROR\", \"display_name must be non-empty\", field=\"display_name\")\n        if not isinstance(server.get(\"description\"), str) or server.get(\"description\") == \"\":\n            return _err(\"VALIDATION_ERROR\", \"description must be non-empty\", field=\"description\")\n        if not isinstance(server.get(\"qualified_name\"), str) or server.get(\"qualified_name\") == \"\":\n            return _err(\"CONFLICT\", \"Stored server has invalid qualified_name\", id=id)\n\n        # qualified_name immutability after activation: refuse changing it if server has ever been active.\n        # (No qualified_name param in this tool; enforce by ensuring no external mutation path here.)\n        # Still, defend against stored state anomalies by checking activation history flag if present.\n        ever_active = server.get(\"ever_activated\")\n        if ever_active is True and server.get(\"qualified_name\") != servers[idx].get(\"qualified_name\"):\n            return _err(\"INVALID_TRANSITION\", \"qualified_name is immutable after activation\", field=\"qualified_name\")\n\n        # Unique qualified_name constraint (unchanged here, but enforce in case of datastore anomalies)\n        qn = server.get(\"qualified_name\")\n        for s in servers:\n            if isinstance(s, dict) and s.get(\"id\") != id and s.get(\"qualified_name\") == qn:\n                return _err(\"CONFLICT\", \"qualified_name must be unique\", field=\"qualified_name\", qualified_name=qn)\n\n        # Lifecycle transition\n        if status is not None and status != old_status:\n            transitions = {\n                \"draft\": (\"active\", \"disabled\"),\n                \"active\": (\"deprecated\", \"disabled\"),\n                \"deprecated\": (\"active\", \"disabled\"),\n                \"disabled\": (\"active\",),\n            }\n            allowed = transitions.get(old_status, ())\n            if status not in allowed:\n                return _err(\"INVALID_TRANSITION\", \"Invalid lifecycle transition\", from_status=old_status, to_status=status)\n\n            server[\"status\"] = status\n            if status == \"active\":\n                # lock qualified_name from this point forward\n                server[\"ever_activated\"] = True\n\n        # Update timestamps\n        now = _now()\n        if not isinstance(server.get(\"created_at\"), str) or not server.get(\"created_at\"):\n            server[\"created_at\"] = now\n        # Ensure created_at parseable; if not, normalize\n        try:\n            _parse_dt(server.get(\"created_at\"))\n        except Exception:\n            server[\"created_at\"] = now\n        server[\"updated_at\"] = now\n\n        servers[idx] = server\n        _save(\"mcp_servers.json\", servers)\n\n        return {\"server\": server}\n    except (ValueError, TypeError) as e:\n        return _err(\"VALIDATION_ERROR\", \"Invalid input\", details=str(e))\n    except Exception as e:\n        return _err(\"CONFLICT\", \"Unexpected error\", details=str(e))\n"
+        },
+        {
+          "name": "list_tool_executions",
+          "description": "List recorded tool executions with filtering and cursor pagination. Returns execution metadata including status, latency, and any error details; response payloads may be included or omitted depending on include_response. Refuses invalid filters and returns UNAUTHORIZED if the caller is not authenticated.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "server_id": {
+                "type": "string",
+                "description": "Filter by MCP server id."
+              },
+              "qualified_name": {
+                "type": "string",
+                "description": "Filter by MCP server qualified name."
+              },
+              "tool_id": {
+                "type": "string",
+                "description": "Filter by tool id."
+              },
+              "tool_name": {
+                "type": "string",
+                "description": "Filter by tool name (exact match)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "Filter by execution lifecycle status."
+              },
+              "created_after": {
+                "type": "string",
+                "description": "Only return executions created after this timestamp (RFC 3339)."
+              },
+              "created_before": {
+                "type": "string",
+                "description": "Only return executions created before this timestamp (RFC 3339)."
+              },
+              "include_response": {
+                "type": "boolean",
+                "default": false,
+                "description": "Whether to include the response field in each execution record."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 20,
+                "description": "Maximum number of executions to return in this page."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque cursor from a previous list response to continue pagination."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at_desc",
+                  "created_at_asc"
+                ],
+                "default": "created_at_desc",
+                "description": "Sort order for the result set."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_tool_executions(server_id=None, qualified_name=None, tool_id=None, tool_name=None, status=None, created_after=None, created_before=None, include_response=None, limit=None, cursor=None, sort=None, **_extra):\n    import json, os, datetime, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0063000\" if __import__(\"os\").path.isdir(\"./environment_mix/0063000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _parse_rfc3339_lenient(s):\n        # Accept strict RFC3339, but also accept arbitrary strings by treating them as non-parsable (no filter),\n        # because caller args may contain ids (audit defect) and should not hard error for list.\n        if s is None:\n            return None, None\n        if not isinstance(s, str):\n            return None, \"not_string\"\n        ss = s.strip()\n        if not ss:\n            return None, \"empty\"\n        try:\n            if ss.endswith(\"Z\"):\n                ss = ss[:-1] + \"+00:00\"\n            dt = datetime.datetime.fromisoformat(ss)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt, None\n        except ValueError:\n            return None, \"parse_error\"\n\n    def _b64d(s):\n        pad = \"=\" * (-len(s) % 4)\n        return base64.urlsafe_b64decode((s + pad).encode(\"utf-8\")).decode(\"utf-8\")\n\n    def _b64e(s):\n        return base64.urlsafe_b64encode(s.encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    # Validate types (but do not over-validate timestamp formats; treat unparseable as \"no time filter\")\n    for fn, v in [(\"server_id\", server_id), (\"qualified_name\", qualified_name), (\"tool_id\", tool_id), (\"tool_name\", tool_name), (\"cursor\", cursor), (\"sort\", sort)]:\n        if v is not None and not isinstance(v, str):\n            return _err(\"VALIDATION_ERROR\", f\"{fn} must be a string\", field=fn)\n\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"):\n            return _err(\"VALIDATION_ERROR\", \"status must be one of queued, running, succeeded, failed, cancelled\", field=\"status\")\n\n    if include_response is None:\n        include_response_v = False\n    else:\n        if not isinstance(include_response, bool):\n            return _err(\"VALIDATION_ERROR\", \"include_response must be a boolean\", field=\"include_response\")\n        include_response_v = include_response\n\n    if limit is None:\n        limit_v = 20\n    else:\n        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 100:\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 100\", field=\"limit\")\n        limit_v = limit\n\n    if sort is None:\n        sort_v = \"created_at_desc\"\n    else:\n        if sort not in (\"created_at_desc\", \"created_at_asc\"):\n            return _err(\"VALIDATION_ERROR\", \"sort must be one of created_at_desc, created_at_asc\", field=\"sort\")\n        sort_v = sort\n\n    created_after_dt, _ = _parse_rfc3339_lenient(created_after)\n    created_before_dt, _ = _parse_rfc3339_lenient(created_before)\n\n    execs = _load(\"tool_executions.json\")\n    if not isinstance(execs, list):\n        execs = []\n\n    # Filter\n    out = []\n    for r in execs:\n        if not isinstance(r, dict):\n            continue\n        if server_id is not None and r.get(\"server_id\") != server_id:\n            continue\n        if qualified_name is not None and r.get(\"qualified_name\") != qualified_name:\n            continue\n        if tool_id is not None and r.get(\"tool_id\") != tool_id:\n            continue\n        if tool_name is not None and r.get(\"tool_name\") != tool_name:\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n\n        # Time filters only if parsable\n        if created_after_dt is not None or created_before_dt is not None:\n            ca = r.get(\"created_at\")\n            if isinstance(ca, str):\n                ca_dt, err = _parse_rfc3339_lenient(ca)\n            else:\n                ca_dt, err = (None, \"missing\")\n            if ca_dt is None:\n                # If we can't parse stored created_at, do not exclude it based on time filters.\n                pass\n            else:\n                if created_after_dt is not None and not (ca_dt > created_after_dt):\n                    continue\n                if created_before_dt is not None and not (ca_dt < created_before_dt):\n                    continue\n\n        out.append(r)\n\n    # Sort\n    def _key_dt(rec):\n        v = rec.get(\"created_at\")\n        if not isinstance(v, str):\n            return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n        dt, err = _parse_rfc3339_lenient(v)\n        return dt if dt is not None else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n\n    reverse = (sort_v == \"created_at_desc\")\n    out.sort(key=_key_dt, reverse=reverse)\n\n    # Cursor pagination (opaque)\n    start = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or not cursor.strip():\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string when provided\", field=\"cursor\")\n        token = cursor\n        decoded = None\n        try:\n            decoded = _b64d(token)\n        except (ValueError, UnicodeDecodeError):\n            decoded = None\n        # Accept either base64(\"id:<exec_id>\") or raw exec_id\n        cur_id = None\n        if decoded and decoded.startswith(\"id:\"):\n            cur_id = decoded[3:]\n        else:\n            cur_id = token\n        # start after this id if present\n        for i, r in enumerate(out):\n            if r.get(\"id\") == cur_id:\n                start = i + 1\n                break\n\n    page = out[start:start + limit_v]\n    next_cursor = None\n    has_more = (start + limit_v) < len(out)\n    if has_more and page:\n        next_cursor = _b64e(\"id:\" + str(page[-1].get(\"id\")))\n\n    # Drop response if not requested\n    if not include_response_v:\n        page = [dict({k: v for k, v in rec.items() if k != \"response\"}) for rec in page]\n\n    return {\n        \"executions\": page,\n        \"total\": len(out),\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n        \"limit\": limit_v,\n        \"sort\": sort_v,\n    }\n"
+        },
+        {
+          "name": "cancel_tool_execution",
+          "description": "Request cancellation of a tool execution by id. If the execution is queued or running, transitions it to cancelled and returns the updated record; if it is already terminal (succeeded/failed/cancelled), returns the current record without changing state. Returns NOT_FOUND if the id does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Primary key of the tool execution to cancel."
+              },
+              "reason": {
+                "type": "string",
+                "description": "Optional human-readable reason for cancellation (stored with the execution if supported)."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def cancel_tool_execution(id, reason=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0063000\" if __import__(\"os\").path.isdir(\"./environment_mix/0063000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_iso(s):\n        if not isinstance(s, str) or not s:\n            return None\n        try:\n            return datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n        except ValueError:\n            return None\n\n    if not isinstance(id, str) or not id.strip():\n        return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\", field=\"id\")\n    if reason is not None and not isinstance(reason, str):\n        return _err(\"VALIDATION_ERROR\", \"reason must be a string\", field=\"reason\")\n\n    executions = _load(\"tool_executions.json\")\n    if not isinstance(executions, list):\n        executions = []\n\n    ex = None\n    idx = None\n    for i, r in enumerate(executions):\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            ex = r\n            idx = i\n            break\n    if ex is None:\n        return _err(\"NOT_FOUND\", \"Tool execution not found\", id=id)\n\n    allowed = {\n        \"queued\": {\"running\", \"cancelled\", \"failed\"},\n        \"running\": {\"succeeded\", \"failed\", \"cancelled\"},\n        \"succeeded\": set(),\n        \"failed\": set(),\n        \"cancelled\": set(),\n    }\n    st = ex.get(\"status\")\n    if st not in allowed:\n        return _err(\"CONFLICT\", \"Stored execution has invalid status\", id=id, status=st)\n\n    # Idempotent for terminal states\n    if st in (\"succeeded\", \"failed\", \"cancelled\"):\n        return {\"execution\": ex}\n\n    if \"cancelled\" not in allowed.get(st, set()):\n        return _err(\"INVALID_TRANSITION\", \"Invalid lifecycle transition\", from_status=st, to_status=\"cancelled\")\n\n    now = _now_iso()\n    ex[\"status\"] = \"cancelled\"\n    ex[\"updated_at\"] = now\n    ex[\"request_finished_at\"] = now\n\n    # Store cancellation reason if a field exists or can be added without breaking constraints.\n    # Schema does not define it; keep it under response metadata to avoid unknown top-level columns assumptions.\n    if reason is not None and reason.strip():\n        resp = ex.get(\"response\")\n        if resp is None or not isinstance(resp, dict):\n            resp = {}\n        meta = resp.get(\"_meta\")\n        if meta is None or not isinstance(meta, dict):\n            meta = {}\n        meta[\"cancellation_reason\"] = reason\n        resp[\"_meta\"] = meta\n        ex[\"response\"] = resp\n\n    # latency_ms: compute if possible, else keep existing, else set to 0\n    started = _parse_iso(ex.get(\"request_started_at\"))\n    finished = _parse_iso(now)\n    if started and finished:\n        ms = int((finished - started).total_seconds() * 1000)\n        ex[\"latency_ms\"] = ms if ms >= 0 else 0\n    else:\n        if ex.get(\"latency_ms\") is None:\n            ex[\"latency_ms\"] = 0\n\n    executions[idx] = ex\n    _save(\"tool_executions.json\", executions)\n    return {\"execution\": ex}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0063000",
+    "index": 63,
+    "name": "Toolbox (Preview)",
+    "description": "This backend stores a registry of Model Context Protocol (MCP) servers and their available tools, plus operational logs of search queries and tool executions. Main workflows are (1) hybrid-searching the registry to return top N servers and (2) executing a named tool on a selected server while record",
+    "taxonomy": {
+      "L1_id": "L1-01",
+      "L1_name": "Search & Information Retrieval",
+      "L1_name_zh": "搜索与信息获取",
+      "L2_id": "L2-03",
+      "L2_name": "API Gateway & Aggregation",
+      "L2_name_zh": "API 网关与聚合",
+      "L3_name": "MCP Tool Registry & Execution Gateway",
+      "L3_name_zh": "MCP 工具注册与执行网关"
+    },
+    "database_dir": "./environment_mix/0063000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 4,
+    "n_records": 74,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 3,
+      "read_operations": 3,
+      "mutations_persisted": 1,
+      "mutations_attempted": 4
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "search_servers",
+      "returned_chars": 4997
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

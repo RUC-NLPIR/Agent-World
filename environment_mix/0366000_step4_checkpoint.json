@@ -1,0 +1,179 @@
+{
+  "index": 366,
+  "local_files_dir": "./environment_mix/0366000",
+  "file_list": [
+    "./environment_mix/0366000/8d_240309.md",
+    "./environment_mix/0366000/README.md",
+    "./environment_mix/0366000/audit_plan_partsco.md",
+    "./environment_mix/0366000/calibration_log.csv",
+    "./environment_mix/0366000/capa_log.csv",
+    "./environment_mix/0366000/complaints.json",
+    "./environment_mix/0366000/inventory.csv",
+    "./environment_mix/0366000/lots.csv",
+    "./environment_mix/0366000/press7_tonnage_log.csv",
+    "./environment_mix/0366000/production_notes_line3.md",
+    "./environment_mix/0366000/suppliers.csv",
+    "./environment_mix/0366000/triage.txt",
+    "./environment_mix/0366000/usage.json",
+    "./environment_mix/0366000/weekly_w12.md",
+    "./environment_mix/0366000/weekly_w13.md"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore.",
+        "workspace/data/complaints.json": "JSON array of 12 complaint records (id,lot,issue,severity,reported_by,date,status,customer,notes).",
+        "workspace/data/lots.csv": "CSV of 25 lot defect rates (columns: lot,defect_rate,status).",
+        "workspace/notes/triage.txt": "Triage notes prioritizing escalated/review/resolved lots and routine items.",
+        "workspace/reports/weekly_w12.md": "Weekly QC report W12 with summary, escalated lots, calibration, suppliers, KPIs.",
+        "workspace/reports/weekly_w13.md": "Weekly QC report W13.",
+        "workspace/data/suppliers.csv": "CSV supplier scorecard (supplier,tier,on_time_pct,defect_ppm,score,last_audit,contact,email).",
+        "workspace/data/press7_tonnage_log.csv": "Press-7 tonnage sensor log showing PS-7 fault and replacement.",
+        "workspace/data/capa_log.csv": "CAPA log CSV (7 records).",
+        "workspace/data/inventory.csv": "Inventory levels CSV (10 SKUs).",
+        "workspace/data/calibration_log.csv": "Calibration log CSV for CMM/gauges/sensors.",
+        "workspace/audits/8d_240309.md": "8D report for lot-240309 cracking.",
+        "workspace/audits/audit_plan_partsco.md": "PartsCo supplier audit plan.",
+        "workspace/notes/production_notes_line3.md": "Line 3 production notes.",
+        "workspace/README.md": "Workspace data directory overview."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "read_file",
+          "description": "Returns the full text contents of the file at the given workspace-relative path. It refuses requests where the path is missing, empty, points outside the workspace, or does not exist. It also refuses paths that refer to a directory or to content that cannot be read as text.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "remote_path": {
+                "type": "string",
+                "description": "Path relative to the workspace root."
+              }
+            },
+            "required": [
+              "remote_path"
+            ]
+          },
+          "implementation": "def read_file(remote_path, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0366000\" if __import__(\"os\").path.isdir(\"./environment_mix/0366000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ensure_audit_store():\n        # Create audit/usage store if absent. This is required so \"every call moves the datastore\".\n        audits = _load(\"usage.json\")\n        if not isinstance(audits, dict) or \"requests\" not in audits or \"counters\" not in audits:\n            audits = {\n                \"requests\": [],\n                \"counters\": {\"total_calls\": 0, \"by_tool\": {}, \"by_status\": {}},\n                \"rate_limit\": {\"window_seconds\": 60, \"max_requests\": 600},\n                \"quota\": {\"max_requests_total\": None},\n            }\n            _save(\"usage.json\", audits)\n        return audits\n\n    def _audit_and_enforce(tool, params, status=None):\n        audits = _ensure_audit_store()\n\n        # Enforce rate limit and quota using persisted history.\n        rl = audits.get(\"rate_limit\") or {}\n        window_seconds = rl.get(\"window_seconds\", 60)\n        max_requests = rl.get(\"max_requests\", 600)\n        quota = audits.get(\"quota\") or {}\n        max_total = quota.get(\"max_requests_total\", None)\n\n        now = datetime.datetime.utcnow()\n        reqs = audits.get(\"requests\", [])\n        # Filter within window; tolerate malformed timestamps by ignoring them.\n        cutoff = now - datetime.timedelta(seconds=int(window_seconds) if isinstance(window_seconds, int) else 60)\n        in_window = 0\n        for r in reqs:\n            ts = r.get(\"timestamp\")\n            if isinstance(ts, str):\n                try:\n                    dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if dt >= cutoff:\n                    in_window += 1\n\n        if isinstance(max_requests, int) and max_requests >= 0 and in_window >= max_requests:\n            # Record refused request as well.\n            return audits, _err(\"RATE_LIMIT\", \"Rate limit exceeded\", window_seconds=window_seconds, max_requests=max_requests)\n\n        if isinstance(max_total, int) and max_total >= 0:\n            total_calls = (audits.get(\"counters\") or {}).get(\"total_calls\", 0)\n            if isinstance(total_calls, int) and total_calls >= max_total:\n                return audits, _err(\"QUOTA_EXCEEDED\", \"Quota exceeded\", max_requests_total=max_total)\n\n        return audits, None\n\n    def _record(audits, tool, params, status, started_at):\n        ended = time.time()\n        latency_ms = int(round((ended - started_at) * 1000))\n        row = {\n            \"id\": f\"req_{int(ended * 1000)}_{os.getpid()}\",\n            \"timestamp\": _now(),\n            \"tool\": tool,\n            \"params\": params,\n            \"status\": status,\n            \"latency_ms\": latency_ms,\n        }\n        audits[\"requests\"] = audits.get(\"requests\", [])\n        audits[\"requests\"].append(row)\n        counters = audits.get(\"counters\", {})\n        counters[\"total_calls\"] = int(counters.get(\"total_calls\", 0) or 0) + 1\n        by_tool = counters.get(\"by_tool\") or {}\n        by_tool[tool] = int(by_tool.get(tool, 0) or 0) + 1\n        counters[\"by_tool\"] = by_tool\n        by_status = counters.get(\"by_status\") or {}\n        by_status[status] = int(by_status.get(status, 0) or 0) + 1\n        counters[\"by_status\"] = by_status\n        audits[\"counters\"] = counters\n        _save(\"usage.json\", audits)\n\n    def _validate_remote_path(p):\n        if p is None or not isinstance(p, str):\n            return _err(\"VALIDATION_ERROR\", \"remote_path must be a string\")\n        if p.strip() == \"\":\n            return _err(\"VALIDATION_ERROR\", \"remote_path is required\")\n        # Normalize separators and refuse traversal / absolute paths.\n        if \"\\x00\" in p:\n            return _err(\"VALIDATION_ERROR\", \"remote_path contains invalid characters\")\n        norm = p.replace(\"\\\\\", \"/\")\n        if norm.startswith(\"/\"):\n            return _err(\"VALIDATION_ERROR\", \"remote_path must be workspace-relative\")\n        parts = [x for x in norm.split(\"/\") if x not in (\"\", \".\")]\n        if any(x == \"..\" for x in parts):\n            return _err(\"VALIDATION_ERROR\", \"remote_path attempts to traverse outside the workspace\")\n        # basic naming rules: disallow empty parts already handled; keep as-is.\n        return None\n\n    started = time.time()\n    tool = \"read_file\"\n    params_for_log = {\"remote_path\": remote_path}\n\n    audits, blocked = _audit_and_enforce(tool, params_for_log)\n    if blocked is not None:\n        _record(audits, tool, params_for_log, \"error\", started)\n        return blocked\n\n    v = _validate_remote_path(remote_path)\n    if v is not None:\n        _record(audits, tool, params_for_log, \"error\", started)\n        return v\n\n    # Map \"workspace-relative\" path to local datastore.\n    # The workspace root is /app/database/workspace. If it doesn't exist, treat as NOT_FOUND.\n    workspace_root = os.path.join(_DB, \"workspace\")\n    abs_path = os.path.normpath(os.path.join(workspace_root, remote_path.replace(\"\\\\\", \"/\")))\n\n    # Ensure abs_path is within workspace_root.\n    try:\n        common = os.path.commonpath([workspace_root, abs_path])\n    except ValueError:\n        _record(audits, tool, params_for_log, \"error\", started)\n        return _err(\"VALIDATION_ERROR\", \"remote_path is invalid for this workspace\")\n    if common != workspace_root:\n        _record(audits, tool, params_for_log, \"error\", started)\n        return _err(\"VALIDATION_ERROR\", \"remote_path attempts to traverse outside the workspace\")\n\n    if not os.path.exists(abs_path):\n        _record(audits, tool, params_for_log, \"error\", started)\n        return _err(\"NOT_FOUND\", \"Path does not exist\", remote_path=remote_path)\n\n    if os.path.isdir(abs_path):\n        _record(audits, tool, params_for_log, \"error\", started)\n        return _err(\"VALIDATION_ERROR\", \"Path refers to a directory\", remote_path=remote_path)\n\n    if not os.path.isfile(abs_path):\n        _record(audits, tool, params_for_log, \"error\", started)\n        return _err(\"VALIDATION_ERROR\", \"Path is not a file\", remote_path=remote_path)\n\n    try:\n        with open(abs_path, \"r\", encoding=\"utf-8\") as f:\n            text = f.read()\n    except UnicodeDecodeError:\n        _record(audits, tool, params_for_log, \"error\", started)\n        return _err(\"VALIDATION_ERROR\", \"File is not valid UTF-8 text\", remote_path=remote_path)\n    except OSError:\n        _record(audits, tool, params_for_log, \"error\", started)\n        return _err(\"NOT_FOUND\", \"File could not be read\", remote_path=remote_path)\n\n    _record(audits, tool, params_for_log, \"ok\", started)\n    return {\n        \"remote_path\": remote_path,\n        \"content\": text,\n        \"content_length\": len(text),\n    }\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "exists",
+          "description": "Checks whether the given workspace-relative path currently exists and returns a boolean result. It refuses requests where the path is missing, empty, or attempts to traverse outside the workspace. It may also refuse paths that are not valid for this workspace’s naming and path rules.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "remote_path": {
+                "type": "string",
+                "description": "Path relative to the workspace root."
+              }
+            },
+            "required": [
+              "remote_path"
+            ]
+          },
+          "implementation": "def exists(remote_path, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0366000\" if __import__(\"os\").path.isdir(\"./environment_mix/0366000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ensure_audit_store():\n        audits = _load(\"usage.json\")\n        if not isinstance(audits, dict) or \"requests\" not in audits or \"counters\" not in audits:\n            audits = {\n                \"requests\": [],\n                \"counters\": {\"total_calls\": 0, \"by_tool\": {}, \"by_status\": {}},\n                \"rate_limit\": {\"window_seconds\": 60, \"max_requests\": 600},\n                \"quota\": {\"max_requests_total\": None},\n            }\n            _save(\"usage.json\", audits)\n        return audits\n\n    def _audit_and_enforce(tool, params):\n        audits = _ensure_audit_store()\n\n        rl = audits.get(\"rate_limit\") or {}\n        window_seconds = rl.get(\"window_seconds\", 60)\n        max_requests = rl.get(\"max_requests\", 600)\n        quota = audits.get(\"quota\") or {}\n        max_total = quota.get(\"max_requests_total\", None)\n\n        now = datetime.datetime.utcnow()\n        reqs = audits.get(\"requests\", [])\n        cutoff = now - datetime.timedelta(seconds=int(window_seconds) if isinstance(window_seconds, int) else 60)\n        in_window = 0\n        for r in reqs:\n            ts = r.get(\"timestamp\")\n            if isinstance(ts, str):\n                try:\n                    dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if dt >= cutoff:\n                    in_window += 1\n\n        if isinstance(max_requests, int) and max_requests >= 0 and in_window >= max_requests:\n            return audits, _err(\"RATE_LIMIT\", \"Rate limit exceeded\", window_seconds=window_seconds, max_requests=max_requests)\n\n        if isinstance(max_total, int) and max_total >= 0:\n            total_calls = (audits.get(\"counters\") or {}).get(\"total_calls\", 0)\n            if isinstance(total_calls, int) and total_calls >= max_total:\n                return audits, _err(\"QUOTA_EXCEEDED\", \"Quota exceeded\", max_requests_total=max_total)\n\n        return audits, None\n\n    def _record(audits, tool, params, status, started_at):\n        ended = time.time()\n        latency_ms = int(round((ended - started_at) * 1000))\n        row = {\n            \"id\": f\"req_{int(ended * 1000)}_{os.getpid()}\",\n            \"timestamp\": _now(),\n            \"tool\": tool,\n            \"params\": params,\n            \"status\": status,\n            \"latency_ms\": latency_ms,\n        }\n        audits[\"requests\"] = audits.get(\"requests\", [])\n        audits[\"requests\"].append(row)\n        counters = audits.get(\"counters\", {})\n        counters[\"total_calls\"] = int(counters.get(\"total_calls\", 0) or 0) + 1\n        by_tool = counters.get(\"by_tool\") or {}\n        by_tool[tool] = int(by_tool.get(tool, 0) or 0) + 1\n        counters[\"by_tool\"] = by_tool\n        by_status = counters.get(\"by_status\") or {}\n        by_status[status] = int(by_status.get(status, 0) or 0) + 1\n        counters[\"by_status\"] = by_status\n        audits[\"counters\"] = counters\n        _save(\"usage.json\", audits)\n\n    def _validate_remote_path(p):\n        if p is None or not isinstance(p, str):\n            return _err(\"VALIDATION_ERROR\", \"remote_path must be a string\")\n        if p.strip() == \"\":\n            return _err(\"VALIDATION_ERROR\", \"remote_path is required\")\n        if \"\\x00\" in p:\n            return _err(\"VALIDATION_ERROR\", \"remote_path contains invalid characters\")\n        norm = p.replace(\"\\\\\", \"/\")\n        if norm.startswith(\"/\"):\n            return _err(\"VALIDATION_ERROR\", \"remote_path must be workspace-relative\")\n        parts = [x for x in norm.split(\"/\") if x not in (\"\", \".\")]\n        if any(x == \"..\" for x in parts):\n            return _err(\"VALIDATION_ERROR\", \"remote_path attempts to traverse outside the workspace\")\n        return None\n\n    started = time.time()\n    tool = \"exists\"\n    params_for_log = {\"remote_path\": remote_path}\n\n    audits, blocked = _audit_and_enforce(tool, params_for_log)\n    if blocked is not None:\n        _record(audits, tool, params_for_log, \"error\", started)\n        return blocked\n\n    v = _validate_remote_path(remote_path)\n    if v is not None:\n        _record(audits, tool, params_for_log, \"error\", started)\n        return v\n\n    workspace_root = os.path.join(_DB, \"workspace\")\n    abs_path = os.path.normpath(os.path.join(workspace_root, remote_path.replace(\"\\\\\", \"/\")))\n\n    try:\n        common = os.path.commonpath([workspace_root, abs_path])\n    except ValueError:\n        _record(audits, tool, params_for_log, \"error\", started)\n        return _err(\"VALIDATION_ERROR\", \"remote_path is invalid for this workspace\")\n\n    if common != workspace_root:\n        _record(audits, tool, params_for_log, \"error\", started)\n        return _err(\"VALIDATION_ERROR\", \"remote_path attempts to traverse outside the workspace\")\n\n    result = {\n        \"remote_path\": remote_path,\n        \"exists\": os.path.exists(abs_path),\n        \"is_file\": os.path.isfile(abs_path),\n        \"is_dir\": os.path.isdir(abs_path),\n    }\n    _record(audits, tool, params_for_log, \"ok\", started)\n    return result\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "list_dir",
+          "description": "Lists the entries under the given workspace-relative directory and returns the full recursive listing. It refuses requests where the directory path points outside the workspace, does not exist, or is not a directory. It may refuse listings when the caller does not have permission to view the directory’s contents.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "remote_dir": {
+                "type": "string",
+                "description": "Directory path (default workspace)."
+              }
+            },
+            "required": []
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0366000\" if __import__(\"os\").path.isdir(\"./environment_mix/0366000\") else \"/app/database\")\ndef list_dir(remote_dir=\"workspace\"):\n    import os\n    def _abs(remote_path):\n        root = os.path.join(_DB, \"workspace\")\n        p = str(remote_path)\n        if p.startswith(_DB): return p\n        if p.startswith(\"workspace\"): return os.path.join(_DB, p)\n        return os.path.join(root, p.lstrip(\"/\"))\n    path = _abs(remote_dir)\n    if not os.path.isdir(path):\n        return {\"error\": f\"not a directory: {remote_dir}\"}\n    out = []\n    for dp, dn, fn in os.walk(path):\n        for f in fn:\n            rel = os.path.relpath(os.path.join(dp, f), os.path.join(_DB))\n            out.append(rel)\n    return sorted(out)\n",
+          "description_restored": true
+        },
+        {
+          "name": "write_file",
+          "description": "Creates or overwrites a text file at the given workspace-relative path and returns confirmation of the write. It refuses requests where the path or content is missing, the path is empty, points outside the workspace, or refers to a directory. It also refuses writes when parent locations cannot be created or when the caller is not allowed to modify the destination.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "remote_path": {
+                "type": "string",
+                "description": "Destination path."
+              },
+              "content": {
+                "type": "string",
+                "description": "Text content."
+              }
+            },
+            "required": [
+              "remote_path",
+              "content"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0366000\" if __import__(\"os\").path.isdir(\"./environment_mix/0366000\") else \"/app/database\")\ndef write_file(remote_path, content):\n    import os\n    def _abs(remote_path):\n        root = os.path.join(_DB, \"workspace\")\n        p = str(remote_path)\n        if p.startswith(_DB): return p\n        if p.startswith(\"workspace\"): return os.path.join(_DB, p)\n        return os.path.join(root, p.lstrip(\"/\"))\n    path = _abs(remote_path)\n    os.makedirs(os.path.dirname(path), exist_ok=True)\n    with open(path, \"w\", encoding=\"utf-8\") as f:\n        f.write(content if isinstance(content, str) else str(content))\n    return {\"written\": True, \"path\": remote_path, \"bytes\": len(content or \"\")}\n",
+          "description_restored": true
+        },
+        {
+          "name": "delete_file",
+          "description": "Deletes the file at the given workspace-relative path and returns confirmation of deletion. It refuses requests where the path is missing, empty, points outside the workspace, or does not exist. It also refuses deletion when the path refers to a directory or when the caller is not allowed to remove the target.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "remote_path": {
+                "type": "string",
+                "description": "Path to delete."
+              }
+            },
+            "required": [
+              "remote_path"
+            ]
+          },
+          "implementation": "def delete_file(remote_path, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0366000\" if __import__(\"os\").path.isdir(\"./environment_mix/0366000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ensure_audit_store():\n        audits = _load(\"usage.json\")\n        if not isinstance(audits, dict) or \"requests\" not in audits or \"counters\" not in audits:\n            audits = {\n                \"requests\": [],\n                \"counters\": {\"total_calls\": 0, \"by_tool\": {}, \"by_status\": {}},\n                \"rate_limit\": {\"window_seconds\": 60, \"max_requests\": 600},\n                \"quota\": {\"max_requests_total\": None},\n            }\n            _save(\"usage.json\", audits)\n        return audits\n\n    def _audit_and_enforce(tool, params):\n        audits = _ensure_audit_store()\n\n        rl = audits.get(\"rate_limit\") or {}\n        window_seconds = rl.get(\"window_seconds\", 60)\n        max_requests = rl.get(\"max_requests\", 600)\n        quota = audits.get(\"quota\") or {}\n        max_total = quota.get(\"max_requests_total\", None)\n\n        now = datetime.datetime.utcnow()\n        reqs = audits.get(\"requests\", [])\n        cutoff = now - datetime.timedelta(seconds=int(window_seconds) if isinstance(window_seconds, int) else 60)\n        in_window = 0\n        for r in reqs:\n            ts = r.get(\"timestamp\")\n            if isinstance(ts, str):\n                try:\n                    dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if dt >= cutoff:\n                    in_window += 1\n\n        if isinstance(max_requests, int) and max_requests >= 0 and in_window >= max_requests:\n            return audits, _err(\"RATE_LIMIT\", \"Rate limit exceeded\", window_seconds=window_seconds, max_requests=max_requests)\n\n        if isinstance(max_total, int) and max_total >= 0:\n            total_calls = (audits.get(\"counters\") or {}).get(\"total_calls\", 0)\n            if isinstance(total_calls, int) and total_calls >= max_total:\n                return audits, _err(\"QUOTA_EXCEEDED\", \"Quota exceeded\", max_requests_total=max_total)\n\n        return audits, None\n\n    def _record(audits, tool, params, status, started_at):\n        ended = time.time()\n        latency_ms = int(round((ended - started_at) * 1000))\n        row = {\n            \"id\": f\"req_{int(ended * 1000)}_{os.getpid()}\",\n            \"timestamp\": _now(),\n            \"tool\": tool,\n            \"params\": params,\n            \"status\": status,\n            \"latency_ms\": latency_ms,\n        }\n        audits[\"requests\"] = audits.get(\"requests\", [])\n        audits[\"requests\"].append(row)\n        counters = audits.get(\"counters\", {})\n        counters[\"total_calls\"] = int(counters.get(\"total_calls\", 0) or 0) + 1\n        by_tool = counters.get(\"by_tool\") or {}\n        by_tool[tool] = int(by_tool.get(tool, 0) or 0) + 1\n        counters[\"by_tool\"] = by_tool\n        by_status = counters.get(\"by_status\") or {}\n        by_status[status] = int(by_status.get(status, 0) or 0) + 1\n        counters[\"by_status\"] = by_status\n        audits[\"counters\"] = counters\n        _save(\"usage.json\", audits)\n\n    def _validate_remote_path(p):\n        if p is None or not isinstance(p, str):\n            return _err(\"VALIDATION_ERROR\", \"remote_path must be a string\")\n        if p.strip() == \"\":\n            return _err(\"VALIDATION_ERROR\", \"remote_path is required\")\n        if \"\\x00\" in p:\n            return _err(\"VALIDATION_ERROR\", \"remote_path contains invalid characters\")\n        norm = p.replace(\"\\\\\", \"/\")\n        if norm.startswith(\"/\"):\n            return _err(\"VALIDATION_ERROR\", \"remote_path must be workspace-relative\")\n        parts = [x for x in norm.split(\"/\") if x not in (\"\", \".\")]\n        if any(x == \"..\" for x in parts):\n            return _err(\"VALIDATION_ERROR\", \"remote_path attempts to traverse outside the workspace\")\n        return None\n\n    started = time.time()\n    tool = \"delete_file\"\n    params_for_log = {\"remote_path\": remote_path}\n\n    audits, blocked = _audit_and_enforce(tool, params_for_log)\n    if blocked is not None:\n        _record(audits, tool, params_for_log, \"error\", started)\n        return blocked\n\n    v = _validate_remote_path(remote_path)\n    if v is not None:\n        _record(audits, tool, params_for_log, \"error\", started)\n        return v\n\n    workspace_root = os.path.join(_DB, \"workspace\")\n    abs_path = os.path.normpath(os.path.join(workspace_root, remote_path.replace(\"\\\\\", \"/\")))\n\n    try:\n        common = os.path.commonpath([workspace_root, abs_path])\n    except ValueError:\n        _record(audits, tool, params_for_log, \"error\", started)\n        return _err(\"VALIDATION_ERROR\", \"remote_path is invalid for this workspace\")\n\n    if common != workspace_root:\n        _record(audits, tool, params_for_log, \"error\", started)\n        return _err(\"VALIDATION_ERROR\", \"remote_path attempts to traverse outside the workspace\")\n\n    if not os.path.exists(abs_path):\n        _record(audits, tool, params_for_log, \"error\", started)\n        return _err(\"NOT_FOUND\", \"Path does not exist\", remote_path=remote_path)\n\n    if os.path.isdir(abs_path):\n        _record(audits, tool, params_for_log, \"error\", started)\n        return _err(\"VALIDATION_ERROR\", \"Path refers to a directory\", remote_path=remote_path)\n\n    if not os.path.isfile(abs_path):\n        _record(audits, tool, params_for_log, \"error\", started)\n        return _err(\"VALIDATION_ERROR\", \"Path is not a file\", remote_path=remote_path)\n\n    try:\n        os.remove(abs_path)\n    except PermissionError:\n        _record(audits, tool, params_for_log, \"error\", started)\n        return _err(\"UNAUTHORIZED\", \"Not allowed to delete the target\", remote_path=remote_path)\n    except OSError:\n        _record(audits, tool, params_for_log, \"error\", started)\n        return _err(\"CONFLICT\", \"File could not be deleted\", remote_path=remote_path)\n\n    # Confirm deletion had effect.\n    if os.path.exists(abs_path):\n        _record(audits, tool, params_for_log, \"error\", started)\n        return _err(\"CONFLICT\", \"Deletion did not complete\", remote_path=remote_path)\n\n    _record(audits, tool, params_for_log, \"ok\", started)\n    return {\"remote_path\": remote_path, \"deleted\": True}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0366000",
+    "index": 366,
+    "name": "ForgeLine QualityOps Vault",
+    "description": "A file-backed service for storing and managing manufacturing quality operations records—complaints, weekly QC reports, supplier audits/8D, CAPA and related notes—through simple filesystem-style APIs.",
+    "taxonomy": {
+      "L1_id": "L1-10",
+      "L1_name": "Data Storage & Databases",
+      "L1_name_zh": "数据存储与数据库",
+      "L2_id": "L2-27",
+      "L2_name": "Memory & Knowledge Management",
+      "L2_name_zh": "记忆与知识管理",
+      "L3_name": "Workspace Docs & Notes",
+      "L3_name_zh": "工作空间文档与笔记"
+    },
+    "database_dir": "./environment_mix/0366000",
+    "mount_path": "/app/database",
+    "n_tools": 5,
+    "n_collections": 1,
+    "n_records": 12,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 5,
+      "loaded": 5,
+      "reads_returning_data": 2,
+      "read_operations": 3,
+      "mutations_persisted": 2,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 5,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "read_file",
+      "returned_chars": 95
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

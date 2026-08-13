@@ -1,0 +1,226 @@
+{
+  "index": 159,
+  "local_files_dir": "./environment_mix/0159000",
+  "file_list": [
+    "./environment_mix/0159000/README.md",
+    "./environment_mix/0159000/api_keys.json",
+    "./environment_mix/0159000/events.json",
+    "./environment_mix/0159000/ingestion_jobs.json",
+    "./environment_mix/0159000/search_queries.json",
+    "./environment_mix/0159000/search_query_results.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "events.json": "36 rows",
+        "search_queries.json": "30 rows",
+        "search_query_results.json": "30 rows",
+        "api_keys.json": "31 rows",
+        "ingestion_jobs.json": "30 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "get_events",
+          "description": "Searches the event listings for records matching the provided keywords and returns up to `limit` results (default 10); results are limited rather than paginated. Raises VALIDATION_ERROR if `keywords` is missing/empty or if `limit` is not a positive integer. Raises UNAUTHORIZED if the caller is not permitted to query events and QUOTA_EXCEEDED when the service rejects the request due to query-usage limits.",
+          "parameters": {
+            "properties": {
+              "keywords": {
+                "title": "Keywords",
+                "type": "string"
+              },
+              "limit": {
+                "default": 10,
+                "title": "Limit",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "keywords"
+            ],
+            "title": "get_eventsArguments",
+            "type": "object"
+          },
+          "implementation": "def get_events(keywords, limit=None, **_extra):\n    import json, os, datetime, time, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0159000\" if __import__(\"os\").path.isdir(\"./environment_mix/0159000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n    now_iso = now.isoformat().replace(\"+00:00\", \"Z\")\n\n    # ---- helpers ----\n    def _norm_kw(s):\n        s = s.strip().lower()\n        s = \" \".join(s.split())\n        return s\n\n    def _gen_id(prefix):\n        # deterministic-ish unique id with timestamp + random-ish hash\n        raw = f\"{prefix}_{now.timestamp()}_{os.getpid()}_{time.time_ns()}\"\n        h = hashlib.sha256(raw.encode(\"utf-8\")).hexdigest()[:24]\n        return f\"{prefix}_{now.strftime('%Y%m%dT%H%M%S')}_{h}\"\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, str):\n            try:\n                if v.endswith(\"Z\"):\n                    return datetime.datetime.fromisoformat(v.replace(\"Z\", \"+00:00\"))\n                return datetime.datetime.fromisoformat(v)\n            except ValueError:\n                return None\n        return None\n\n    def _same_utc_day(iso_ts, day_start):\n        dt = _parse_dt(iso_ts)\n        if dt is None:\n            return False\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        dt_utc = dt.astimezone(datetime.timezone.utc)\n        return day_start <= dt_utc < (day_start + datetime.timedelta(days=1))\n\n    # ---- validate ----\n    if not isinstance(keywords, str):\n        return _err(\"VALIDATION_ERROR\", \"keywords must be a string\")\n    norm = _norm_kw(keywords)\n    if not norm:\n        return _err(\"VALIDATION_ERROR\", \"keywords must not be empty\")\n    if limit is None:\n        limit = 10\n    if not isinstance(limit, int):\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n    if limit < 1 or limit > 100:\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 100\", min=1, max=100)\n\n    # ---- auth / key context ----\n    # Tool signature carries no api_key; authenticate ambiently by finding any active key that can serve the request.\n    api_keys = _load(\"api_keys.json\")\n    active_keys = [k for k in api_keys if isinstance(k, dict) and k.get(\"status\") == \"active\"]\n    if not active_keys:\n        # no key in the store that can authorize requests\n        return _err(\"UNAUTHORIZED\", \"No active API key available to authorize queries\")\n\n    # enforce per-key daily_limit by choosing a key that has remaining quota.\n    search_queries = _load(\"search_queries.json\")\n    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)\n    chosen_key = None\n    for k in active_keys:\n        dl = k.get(\"daily_limit\")\n        if not isinstance(dl, int):\n            continue\n        if dl <= 0:\n            chosen_key = k\n            break\n        kid = k.get(\"id\")\n        used = 0\n        for q in search_queries:\n            if not isinstance(q, dict):\n                continue\n            if q.get(\"api_key_id\") == kid and isinstance(q.get(\"created_at\"), str) and _same_utc_day(q.get(\"created_at\"), day_start):\n                used += 1\n        if used < dl:\n            chosen_key = k\n            break\n\n    if chosen_key is None:\n        # Since at least one active key exists but none have remaining quota\n        # Return QUOTA_EXCEEDED (per business rules).\n        # (Not RATE_LIMIT; daily_limit is quota.)\n        # Also record a failed query attempt? Rule: each get_events call creates a search_queries row,\n        # but revoked keys cannot create. Here we have active but over quota; create row with failed.\n        # We can create the row with the least-over-limit key for audit; pick first active key.\n        chosen_key = active_keys[0]\n        qid = _gen_id(\"sq\")\n        qrow = {\n            \"id\": qid,\n            \"api_key_id\": chosen_key.get(\"id\"),\n            \"keywords\": keywords,\n            \"normalized_keywords\": norm,\n            \"limit\": int(limit),\n            \"status\": \"received\",\n            \"error_message\": None,\n            \"results_count\": None,\n            \"execution_ms\": None,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n        }\n        search_queries.append(qrow)\n        _save(\"search_queries.json\", search_queries)\n\n        # transition received -> failed exactly once\n        qrow[\"status\"] = \"failed\"\n        qrow[\"error_message\"] = \"Daily query limit exceeded\"\n        qrow[\"results_count\"] = 0\n        qrow[\"execution_ms\"] = int((time.time() - t0) * 1000)\n        qrow[\"updated_at\"] = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n        _save(\"search_queries.json\", search_queries)\n        return _err(\"QUOTA_EXCEEDED\", \"Daily query limit exceeded\")\n\n    # ---- create search query row (received) ----\n    qid = _gen_id(\"sq\")\n    qrow = {\n        \"id\": qid,\n        \"api_key_id\": chosen_key.get(\"id\"),\n        \"keywords\": keywords,\n        \"normalized_keywords\": norm,\n        \"limit\": int(limit),\n        \"status\": \"received\",\n        \"error_message\": None,\n        \"results_count\": None,\n        \"execution_ms\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n    }\n    search_queries.append(qrow)\n    _save(\"search_queries.json\", search_queries)\n\n    # ---- run search ----\n    try:\n        events = _load(\"events.json\")\n        active_events = [e for e in events if isinstance(e, dict) and e.get(\"status\") == \"active\"]\n\n        # simple scoring: count keyword token occurrences in search_document + title boost\n        tokens = [t for t in norm.split(\" \") if t]\n        def _text(e):\n            sd = e.get(\"search_document\")\n            if isinstance(sd, str) and sd.strip():\n                return sd.lower()\n            # fallback\n            parts = []\n            for f in (\"title\", \"description\", \"location\", \"organizer\"):\n                v = e.get(f)\n                if isinstance(v, str):\n                    parts.append(v)\n            tp = e.get(\"topics\")\n            if isinstance(tp, list):\n                parts.extend([x for x in tp if isinstance(x, str)])\n            return \" \".join(parts).lower()\n\n        def _score(e):\n            txt = _text(e)\n            score = 0.0\n            for t in tokens:\n                if not t:\n                    continue\n                c = txt.count(t)\n                score += float(c)\n            title = e.get(\"title\")\n            if isinstance(title, str):\n                ttl = title.lower()\n                for t in tokens:\n                    if t and t in ttl:\n                        score += 2.0\n            return score\n\n        scored = []\n        for e in active_events:\n            s = _score(e)\n            if s > 0:\n                scored.append((s, e))\n        scored.sort(key=lambda x: (x[0], x[1].get(\"updated_at\") or \"\", x[1].get(\"id\") or \"\"), reverse=True)\n\n        top = scored[:limit]\n        results = [e for _, e in top]\n\n        # ---- write results rows (completed query) ----\n        sqr = _load(\"search_query_results.json\")\n        existing_by_pair = set()\n        existing_by_rank = set()\n        for r in sqr:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"search_query_id\") == qid:\n                existing_by_pair.add((r.get(\"search_query_id\"), r.get(\"event_id\")))\n                existing_by_rank.add((r.get(\"search_query_id\"), r.get(\"rank\")))\n\n        inserted = 0\n        rank = 1\n        for s, e in top:\n            if rank > limit:\n                break\n            eid = e.get(\"id\")\n            if not isinstance(eid, str) or not eid:\n                rank += 1\n                continue\n            if (qid, eid) in existing_by_pair or (qid, rank) in existing_by_rank:\n                # should not happen for new qid; skip to preserve uniqueness\n                rank += 1\n                continue\n            rid = _gen_id(\"sqr\")\n            row = {\n                \"id\": rid,\n                \"search_query_id\": qid,\n                \"event_id\": eid,\n                \"rank\": rank,\n                \"score\": float(s),\n                \"created_at\": now_iso,\n                \"updated_at\": now_iso,\n            }\n            sqr.append(row)\n            inserted += 1\n            rank += 1\n\n        if inserted > 0:\n            _save(\"search_query_results.json\", sqr)\n\n        # ---- transition query to completed exactly once ----\n        qrow[\"status\"] = \"completed\"\n        qrow[\"results_count\"] = len(results)\n        qrow[\"execution_ms\"] = int((time.time() - t0) * 1000)\n        qrow[\"updated_at\"] = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n        _save(\"search_queries.json\", search_queries)\n\n        return {\n            \"search_query\": {\n                \"id\": qid,\n                \"keywords\": keywords,\n                \"normalized_keywords\": norm,\n                \"limit\": int(limit),\n                \"status\": qrow[\"status\"],\n                \"results_count\": qrow[\"results_count\"],\n                \"execution_ms\": qrow[\"execution_ms\"],\n                \"created_at\": qrow[\"created_at\"],\n                \"updated_at\": qrow[\"updated_at\"],\n            },\n            \"events\": results,\n            \"count\": len(results),\n            \"limit\": int(limit),\n        }\n\n    except (TypeError, ValueError) as e:\n        # ---- transition query to failed exactly once ----\n        qrow[\"status\"] = \"failed\"\n        qrow[\"error_message\"] = str(e)\n        qrow[\"results_count\"] = 0\n        qrow[\"execution_ms\"] = int((time.time() - t0) * 1000)\n        qrow[\"updated_at\"] = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n        _save(\"search_queries.json\", search_queries)\n        return _err(\"VALIDATION_ERROR\", \"Failed to execute search\", detail=str(e))\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_event",
+          "description": "Fetches a single event by `id`. Returns the event record when found. Raises NOT_FOUND if no such event exists and UNAUTHORIZED if the caller is not permitted to access the event.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "The event primary key."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_event(id, **_extra):\n    import json, os, datetime\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0159000\" if __import__(\"os\").path.isdir(\"./environment_mix/0159000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    if not isinstance(id, str) or not id.strip():\n        return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\")\n\n    # Ambient auth: allow if there exists any active API key in the system.\n    api_keys = _load(\"api_keys.json\")\n    if not any(isinstance(k, dict) and k.get(\"status\") == \"active\" for k in api_keys):\n        return _err(\"UNAUTHORIZED\", \"No active API key available to authorize access\")\n\n    events = _load(\"events.json\")\n    for e in events:\n        if isinstance(e, dict) and e.get(\"id\") == id:\n            return {\"event\": e}\n    return _err(\"NOT_FOUND\", \"Event not found\", id=id)\n"
+        },
+        {
+          "name": "list_ingestion_jobs",
+          "description": "Lists ingestion jobs in reverse chronological order with optional status and source filtering. Returns a page of jobs and a cursor for the next page when available. Raises UNAUTHORIZED if the caller is not permitted to view ingestion jobs.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "Filter ingestion jobs by lifecycle status."
+              },
+              "source_name": {
+                "type": "string",
+                "description": "Filter jobs by source name (exact match)."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of jobs to return.",
+                "default": 50,
+                "minimum": 1,
+                "maximum": 200
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_ingestion_jobs(status=None, source_name=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0159000\" if __import__(\"os\").path.isdir(\"./environment_mix/0159000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    # Ambient auth\n    api_keys = _load(\"api_keys.json\")\n    if not any(isinstance(k, dict) and k.get(\"status\") == \"active\" for k in api_keys):\n        return _err(\"UNAUTHORIZED\", \"No active API key available to authorize access\")\n\n    allowed_status = {\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            return _err(\"VALIDATION_ERROR\", \"Invalid status\", allowed=sorted(list(allowed_status)))\n    if source_name is not None and (not isinstance(source_name, str) or not source_name.strip()):\n        return _err(\"VALIDATION_ERROR\", \"source_name must be a non-empty string when provided\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n    if limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200\", min=1, max=200)\n\n    start_index = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or not cursor:\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string when provided\")\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\")).decode(\"utf-8\")\n            if not raw.startswith(\"idx:\"):\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n            start_index = int(raw.split(\":\", 1)[1])\n            if start_index < 0:\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor index\")\n        except (ValueError, UnicodeDecodeError, base64.binascii.Error):\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n\n    jobs = _load(\"ingestion_jobs.json\")\n    rows = [j for j in jobs if isinstance(j, dict)]\n\n    if status is not None:\n        rows = [j for j in rows if j.get(\"status\") == status]\n    if source_name is not None:\n        rows = [j for j in rows if j.get(\"source_name\") == source_name]\n\n    def _sort_key(j):\n        # reverse chronological by created_at, fallback updated_at then id\n        ca = j.get(\"created_at\") if isinstance(j.get(\"created_at\"), str) else \"\"\n        ua = j.get(\"updated_at\") if isinstance(j.get(\"updated_at\"), str) else \"\"\n        return (ca, ua, j.get(\"id\") or \"\")\n\n    rows.sort(key=_sort_key, reverse=True)\n\n    total = len(rows)\n    page = rows[start_index:start_index + limit]\n    next_index = start_index + len(page)\n    has_more = next_index < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(f\"idx:{next_index}\".encode(\"utf-8\")).decode(\"utf-8\")\n\n    return {\n        \"jobs\": page,\n        \"page\": {\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"total\": total,\n        },\n    }\n"
+        },
+        {
+          "name": "get_ingestion_job",
+          "description": "Fetches a single ingestion job by `id`. Returns the job record including status and counters. Raises NOT_FOUND if no such job exists and UNAUTHORIZED if the caller is not permitted to view ingestion jobs.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "The ingestion job primary key."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_ingestion_job(id, **_extra):\n    import json, os, datetime, time, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0159000\" if __import__(\"os\").path.isdir(\"./environment_mix/0159000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n\n    def _now_iso():\n        return _now().isoformat().replace(\"+00:00\", \"Z\")\n\n    def _unwrap_rows(data):\n        # supports either raw list or {\"rows\":[...]} container\n        if isinstance(data, dict) and isinstance(data.get(\"rows\"), list):\n            return data[\"rows\"], True, data\n        if isinstance(data, list):\n            return data, False, None\n        return [], False, None\n\n    def _append_request_log(endpoint, status, latency_ms, error_code=None, credential_id=None):\n        # only if file exists; schema doesn't declare it but service may include it\n        path = os.path.join(_DB, \"request_logs.json\")\n        if not os.path.exists(path):\n            return\n        reqlog = _load(\"request_logs.json\")\n        rows, wrapped, container = _unwrap_rows(reqlog)\n        row = {\n            \"id\": f\"cfp_req_{int(time.time() * 1000)}_{secrets.token_hex(4)}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": int(latency_ms),\n            \"created_at\": _now_iso(),\n        }\n        rows.append(row)\n        if wrapped and isinstance(container, dict):\n            container[\"rows\"] = rows\n            _save(\"request_logs.json\", container)\n        else:\n            _save(\"request_logs.json\", rows)\n\n    t0 = time.time()\n    endpoint = \"get_ingestion_job\"\n\n    # Validate inputs\n    if not isinstance(id, str):\n        latency_ms = (time.time() - t0) * 1000\n        _append_request_log(endpoint, \"error\", latency_ms, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"id must be a string\")\n    job_id = id.strip()\n    if not job_id:\n        latency_ms = (time.time() - t0) * 1000\n        _append_request_log(endpoint, \"error\", latency_ms, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"id is required\")\n\n    # Ambient auth: caller is already authenticated; no further ACL model is provided in schema.\n    # Only return UNAUTHORIZED if there is some explicit auth model and no valid context exists.\n    # (No such model exists in this datastore/schema.)\n    jobs_data = _load(\"ingestion_jobs.json\")\n    jobs, wrapped, container = _unwrap_rows(jobs_data)\n\n    job = None\n    for r in jobs:\n        if isinstance(r, dict) and r.get(\"id\") == job_id:\n            job = r\n            break\n\n    if not job:\n        latency_ms = (time.time() - t0) * 1000\n        _append_request_log(endpoint, \"error\", latency_ms, error_code=\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Ingestion job not found\", id=job_id)\n\n    latency_ms = (time.time() - t0) * 1000\n    _append_request_log(endpoint, \"ok\", latency_ms)\n    return {\"data\": job}\n"
+        },
+        {
+          "name": "create_ingestion_job",
+          "description": "Creates an ingestion job to ingest/upsert events from an external CFP source. Returns the created job in `queued` status. Raises VALIDATION_ERROR for invalid input and UNAUTHORIZED if the caller is not permitted to create ingestion jobs.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "source_name": {
+                "type": "string",
+                "description": "Human-readable source identifier (e.g., 'wikicfp')."
+              },
+              "source_url": {
+                "type": "string",
+                "description": "The URL or feed endpoint to ingest from."
+              }
+            },
+            "required": [
+              "source_name",
+              "source_url"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_ingestion_job(source_name, source_url, **_extra):\n    import json, os, datetime, time, re, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0159000\" if __import__(\"os\").path.isdir(\"./environment_mix/0159000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    # No request-log/usage collection defined in schema for this service.\n\n    # Validate input\n    if not isinstance(source_name, str):\n        return _err(\"VALIDATION_ERROR\", \"source_name must be a string\")\n    if not isinstance(source_url, str):\n        return _err(\"VALIDATION_ERROR\", \"source_url must be a string\")\n\n    sn = source_name.strip()\n    su = source_url.strip()\n\n    if not sn:\n        return _err(\"VALIDATION_ERROR\", \"source_name is required\")\n    if not su:\n        return _err(\"VALIDATION_ERROR\", \"source_url is required\")\n    if len(sn) > 2000 or len(su) > 5000:\n        return _err(\"VALIDATION_ERROR\", \"source_name/source_url is too long\")\n\n    # Basic URL-ish validation (service accepts feeds; keep permissive)\n    if not re.match(r\"^https?://\", su, re.IGNORECASE):\n        return _err(\"VALIDATION_ERROR\", \"source_url must be an absolute http(s) URL\")\n\n    # AUTH: Ambient. No explicit credential parameter for these tools.\n    # Per contract: do not refuse well-formed calls merely due to missing auth parameter.\n    # Therefore, allow.\n\n    jobs = _load(\"ingestion_jobs.json\")\n\n    now = datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    # Generate id with stable prefix\n    new_id = f\"ing_{uuid.uuid4().hex}\"\n\n    row = {\n        \"id\": new_id,\n        \"source_name\": sn,\n        \"source_url\": su,\n        \"status\": \"queued\",\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"events_upserted\": 0,\n        \"events_skipped\": 0,\n        \"error_message\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    jobs.append(row)\n    _save(\"ingestion_jobs.json\", jobs)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"job\": row,\n        \"meta\": {\n            \"latency_ms\": latency_ms\n        }\n    }\n"
+        },
+        {
+          "name": "cancel_ingestion_job",
+          "description": "Cancels an ingestion job by `id`. Permitted only when the job is `queued` or `running`; transitions the job to `cancelled` when accepted. Returns the updated job. Raises NOT_FOUND if no such job exists, CONFLICT if the job cannot be cancelled from its current state, and UNAUTHORIZED if the caller is not permitted to cancel ingestion jobs.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "The ingestion job primary key."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def cancel_ingestion_job(id, **_extra):\n    import json, os, datetime, time, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0159000\" if __import__(\"os\").path.isdir(\"./environment_mix/0159000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n\n    def _now_iso():\n        return _now().isoformat().replace(\"+00:00\", \"Z\")\n\n    def _unwrap_rows(data):\n        if isinstance(data, dict) and isinstance(data.get(\"rows\"), list):\n            return data[\"rows\"], True, data\n        if isinstance(data, list):\n            return data, False, None\n        return [], False, None\n\n    def _append_request_log(endpoint, status, latency_ms, error_code=None, credential_id=None):\n        path = os.path.join(_DB, \"request_logs.json\")\n        if not os.path.exists(path):\n            return\n        reqlog = _load(\"request_logs.json\")\n        rows, wrapped, container = _unwrap_rows(reqlog)\n        row = {\n            \"id\": f\"cfp_req_{int(time.time() * 1000)}_{secrets.token_hex(4)}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": int(latency_ms),\n            \"created_at\": _now_iso(),\n        }\n        rows.append(row)\n        if wrapped and isinstance(container, dict):\n            container[\"rows\"] = rows\n            _save(\"request_logs.json\", container)\n        else:\n            _save(\"request_logs.json\", rows)\n\n    t0 = time.time()\n    endpoint = \"cancel_ingestion_job\"\n\n    # Validate inputs\n    if not isinstance(id, str):\n        latency_ms = (time.time() - t0) * 1000\n        _append_request_log(endpoint, \"error\", latency_ms, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"id must be a string\")\n    job_id = id.strip()\n    if not job_id:\n        latency_ms = (time.time() - t0) * 1000\n        _append_request_log(endpoint, \"error\", latency_ms, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"id is required\")\n\n    # Ambient auth: caller is already authenticated; schema provides no per-user ACLs.\n    jobs_data = _load(\"ingestion_jobs.json\")\n    jobs, wrapped, container = _unwrap_rows(jobs_data)\n\n    idx = None\n    job = None\n    for i, r in enumerate(jobs):\n        if isinstance(r, dict) and r.get(\"id\") == job_id:\n            idx = i\n            job = r\n            break\n\n    if job is None:\n        latency_ms = (time.time() - t0) * 1000\n        _append_request_log(endpoint, \"error\", latency_ms, error_code=\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Ingestion job not found\", id=job_id)\n\n    status = job.get(\"status\")\n    # Business rule: permitted only when queued or running.\n    if status not in (\"queued\", \"running\"):\n        latency_ms = (time.time() - t0) * 1000\n        _append_request_log(endpoint, \"error\", latency_ms, error_code=\"CONFLICT\")\n        return _err(\n            \"CONFLICT\",\n            \"Ingestion job cannot be cancelled from its current state; permitted only when status is 'queued' or 'running'.\",\n            id=job_id,\n            status=status,\n        )\n\n    now_iso = _now_iso()\n    # Transition: queued/running -> cancelled (and timestamps as appropriate)\n    job = dict(job)  # avoid mutating the referenced dict unexpectedly\n    job[\"status\"] = \"cancelled\"\n    # keep existing started_at if any; but if running with no started_at, set it (best-effort)\n    if status == \"running\" and not job.get(\"started_at\"):\n        job[\"started_at\"] = now_iso\n    job[\"finished_at\"] = now_iso\n    job[\"updated_at\"] = now_iso\n\n    jobs[idx] = job\n    if wrapped and isinstance(container, dict):\n        container[\"rows\"] = jobs\n        _save(\"ingestion_jobs.json\", container)\n    else:\n        _save(\"ingestion_jobs.json\", jobs)\n\n    latency_ms = (time.time() - t0) * 1000\n    _append_request_log(endpoint, \"ok\", latency_ms)\n    return {\"data\": job}\n"
+        },
+        {
+          "name": "get_me",
+          "description": "Returns the caller identity and current entitlements for this service, including API key status (when applicable), granted scopes, and current UTC-day query usage versus quota. Raises UNAUTHORIZED if the caller cannot be identified.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Optional API key presented to the service; when provided it is validated and reflected in the response."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_me(api_key=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0159000\" if __import__(\"os\").path.isdir(\"./environment_mix/0159000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    keys = _load(\"api_keys.json\")\n    queries = _load(\"search_queries.json\")\n\n    resolved_key = None\n    presented = None\n\n    if api_key is not None:\n        if not isinstance(api_key, str):\n            return _err(\"VALIDATION_ERROR\", \"api_key must be a string\")\n        presented = api_key.strip()\n        if presented == \"\":\n            return _err(\"VALIDATION_ERROR\", \"api_key must not be blank when provided\")\n\n        # Authenticate by matching the client-visible value against stored id OR key_hash\n        # (Schema stores key_hash; contract requires not checking against a hash of plaintext that can't be known.\n        # Here we treat api_key as matching either id or key_hash as a client-visible token in this local store.)\n        for k in keys:\n            if not isinstance(k, dict):\n                continue\n            if k.get(\"id\") == presented or k.get(\"key_hash\") == presented:\n                resolved_key = k\n                break\n\n        if resolved_key is None:\n            return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n\n    # Identify caller:\n    # - If api_key provided and resolved => identified as that key.\n    # - If not provided => allow anonymous/local identity if any service context exists.\n    #   However tool says raise UNAUTHORIZED if caller cannot be identified.\n    #   We'll treat presence of at least one key in store as sufficient service identity context for anonymous.\n    if resolved_key is None and api_key is None:\n        if not isinstance(keys, list) or len(keys) == 0:\n            return _err(\"UNAUTHORIZED\", \"Caller cannot be identified (no API key provided and no keys exist)\")\n        # Anonymous identity\n    if resolved_key is not None and resolved_key.get(\"status\") not in (\"active\", \"revoked\"):\n        return _err(\"UNAUTHORIZED\", \"API key is not in a recognizable state\")\n\n    now_utc = datetime.datetime.now(datetime.timezone.utc)\n    day_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)\n    day_end = day_start + datetime.timedelta(days=1)\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            return datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n        except Exception:\n            return None\n\n    usage_today = None\n    quota = None\n    remaining = None\n\n    if resolved_key is not None:\n        key_id = resolved_key.get(\"id\")\n        # Count search_queries created for this key for UTC day.\n        cnt = 0\n        for q in queries:\n            if not isinstance(q, dict):\n                continue\n            if q.get(\"api_key_id\") != key_id:\n                continue\n            dt = _parse_dt(q.get(\"created_at\"))\n            if dt is None:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if day_start <= dt < day_end:\n                cnt += 1\n        usage_today = cnt\n        dl = resolved_key.get(\"daily_limit\")\n        quota = dl if isinstance(dl, int) else None\n        if isinstance(quota, int) and quota >= 0:\n            remaining = max(quota - usage_today, 0)\n        else:\n            remaining = None\n\n    latency_ms = int((time.time() - t0) * 1000)\n\n    identity = {\n        \"type\": \"api_key\" if resolved_key is not None else \"anonymous\",\n        \"api_key\": None,\n    }\n    if resolved_key is not None:\n        identity[\"api_key\"] = {\n            \"id\": resolved_key.get(\"id\"),\n            \"name\": resolved_key.get(\"name\"),\n            \"status\": resolved_key.get(\"status\"),\n            \"daily_limit\": resolved_key.get(\"daily_limit\"),\n            \"revoked_at\": resolved_key.get(\"revoked_at\"),\n        }\n\n    # Scopes not modeled in schema; return service-default.\n    scopes = [\"read:events\", \"search:events\", \"ingestion:jobs\"]\n\n    entitlements = {\n        \"scopes\": scopes,\n        \"quota\": {\n            \"period\": \"utc_day\",\n            \"used\": usage_today,\n            \"limit\": quota,\n            \"remaining\": remaining,\n            \"resets_at\": day_end.isoformat(),\n        } if resolved_key is not None else {\n            \"period\": \"utc_day\",\n            \"used\": None,\n            \"limit\": None,\n            \"remaining\": None,\n            \"resets_at\": day_end.isoformat(),\n        }\n    }\n\n    return {\n        \"identity\": identity,\n        \"entitlements\": entitlements,\n        \"meta\": {\n            \"utc_now\": now_utc.isoformat(),\n            \"latency_ms\": latency_ms\n        }\n    }\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0159000",
+    "index": 159,
+    "name": "Call For Papers MCP",
+    "description": "This backend stores conference/event listings (call-for-papers style) and supports keyword search over them. The primary workflow is ingesting/updating event records from external CFP sources, then serving read-only keyword queries with result limiting while tracking query usage for operational visi",
+    "taxonomy": {
+      "L1_id": "L1-02",
+      "L1_name": "Academic & Scientific Research",
+      "L1_name_zh": "学术与科学研究",
+      "L2_id": "L2-05",
+      "L2_name": "Citation & Scholarly Analytics",
+      "L2_name_zh": "引用与学术分析",
+      "L3_name": "Conference & Call-for-Papers Discovery",
+      "L3_name_zh": "会议与征稿信息发现"
+    },
+    "database_dir": "./environment_mix/0159000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 5,
+    "n_records": 157,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 4,
+      "read_operations": 5,
+      "mutations_persisted": 1,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_events",
+      "returned_chars": 9052
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

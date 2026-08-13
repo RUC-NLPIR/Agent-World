@@ -1,0 +1,443 @@
+{
+  "index": 67,
+  "local_files_dir": "./environment_mix/0067000",
+  "file_list": [
+    "./environment_mix/0067000/README.md",
+    "./environment_mix/0067000/author_affiliations.json",
+    "./environment_mix/0067000/author_keywords.json",
+    "./environment_mix/0067000/authors.json",
+    "./environment_mix/0067000/coauthorships.json",
+    "./environment_mix/0067000/profile_fetch_jobs.json",
+    "./environment_mix/0067000/request_logs.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "authors.json": "18 rows",
+        "author_affiliations.json": "17 rows",
+        "author_keywords.json": "18 rows",
+        "coauthorships.json": "18 rows",
+        "profile_fetch_jobs.json": "20 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "get_coauthors",
+          "description": "Resolves the provided author identity (name, surname, and optional institution/field disambiguators) to a canonical author profile and returns that author’s co-author network as a list of co-author profiles with available provenance/metadata from the latest cached snapshot (results are not paginated). Raises VALIDATION_ERROR when required fields are missing/blank, UNAUTHORIZED when the caller is not permitted to access author network data, QUOTA_EXCEEDED when request limits are exceeded, and NOT_FOUND when no canonical author profile can be resolved from the inputs. Raises CONFLICT when the inputs match multiple plausible authors and the optional disambiguators are insufficient to select a single profile, or when the profile exists but co-author data is unavailable for the current snapshot state.",
+          "parameters": {
+            "properties": {
+              "name": {
+                "title": "Name",
+                "type": "string"
+              },
+              "surname": {
+                "title": "Surname",
+                "type": "string"
+              },
+              "institution": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Institution"
+              },
+              "field": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Field"
+              }
+            },
+            "required": [
+              "name",
+              "surname"
+            ],
+            "title": "get_coauthorsArguments",
+            "type": "object"
+          },
+          "implementation": "def get_coauthors(name, surname, institution=None, field=None, **_extra):\n    import json, os, datetime, time, hashlib, unicodedata, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0067000\" if __import__(\"os\").path.isdir(\"./environment_mix/0067000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now = now_dt.isoformat() + \"Z\"\n\n    def _parse_dt(s):\n        if s is None or not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1]\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _log(status, err_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        latency_ms = int((time.time() - t0) * 1000)\n        rid = \"req_\" + hashlib.sha256(f\"get_coauthors|{now}|{latency_ms}|{len(logs)}\".encode(\"utf-8\")).hexdigest()[:16]\n        logs.append({\n            \"id\": rid,\n            \"endpoint\": \"get_coauthors\",\n            \"timestamp\": now,\n            \"status\": status,\n            \"error_code\": err_code,\n            \"latency_ms\": latency_ms\n        })\n        _save(\"request_logs.json\", logs)\n\n    # Rate limit: 120 req/min per endpoint\n    logs_rl = _load(\"request_logs.json\")\n    if not isinstance(logs_rl, list):\n        logs_rl = []\n    cutoff = now_dt - datetime.timedelta(seconds=60)\n    recent = 0\n    for r in logs_rl:\n        if isinstance(r, dict) and r.get(\"endpoint\") == \"get_coauthors\":\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if ts and ts >= cutoff:\n                recent += 1\n    if recent >= 120:\n        _log(\"error\", \"rate_limited\")\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded for get_coauthors.\", error_code=\"rate_limited\")\n\n    # Validation (relaxed: surname may be an id per observed usage; still must be non-blank string)\n    if not isinstance(name, str) or not name.strip():\n        _log(\"error\", \"validation_error\")\n        return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string\", field=\"name\")\n    if not isinstance(surname, str) or not surname.strip():\n        _log(\"error\", \"validation_error\")\n        return _err(\"VALIDATION_ERROR\", \"surname must be a non-empty string\", field=\"surname\")\n    if institution is not None and (not isinstance(institution, str) or not institution.strip()):\n        _log(\"error\", \"validation_error\")\n        return _err(\"VALIDATION_ERROR\", \"institution must be a non-empty string or null\", field=\"institution\")\n    if field is not None and (not isinstance(field, str) or not field.strip()):\n        _log(\"error\", \"validation_error\")\n        return _err(\"VALIDATION_ERROR\", \"field must be a non-empty string or null\", field=\"field\")\n\n    def _norm_full(given, family):\n        s = f\"{given} {family}\"\n        s2 = unicodedata.normalize(\"NFKD\", s)\n        s2 = \"\".join(ch for ch in s2 if not unicodedata.combining(ch))\n        s2 = s2.lower()\n        s2 = re.sub(r\"\\s+\", \" \", s2).strip()\n        return s2\n\n    def _norm_ws(s):\n        s2 = re.sub(r\"\\s+\", \" \", s).strip().lower()\n        return s2\n\n    def _follow_merge(authors_by_id, author_row, allow_inactive_flag):\n        seen = set()\n        cur = author_row\n        while isinstance(cur, dict) and cur.get(\"status\") == \"merged\":\n            aid = cur.get(\"id\")\n            if aid in seen:\n                return None\n            seen.add(aid)\n            nxt_id = cur.get(\"merged_into_author_id\")\n            if not nxt_id or nxt_id not in authors_by_id:\n                return None\n            cur = authors_by_id[nxt_id]\n        if not isinstance(cur, dict):\n            return None\n        if allow_inactive_flag:\n            # allow active or disabled canonical; merged already followed\n            if cur.get(\"status\") not in (\"active\", \"disabled\"):\n                return None\n        else:\n            if cur.get(\"status\") != \"active\":\n                return None\n        return cur\n\n    def _compute_cache_key(given, family, inst, fld, provider=\"google_scholar\"):\n        payload = {\n            \"name\": _norm_ws(given),\n            \"surname\": _norm_ws(family),\n            \"institution\": _norm_ws(inst) if inst is not None else \"\",\n            \"field\": _norm_ws(fld) if fld is not None else \"\",\n            \"provider\": provider\n        }\n        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode(\"utf-8\")\n        return hashlib.sha256(raw).hexdigest()\n\n    authors = _load(\"authors.json\")\n    if not isinstance(authors, list):\n        authors = []\n    affiliations = _load(\"author_affiliations.json\")\n    if not isinstance(affiliations, list):\n        affiliations = []\n    keywords = _load(\"author_keywords.json\")\n    if not isinstance(keywords, list):\n        keywords = []\n    coauths = _load(\"coauthorships.json\")\n    if not isinstance(coauths, list):\n        coauths = []\n    jobs = _load(\"profile_fetch_jobs.json\")\n    if not isinstance(jobs, list):\n        jobs = []\n\n    authors_by_id = {a.get(\"id\"): a for a in authors if isinstance(a, dict) and isinstance(a.get(\"id\"), str)}\n    norm_full = _norm_full(name, surname)\n\n    resolved = None\n    resolution_path = None\n\n    # Accept \"surname\" being an author_id if it matches (audit showed such calls)\n    if surname in authors_by_id:\n        candidate = _follow_merge(authors_by_id, authors_by_id[surname], False)\n        if candidate is not None:\n            resolved = candidate\n            resolution_path = \"direct_id\"\n        else:\n            # if it exists but isn't resolvable to active, treat as not found (since allow_inactive=false here)\n            _log(\"error\", \"not_found\")\n            return _err(\"NOT_FOUND\", \"Author not found for provided identity.\", error_code=\"not_found\", reason=\"author_id_not_active_or_bad_merge\")\n\n    # Resolution rule (a): exact normalized_full_name + current affiliation matching institution\n    if resolved is None:\n        candidates = []\n        for a in authors:\n            if not isinstance(a, dict):\n                continue\n            if a.get(\"status\") not in (\"active\", \"merged\"):\n                continue\n            if a.get(\"normalized_full_name\") == norm_full:\n                candidates.append(a)\n\n        if institution is not None:\n            inst_norm = _norm_ws(institution)\n            # current affiliations map\n            current_aff = {}\n            for aff in affiliations:\n                if not isinstance(aff, dict):\n                    continue\n                if aff.get(\"is_current\") is True and isinstance(aff.get(\"author_id\"), str) and isinstance(aff.get(\"institution_name\"), str):\n                    current_aff.setdefault(aff[\"author_id\"], []).append(_norm_ws(aff[\"institution_name\"]))\n            inst_matched = []\n            for a in candidates:\n                aid = a.get(\"id\")\n                if aid in current_aff and inst_norm in current_aff[aid]:\n                    inst_matched.append(a)\n            if len(inst_matched) == 1:\n                cand = _follow_merge(authors_by_id, inst_matched[0], False)\n                if cand is not None:\n                    resolved = cand\n                    resolution_path = \"name+institution\"\n            elif len(inst_matched) > 1:\n                # ambiguous even after institution match\n                _log(\"error\", \"ambiguous_author\")\n                return _err(\"CONFLICT\", \"Multiple authors matched the provided identity; add more disambiguation.\", error_code=\"ambiguous_author\", reason=\"multiple_name_institution_matches\")\n        else:\n            # without institution, don't resolve here unless single unique normalized_full_name\n            if len(candidates) == 1:\n                cand = _follow_merge(authors_by_id, candidates[0], False)\n                if cand is not None:\n                    resolved = cand\n                    resolution_path = \"name_only_unique\"\n\n    # Resolution rule (b)/(c): latest succeeded profile_fetch_jobs for deterministic cache_key\n    if resolved is None:\n        ck = _compute_cache_key(name, surname, institution, field, provider=\"google_scholar\")\n        succeeded = []\n        for j in jobs:\n            if not isinstance(j, dict):\n                continue\n            if j.get(\"cache_key\") != ck:\n                continue\n            if j.get(\"status\") != \"succeeded\":\n                continue\n            ra = j.get(\"resolved_author_id\")\n            if not isinstance(ra, str) or ra not in authors_by_id:\n                continue\n            finished = _parse_dt(j.get(\"finished_at\")) or _parse_dt(j.get(\"updated_at\")) or _parse_dt(j.get(\"created_at\"))\n            succeeded.append((finished or datetime.datetime.min, j))\n        if succeeded:\n            succeeded.sort(key=lambda x: x[0], reverse=True)\n            best_job = succeeded[0][1]\n            cand = _follow_merge(authors_by_id, authors_by_id[best_job[\"resolved_author_id\"]], False)\n            if cand is not None:\n                resolved = cand\n                resolution_path = \"latest_succeeded_job\"\n\n    if resolved is None:\n        _log(\"error\", \"not_found\")\n        return _err(\"NOT_FOUND\", \"Author not found for provided identity.\", error_code=\"not_found\", reason=\"no_author_matches_name\")\n\n    resolved_id = resolved.get(\"id\")\n\n    # Field filter behavior (stable & documented):\n    # If field provided:\n    #   include edge if edge.primary_field case-insensitive equals field_norm\n    #   OR coauthor has an ACTIVE keyword whose normalized_keyword equals field_norm\n    field_norm = None\n    if field is not None:\n        field_norm = _norm_ws(field)\n\n    # Build helper: active keywords per author (normalized)\n    active_kw_by_author = {}\n    if field_norm is not None:\n        for kw in keywords:\n            if not isinstance(kw, dict):\n                continue\n            if kw.get(\"status\") != \"active\":\n                continue\n            aid = kw.get(\"author_id\")\n            nk = kw.get(\"normalized_keyword\")\n            if isinstance(aid, str) and isinstance(nk, str):\n                active_kw_by_author.setdefault(aid, set()).add(_norm_ws(nk))\n\n    # Select coauthorship edges (status active/stale) with canonical mapping\n    edges = []\n    for e in coauths:\n        if not isinstance(e, dict):\n            continue\n        if e.get(\"status\") not in (\"active\", \"stale\"):\n            continue\n        a1 = e.get(\"author_id\")\n        a2 = e.get(\"coauthor_id\")\n        if not isinstance(a1, str) or not isinstance(a2, str):\n            continue\n        if a1 != resolved_id and a2 != resolved_id:\n            continue\n        co_id = a2 if a1 == resolved_id else a1\n\n        # field filter\n        if field_norm is not None:\n            pf = e.get(\"primary_field\")\n            pf_norm = _norm_ws(pf) if isinstance(pf, str) else None\n            kw_match = field_norm in active_kw_by_author.get(co_id, set())\n            if not (pf_norm == field_norm or kw_match):\n                continue\n\n        edges.append((e, co_id))\n\n    # Assemble response coauthor profiles, following merges\n    coauthors_out = []\n    for e, co_id in edges:\n        if co_id not in authors_by_id:\n            continue\n        canonical = _follow_merge(authors_by_id, authors_by_id[co_id], False)\n        if canonical is None:\n            continue\n        # If merge changes id, keep edge as-is but report canonical author\n        coauthors_out.append({\n            \"author\": canonical,\n            \"edge\": e\n        })\n\n    # Deduplicate by canonical author id, keeping max collaboration_count and most-recent updated_at/last_seen_at\n    def _edge_sort_key(item):\n        e = item.get(\"edge\", {}) if isinstance(item, dict) else {}\n        cc = e.get(\"collaboration_count\")\n        if not isinstance(cc, int):\n            cc = 0\n        ls = _parse_dt(e.get(\"last_seen_at\")) or _parse_dt(e.get(\"updated_at\")) or _parse_dt(e.get(\"created_at\")) or datetime.datetime.min\n        return (cc, ls)\n\n    by_aid = {}\n    for item in coauthors_out:\n        aid = item.get(\"author\", {}).get(\"id\") if isinstance(item.get(\"author\"), dict) else None\n        if not isinstance(aid, str):\n            continue\n        if aid not in by_aid or _edge_sort_key(item) > _edge_sort_key(by_aid[aid]):\n            by_aid[aid] = item\n\n    result = list(by_aid.values())\n    # sort by collaboration_count desc, then coauthor family_name, given_name\n    def _sort_tuple(item):\n        e = item.get(\"edge\", {}) if isinstance(item, dict) else {}\n        a = item.get(\"author\", {}) if isinstance(item.get(\"author\"), dict) else {}\n        cc = e.get(\"collaboration_count\")\n        if not isinstance(cc, int):\n            cc = 0\n        fam = a.get(\"family_name\") if isinstance(a.get(\"family_name\"), str) else \"\"\n        giv = a.get(\"given_name\") if isinstance(a.get(\"given_name\"), str) else \"\"\n        return (-cc, fam.lower(), giv.lower(), a.get(\"id\") or \"\")\n    result.sort(key=_sort_tuple)\n\n    _log(\"success\", None)\n    return {\n        \"resolved_author\": resolved,\n        \"resolution\": {\"path\": resolution_path},\n        \"coauthors\": result,\n        \"count\": len(result)\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_author_keywords",
+          "description": "Resolves the provided author identity (name, surname, and optional institution disambiguator) to a canonical author profile and returns the author’s extracted research keywords/areas from the latest cached Google Scholar snapshot with available provenance (results are not paginated). Raises VALIDATION_ERROR when required fields are missing/blank, UNAUTHORIZED when the caller is not permitted to access keyword data, QUOTA_EXCEEDED when request limits are exceeded, and NOT_FOUND when no canonical author profile can be resolved from the inputs. Raises CONFLICT when the inputs match multiple plausible authors and the optional disambiguator is insufficient to select a single profile, or when the profile exists but keyword extraction is unavailable for the current snapshot state.",
+          "parameters": {
+            "properties": {
+              "name": {
+                "title": "Name",
+                "type": "string"
+              },
+              "surname": {
+                "title": "Surname",
+                "type": "string"
+              },
+              "institution": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Institution"
+              }
+            },
+            "required": [
+              "name",
+              "surname"
+            ],
+            "title": "get_author_keywordsArguments",
+            "type": "object"
+          },
+          "implementation": "def get_author_keywords(name, surname, institution=None, **_extra):\n    import json, os, datetime, time, hashlib, unicodedata, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0067000\" if __import__(\"os\").path.isdir(\"./environment_mix/0067000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now = now_dt.isoformat() + \"Z\"\n\n    def _parse_dt(s):\n        if s is None or not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1]\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _log(status, err_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        latency_ms = int((time.time() - t0) * 1000)\n        rid = \"req_\" + hashlib.sha256(f\"get_author_keywords|{now}|{latency_ms}|{len(logs)}\".encode(\"utf-8\")).hexdigest()[:16]\n        logs.append({\n            \"id\": rid,\n            \"endpoint\": \"get_author_keywords\",\n            \"timestamp\": now,\n            \"status\": status,\n            \"error_code\": err_code,\n            \"latency_ms\": latency_ms\n        })\n        _save(\"request_logs.json\", logs)\n\n    # Rate limit: 120 req/min per endpoint\n    logs_rl = _load(\"request_logs.json\")\n    if not isinstance(logs_rl, list):\n        logs_rl = []\n    cutoff = now_dt - datetime.timedelta(seconds=60)\n    recent = 0\n    for r in logs_rl:\n        if isinstance(r, dict) and r.get(\"endpoint\") == \"get_author_keywords\":\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if ts and ts >= cutoff:\n                recent += 1\n    if recent >= 120:\n        _log(\"error\", \"rate_limited\")\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded for get_author_keywords.\", error_code=\"rate_limited\")\n\n    # Validation (relaxed: surname may be an id per observed usage)\n    if not isinstance(name, str) or not name.strip():\n        _log(\"error\", \"validation_error\")\n        return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string\", field=\"name\")\n    if not isinstance(surname, str) or not surname.strip():\n        _log(\"error\", \"validation_error\")\n        return _err(\"VALIDATION_ERROR\", \"surname must be a non-empty string\", field=\"surname\")\n    if institution is not None and (not isinstance(institution, str) or not institution.strip()):\n        _log(\"error\", \"validation_error\")\n        return _err(\"VALIDATION_ERROR\", \"institution must be a non-empty string or null\", field=\"institution\")\n\n    def _norm_full(given, family):\n        s = f\"{given} {family}\"\n        s2 = unicodedata.normalize(\"NFKD\", s)\n        s2 = \"\".join(ch for ch in s2 if not unicodedata.combining(ch))\n        s2 = s2.lower()\n        s2 = re.sub(r\"\\s+\", \" \", s2).strip()\n        return s2\n\n    def _norm_ws(s):\n        return re.sub(r\"\\s+\", \" \", s).strip().lower()\n\n    def _follow_merge(authors_by_id, author_row):\n        seen = set()\n        cur = author_row\n        while isinstance(cur, dict) and cur.get(\"status\") == \"merged\":\n            aid = cur.get(\"id\")\n            if aid in seen:\n                return None\n            seen.add(aid)\n            nxt_id = cur.get(\"merged_into_author_id\")\n            if not nxt_id or nxt_id not in authors_by_id:\n                return None\n            cur = authors_by_id[nxt_id]\n        if not isinstance(cur, dict):\n            return None\n        if cur.get(\"status\") != \"active\":\n            return None\n        return cur\n\n    def _compute_cache_key(given, family, inst, provider=\"google_scholar\"):\n        payload = {\n            \"name\": _norm_ws(given),\n            \"surname\": _norm_ws(family),\n            \"institution\": _norm_ws(inst) if inst is not None else \"\",\n            \"field\": \"\",\n            \"provider\": provider\n        }\n        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode(\"utf-8\")\n        return hashlib.sha256(raw).hexdigest()\n\n    authors = _load(\"authors.json\")\n    if not isinstance(authors, list):\n        authors = []\n    affiliations = _load(\"author_affiliations.json\")\n    if not isinstance(affiliations, list):\n        affiliations = []\n    kws = _load(\"author_keywords.json\")\n    if not isinstance(kws, list):\n        kws = []\n    jobs = _load(\"profile_fetch_jobs.json\")\n    if not isinstance(jobs, list):\n        jobs = []\n\n    authors_by_id = {a.get(\"id\"): a for a in authors if isinstance(a, dict) and isinstance(a.get(\"id\"), str)}\n    norm_full = _norm_full(name, surname)\n\n    resolved = None\n    resolution_path = None\n\n    # Accept surname being author id\n    if surname in authors_by_id:\n        cand = _follow_merge(authors_by_id, authors_by_id[surname])\n        if cand is not None:\n            resolved = cand\n            resolution_path = \"direct_id\"\n        else:\n            _log(\"error\", \"not_found\")\n            return _err(\"NOT_FOUND\", \"Author not found for provided identity.\", error_code=\"not_found\", reason=\"author_id_not_active_or_bad_merge\")\n\n    # Rule (a): exact normalized_full_name + current affiliation matching institution\n    if resolved is None:\n        candidates = []\n        for a in authors:\n            if not isinstance(a, dict):\n                continue\n            if a.get(\"status\") not in (\"active\", \"merged\"):\n                continue\n            if a.get(\"normalized_full_name\") == norm_full:\n                candidates.append(a)\n\n        if institution is not None:\n            inst_norm = _norm_ws(institution)\n            current_aff = {}\n            for aff in affiliations:\n                if not isinstance(aff, dict):\n                    continue\n                if aff.get(\"is_current\") is True and isinstance(aff.get(\"author_id\"), str) and isinstance(aff.get(\"institution_name\"), str):\n                    current_aff.setdefault(aff[\"author_id\"], []).append(_norm_ws(aff[\"institution_name\"]))\n            inst_matched = []\n            for a in candidates:\n                aid = a.get(\"id\")\n                if aid in current_aff and inst_norm in current_aff[aid]:\n                    inst_matched.append(a)\n            if len(inst_matched) == 1:\n                cand = _follow_merge(authors_by_id, inst_matched[0])\n                if cand is not None:\n                    resolved = cand\n                    resolution_path = \"name+institution\"\n            elif len(inst_matched) > 1:\n                _log(\"error\", \"ambiguous_author\")\n                return _err(\"CONFLICT\", \"Multiple authors matched the provided identity; add more disambiguation.\",\n                            error_code=\"ambiguous_author\", reason=\"multiple_name_institution_matches\")\n        else:\n            if len(candidates) == 1:\n                cand = _follow_merge(authors_by_id, candidates[0])\n                if cand is not None:\n                    resolved = cand\n                    resolution_path = \"name_only_unique\"\n\n    # Rule (c): highest-confidence from latest succeeded job for cache_key (we use latest succeeded)\n    if resolved is None:\n        ck = _compute_cache_key(name, surname, institution, provider=\"google_scholar\")\n        succeeded = []\n        for j in jobs:\n            if not isinstance(j, dict):\n                continue\n            if j.get(\"cache_key\") != ck:\n                continue\n            if j.get(\"status\") != \"succeeded\":\n                continue\n            ra = j.get(\"resolved_author_id\")\n            if not isinstance(ra, str) or ra not in authors_by_id:\n                continue\n            finished = _parse_dt(j.get(\"finished_at\")) or _parse_dt(j.get(\"updated_at\")) or _parse_dt(j.get(\"created_at\"))\n            succeeded.append((finished or datetime.datetime.min, j))\n        if succeeded:\n            succeeded.sort(key=lambda x: x[0], reverse=True)\n            best_job = succeeded[0][1]\n            cand = _follow_merge(authors_by_id, authors_by_id[best_job[\"resolved_author_id\"]])\n            if cand is not None:\n                resolved = cand\n                resolution_path = \"latest_succeeded_job\"\n\n    if resolved is None:\n        _log(\"error\", \"not_found\")\n        return _err(\"NOT_FOUND\", \"Author not found for provided identity.\", error_code=\"not_found\", reason=\"no_author_matches_name\")\n\n    author_id = resolved.get(\"id\")\n\n    # Return only active keywords, dedupe by normalized_keyword\n    active = []\n    for kw in kws:\n        if not isinstance(kw, dict):\n            continue\n        if kw.get(\"author_id\") != author_id:\n            continue\n        if kw.get(\"status\") != \"active\":\n            continue\n        if not isinstance(kw.get(\"normalized_keyword\"), str):\n            continue\n        active.append(kw)\n\n    # Deduplicate: keep most recently updated row per normalized_keyword\n    by_norm = {}\n    for kw in active:\n        nk = _norm_ws(kw.get(\"normalized_keyword\"))\n        dt = _parse_dt(kw.get(\"updated_at\")) or _parse_dt(kw.get(\"created_at\")) or datetime.datetime.min\n        if nk not in by_norm or dt > (_parse_dt(by_norm[nk].get(\"updated_at\")) or _parse_dt(by_norm[nk].get(\"created_at\")) or datetime.datetime.min):\n            by_norm[nk] = kw\n\n    out = list(by_norm.values())\n    out.sort(key=lambda r: (r.get(\"keyword\") or \"\").lower())\n\n    _log(\"success\", None)\n    return {\n        \"resolved_author\": resolved,\n        \"resolution\": {\"path\": resolution_path},\n        \"keywords\": out,\n        \"count\": len(out)\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "resolve_author",
+          "description": "Resolves an input identity (given/family name plus optional institution/field hints) to exactly one canonical active author profile, transparently following merged records. Returns the resolved author record when unique; refuses with not_found when no match exists and ambiguous_author when multiple candidates remain after applying deterministic tie-break rules.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Author given name (or first name token(s)); must be non-blank."
+              },
+              "surname": {
+                "type": "string",
+                "description": "Author family name (surname); must be non-blank."
+              },
+              "institution": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Optional institution hint used to disambiguate against current affiliations (case/whitespace-insensitive match)."
+              },
+              "field": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Optional field/area hint used to disambiguate against author primary_field and active keywords (case-insensitive token match)."
+              },
+              "allow_inactive": {
+                "type": "boolean",
+                "default": false,
+                "description": "When false, resolution returns only active canonical authors (merged are followed; disabled are excluded). When true, may return disabled authors as well."
+              }
+            },
+            "required": [
+              "name",
+              "surname"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def resolve_author(name, surname, institution=None, field=None, allow_inactive=False, **_extra):\n    import json, os, datetime, time, hashlib, unicodedata, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0067000\" if __import__(\"os\").path.isdir(\"./environment_mix/0067000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now = now_dt.isoformat() + \"Z\"\n\n    def _parse_dt(s):\n        if s is None or not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1]\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _log(status, err_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        latency_ms = int((time.time() - t0) * 1000)\n        rid = \"req_\" + hashlib.sha256(f\"resolve_author|{now}|{latency_ms}|{len(logs)}\".encode(\"utf-8\")).hexdigest()[:16]\n        logs.append({\n            \"id\": rid,\n            \"endpoint\": \"resolve_author\",\n            \"timestamp\": now,\n            \"status\": status,\n            \"error_code\": err_code,\n            \"latency_ms\": latency_ms\n        })\n        _save(\"request_logs.json\", logs)\n\n    # Rate limit: 240 req/min\n    logs_rl = _load(\"request_logs.json\")\n    if not isinstance(logs_rl, list):\n        logs_rl = []\n    cutoff = now_dt - datetime.timedelta(seconds=60)\n    recent = 0\n    for r in logs_rl:\n        if isinstance(r, dict) and r.get(\"endpoint\") == \"resolve_author\":\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if ts and ts >= cutoff:\n                recent += 1\n    if recent >= 240:\n        _log(\"error\", \"rate_limited\")\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded for resolve_author.\", error_code=\"rate_limited\")\n\n    # Validation (relaxed for observed usage: surname may be an author id)\n    if not isinstance(name, str) or not name.strip():\n        _log(\"error\", \"validation_error\")\n        return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string\", field=\"name\")\n    if not isinstance(surname, str) or not surname.strip():\n        _log(\"error\", \"validation_error\")\n        return _err(\"VALIDATION_ERROR\", \"surname must be a non-empty string\", field=\"surname\")\n    if institution is not None and (not isinstance(institution, str) or not institution.strip()):\n        _log(\"error\", \"validation_error\")\n        return _err(\"VALIDATION_ERROR\", \"institution must be a non-empty string or null\", field=\"institution\")\n    if field is not None and (not isinstance(field, str) or not field.strip()):\n        _log(\"error\", \"validation_error\")\n        return _err(\"VALIDATION_ERROR\", \"field must be a non-empty string or null\", field=\"field\")\n    if not isinstance(allow_inactive, bool):\n        _log(\"error\", \"validation_error\")\n        return _err(\"VALIDATION_ERROR\", \"allow_inactive must be a boolean\", field=\"allow_inactive\")\n\n    def _norm_full(given, family):\n        s = f\"{given} {family}\"\n        s2 = unicodedata.normalize(\"NFKD\", s)\n        s2 = \"\".join(ch for ch in s2 if not unicodedata.combining(ch))\n        s2 = s2.lower()\n        s2 = re.sub(r\"\\s+\", \" \", s2).strip()\n        return s2\n\n    def _norm_ws(s):\n        return re.sub(r\"\\s+\", \" \", s).strip().lower()\n\n    def _follow_merge(authors_by_id, author_row, allow_inactive_flag):\n        seen = set()\n        cur = author_row\n        while isinstance(cur, dict) and cur.get(\"status\") == \"merged\":\n            aid = cur.get(\"id\")\n            if aid in seen:\n                return None\n            seen.add(aid)\n            nxt_id = cur.get(\"merged_into_author_id\")\n            if not nxt_id or nxt_id not in authors_by_id:\n                return None\n            cur = authors_by_id[nxt_id]\n        if not isinstance(cur, dict):\n            return None\n        if allow_inactive_flag:\n            if cur.get(\"status\") not in (\"active\", \"disabled\"):\n                return None\n        else:\n            if cur.get(\"status\") != \"active\":\n                return None\n        return cur\n\n    def _compute_cache_key(given, family, inst, fld, provider=\"google_scholar\"):\n        payload = {\n            \"name\": _norm_ws(given),\n            \"surname\": _norm_ws(family),\n            \"institution\": _norm_ws(inst) if inst is not None else \"\",\n            \"field\": _norm_ws(fld) if fld is not None else \"\",\n            \"provider\": provider\n        }\n        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode(\"utf-8\")\n        return hashlib.sha256(raw).hexdigest()\n\n    authors = _load(\"authors.json\")\n    if not isinstance(authors, list):\n        authors = []\n    affiliations = _load(\"author_affiliations.json\")\n    if not isinstance(affiliations, list):\n        affiliations = []\n    kws = _load(\"author_keywords.json\")\n    if not isinstance(kws, list):\n        kws = []\n    jobs = _load(\"profile_fetch_jobs.json\")\n    if not isinstance(jobs, list):\n        jobs = []\n\n    authors_by_id = {a.get(\"id\"): a for a in authors if isinstance(a, dict) and isinstance(a.get(\"id\"), str)}\n    norm_full = _norm_full(name, surname)\n    inst_norm = _norm_ws(institution) if institution is not None else None\n    field_norm = _norm_ws(field) if field is not None else None\n\n    # 0) If surname is an author id, resolve directly\n    if surname in authors_by_id:\n        resolved = _follow_merge(authors_by_id, authors_by_id[surname], allow_inactive)\n        if resolved is None:\n            _log(\"error\", \"not_found\")\n            return _err(\"NOT_FOUND\", \"Author not found for provided identity.\", error_code=\"not_found\", reason=\"author_id_not_resolvable\")\n        _log(\"success\", None)\n        return {\"author\": resolved, \"resolution\": {\"path\": \"direct_id\"}}\n\n    # Candidate set by normalized_full_name (active/merged; or include disabled if allow_inactive)\n    candidates = []\n    for a in authors:\n        if not isinstance(a, dict):\n            continue\n        st = a.get(\"status\")\n        if allow_inactive:\n            if st not in (\"active\", \"disabled\", \"merged\"):\n                continue\n        else:\n            if st not in (\"active\", \"merged\"):\n                continue\n        if a.get(\"normalized_full_name\") == norm_full:\n            candidates.append(a)\n\n    if not candidates:\n        _log(\"error\", \"not_found\")\n        return _err(\"NOT_FOUND\", \"Author not found for provided identity.\", error_code=\"not_found\", reason=\"no_author_matches_name\")\n\n    # Apply institution disambiguation: exact match vs current affiliation\n    if inst_norm is not None:\n        current_aff = {}\n        for aff in affiliations:\n            if not isinstance(aff, dict):\n                continue\n            if aff.get(\"is_current\") is True and isinstance(aff.get(\"author_id\"), str) and isinstance(aff.get(\"institution_name\"), str):\n                current_aff.setdefault(aff[\"author_id\"], []).append(_norm_ws(aff[\"institution_name\"]))\n        inst_matched = []\n        for a in candidates:\n            aid = a.get(\"id\")\n            if isinstance(aid, str) and inst_norm in current_aff.get(aid, []):\n                inst_matched.append(a)\n        if inst_matched:\n            candidates = inst_matched\n\n    # Optional field hint disambiguation (stable mapping):\n    # keep candidate if candidate.primary_field equals field_norm OR candidate has an ACTIVE keyword normalized_keyword equals field_norm\n    if field_norm is not None and candidates:\n        active_kw = {}\n        for kw in kws:\n            if not isinstance(kw, dict):\n                continue\n            if kw.get(\"status\") != \"active\":\n                continue\n            aid = kw.get(\"author_id\")\n            nk = kw.get(\"normalized_keyword\")\n            if isinstance(aid, str) and isinstance(nk, str):\n                active_kw.setdefault(aid, set()).add(_norm_ws(nk))\n        filtered = []\n        for a in candidates:\n            aid = a.get(\"id\")\n            pf = a.get(\"primary_field\")\n            pf_norm = _norm_ws(pf) if isinstance(pf, str) else None\n            if pf_norm == field_norm or (isinstance(aid, str) and field_norm in active_kw.get(aid, set())):\n                filtered.append(a)\n        if filtered:\n            candidates = filtered\n\n    # If exactly one after deterministic filtering, follow merge and return\n    if len(candidates) == 1:\n        resolved = _follow_merge(authors_by_id, candidates[0], allow_inactive)\n        if resolved is None:\n            _log(\"error\", \"not_found\")\n            return _err(\"NOT_FOUND\", \"Author not found for provided identity.\", error_code=\"not_found\", reason=\"candidate_not_resolvable\")\n        _log(\"success\", None)\n        return {\"author\": resolved, \"resolution\": {\"path\": \"filtered_unique\"}}\n\n    # Otherwise consult latest succeeded profile_fetch_job for cache_key as deterministic tie-breaker\n    ck = _compute_cache_key(name, surname, institution, field, provider=\"google_scholar\")\n    succeeded = []\n    for j in jobs:\n        if not isinstance(j, dict):\n            continue\n        if j.get(\"cache_key\") != ck:\n            continue\n        if j.get(\"status\") != \"succeeded\":\n            continue\n        ra = j.get(\"resolved_author_id\")\n        if not isinstance(ra, str) or ra not in authors_by_id:\n            continue\n        finished = _parse_dt(j.get(\"finished_at\")) or _parse_dt(j.get(\"updated_at\")) or _parse_dt(j.get(\"created_at\"))\n        succeeded.append((finished or datetime.datetime.min, j))\n    if succeeded:\n        succeeded.sort(key=lambda x: x[0], reverse=True)\n        best_job = succeeded[0][1]\n        resolved = _follow_merge(authors_by_id, authors_by_id[best_job[\"resolved_author_id\"]], allow_inactive)\n        if resolved is not None:\n            _log(\"success\", None)\n            return {\"author\": resolved, \"resolution\": {\"path\": \"latest_succeeded_job\", \"job_id\": best_job.get(\"id\")}}\n\n    # Ambiguous after all deterministic methods\n    _log(\"error\", \"ambiguous_author\")\n    return _err(\"CONFLICT\", \"Multiple authors matched the provided identity; add more disambiguation.\",\n                error_code=\"ambiguous_author\", reason=\"multiple_candidates_remain\", candidate_count=len(candidates))\n"
+        },
+        {
+          "name": "list_authors",
+          "description": "Lists canonical author profiles with optional filtering and pagination. Returns only authors matching the supplied filters; refuses invalid pagination parameters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "q": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Optional free-text search over normalized_full_name (implementation-defined matching)."
+              },
+              "given_name": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Filter by given_name (case-insensitive exact match after normalization)."
+              },
+              "family_name": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Filter by family_name (case-insensitive exact match after normalization)."
+              },
+              "institution": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Filter by primary_institution (case/whitespace-insensitive match)."
+              },
+              "primary_field": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Filter by primary_field (case-insensitive match)."
+              },
+              "google_scholar_profile_id": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Filter by Google Scholar profile identifier (exact match)."
+              },
+              "status": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "active",
+                      "merged",
+                      "disabled"
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Filter by author lifecycle status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of authors to return."
+              },
+              "cursor": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Opaque pagination cursor from a previous response."
+              },
+              "order_by": {
+                "type": "string",
+                "enum": [
+                  "updated_at_desc",
+                  "created_at_desc",
+                  "family_name_asc"
+                ],
+                "default": "updated_at_desc",
+                "description": "Sort order for results."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_authors(q=None, given_name=None, family_name=None, institution=None, primary_field=None, google_scholar_profile_id=None, status=None, limit=50, cursor=None, order_by=\"updated_at_desc\", **_extra):\n    import json, os, datetime, time, hashlib, unicodedata, re, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0067000\" if __import__(\"os\").path.isdir(\"./environment_mix/0067000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _norm(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        s2 = unicodedata.normalize(\"NFKD\", s)\n        s2 = \"\".join(ch for ch in s2 if not unicodedata.combining(ch))\n        s2 = s2.lower()\n        s2 = re.sub(r\"\\s+\", \" \", s2).strip()\n        return s2\n\n    def _norm_ws(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        return re.sub(r\"\\s+\", \" \", s).strip().lower()\n\n    def _parse_dt(s):\n        if s is None or not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1]\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _log(status_s, err_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        latency_ms = int((time.time() - t0) * 1000)\n        logs.append({\n            \"id\": \"req_\" + hashlib.sha256(f\"list_authors|{now}|{latency_ms}|{len(logs)}\".encode(\"utf-8\")).hexdigest()[:16],\n            \"endpoint\": \"list_authors\",\n            \"timestamp\": now,\n            \"status\": status_s,\n            \"error_code\": err_code,\n            \"latency_ms\": latency_ms\n        })\n        _save(\"request_logs.json\", logs)\n\n    # Rate limit: 240 req/min\n    logs_rl = _load(\"request_logs.json\")\n    if not isinstance(logs_rl, list):\n        logs_rl = []\n    cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=60)\n    recent = 0\n    for r in logs_rl:\n        if isinstance(r, dict) and r.get(\"endpoint\") == \"list_authors\":\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if ts and ts >= cutoff:\n                recent += 1\n    if recent >= 240:\n        _log(\"error\", \"rate_limited\")\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded. Please retry later.\", retry_after_seconds=60)\n\n    # Validate\n    for s, fn in [(q, \"q\"), (given_name, \"given_name\"), (family_name, \"family_name\"), (institution, \"institution\"),\n                 (primary_field, \"primary_field\"), (google_scholar_profile_id, \"google_scholar_profile_id\"),\n                 (cursor, \"cursor\")]:\n        if s is not None and not isinstance(s, str):\n            _log(\"error\", \"validation_error\")\n            return _err(\"VALIDATION_ERROR\", f\"Parameter '{fn}' must be a string or null.\", field=fn)\n        if isinstance(s, str) and fn != \"cursor\" and s.strip() == \"\":\n            _log(\"error\", \"validation_error\")\n            return _err(\"VALIDATION_ERROR\", f\"Parameter '{fn}' must be non-blank when provided.\", field=fn)\n\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"active\", \"merged\", \"disabled\"):\n            _log(\"error\", \"validation_error\")\n            return _err(\"VALIDATION_ERROR\", \"Parameter 'status' must be one of: active, merged, disabled (or null).\", field=\"status\")\n\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        _log(\"error\", \"validation_error\")\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'limit' must be an integer between 1 and 200.\", field=\"limit\")\n\n    if order_by not in (\"updated_at_desc\", \"created_at_desc\", \"family_name_asc\"):\n        _log(\"error\", \"validation_error\")\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'order_by' must be one of: updated_at_desc, created_at_desc, family_name_asc.\", field=\"order_by\")\n\n    # Decode cursor\n    offset = 0\n    if cursor is not None:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            payload = json.loads(raw.decode(\"utf-8\"))\n            if not isinstance(payload, dict) or payload.get(\"v\") != 1 or payload.get(\"endpoint\") != \"list_authors\":\n                _log(\"error\", \"validation_error\")\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n            offset = payload.get(\"offset\")\n            if not isinstance(offset, int) or offset < 0:\n                _log(\"error\", \"validation_error\")\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor offset.\", field=\"cursor\")\n        except Exception:\n            _log(\"error\", \"validation_error\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n\n    authors = _load(\"authors.json\")\n    if not isinstance(authors, list):\n        authors = []\n\n    # Filters\n    qn = _norm(q) if q is not None else None\n    gn = _norm(given_name) if given_name is not None else None\n    fn = _norm(family_name) if family_name is not None else None\n    instn = _norm_ws(institution) if institution is not None else None\n    pfn = _norm(primary_field) if primary_field is not None else None\n\n    filtered = []\n    for a in authors:\n        if not isinstance(a, dict):\n            continue\n        if status is not None and a.get(\"status\") != status:\n            continue\n        if google_scholar_profile_id is not None and a.get(\"google_scholar_profile_id\") != google_scholar_profile_id:\n            continue\n        if gn is not None and _norm(a.get(\"given_name\") or \"\") != gn:\n            continue\n        if fn is not None and _norm(a.get(\"family_name\") or \"\") != fn:\n            continue\n        if instn is not None:\n            pi = a.get(\"primary_institution\")\n            if not (isinstance(pi, str) and _norm_ws(pi) == instn):\n                continue\n        if pfn is not None:\n            pfv = a.get(\"primary_field\")\n            if not (isinstance(pfv, str) and _norm(pfv) == pfn):\n                continue\n        if qn is not None:\n            nfull = a.get(\"normalized_full_name\")\n            if not isinstance(nfull, str):\n                continue\n            # implementation-defined: substring match on normalized_full_name\n            if qn not in _norm(nfull):\n                continue\n        filtered.append(a)\n\n    total = len(filtered)\n\n    # Sort\n    if order_by == \"updated_at_desc\":\n        filtered.sort(key=lambda a: (_parse_dt(a.get(\"updated_at\")) or datetime.datetime.min, a.get(\"id\") or \"\"), reverse=True)\n    elif order_by == \"created_at_desc\":\n        filtered.sort(key=lambda a: (_parse_dt(a.get(\"created_at\")) or datetime.datetime.min, a.get(\"id\") or \"\"), reverse=True)\n    else:  # family_name_asc\n        filtered.sort(key=lambda a: (_norm(a.get(\"family_name\") or \"\"), _norm(a.get(\"given_name\") or \"\"), a.get(\"id\") or \"\"))\n\n    page = filtered[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        payload = {\"v\": 1, \"endpoint\": \"list_authors\", \"offset\": next_offset, \"order_by\": order_by}\n        enc = base64.urlsafe_b64encode(json.dumps(payload, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n        next_cursor = enc\n\n    _log(\"ok\", None)\n    return {\n        \"authors\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"order_by\": order_by\n        }\n    }\n"
+        },
+        {
+          "name": "get_author",
+          "description": "Fetches a single author profile by id. If the author is merged, returns the active canonical author the record was merged into (unless follow_merges=false). Refuses with not_found when the id does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Author id (primary key)."
+              },
+              "follow_merges": {
+                "type": "boolean",
+                "default": true,
+                "description": "When true, merged authors are transparently resolved to their merged_into_author_id before returning."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_author(id, follow_merges=True, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0067000\" if __import__(\"os\").path.isdir(\"./environment_mix/0067000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = datetime.datetime.utcnow()\n    endpoint = \"get_author\"\n    status = \"success\"\n\n    try:\n        if not isinstance(id, str) or not id.strip():\n            status = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\", field=\"id\")\n        if follow_merges is None:\n            follow_merges = True\n        if not isinstance(follow_merges, bool):\n            status = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"follow_merges must be a boolean\", field=\"follow_merges\")\n\n        authors = _load(\"authors.json\")\n        by_id = {a.get(\"id\"): a for a in authors if isinstance(a, dict) and isinstance(a.get(\"id\"), str)}\n\n        if id not in by_id:\n            status = \"error\"\n            return _err(\"NOT_FOUND\", \"author not found\", id=id)\n\n        row = by_id[id]\n\n        if follow_merges:\n            # Follow merge chain to canonical author (must terminate; protect against cycles)\n            seen = set()\n            cur = row\n            while isinstance(cur, dict) and cur.get(\"status\") == \"merged\":\n                if cur.get(\"id\") in seen:\n                    status = \"error\"\n                    return _err(\"CONFLICT\", \"merge cycle detected\", id=id)\n                seen.add(cur.get(\"id\"))\n                target_id = cur.get(\"merged_into_author_id\")\n                if not isinstance(target_id, str) or not target_id.strip():\n                    status = \"error\"\n                    return _err(\"CONFLICT\", \"merged author missing merged_into_author_id\", id=cur.get(\"id\"))\n                target = by_id.get(target_id)\n                if not isinstance(target, dict):\n                    status = \"error\"\n                    return _err(\"CONFLICT\", \"merged_into_author_id references missing author\", merged_into_author_id=target_id)\n                cur = target\n            row = cur\n\n        return {\"author\": row}\n    finally:\n        # Request log (if collection exists)\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            end = datetime.datetime.utcnow()\n            latency_ms = int((end - start).total_seconds() * 1000)\n            logs.append({\n                \"id\": \"req_\" + end.strftime(\"%Y%m%d%H%M%S%f\"),\n                \"endpoint\": endpoint,\n                \"credential_id\": None,\n                \"status\": status,\n                \"latency_ms\": latency_ms,\n                \"created_at\": end.isoformat(timespec=\"seconds\") + \"Z\"\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n"
+        },
+        {
+          "name": "create_profile_fetch_job",
+          "description": "Creates (or reuses) a profile fetch job for the supplied normalized input and provider to refresh cached author/coauthor/keyword snapshots. If an unexpired succeeded job already exists for the same cache_key and reuse_if_fresh=true, returns that existing job instead of enqueuing a new fetch. Refuses when provider is unsupported or required fields are blank.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Query given name (as provided by the caller); must be non-blank."
+              },
+              "surname": {
+                "type": "string",
+                "description": "Query family name (as provided by the caller); must be non-blank."
+              },
+              "institution": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Optional query institution used for cache_key and provider disambiguation."
+              },
+              "field": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Optional query field used for cache_key and provider disambiguation."
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "google_scholar"
+                ],
+                "description": "External source provider to fetch from."
+              },
+              "reuse_if_fresh": {
+                "type": "boolean",
+                "default": true,
+                "description": "When true, reuses an existing unexpired succeeded job for the same cache_key instead of creating a new job."
+              },
+              "force_refresh": {
+                "type": "boolean",
+                "default": false,
+                "description": "When true, creates a new job even if a fresh succeeded job exists (may be rate-limited)."
+              }
+            },
+            "required": [
+              "name",
+              "surname",
+              "provider"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_profile_fetch_job(name, surname, provider, institution=None, field=None, reuse_if_fresh=True, force_refresh=False, **_extra):\n    import json, os, datetime, hashlib, unicodedata, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0067000\" if __import__(\"os\").path.isdir(\"./environment_mix/0067000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = datetime.datetime.utcnow()\n    endpoint = \"create_profile_fetch_job\"\n    status = \"success\"\n\n    def _is_blank(s):\n        return s is None or (isinstance(s, str) and s.strip() == \"\")\n\n    def _norm_text(s):\n        if s is None:\n            return \"\"\n        if not isinstance(s, str):\n            return None\n        t = unicodedata.normalize(\"NFKD\", s)\n        t = \"\".join(ch for ch in t if not unicodedata.combining(ch))\n        t = t.lower()\n        t = re.sub(r\"\\s+\", \" \", t).strip()\n        return t\n\n    def _now_iso(dt):\n        return dt.isoformat(timespec=\"seconds\") + \"Z\"\n\n    try:\n        # Validate\n        if not isinstance(name, str) or not name.strip():\n            status = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"name must be a non-blank string\", field=\"name\")\n        if not isinstance(surname, str) or not surname.strip():\n            status = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"surname must be a non-blank string\", field=\"surname\")\n        if provider != \"google_scholar\":\n            status = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"unsupported provider\", field=\"provider\", allowed=[\"google_scholar\"])\n        if institution is not None and not isinstance(institution, str):\n            status = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"institution must be a string or null\", field=\"institution\")\n        if field is not None and not isinstance(field, str):\n            status = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"field must be a string or null\", field=\"field\")\n        if reuse_if_fresh is None:\n            reuse_if_fresh = True\n        if not isinstance(reuse_if_fresh, bool):\n            status = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"reuse_if_fresh must be a boolean\", field=\"reuse_if_fresh\")\n        if force_refresh is None:\n            force_refresh = False\n        if not isinstance(force_refresh, bool):\n            status = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"force_refresh must be a boolean\", field=\"force_refresh\")\n\n        n_name = _norm_text(name)\n        n_surname = _norm_text(surname)\n        n_inst = _norm_text(institution) if institution is not None else \"\"\n        n_field = _norm_text(field) if field is not None else \"\"\n\n        if n_name is None or n_surname is None or (institution is not None and n_inst is None) or (field is not None and n_field is None):\n            status = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"invalid text input type\")\n\n        # cache_key: deterministic sha256 of normalized inputs + provider\n        key_material = \"|\".join([provider, n_name, n_surname, n_inst, n_field]).encode(\"utf-8\")\n        cache_key = hashlib.sha256(key_material).hexdigest()\n\n        jobs = _load(\"profile_fetch_jobs.json\")\n        if not isinstance(jobs, list):\n            jobs = []\n\n        # Rate limit / quota via request_logs if present (simple, stable):\n        # - RATE_LIMIT: max 30 create_profile_fetch_job calls in last 60 seconds\n        # - QUOTA_EXCEEDED: max 1000 create_profile_fetch_job calls in last 30 days\n        try:\n            logs = _load(\"request_logs.json\")\n            if isinstance(logs, list):\n                now = datetime.datetime.utcnow()\n                def _parse(ts):\n                    if not isinstance(ts, str):\n                        return None\n                    t = ts.rstrip(\"Z\")\n                    try:\n                        return datetime.datetime.fromisoformat(t)\n                    except Exception:\n                        return None\n                recent_60 = 0\n                recent_30d = 0\n                for r in logs:\n                    if not isinstance(r, dict):\n                        continue\n                    if r.get(\"endpoint\") != endpoint:\n                        continue\n                    dt = _parse(r.get(\"created_at\"))\n                    if dt is None:\n                        continue\n                    delta = (now - dt).total_seconds()\n                    if 0 <= delta <= 60:\n                        recent_60 += 1\n                    if 0 <= delta <= 30 * 24 * 3600:\n                        recent_30d += 1\n                if recent_60 >= 30:\n                    status = \"error\"\n                    return _err(\"RATE_LIMIT\", \"too many requests; try again later\")\n                if recent_30d >= 1000:\n                    status = \"error\"\n                    return _err(\"QUOTA_EXCEEDED\", \"monthly quota exceeded\")\n        except Exception:\n            pass\n\n        # Find existing job by unique cache_key\n        existing = None\n        for j in jobs:\n            if isinstance(j, dict) and j.get(\"cache_key\") == cache_key:\n                existing = j\n                break\n\n        now = datetime.datetime.utcnow()\n\n        def _is_unexpired_succeeded(j):\n            if not isinstance(j, dict):\n                return False\n            if j.get(\"status\") != \"succeeded\":\n                return False\n            exp = j.get(\"expires_at\")\n            if not isinstance(exp, str):\n                return False\n            try:\n                exp_dt = datetime.datetime.fromisoformat(exp.rstrip(\"Z\"))\n            except Exception:\n                return False\n            return exp_dt > now\n\n        # Reuse if fresh and allowed, unless force_refresh\n        if existing is not None and reuse_if_fresh and (not force_refresh) and _is_unexpired_succeeded(existing):\n            return {\"job\": existing, \"reused\": True}\n\n        # If cache_key exists but isn't reusable, dedupe by updating it to queued (legal transitions enforced)\n        if existing is not None:\n            transitions = {\n                \"queued\": [\"running\", \"cancelled\"],\n                \"running\": [\"succeeded\", \"failed\", \"cancelled\"],\n                \"succeeded\": [],\n                \"failed\": [\"queued\"],\n                \"cancelled\": [\"queued\"],\n            }\n            cur = existing.get(\"status\")\n            if cur not in transitions:\n                status = \"error\"\n                return _err(\"CONFLICT\", \"job has invalid status in store\", id=existing.get(\"id\"))\n            if \"queued\" not in transitions.get(cur, []):\n                # Can't move succeeded->queued; must create new job, but unique(cache_key) blocks.\n                # Real backend would either create a new cache_key variant or keep succeeded; here, refresh by setting expires_at to past.\n                if cur == \"succeeded\":\n                    # expire it and then allow caller to create a new job by updating the same row to queued? still illegal transition.\n                    status = \"error\"\n                    return _err(\"INVALID_TRANSITION\", \"cannot re-queue a succeeded job; use force_refresh with a different input or wait for expiry\", from_status=cur, to_status=\"queued\")\n                status = \"error\"\n                return _err(\"INVALID_TRANSITION\", \"cannot re-queue job from current status\", from_status=cur, to_status=\"queued\")\n\n            # Transition to queued and clear outcome fields\n            existing[\"status\"] = \"queued\"\n            existing[\"error_code\"] = None\n            existing[\"error_message\"] = None\n            existing[\"started_at\"] = None\n            existing[\"finished_at\"] = None\n            existing[\"resolved_author_id\"] = None\n\n            # Set new expiry window (24h) from now; must be > created_at per constraint,\n            # but created_at is historical; keep it, update expires_at and updated_at.\n            existing[\"expires_at\"] = _now_iso(now + datetime.timedelta(hours=24))\n            existing[\"updated_at\"] = _now_iso(now)\n            _save(\"profile_fetch_jobs.json\", jobs)\n            return {\"job\": existing, \"reused\": False}\n\n        # Create new job (unique(cache_key))\n        job_id = \"pfj_\" + now.strftime(\"%Y%m%d%H%M%S%f\")\n        job = {\n            \"id\": job_id,\n            \"query_given_name\": name,\n            \"query_family_name\": surname,\n            \"query_institution\": institution,\n            \"query_field\": field,\n            \"resolved_author_id\": None,\n            \"status\": \"queued\",\n            \"provider\": provider,\n            \"cache_key\": cache_key,\n            \"error_code\": None,\n            \"error_message\": None,\n            \"started_at\": None,\n            \"finished_at\": None,\n            \"expires_at\": _now_iso(now + datetime.timedelta(hours=24)),\n            \"created_at\": _now_iso(now),\n            \"updated_at\": _now_iso(now),\n        }\n        jobs.append(job)\n        _save(\"profile_fetch_jobs.json\", jobs)\n        return {\"job\": job, \"reused\": False}\n    finally:\n        # Request log (if collection exists)\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            end = datetime.datetime.utcnow()\n            latency_ms = int((end - start).total_seconds() * 1000)\n            logs.append({\n                \"id\": \"req_\" + end.strftime(\"%Y%m%d%H%M%S%f\"),\n                \"endpoint\": endpoint,\n                \"credential_id\": None,\n                \"status\": status,\n                \"latency_ms\": latency_ms,\n                \"created_at\": end.isoformat(timespec=\"seconds\") + \"Z\"\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n"
+        },
+        {
+          "name": "get_profile_fetch_job",
+          "description": "Fetches a single profile fetch job by id, including its current status and resolution outcome. Refuses with not_found when the id does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Profile fetch job id (primary key)."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_profile_fetch_job(id, **_extra):\n    import json, os, datetime, time, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0067000\" if __import__(\"os\").path.isdir(\"./environment_mix/0067000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now = now_dt.isoformat() + \"Z\"\n\n    def _parse_dt(s):\n        if not s or not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1]\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _log(status, err_code=None, http_status=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        latency_ms = int((time.time() - t0) * 1000)\n        rid_src = f\"get_profile_fetch_job|{now}|{latency_ms}|{len(logs)}|{id}\"\n        rid = \"req_\" + hashlib.sha256(rid_src.encode(\"utf-8\")).hexdigest()[:16]\n        row = {\n            \"id\": rid,\n            \"endpoint\": \"get_profile_fetch_job\",\n            \"timestamp\": now,\n            \"status\": status,\n            \"error_code\": err_code,\n            \"latency_ms\": latency_ms,\n        }\n        if http_status is not None:\n            row[\"http_status\"] = http_status\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    # Rate limit: 240 req/min per endpoint (best-effort with request_logs)\n    logs_rl = _load(\"request_logs.json\")\n    if not isinstance(logs_rl, list):\n        logs_rl = []\n    cutoff = now_dt - datetime.timedelta(seconds=60)\n    recent = 0\n    for r in logs_rl:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"endpoint\") != \"get_profile_fetch_job\":\n            continue\n        ts = _parse_dt(r.get(\"timestamp\"))\n        if ts and ts >= cutoff:\n            recent += 1\n    if recent >= 240:\n        _log(\"error\", \"rate_limited\", http_status=429)\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded for get_profile_fetch_job.\", error_code=\"rate_limited\")\n\n    if not isinstance(id, str) or not id.strip():\n        _log(\"error\", \"validation_error\", http_status=400)\n        return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\", field=\"id\")\n\n    # Accept any string id and try to resolve:\n    # - first, as a profile_fetch_jobs.id\n    # - if not found, as an authors.id to return the latest job that resolved to that author (common caller mistake)\n    jobs = _load(\"profile_fetch_jobs.json\")\n    if not isinstance(jobs, list):\n        jobs = []\n\n    job = None\n    for r in jobs:\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            job = r\n            break\n\n    if job is None:\n        # Fallback: if caller passed an author id, map to latest job for that author\n        candidates = []\n        for r in jobs:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"resolved_author_id\") != id:\n                continue\n            candidates.append(r)\n\n        def _job_sort_key(r):\n            # Prefer updated_at, then created_at, then finished_at, then started_at\n            for k in (\"updated_at\", \"created_at\", \"finished_at\", \"started_at\"):\n                dt = _parse_dt(r.get(k))\n                if dt:\n                    return dt\n            return datetime.datetime.min\n\n        if candidates:\n            candidates.sort(key=_job_sort_key, reverse=True)\n            job = candidates[0]\n\n    if job is None:\n        _log(\"error\", \"not_found\", http_status=404)\n        return _err(\n            \"NOT_FOUND\",\n            \"profile fetch job not found\",\n            error_code=\"not_found\",\n            id=id,\n        )\n\n    _log(\"ok\", None, http_status=200)\n    return {\n        \"profile_fetch_job\": job,\n    }\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0067000",
+    "index": 67,
+    "name": "Academic Author Network",
+    "description": "This backend stores canonical author profiles, their affiliations, extracted research keywords, and co-authorship links derived from external sources such as Google Scholar. The main workflows are (1) resolving an input name/surname (+ optional institution/field) to a specific author profile and (2)",
+    "taxonomy": {
+      "L1_id": "L1-02",
+      "L1_name": "Academic & Scientific Research",
+      "L1_name_zh": "学术与科学研究",
+      "L2_id": "L2-05",
+      "L2_name": "Citation & Scholarly Analytics",
+      "L2_name_zh": "引用与学术分析",
+      "L3_name": "Author Profiles & Co-authorship Networks",
+      "L3_name_zh": "作者画像与合著网络"
+    },
+    "database_dir": "./environment_mix/0067000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 5,
+    "n_records": 91,
+    "n_questions": 2,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 6,
+      "read_operations": 6,
+      "mutations_persisted": 1,
+      "mutations_attempted": 1
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_coauthors",
+      "returned_chars": 149
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

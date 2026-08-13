@@ -1,0 +1,123 @@
+{
+  "index": 358,
+  "local_files_dir": "./environment_mix/0358000",
+  "file_list": [
+    "./environment_mix/0358000/README.md",
+    "./environment_mix/0358000/api_keys.json",
+    "./environment_mix/0358000/workflow_connections.json",
+    "./environment_mix/0358000/workflow_create_requests.json",
+    "./environment_mix/0358000/workflow_nodes.json",
+    "./environment_mix/0358000/workflows.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "workflows.json": "17 rows",
+        "workflow_nodes.json": "18 rows",
+        "workflow_connections.json": "18 rows",
+        "workflow_create_requests.json": "20 rows",
+        "api_keys.json": "16 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "create_workflow",
+          "description": "Creates a new n8n workflow snapshot from the provided nodes and optional connections, validating required fields and returning the persisted workflow definition including its nodes, connections, and initial lifecycle state (for example, draft). Connections are validated to ensure each source and target refers to an existing node name and that node names are unique within the workflow; workflows with invalid node types/names or broken connection references raise VALIDATION_ERROR. Raises UNAUTHORIZED if the caller cannot create workflows, QUOTA_EXCEEDED if creation limits are reached, and CONFLICT if a workflow with the same identifier in the same scope already exists.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "nodes": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "parameters": {
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "name"
+                  ]
+                }
+              },
+              "connections": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "source": {
+                      "type": "string"
+                    },
+                    "target": {
+                      "type": "string"
+                    },
+                    "sourceOutput": {
+                      "type": "number",
+                      "default": 0
+                    },
+                    "targetInput": {
+                      "type": "number",
+                      "default": 0
+                    }
+                  },
+                  "required": [
+                    "source",
+                    "target"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "nodes"
+            ]
+          },
+          "implementation": "def create_workflow(nodes, connections=None, **_extra):\n    import json, os, datetime, hashlib, time, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0358000\" if __import__(\"os\").path.isdir(\"./environment_mix/0358000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_dt(s):\n        if not s or not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s2 = s[:-1]\n                return datetime.datetime.fromisoformat(s2)\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _gen_id(prefix):\n        return f\"{prefix}_{uuid.uuid4().hex}\"\n\n    def _stable_json(obj):\n        return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(\",\", \":\"))\n\n    def _canonicalize(nodes_in, conns_in):\n        # nodes canonical: list of {type,name,parameters} sorted by name\n        canon_nodes = []\n        for n in nodes_in:\n            canon_nodes.append({\n                \"type\": n.get(\"type\"),\n                \"name\": n.get(\"name\"),\n                \"parameters\": n.get(\"parameters\", None) if isinstance(n.get(\"parameters\", None), dict) else None,\n            })\n        canon_nodes.sort(key=lambda x: x[\"name\"])\n\n        canon_conns = []\n        for c in conns_in:\n            so = c.get(\"sourceOutput\", 0)\n            ti = c.get(\"targetInput\", 0)\n            canon_conns.append({\n                \"source\": c.get(\"source\"),\n                \"target\": c.get(\"target\"),\n                \"sourceOutput\": so,\n                \"targetInput\": ti,\n            })\n        canon_conns.sort(key=lambda x: (x[\"source\"], x[\"target\"], x[\"sourceOutput\"], x[\"targetInput\"]))\n        return {\"nodes\": canon_nodes, \"connections\": canon_conns}\n\n    start = time.time()\n\n    # Load stores\n    workflows = _load(\"workflows.json\")\n    wf_nodes = _load(\"workflow_nodes.json\")\n    wf_conns = _load(\"workflow_connections.json\")\n    create_reqs = _load(\"workflow_create_requests.json\")\n    api_keys = _load(\"api_keys.json\")\n\n    # Minimal request logging if a request log collection exists (schema didn't define one).\n    # Enforce quota/rate using api_keys collection as specified.\n\n    # Validate input types\n    if not isinstance(nodes, list):\n        return _err(\"VALIDATION_ERROR\", \"nodes must be an array\")\n    if len(nodes) < 1:\n        # Must also create request row -> failed\n        req_id = _gen_id(\"wcr\")\n        now = _now()\n        create_reqs.append({\n            \"id\": req_id,\n            \"idempotency_key\": None,\n            \"workflow_id\": None,\n            \"request_nodes\": nodes if isinstance(nodes, list) else [],\n            \"request_connections\": [] if connections is None else connections,\n            \"status\": \"failed\",\n            \"error_message\": \"request_nodes length must be >= 1\",\n            \"created_at\": now,\n            \"updated_at\": now,\n        })\n        _save(\"workflow_create_requests.json\", create_reqs)\n        return _err(\"VALIDATION_ERROR\", \"nodes must contain at least 1 node\", request_id=req_id)\n\n    if connections is None:\n        connections_list = []\n    else:\n        if not isinstance(connections, list):\n            return _err(\"VALIDATION_ERROR\", \"connections must be an array when provided\")\n        connections_list = connections\n\n    # Find an authorized active API key (ambient auth). Must have status=active.\n    # If none exists, refuse.\n    active_keys = [k for k in api_keys if isinstance(k, dict) and k.get(\"status\") == \"active\"]\n    if not active_keys:\n        return _err(\"UNAUTHORIZED\", \"No active API key available\")\n\n    # Choose a key that can satisfy quota for a successful create (if it proceeds).\n    # Rolling day window based on window_start_at. Reset if >= 24h.\n    now_dt = datetime.datetime.utcnow()\n    chosen_key = None\n    for k in active_keys:\n        limit = k.get(\"daily_create_limit\")\n        used = k.get(\"daily_create_used\")\n        if not isinstance(limit, int) or not isinstance(used, int):\n            continue\n        ws = _parse_dt(k.get(\"window_start_at\"))\n        if ws is None:\n            # treat as needs reset to now\n            ws = now_dt\n            k[\"window_start_at\"] = _now()\n            k[\"daily_create_used\"] = 0\n            used = 0\n        if (now_dt - ws) >= datetime.timedelta(days=1):\n            k[\"window_start_at\"] = _now()\n            k[\"daily_create_used\"] = 0\n            used = 0\n        if used < limit:\n            chosen_key = k\n            break\n\n    if chosen_key is None:\n        # persist any window resets possibly done above\n        _save(\"api_keys.json\", api_keys)\n        return _err(\"QUOTA_EXCEEDED\", \"Daily create_workflow limit exceeded\")\n\n    # Validate nodes content and uniqueness of names\n    node_names = []\n    node_name_set = set()\n    norm_nodes = []\n    for i, n in enumerate(nodes):\n        if not isinstance(n, dict):\n            return _err(\"VALIDATION_ERROR\", f\"nodes[{i}] must be an object\")\n        if \"type\" not in n or \"name\" not in n:\n            return _err(\"VALIDATION_ERROR\", f\"nodes[{i}] must include required fields: type, name\")\n        nt = n.get(\"type\")\n        nn = n.get(\"name\")\n        if not isinstance(nt, str) or not (1 <= len(nt) <= 255):\n            return _err(\"VALIDATION_ERROR\", f\"nodes[{i}].type must be a string length 1..255\")\n        if not isinstance(nn, str) or not (1 <= len(nn) <= 255):\n            return _err(\"VALIDATION_ERROR\", f\"nodes[{i}].name must be a string length 1..255\")\n        if nn in node_name_set:\n            # Create request must be marked failed\n            req_id = _gen_id(\"wcr\")\n            now = _now()\n            create_reqs.append({\n                \"id\": req_id,\n                \"idempotency_key\": None,\n                \"workflow_id\": None,\n                \"request_nodes\": nodes,\n                \"request_connections\": connections_list,\n                \"status\": \"failed\",\n                \"error_message\": f\"Duplicate node name within workflow: {nn}\",\n                \"created_at\": now,\n                \"updated_at\": now,\n            })\n            _save(\"workflow_create_requests.json\", create_reqs)\n            return _err(\"VALIDATION_ERROR\", \"Each nodes[].name must be unique within the workflow\", node_name=nn, request_id=req_id)\n        node_name_set.add(nn)\n        node_names.append(nn)\n        params = n.get(\"parameters\", None)\n        if params is not None and not isinstance(params, dict):\n            return _err(\"VALIDATION_ERROR\", f\"nodes[{i}].parameters must be an object when provided\")\n        norm_nodes.append({\"type\": nt, \"name\": nn, \"parameters\": params})\n\n    # Validate connections: references by name must exist; defaults for outputs/inputs\n    norm_conns = []\n    for i, c in enumerate(connections_list):\n        if not isinstance(c, dict):\n            return _err(\"VALIDATION_ERROR\", f\"connections[{i}] must be an object\")\n        if \"source\" not in c or \"target\" not in c:\n            return _err(\"VALIDATION_ERROR\", f\"connections[{i}] must include required fields: source, target\")\n        s = c.get(\"source\")\n        t = c.get(\"target\")\n        if not isinstance(s, str) or not s:\n            return _err(\"VALIDATION_ERROR\", f\"connections[{i}].source must be a non-empty string\")\n        if not isinstance(t, str) or not t:\n            return _err(\"VALIDATION_ERROR\", f\"connections[{i}].target must be a non-empty string\")\n        so = c.get(\"sourceOutput\", 0)\n        ti = c.get(\"targetInput\", 0)\n\n        # must be integers >= 0 (tool schema says number; business says integer)\n        if isinstance(so, bool) or not (isinstance(so, int) or (isinstance(so, float) and so.is_integer())):\n            return _err(\"VALIDATION_ERROR\", f\"connections[{i}].sourceOutput must be an integer >= 0\")\n        if isinstance(ti, bool) or not (isinstance(ti, int) or (isinstance(ti, float) and ti.is_integer())):\n            return _err(\"VALIDATION_ERROR\", f\"connections[{i}].targetInput must be an integer >= 0\")\n        so = int(so)\n        ti = int(ti)\n        if so < 0:\n            return _err(\"VALIDATION_ERROR\", f\"connections[{i}].sourceOutput must be >= 0\")\n        if ti < 0:\n            return _err(\"VALIDATION_ERROR\", f\"connections[{i}].targetInput must be >= 0\")\n\n        if s not in node_name_set or t not in node_name_set:\n            req_id = _gen_id(\"wcr\")\n            now = _now()\n            create_reqs.append({\n                \"id\": req_id,\n                \"idempotency_key\": None,\n                \"workflow_id\": None,\n                \"request_nodes\": nodes,\n                \"request_connections\": connections_list,\n                \"status\": \"failed\",\n                \"error_message\": f\"Connection references unknown node name(s): source={s}, target={t}\",\n                \"created_at\": now,\n                \"updated_at\": now,\n            })\n            _save(\"workflow_create_requests.json\", create_reqs)\n            return _err(\"VALIDATION_ERROR\", \"connections[].source and connections[].target must match a nodes[].name within the same request\",\n                        connection_index=i, request_id=req_id)\n        norm_conns.append({\"source\": s, \"target\": t, \"sourceOutput\": so, \"targetInput\": ti})\n\n    # Create workflow_create_requests row (no idempotency_key parameter exposed -> store null)\n    req_id = _gen_id(\"wcr\")\n    now = _now()\n    req_row = {\n        \"id\": req_id,\n        \"idempotency_key\": None,\n        \"workflow_id\": None,\n        \"request_nodes\": nodes,\n        \"request_connections\": connections_list,\n        \"status\": \"received\",\n        \"error_message\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    create_reqs.append(req_row)\n    _save(\"workflow_create_requests.json\", create_reqs)\n\n    # Transition received -> validated\n    req_row[\"status\"] = \"validated\"\n    req_row[\"updated_at\"] = _now()\n    _save(\"workflow_create_requests.json\", create_reqs)\n\n    # Compute definition_hash from canonical JSON of nodes and connections including defaults.\n    canonical = _canonicalize(norm_nodes, norm_conns)\n    canon_str = _stable_json(canonical)\n    definition_hash = hashlib.sha256(canon_str.encode(\"utf-8\")).hexdigest()\n\n    # Prevent duplicates where status != deleted\n    for w in workflows:\n        if not isinstance(w, dict):\n            continue\n        if w.get(\"status\") != \"deleted\" and w.get(\"definition_hash\") == definition_hash:\n            # Mark request failed, no workflow created\n            req_row[\"status\"] = \"failed\"\n            req_row[\"error_message\"] = \"Duplicate workflow definition_hash exists for non-deleted workflow\"\n            req_row[\"updated_at\"] = _now()\n            _save(\"workflow_create_requests.json\", create_reqs)\n            return _err(\"CONFLICT\", \"Duplicate workflow definition (definition_hash) already exists\", definition_hash=definition_hash, request_id=req_id)\n\n    # Re-check quota just before persisting; we already chose a key with capacity, but window may have been reset above.\n    limit = chosen_key.get(\"daily_create_limit\")\n    used = chosen_key.get(\"daily_create_used\")\n    if not isinstance(limit, int) or not isinstance(used, int):\n        req_row[\"status\"] = \"failed\"\n        req_row[\"error_message\"] = \"API key quota configuration invalid\"\n        req_row[\"updated_at\"] = _now()\n        _save(\"workflow_create_requests.json\", create_reqs)\n        return _err(\"UNAUTHORIZED\", \"API key configuration invalid\")\n    if used + 1 > limit:\n        req_row[\"status\"] = \"failed\"\n        req_row[\"error_message\"] = \"Daily create_workflow limit exceeded\"\n        req_row[\"updated_at\"] = _now()\n        _save(\"workflow_create_requests.json\", create_reqs)\n        _save(\"api_keys.json\", api_keys)\n        return _err(\"QUOTA_EXCEEDED\", \"Daily create_workflow limit exceeded\", request_id=req_id)\n\n    # Persist atomically: prepare rows first, validate self-loop/uniques among new connections, then append and save.\n    workflow_id = _gen_id(\"wf\")\n    ts = _now()\n\n    # Create nodes rows\n    new_node_rows = []\n    name_to_id = {}\n    for n in norm_nodes:\n        nid = _gen_id(\"wfn\")\n        name_to_id[n[\"name\"]] = nid\n        new_node_rows.append({\n            \"id\": nid,\n            \"workflow_id\": workflow_id,\n            \"node_type\": n[\"type\"],\n            \"node_name\": n[\"name\"],\n            \"parameters\": n[\"parameters\"],\n            \"created_at\": ts,\n            \"updated_at\": ts,\n            \"status\": \"configured\",\n        })\n\n    # Ensure unique(workflow_id, node_name) - new workflow, so only internal uniqueness needed (already checked)\n    # Create connections rows, resolve names to ids, enforce constraints\n    new_conn_rows = []\n    conn_unique = set()\n    for c in norm_conns:\n        sid = name_to_id.get(c[\"source\"])\n        tid = name_to_id.get(c[\"target\"])\n        if sid is None or tid is None:\n            # Shouldn't happen due to earlier validation, but treat as failure without partial commit\n            req_row[\"status\"] = \"failed\"\n            req_row[\"error_message\"] = \"Internal name resolution failed\"\n            req_row[\"updated_at\"] = _now()\n            _save(\"workflow_create_requests.json\", create_reqs)\n            return _err(\"VALIDATION_ERROR\", \"Connection name resolution failed\", request_id=req_id)\n\n        if sid == tid:\n            req_row[\"status\"] = \"failed\"\n            req_row[\"error_message\"] = \"Connection cannot be a self-loop\"\n            req_row[\"updated_at\"] = _now()\n            _save(\"workflow_create_requests.json\", create_reqs)\n            return _err(\"VALIDATION_ERROR\", \"A connection cannot be a self-loop\", request_id=req_id)\n\n        tup = (sid, tid, c[\"sourceOutput\"], c[\"targetInput\"])\n        if tup in conn_unique:\n            req_row[\"status\"] = \"failed\"\n            req_row[\"error_message\"] = \"Duplicate connection in request\"\n            req_row[\"updated_at\"] = _now()\n            _save(\"workflow_create_requests.json\", create_reqs)\n            return _err(\"VALIDATION_ERROR\", \"Duplicate connection within workflow request\", request_id=req_id)\n        conn_unique.add(tup)\n\n        cid = _gen_id(\"wfc\")\n        new_conn_rows.append({\n            \"id\": cid,\n            \"workflow_id\": workflow_id,\n            \"source_node_id\": sid,\n            \"target_node_id\": tid,\n            \"source_node_name\": c[\"source\"],\n            \"target_node_name\": c[\"target\"],\n            \"source_output\": c[\"sourceOutput\"],\n            \"target_input\": c[\"targetInput\"],\n            \"created_at\": ts,\n            \"updated_at\": ts,\n            \"status\": \"valid\",\n        })\n\n    # Persist workflow row\n    new_wf_row = {\n        \"id\": workflow_id,\n        \"status\": \"draft\",\n        \"version\": 1,\n        \"node_count\": len(new_node_rows),\n        \"connection_count\": len(new_conn_rows),\n        \"definition_hash\": definition_hash,\n        \"created_at\": ts,\n        \"updated_at\": ts,\n    }\n\n    # Commit all changes\n    workflows.append(new_wf_row)\n    wf_nodes.extend(new_node_rows)\n    wf_conns.extend(new_conn_rows)\n\n    # Update request to persisted\n    req_row[\"status\"] = \"persisted\"\n    req_row[\"workflow_id\"] = workflow_id\n    req_row[\"error_message\"] = None\n    req_row[\"updated_at\"] = _now()\n\n    # Increment usage/counters for successful create\n    chosen_key[\"daily_create_used\"] = int(chosen_key.get(\"daily_create_used\", 0)) + 1\n    chosen_key[\"last_used_at\"] = _now()\n    chosen_key[\"updated_at\"] = _now()\n\n    # Save all\n    _save(\"workflows.json\", workflows)\n    _save(\"workflow_nodes.json\", wf_nodes)\n    _save(\"workflow_connections.json\", wf_conns)\n    _save(\"workflow_create_requests.json\", create_reqs)\n    _save(\"api_keys.json\", api_keys)\n\n    latency_ms = int((time.time() - start) * 1000)\n\n    # Return persisted definition\n    return {\n        \"workflow\": new_wf_row,\n        \"nodes\": new_node_rows,\n        \"connections\": new_conn_rows,\n        \"request\": {\n            \"id\": req_row[\"id\"],\n            \"status\": req_row[\"status\"],\n            \"workflow_id\": req_row[\"workflow_id\"],\n            \"created_at\": req_row[\"created_at\"],\n            \"updated_at\": req_row[\"updated_at\"],\n        },\n        \"usage\": {\n            \"api_key_id\": chosen_key.get(\"id\"),\n            \"daily_create_limit\": chosen_key.get(\"daily_create_limit\"),\n            \"daily_create_used\": chosen_key.get(\"daily_create_used\"),\n            \"window_start_at\": chosen_key.get(\"window_start_at\"),\n            \"last_used_at\": chosen_key.get(\"last_used_at\"),\n        },\n        \"meta\": {\n            \"latency_ms\": latency_ms,\n        },\n    }\n",
+          "description_restored": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0358000",
+    "index": 358,
+    "name": "n8n Workflow Builder",
+    "description": "This backend stores programmatically generated n8n workflow definitions, including their nodes and node-to-node connections. The primary workflow is accepting a create_workflow request, validating node names/types and connection integrity, persisting a workflow snapshot, and tracking lifecycle state",
+    "taxonomy": {
+      "L1_id": "L1-08",
+      "L1_name": "System & Cloud Infrastructure",
+      "L1_name_zh": "系统与云基础设施",
+      "L2_id": "L2-22",
+      "L2_name": "DevOps & Workflow Automation",
+      "L2_name_zh": "DevOps 与流程自动化",
+      "L3_name": "Workflow Automation & Scheduling",
+      "L3_name_zh": "工作流自动化与调度"
+    },
+    "database_dir": "./environment_mix/0358000",
+    "mount_path": "/app/database",
+    "n_tools": 1,
+    "n_collections": 5,
+    "n_records": 89,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 1,
+      "loaded": 1,
+      "reads_returning_data": 0,
+      "read_operations": 0,
+      "mutations_persisted": 1,
+      "mutations_attempted": 1
+    },
+    "tools_loadable_from_database_dir": 1,
+    "tool_load_errors": 0,
+    "verified_call": null,
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

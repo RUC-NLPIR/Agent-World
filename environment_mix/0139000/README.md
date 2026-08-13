@@ -1,0 +1,568 @@
+# Trailhead Park Explorer API
+
+Trailhead Park Explorer API is a service for searching and retrieving information about U.S. national parks and related visitor-facing details such as alerts, visitor centers, campgrounds, and events.
+
+## Datastore
+
+### `nps.json` — object of 5 records keyed by identifier
+Holds per-park keyed records that combine core park details with associated informational items (such as alerts, visitor center info, campground info, and events) so the service can serve park search and detail lookups from a single store.
+Keys look like: parks, alerts, visitorcenters
+
+- `acad` — array/object
+  each record in `acad` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string — one of 2026-07-15, 2026-08-12
+  - `dateEnd` — string — one of 2026-07-15, 2026-08-12
+- `arch` — array/object
+  each record in `arch` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Warning
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `badl` — array/object
+  each record in `badl` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `bibe` — array/object
+  each record in `bibe` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Warning
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `bisc` — array/object
+  each record in `bisc` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `blca` — array/object
+  each record in `blca` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Park Closure
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `brca` — array/object
+  each record in `brca` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Information, Park Closure
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `cany` — array/object
+  each record in `cany` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `care` — array/object
+  each record in `care` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `crla` — array/object
+  each record in `crla` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Information, Park Closure
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `dena` — array/object
+  each record in `dena` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Park Closure
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `deva` — array/object
+  each record in `deva` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Danger
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `ever` — array/object
+  each record in `ever` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `gaar` — array/object
+  each record in `gaar` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `glba` — array/object
+  each record in `glba` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Information, Warning
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `glac` — array/object
+  each record in `glac` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `grba` — array/object
+  each record in `grba` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `grsa` — array/object
+  each record in `grsa` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Information, Warning
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `grsm` — array/object
+  each record in `grsm` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `guis` — array/object
+  each record in `guis` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `hale` — array/object
+  each record in `hale` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `havo` — array/object
+  each record in `havo` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Information, Warning
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `hot` — array/object
+  each record in `hot` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `isro` — array/object
+  each record in `isro` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `jotr` — array/object
+  each record in `jotr` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Information, Warning
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `lavo` — array/object
+  each record in `lavo` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `maca` — array/object
+  each record in `maca` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `meve` — array/object
+  each record in `meve` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `mora` — array/object
+  each record in `mora` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `noca` — array/object
+  each record in `noca` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `olym` — array/object
+  each record in `olym` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `pefo` — array/object
+  each record in `pefo` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Information, Warning
+  - `name` — string
+  - `operatingHours` — string
+  - `dateStart` — string
+  - `dateEnd` — string
+- `redw` — array/object
+  each record in `redw` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `romo` — array/object
+  each record in `romo` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `seki` — array/object
+  each record in `seki` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `shen` — array/object
+  each record in `shen` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `thro` — array/object
+  each record in `thro` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `viis` — array/object
+  each record in `viis` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `voya` — array/object
+  each record in `voya` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string
+- `wind` — array/object
+  each record in `wind` has:
+  - `parkCode` — string
+  - `fullName` — string
+  - `states` — string
+  - `description` — string
+  - `activities` — array
+  - `title` — string
+  - `category` — string — one of Caution, Information
+  - `name` — string
+  - `operatingHours` — string
+  - `amenities` — array
+  - `dateStart` — string
+  - `dateEnd` — string

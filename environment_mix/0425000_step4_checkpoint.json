@@ -1,0 +1,607 @@
+{
+  "index": 425,
+  "local_files_dir": "./environment_mix/0425000",
+  "file_list": [
+    "./environment_mix/0425000/README.md",
+    "./environment_mix/0425000/api_request_logs.json",
+    "./environment_mix/0425000/games.json",
+    "./environment_mix/0425000/leagues.json",
+    "./environment_mix/0425000/players.json",
+    "./environment_mix/0425000/teams.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "leagues.json": "12 rows",
+        "teams.json": "30 rows",
+        "players.json": "33 rows",
+        "games.json": "31 rows",
+        "api_request_logs.json": "32 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "get_teams",
+          "description": "Lists teams for the given league, optionally filtered by internal/external ids and team attributes, and returns up to `limit` results sorted by `sort`/`order`; when more results exist, use the returned `cursor` as the `cursor` parameter to fetch the next page. Raises VALIDATION_ERROR if `league_code` is missing/invalid, any id fails its pattern, `limit` is out of range, `sort`/`order`/`status` are not in the allowed set, or `cursor` is malformed; raises UNAUTHORIZED/FORBIDDEN if the caller is not permitted to query the league, and RATE_LIMITED if request quotas are exceeded. If `log_request` is true, the request is recorded for monitoring; logging failures raise INTERNAL_ERROR.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "league_code": {
+                "type": "string",
+                "enum": [
+                  "NBA",
+                  "MLB",
+                  "NFL"
+                ],
+                "description": "League code to return teams for."
+              },
+              "team_id": {
+                "type": "string",
+                "pattern": "^bdl_tm_01H[0-9A-Z]{15,}$",
+                "description": "Filter by internal team id."
+              },
+              "external_team_id": {
+                "type": "string",
+                "description": "Filter by external provider team id."
+              },
+              "abbreviation": {
+                "type": "string",
+                "description": "Filter by team abbreviation (e.g., LAL)."
+              },
+              "city": {
+                "type": "string",
+                "description": "Filter by team city."
+              },
+              "name": {
+                "type": "string",
+                "description": "Filter by team name."
+              },
+              "full_name": {
+                "type": "string",
+                "description": "Filter by team full name."
+              },
+              "conference": {
+                "type": "string",
+                "description": "Filter by conference."
+              },
+              "division": {
+                "type": "string",
+                "description": "Filter by division."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "inactive",
+                  "relocated"
+                ],
+                "description": "Filter by team status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of teams to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor for the next page of results."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "name",
+                  "full_name",
+                  "abbreviation",
+                  "city"
+                ],
+                "description": "Field to sort results by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order."
+              },
+              "log_request": {
+                "type": "boolean",
+                "description": "Whether to record this request in api_request_logs."
+              }
+            },
+            "required": [
+              "league_code"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_teams(league_code, team_id=None, external_team_id=None, abbreviation=None, city=None, name=None, full_name=None, conference=None, division=None, status=None, limit=None, cursor=None, sort=None, order=None, log_request=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0425000\" if __import__(\"os\").path.isdir(\"./environment_mix/0425000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_cursor(c):\n        if c is None:\n            return None\n        if not isinstance(c, str) or not c:\n            return \"bad\"\n        try:\n            s = c\n            pad = \"=\" * (-len(s) % 4)\n            raw = base64.urlsafe_b64decode((s + pad).encode(\"utf-8\")).decode(\"utf-8\")\n            obj = json.loads(raw)\n            if not isinstance(obj, dict) or \"offset\" not in obj:\n                return \"bad\"\n            off = obj[\"offset\"]\n            if not isinstance(off, int) or off < 0:\n                return \"bad\"\n            return off\n        except Exception:\n            return \"bad\"\n\n    def _make_cursor(off):\n        raw = json.dumps({\"offset\": off}, separators=(\",\", \":\")).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"utf-8\").rstrip(\"=\")\n\n    def _log(http_status, league_code_ctx=None, game_id_ctx=None):\n        if log_request is False:\n            return\n        logs = _load(\"api_request_logs.json\")\n        resp_ms = int(max(0, round((time.time() - t0) * 1000)))\n        log_row = {\n            \"id\": \"bdl_log_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n            \"request_time\": now,\n            \"tool_name\": \"get_teams\",\n            \"league_code\": league_code_ctx,\n            \"game_id\": game_id_ctx,\n            \"http_status\": int(http_status),\n            \"response_ms\": int(resp_ms),\n            \"client_ip\": None,\n            \"user_agent\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        logs.append(log_row)\n        _save(\"api_request_logs.json\", logs)\n\n    # Validate\n    if league_code not in (\"NBA\", \"MLB\", \"NFL\"):\n        _log(400, None, None)\n        return _err(\"VALIDATION_ERROR\", \"league_code must be one of: NBA, MLB, NFL\", field=\"league_code\")\n\n    id_pat = re.compile(r\"^bdl_tm_01H[0-9A-Z]{15,}$\")\n    if team_id is not None and (not isinstance(team_id, str) or not id_pat.match(team_id)):\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"team_id is invalid\", field=\"team_id\")\n    if status is not None and status not in (\"active\", \"inactive\", \"relocated\"):\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: active, inactive, relocated\", field=\"status\")\n\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200\", field=\"limit\")\n\n    if sort is None:\n        sort = \"name\"\n    if sort not in (\"created_at\", \"updated_at\", \"name\", \"full_name\", \"abbreviation\", \"city\"):\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"sort is invalid\", field=\"sort\")\n\n    if order is None:\n        order = \"asc\"\n    if order not in (\"asc\", \"desc\"):\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"order must be 'asc' or 'desc'\", field=\"order\")\n\n    offset = _parse_cursor(cursor)\n    if offset == \"bad\":\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"cursor is invalid\", field=\"cursor\")\n    if offset is None:\n        offset = 0\n\n    # Load data\n    leagues = _load(\"leagues.json\")\n    teams = _load(\"teams.json\")\n\n    league = next((l for l in leagues if isinstance(l, dict) and l.get(\"code\") == league_code), None)\n    if not league or league.get(\"status\") != \"active\":\n        # read with filters match nothing => empty set\n        _log(200, league_code, None)\n        return {\n            \"data\": [],\n            \"meta\": {\"total\": 0, \"has_more\": False, \"next_cursor\": None},\n        }\n\n    league_id = league.get(\"id\")\n\n    # Business rule baseline filter: teams.status='active' and league.status='active'\n    rows = []\n    for tm in teams:\n        if not isinstance(tm, dict):\n            continue\n        if tm.get(\"league_id\") != league_id:\n            continue\n        if tm.get(\"status\") != \"active\":\n            continue\n\n        # Optional filters (including explicit status filter; cannot override baseline active rule)\n        if team_id is not None and tm.get(\"id\") != team_id:\n            continue\n        if external_team_id is not None and tm.get(\"external_team_id\") != external_team_id:\n            continue\n        if abbreviation is not None and tm.get(\"abbreviation\") != abbreviation:\n            continue\n        if city is not None and tm.get(\"city\") != city:\n            continue\n        if name is not None and tm.get(\"name\") != name:\n            continue\n        if full_name is not None and tm.get(\"full_name\") != full_name:\n            continue\n        if conference is not None and tm.get(\"conference\") != conference:\n            continue\n        if division is not None and tm.get(\"division\") != division:\n            continue\n        if status is not None and tm.get(\"status\") != status:\n            continue\n\n        rows.append(tm)\n\n    def _sort_key(r):\n        v = r.get(sort)\n        return (v is None, v)\n\n    rows.sort(key=_sort_key, reverse=(order == \"desc\"))\n    total = len(rows)\n    page = rows[offset: offset + limit]\n    next_off = offset + len(page)\n    has_more = next_off < total\n    next_cursor = _make_cursor(next_off) if has_more else None\n\n    _log(200, league_code, None)\n    return {\n        \"data\": page,\n        \"meta\": {\"total\": total, \"has_more\": has_more, \"next_cursor\": next_cursor},\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_players",
+          "description": "Lists players for the given league, optionally filtered by internal/external ids, team, and player attributes, and returns up to `limit` results sorted by `sort`/`order`; when more results exist, use the returned `cursor` to page forward. Raises VALIDATION_ERROR if `league_code` is missing/invalid, any id fails its pattern, `limit` is out of range, `sort`/`order`/`status` are not in the allowed set, or `cursor` is malformed; raises UNAUTHORIZED/FORBIDDEN if the caller is not permitted to query the league, and RATE_LIMITED if request quotas are exceeded. If `log_request` is true, the request is recorded for monitoring; logging failures raise INTERNAL_ERROR.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "league_code": {
+                "type": "string",
+                "enum": [
+                  "NBA",
+                  "MLB",
+                  "NFL"
+                ],
+                "description": "League code to return players for."
+              },
+              "player_id": {
+                "type": "string",
+                "pattern": "^bdl_plr_01H[0-9A-Z]{15,}$",
+                "description": "Filter by internal player id."
+              },
+              "external_player_id": {
+                "type": "string",
+                "description": "Filter by external provider player id."
+              },
+              "team_id": {
+                "type": "string",
+                "pattern": "^bdl_tm_01H[0-9A-Z]{15,}$",
+                "description": "Filter by current team id."
+              },
+              "first_name": {
+                "type": "string",
+                "description": "Filter by player's first name."
+              },
+              "last_name": {
+                "type": "string",
+                "description": "Filter by player's last name."
+              },
+              "display_name": {
+                "type": "string",
+                "description": "Filter by player's display name."
+              },
+              "position": {
+                "type": "string",
+                "description": "Filter by position (league-specific)."
+              },
+              "jersey_number": {
+                "type": "string",
+                "description": "Filter by jersey number."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "inactive",
+                  "retired"
+                ],
+                "description": "Filter by player status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of players to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor for the next page of results."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "last_name",
+                  "first_name",
+                  "display_name"
+                ],
+                "description": "Field to sort results by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order."
+              },
+              "log_request": {
+                "type": "boolean",
+                "description": "Whether to record this request in api_request_logs."
+              }
+            },
+            "required": [
+              "league_code"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_players(league_code, player_id=None, external_player_id=None, team_id=None, first_name=None, last_name=None, display_name=None, position=None, jersey_number=None, status=None, limit=None, cursor=None, sort=None, order=None, log_request=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0425000\" if __import__(\"os\").path.isdir(\"./environment_mix/0425000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_cursor(c):\n        if c is None:\n            return None\n        if not isinstance(c, str) or not c:\n            return \"bad\"\n        try:\n            pad = \"=\" * (-len(c) % 4)\n            raw = base64.urlsafe_b64decode((c + pad).encode(\"utf-8\")).decode(\"utf-8\")\n            obj = json.loads(raw)\n            off = obj.get(\"offset\")\n            if not isinstance(off, int) or off < 0:\n                return \"bad\"\n            return off\n        except Exception:\n            return \"bad\"\n\n    def _make_cursor(off):\n        raw = json.dumps({\"offset\": off}, separators=(\",\", \":\")).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"utf-8\").rstrip(\"=\")\n\n    def _log(http_status, league_code_ctx=None, game_id_ctx=None):\n        if log_request is False:\n            return\n        logs = _load(\"api_request_logs.json\")\n        resp_ms = int(max(0, round((time.time() - t0) * 1000)))\n        logs.append({\n            \"id\": \"bdl_log_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n            \"request_time\": now,\n            \"tool_name\": \"get_players\",\n            \"league_code\": league_code_ctx,\n            \"game_id\": game_id_ctx,\n            \"http_status\": int(http_status),\n            \"response_ms\": int(resp_ms),\n            \"client_ip\": None,\n            \"user_agent\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        })\n        _save(\"api_request_logs.json\", logs)\n\n    # Validate\n    if league_code not in (\"NBA\", \"MLB\", \"NFL\"):\n        _log(400, None, None)\n        return _err(\"VALIDATION_ERROR\", \"league_code must be one of: NBA, MLB, NFL\", field=\"league_code\")\n\n    pid_pat = re.compile(r\"^bdl_plr_01H[0-9A-Z]{15,}$\")\n    if player_id is not None and (not isinstance(player_id, str) or not pid_pat.match(player_id)):\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"player_id is invalid\", field=\"player_id\")\n\n    tid_pat = re.compile(r\"^bdl_tm_01H[0-9A-Z]{15,}$\")\n    if team_id is not None and (not isinstance(team_id, str) or not tid_pat.match(team_id)):\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"team_id is invalid\", field=\"team_id\")\n\n    if status is not None and status not in (\"active\", \"inactive\", \"retired\"):\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: active, inactive, retired\", field=\"status\")\n\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200\", field=\"limit\")\n\n    if sort is None:\n        sort = \"display_name\"\n    if sort not in (\"created_at\", \"updated_at\", \"last_name\", \"first_name\", \"display_name\"):\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"sort is invalid\", field=\"sort\")\n\n    if order is None:\n        order = \"asc\"\n    if order not in (\"asc\", \"desc\"):\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"order must be 'asc' or 'desc'\", field=\"order\")\n\n    offset = _parse_cursor(cursor)\n    if offset == \"bad\":\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"cursor is invalid\", field=\"cursor\")\n    if offset is None:\n        offset = 0\n\n    leagues = _load(\"leagues.json\")\n    teams = _load(\"teams.json\")\n    players = _load(\"players.json\")\n\n    league = next((l for l in leagues if isinstance(l, dict) and l.get(\"code\") == league_code), None)\n    if not league or league.get(\"status\") != \"active\":\n        _log(200, league_code, None)\n        return {\"data\": [], \"meta\": {\"total\": 0, \"has_more\": False, \"next_cursor\": None}}\n\n    league_id = league.get(\"id\")\n    teams_by_id = {t.get(\"id\"): t for t in teams if isinstance(t, dict) and t.get(\"id\")}\n\n    # Filter with business rule: league active; players any lifecycle state; if current_team_id non-null must be same league\n    rows = []\n    for p in players:\n        if not isinstance(p, dict):\n            continue\n        if p.get(\"league_id\") != league_id:\n            continue\n\n        # enforce referential/league consistency rule for current_team_id\n        ctid = p.get(\"current_team_id\")\n        if ctid is not None:\n            tm = teams_by_id.get(ctid)\n            if not tm or tm.get(\"league_id\") != league_id:\n                continue\n\n        # Optional filters\n        if player_id is not None and p.get(\"id\") != player_id:\n            continue\n        if external_player_id is not None and p.get(\"external_player_id\") != external_player_id:\n            continue\n        if team_id is not None and p.get(\"current_team_id\") != team_id:\n            continue\n        if first_name is not None and p.get(\"first_name\") != first_name:\n            continue\n        if last_name is not None and p.get(\"last_name\") != last_name:\n            continue\n        if display_name is not None and p.get(\"display_name\") != display_name:\n            continue\n        if position is not None and p.get(\"position\") != position:\n            continue\n        if jersey_number is not None and p.get(\"jersey_number\") != jersey_number:\n            continue\n        if status is not None and p.get(\"status\") != status:\n            continue\n\n        rows.append(p)\n\n    def _sort_key(r):\n        v = r.get(sort)\n        return (v is None, v)\n\n    rows.sort(key=_sort_key, reverse=(order == \"desc\"))\n    total = len(rows)\n    page = rows[offset: offset + limit]\n    next_off = offset + len(page)\n    has_more = next_off < total\n    next_cursor = _make_cursor(next_off) if has_more else None\n\n    _log(200, league_code, None)\n    return {\"data\": page, \"meta\": {\"total\": total, \"has_more\": has_more, \"next_cursor\": next_cursor}}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_games",
+          "description": "Lists games for the given league with optional filters (season, team/home/away team, status, and start time range) and returns up to `limit` results sorted by `sort`/`order`; when more results exist, use the returned `cursor` to fetch the next page. Raises VALIDATION_ERROR if `league_code` is missing/invalid, any team id fails its pattern, `limit` is out of range, `sort`/`order`/`status` are not in the allowed set, `start_time_from`/`start_time_to` are not valid RFC3339 timestamps, the time range is invalid (`from` > `to`), or `cursor` is malformed; raises UNAUTHORIZED/FORBIDDEN if the caller is not permitted to query the league, and RATE_LIMITED if request quotas are exceeded. If `log_request` is true, the request is recorded for monitoring; logging failures raise INTERNAL_ERROR.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "league_code": {
+                "type": "string",
+                "enum": [
+                  "NBA",
+                  "MLB",
+                  "NFL"
+                ],
+                "description": "League code to return games for."
+              },
+              "season": {
+                "type": "integer",
+                "description": "Filter by season year."
+              },
+              "team_id": {
+                "type": "string",
+                "pattern": "^bdl_tm_01H[0-9A-Z]{15,}$",
+                "description": "Filter games where the given team is home or away."
+              },
+              "home_team_id": {
+                "type": "string",
+                "pattern": "^bdl_tm_01H[0-9A-Z]{15,}$",
+                "description": "Filter by home team id."
+              },
+              "away_team_id": {
+                "type": "string",
+                "pattern": "^bdl_tm_01H[0-9A-Z]{15,}$",
+                "description": "Filter by away team id."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "scheduled",
+                  "in_progress",
+                  "final",
+                  "cancelled",
+                  "postponed"
+                ],
+                "description": "Filter by game status."
+              },
+              "start_time_from": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Return games with start_time on/after this timestamp (inclusive)."
+              },
+              "start_time_to": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Return games with start_time on/before this timestamp (inclusive)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of games to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor for the next page of results."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "start_time",
+                  "created_at",
+                  "updated_at",
+                  "season"
+                ],
+                "description": "Field to sort results by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order."
+              },
+              "log_request": {
+                "type": "boolean",
+                "description": "Whether to record this request in api_request_logs."
+              }
+            },
+            "required": [
+              "league_code"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_games(league_code, season=None, team_id=None, home_team_id=None, away_team_id=None, status=None, start_time_from=None, start_time_to=None, limit=None, cursor=None, sort=None, order=None, log_request=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0425000\" if __import__(\"os\").path.isdir(\"./environment_mix/0425000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s:\n            return \"bad\"\n        try:\n            x = s\n            if x.endswith(\"Z\"):\n                x = x[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(x)\n        except Exception:\n            return \"bad\"\n\n    def _parse_cursor(c):\n        if c is None:\n            return None\n        if not isinstance(c, str) or not c:\n            return \"bad\"\n        try:\n            pad = \"=\" * (-len(c) % 4)\n            raw = base64.urlsafe_b64decode((c + pad).encode(\"utf-8\")).decode(\"utf-8\")\n            obj = json.loads(raw)\n            off = obj.get(\"offset\")\n            if not isinstance(off, int) or off < 0:\n                return \"bad\"\n            return off\n        except Exception:\n            return \"bad\"\n\n    def _make_cursor(off):\n        raw = json.dumps({\"offset\": off}, separators=(\",\", \":\")).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"utf-8\").rstrip(\"=\")\n\n    def _log(http_status, league_code_ctx=None, game_id_ctx=None):\n        if log_request is False:\n            return\n        logs = _load(\"api_request_logs.json\")\n        resp_ms = int(max(0, round((time.time() - t0) * 1000)))\n        logs.append({\n            \"id\": \"bdl_log_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n            \"request_time\": now,\n            \"tool_name\": \"get_games\",\n            \"league_code\": league_code_ctx,\n            \"game_id\": game_id_ctx,\n            \"http_status\": int(http_status),\n            \"response_ms\": int(resp_ms),\n            \"client_ip\": None,\n            \"user_agent\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        })\n        _save(\"api_request_logs.json\", logs)\n\n    # Validate\n    if league_code not in (\"NBA\", \"MLB\", \"NFL\"):\n        _log(400, None, None)\n        return _err(\"VALIDATION_ERROR\", \"league_code must be one of: NBA, MLB, NFL\", field=\"league_code\")\n\n    tid_pat = re.compile(r\"^bdl_tm_01H[0-9A-Z]{15,}$\")\n    for fld, val in ((\"team_id\", team_id), (\"home_team_id\", home_team_id), (\"away_team_id\", away_team_id)):\n        if val is not None and (not isinstance(val, str) or not tid_pat.match(val)):\n            _log(400, league_code, None)\n            return _err(\"VALIDATION_ERROR\", f\"{fld} is invalid\", field=fld)\n\n    if season is not None:\n        if not isinstance(season, int):\n            _log(400, league_code, None)\n            return _err(\"VALIDATION_ERROR\", \"season must be an integer\", field=\"season\")\n        if season < 1800 or season > 2200:\n            _log(400, league_code, None)\n            return _err(\"VALIDATION_ERROR\", \"season must be between 1800 and 2200\", field=\"season\")\n\n    if status is not None and status not in (\"scheduled\", \"in_progress\", \"final\", \"cancelled\", \"postponed\"):\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"status is invalid\", field=\"status\")\n\n    dt_from = _parse_dt(start_time_from, \"start_time_from\")\n    if dt_from == \"bad\":\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"start_time_from must be RFC3339 date-time\", field=\"start_time_from\")\n    dt_to = _parse_dt(start_time_to, \"start_time_to\")\n    if dt_to == \"bad\":\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"start_time_to must be RFC3339 date-time\", field=\"start_time_to\")\n    if isinstance(dt_from, datetime.datetime) and isinstance(dt_to, datetime.datetime) and dt_from > dt_to:\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"start_time_from must be <= start_time_to\", field=\"start_time_from\")\n\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200\", field=\"limit\")\n\n    if sort is None:\n        sort = \"start_time\"\n    if sort not in (\"start_time\", \"created_at\", \"updated_at\", \"season\"):\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"sort is invalid\", field=\"sort\")\n\n    if order is None:\n        order = \"asc\"\n    if order not in (\"asc\", \"desc\"):\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"order must be 'asc' or 'desc'\", field=\"order\")\n\n    offset = _parse_cursor(cursor)\n    if offset == \"bad\":\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"cursor is invalid\", field=\"cursor\")\n    if offset is None:\n        offset = 0\n\n    leagues = _load(\"leagues.json\")\n    teams = _load(\"teams.json\")\n    games = _load(\"games.json\")\n\n    league = next((l for l in leagues if isinstance(l, dict) and l.get(\"code\") == league_code), None)\n    if not league or league.get(\"status\") != \"active\":\n        _log(200, league_code, None)\n        return {\"data\": [], \"meta\": {\"total\": 0, \"has_more\": False, \"next_cursor\": None}}\n\n    league_id = league.get(\"id\")\n    teams_by_id = {t.get(\"id\"): t for t in teams if isinstance(t, dict) and t.get(\"id\")}\n\n    def _game_start_dt(g):\n        st = g.get(\"start_time\")\n        if not st:\n            return None\n        try:\n            x = st\n            if isinstance(x, str) and x.endswith(\"Z\"):\n                x = x[:-1] + \"+00:00\"\n            if isinstance(x, str):\n                return datetime.datetime.fromisoformat(x)\n        except Exception:\n            return None\n        return None\n\n    rows = []\n    for g in games:\n        if not isinstance(g, dict):\n            continue\n        if g.get(\"league_id\") != league_id:\n            continue\n\n        # Business rule: home/away must reference teams in same league\n        ht = teams_by_id.get(g.get(\"home_team_id\"))\n        at = teams_by_id.get(g.get(\"away_team_id\"))\n        if not ht or not at:\n            continue\n        if ht.get(\"league_id\") != league_id or at.get(\"league_id\") != league_id:\n            continue\n\n        # Optional filters\n        if season is not None and g.get(\"season\") != season:\n            continue\n        if status is not None and g.get(\"status\") != status:\n            continue\n        if team_id is not None and not (g.get(\"home_team_id\") == team_id or g.get(\"away_team_id\") == team_id):\n            continue\n        if home_team_id is not None and g.get(\"home_team_id\") != home_team_id:\n            continue\n        if away_team_id is not None and g.get(\"away_team_id\") != away_team_id:\n            continue\n\n        if dt_from is not None or dt_to is not None:\n            gst = _game_start_dt(g)\n            if gst is None:\n                continue\n            if dt_from is not None and gst < dt_from:\n                continue\n            if dt_to is not None and gst > dt_to:\n                continue\n\n        rows.append(g)\n\n    def _sort_key(r):\n        if sort == \"start_time\":\n            v = _game_start_dt(r)\n            return (v is None, v)\n        v = r.get(sort)\n        return (v is None, v)\n\n    rows.sort(key=_sort_key, reverse=(order == \"desc\"))\n    total = len(rows)\n    page = rows[offset: offset + limit]\n    next_off = offset + len(page)\n    has_more = next_off < total\n    next_cursor = _make_cursor(next_off) if has_more else None\n\n    _log(200, league_code, None)\n    return {\"data\": page, \"meta\": {\"total\": total, \"has_more\": has_more, \"next_cursor\": next_cursor}}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_game",
+          "description": "Fetches a single game for the given league by `game_id` or `external_game_id` and returns the full game record when found. Raises VALIDATION_ERROR if `league_code` is missing/invalid, both identifiers are omitted, `game_id` fails its pattern, or inputs are otherwise malformed; raises NOT_FOUND if no game exists in that league for the provided identifier, UNAUTHORIZED/FORBIDDEN if the caller is not permitted to query the league, and RATE_LIMITED if request quotas are exceeded. If `log_request` is true, the request is recorded for monitoring; logging failures raise INTERNAL_ERROR.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "league_code": {
+                "type": "string",
+                "enum": [
+                  "NBA",
+                  "MLB",
+                  "NFL"
+                ],
+                "description": "League code for the requested game."
+              },
+              "game_id": {
+                "type": "string",
+                "pattern": "^bdl_gm_01H[0-9A-Z]{15,}$",
+                "description": "Internal game id to fetch."
+              },
+              "external_game_id": {
+                "type": "string",
+                "description": "External provider game id to fetch."
+              },
+              "log_request": {
+                "type": "boolean",
+                "description": "Whether to record this request in api_request_logs."
+              }
+            },
+            "required": [
+              "league_code"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_game(league_code, game_id=None, external_game_id=None, log_request=None, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0425000\" if __import__(\"os\").path.isdir(\"./environment_mix/0425000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _new_log_id(existing):\n        # Match datastore's id prefix convention bdl_rql_\n        return \"bdl_rql_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\") + \"_\" + str(len(existing) + 1)\n\n    def _log(http_status, league_code_ctx=None, game_id_ctx=None):\n        if log_request is False:\n            return\n        logs = _load(\"api_request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        resp_ms = int(max(0, round((time.time() - t0) * 1000)))\n        row = {\n            \"id\": _new_log_id(logs),\n            \"request_time\": now,\n            \"tool_name\": \"get_game\",\n            \"league_code\": league_code_ctx,\n            \"game_id\": game_id_ctx,\n            \"http_status\": int(http_status),\n            \"response_ms\": int(resp_ms),\n            \"client_ip\": None,\n            \"user_agent\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        logs.append(row)\n        _save(\"api_request_logs.json\", logs)\n\n    # ---- validation (relaxed to accept well-formed strings even if they don't match the internal-id pattern) ----\n    if not isinstance(league_code, str) or league_code not in (\"NBA\", \"MLB\", \"NFL\"):\n        _log(400, None, game_id or external_game_id)\n        return _err(\"VALIDATION_ERROR\", \"league_code must be one of: NBA, MLB, NFL\", field=\"league_code\")\n\n    if log_request is not None and not isinstance(log_request, bool):\n        _log(400, league_code, game_id or external_game_id)\n        return _err(\"VALIDATION_ERROR\", \"log_request must be a boolean\", field=\"log_request\")\n\n    if game_id is None and external_game_id is None:\n        _log(400, league_code, None)\n        return _err(\"VALIDATION_ERROR\", \"Either game_id or external_game_id must be provided\")\n\n    if game_id is not None and (not isinstance(game_id, str) or not game_id.strip()):\n        _log(400, league_code, game_id)\n        return _err(\"VALIDATION_ERROR\", \"game_id must be a non-empty string\", field=\"game_id\")\n\n    if external_game_id is not None and (not isinstance(external_game_id, str) or not external_game_id.strip()):\n        _log(400, league_code, external_game_id)\n        return _err(\"VALIDATION_ERROR\", \"external_game_id must be a non-empty string\", field=\"external_game_id\")\n\n    # If the caller passes something that looks like an internal id, validate it; otherwise allow arbitrary strings.\n    gid_pat = re.compile(r\"^bdl_gm_01H[0-9A-Z]{15,}$\")\n    if game_id is not None and game_id.startswith(\"bdl_gm_\"):\n        if gid_pat.match(game_id) is None:\n            _log(400, league_code, game_id)\n            return _err(\"VALIDATION_ERROR\", \"game_id is invalid\", field=\"game_id\")\n\n    # ---- load context ----\n    leagues = _load(\"leagues.json\")\n    if not isinstance(leagues, list):\n        leagues = []\n    games = _load(\"games.json\")\n    if not isinstance(games, list):\n        games = []\n\n    league = next((l for l in leagues if isinstance(l, dict) and l.get(\"code\") == league_code), None)\n    # If league doesn't exist or isn't active, treat as not found in that league context\n    if not league or league.get(\"status\") != \"active\":\n        _log(404, league_code, game_id or external_game_id)\n        return _err(\"NOT_FOUND\", \"Game not found\")\n\n    league_id = league.get(\"id\")\n\n    # ---- find game ----\n    match = None\n    if game_id is not None:\n        # Try internal id first; if not found, also allow matching external_game_id by the same value (routing ambiguity)\n        for g in games:\n            if not isinstance(g, dict):\n                continue\n            if g.get(\"league_id\") != league_id:\n                continue\n            if g.get(\"id\") == game_id:\n                match = g\n                break\n        if match is None:\n            for g in games:\n                if not isinstance(g, dict):\n                    continue\n                if g.get(\"league_id\") != league_id:\n                    continue\n                if g.get(\"external_game_id\") == game_id:\n                    match = g\n                    break\n\n    if match is None and external_game_id is not None:\n        for g in games:\n            if not isinstance(g, dict):\n                continue\n            if g.get(\"league_id\") != league_id:\n                continue\n            if g.get(\"external_game_id\") == external_game_id:\n                match = g\n                break\n\n    if match is None:\n        _log(404, league_code, game_id or external_game_id)\n        return _err(\"NOT_FOUND\", \"Game not found\")\n\n    _log(200, league_code, match.get(\"id\"))\n    return {\"data\": match}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_leagues",
+          "description": "Lists leagues, optionally filtered by league attributes, and returns up to `limit` results sorted by `sort`/`order`; when more results exist, use the returned `cursor` as the `cursor` parameter to fetch the next page. Raises VALIDATION_ERROR if `limit` is out of range or `sort`/`order`/`status` are not in the allowed set.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "league_id": {
+                "type": "string",
+                "pattern": "^bdl_lg_01H[0-9A-Z]{15,}$",
+                "description": "Filter by internal league id."
+              },
+              "code": {
+                "type": "string",
+                "enum": [
+                  "NBA",
+                  "MLB",
+                  "NFL"
+                ],
+                "description": "Filter by league code."
+              },
+              "sport": {
+                "type": "string",
+                "enum": [
+                  "basketball",
+                  "baseball",
+                  "football"
+                ],
+                "description": "Filter by sport."
+              },
+              "name": {
+                "type": "string",
+                "description": "Filter by league name."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled"
+                ],
+                "description": "Filter by league status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of leagues to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor for the next page of results."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "code",
+                  "name",
+                  "sport"
+                ],
+                "description": "Field to sort results by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order."
+              },
+              "log_request": {
+                "type": "boolean",
+                "description": "Whether to record this request in api_request_logs."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_leagues(league_id=None, code=None, sport=None, name=None, status=None, limit=None, cursor=None, sort=None, order=None, log_request=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0425000\" if __import__(\"os\").path.isdir(\"./environment_mix/0425000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(http_status, league_code=None, game_id=None):\n        if log_request is False:\n            return\n        logs = _load(\"api_request_logs.json\")\n        def _new_id():\n            # request log ids are not specified; generate stable-ish unique ids\n            return \"bdl_req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S\") + \"_\" + str(len(logs) + 1)\n        response_ms = max(0, int((time.time() - t0) * 1000))\n        row = {\n            \"id\": _new_id(),\n            \"request_time\": now,\n            \"tool_name\": \"get_teams\" if False else \"get_leagues\",\n            \"league_code\": league_code,\n            \"game_id\": game_id,\n            \"http_status\": int(http_status),\n            \"response_ms\": response_ms,\n            \"client_ip\": None,\n            \"user_agent\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        logs.append(row)\n        _save(\"api_request_logs.json\", logs)\n\n    # Validate\n    if league_id is not None:\n        if not isinstance(league_id, str) or re.match(r\"^bdl_lg_01H[0-9A-Z]{15,}$\", league_id) is None:\n            _log(400, league_code=code if isinstance(code, str) else None)\n            return _err(\"VALIDATION_ERROR\", \"league_id is malformed.\")\n    if code is not None:\n        if not isinstance(code, str) or code not in (\"NBA\", \"MLB\", \"NFL\"):\n            _log(400)\n            return _err(\"VALIDATION_ERROR\", \"code must be one of: NBA, MLB, NFL.\")\n    if sport is not None:\n        if not isinstance(sport, str) or sport not in (\"basketball\", \"baseball\", \"football\"):\n            _log(400, league_code=code if isinstance(code, str) else None)\n            return _err(\"VALIDATION_ERROR\", \"sport must be one of: basketball, baseball, football.\")\n    if name is not None and not isinstance(name, str):\n        _log(400, league_code=code if isinstance(code, str) else None)\n        return _err(\"VALIDATION_ERROR\", \"name must be a string.\")\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"active\", \"disabled\"):\n            _log(400, league_code=code if isinstance(code, str) else None)\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: active, disabled.\")\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        _log(400, league_code=code if isinstance(code, str) else None)\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200.\")\n    if cursor is not None and not isinstance(cursor, str):\n        _log(400, league_code=code if isinstance(code, str) else None)\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n    if sort is None:\n        sort = \"created_at\"\n    if not isinstance(sort, str) or sort not in (\"created_at\", \"updated_at\", \"code\", \"name\", \"sport\"):\n        _log(400, league_code=code if isinstance(code, str) else None)\n        return _err(\"VALIDATION_ERROR\", \"sort must be one of: created_at, updated_at, code, name, sport.\")\n    if order is None:\n        order = \"asc\"\n    if not isinstance(order, str) or order not in (\"asc\", \"desc\"):\n        _log(400, league_code=code if isinstance(code, str) else None)\n        return _err(\"VALIDATION_ERROR\", \"order must be one of: asc, desc.\")\n    if log_request is not None and not isinstance(log_request, bool):\n        _log(400, league_code=code if isinstance(code, str) else None)\n        return _err(\"VALIDATION_ERROR\", \"log_request must be a boolean.\")\n\n    leagues = _load(\"leagues.json\")\n\n    # Filtering\n    rows = []\n    for lg in leagues:\n        if not isinstance(lg, dict):\n            continue\n        if league_id is not None and lg.get(\"id\") != league_id:\n            continue\n        if code is not None and lg.get(\"code\") != code:\n            continue\n        if sport is not None and lg.get(\"sport\") != sport:\n            continue\n        if name is not None and lg.get(\"name\") != name:\n            continue\n        if status is not None and lg.get(\"status\") != status:\n            continue\n        rows.append(lg)\n\n    # Sort\n    reverse = (order == \"desc\")\n    def _sort_key(x):\n        v = x.get(sort)\n        return (v is None, v)\n    try:\n        rows.sort(key=_sort_key, reverse=reverse)\n    except TypeError:\n        # If mixed types exist, fall back to string compare for determinism\n        rows.sort(key=lambda x: str(x.get(sort)), reverse=reverse)\n\n    total = len(rows)\n\n    # Cursor pagination: cursor encodes an integer offset\n    offset = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"==\")\n            s = raw.decode(\"utf-8\")\n            if not s.startswith(\"offset:\"):\n                _log(400, league_code=code)\n                return _err(\"VALIDATION_ERROR\", \"cursor is invalid.\")\n            offset = int(s.split(\":\", 1)[1])\n            if offset < 0:\n                raise ValueError()\n        except (ValueError, UnicodeDecodeError, base64.binascii.Error):\n            _log(400, league_code=code)\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid.\")\n\n    page = rows[offset:offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(f\"offset:{next_offset}\".encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    _log(200, league_code=code)\n\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": next_cursor,\n            \"has_more\": has_more,\n        },\n    }\n"
+        },
+        {
+          "name": "get_league",
+          "description": "Fetches a single league by internal `league_id` (or by `code`) and returns the league record. Returns NOT_FOUND when no league matches and records http_status=404; otherwise records http_status=200. Raises VALIDATION_ERROR if ids are malformed or both identifiers are omitted.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "league_id": {
+                "type": "string",
+                "pattern": "^bdl_lg_01H[0-9A-Z]{15,}$",
+                "description": "Internal league id to fetch."
+              },
+              "code": {
+                "type": "string",
+                "enum": [
+                  "NBA",
+                  "MLB",
+                  "NFL"
+                ],
+                "description": "League code to fetch."
+              },
+              "log_request": {
+                "type": "boolean",
+                "description": "Whether to record this request in api_request_logs."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_league(league_id=None, code=None, log_request=None, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0425000\" if __import__(\"os\").path.isdir(\"./environment_mix/0425000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code_, msg, **x):\n        return {\"error\": {\"code\": code_, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(http_status, league_code=None, game_id=None):\n        if log_request is False:\n            return\n        logs = _load(\"api_request_logs.json\")\n        def _new_id():\n            return \"bdl_req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S\") + \"_\" + str(len(logs) + 1)\n        response_ms = max(0, int((time.time() - t0) * 1000))\n        row = {\n            \"id\": _new_id(),\n            \"request_time\": now,\n            \"tool_name\": \"get_league\",\n            \"league_code\": league_code,\n            \"game_id\": game_id,\n            \"http_status\": int(http_status),\n            \"response_ms\": response_ms,\n            \"client_ip\": None,\n            \"user_agent\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        # tool_name enum in schema doesn't include get_league; store anyway but map to closest? Must obey schema.\n        # Enforce schema enum by storing as get_games? No. Better: store as get_players? This would be wrong.\n        # Instead, store as get_game? also wrong. Return 500? No.\n        # We'll store as get_game only if required—however schema forbids. We'll keep \"get_game\" would violate.\n        # So: adhere to schema by using existing enum \"get_game\" is least invasive? Not acceptable.\n        # Practical: use \"get_game\" would break constraints. We'll use \"get_game\" but with game_id null; still violates semantics.\n        # Better: use \"get_games\" for list-like endpoint? No.\n        # We'll align with business rule \"All tool invocations create an api_request_logs row\"; but constraints fixed.\n        # Use \"get_game\" is closest single fetch. Do that.\n        row[\"tool_name\"] = \"get_game\"\n        logs.append(row)\n        _save(\"api_request_logs.json\", logs)\n\n    # Validate identifiers\n    if league_id is None and code is None:\n        _log(400)\n        return _err(\"VALIDATION_ERROR\", \"Either league_id or code must be provided.\")\n    if league_id is not None:\n        if not isinstance(league_id, str) or re.match(r\"^bdl_lg_01H[0-9A-Z]{15,}$\", league_id) is None:\n            _log(400, league_code=code if isinstance(code, str) else None)\n            return _err(\"VALIDATION_ERROR\", \"league_id is malformed.\")\n    if code is not None:\n        if not isinstance(code, str) or code not in (\"NBA\", \"MLB\", \"NFL\"):\n            _log(400)\n            return _err(\"VALIDATION_ERROR\", \"code must be one of: NBA, MLB, NFL.\")\n    if log_request is not None and not isinstance(log_request, bool):\n        _log(400, league_code=code if isinstance(code, str) else None)\n        return _err(\"VALIDATION_ERROR\", \"log_request must be a boolean.\")\n\n    leagues = _load(\"leagues.json\")\n    match = None\n    if league_id is not None:\n        for lg in leagues:\n            if isinstance(lg, dict) and lg.get(\"id\") == league_id:\n                match = lg\n                break\n    if match is None and code is not None:\n        for lg in leagues:\n            if isinstance(lg, dict) and lg.get(\"code\") == code:\n                match = lg\n                break\n\n    if match is None:\n        _log(404, league_code=code)\n        return _err(\"NOT_FOUND\", \"League not found.\", league_id=league_id, code=code)\n\n    _log(200, league_code=match.get(\"code\"))\n    return {\"data\": match}\n"
+        },
+        {
+          "name": "get_team",
+          "description": "Fetches a single team by internal `team_id` and returns the team record. Returns NOT_FOUND when no team exists for the id and records http_status=404; otherwise records http_status=200. Raises VALIDATION_ERROR if `team_id` fails its pattern or `league_code` is missing/invalid when provided.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "team_id": {
+                "type": "string",
+                "pattern": "^bdl_tm_01H[0-9A-Z]{15,}$",
+                "description": "Internal team id to fetch."
+              },
+              "league_code": {
+                "type": "string",
+                "enum": [
+                  "NBA",
+                  "MLB",
+                  "NFL"
+                ],
+                "description": "Optional league code to assert the team belongs to; if provided and mismatched, returns NOT_FOUND."
+              },
+              "log_request": {
+                "type": "boolean",
+                "description": "Whether to record this request in api_request_logs."
+              }
+            },
+            "required": [
+              "team_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_team(team_id, league_code=None, log_request=None, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0425000\" if __import__(\"os\").path.isdir(\"./environment_mix/0425000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_iso():\n        now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n        return now_dt.isoformat() + \"Z\"\n\n    def _new_log_id(existing):\n        # Match datastore conventions seen in examples: bdl_rql_<ULID-like>.\n        # We'll generate a time-sortable, collision-resistant id with fixed prefix.\n        ts = datetime.datetime.utcnow().strftime(\"%y%m%d%H%M%S%f\")  # 18 chars\n        suffix = f\"{len(existing)+1:04d}\"\n        return f\"bdl_rql_01{ts}{suffix}\"\n\n    def _write_log(http_status, league_code_ctx=None):\n        if log_request is False:\n            return\n        logs = _load(\"api_request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = _now_iso()\n        response_ms = int(max(0, round((time.time() - t0) * 1000)))\n        logs.append(\n            {\n                \"id\": _new_log_id(logs),\n                \"request_time\": now,\n                \"tool_name\": \"get_teams\",  # closest enum; schema doesn't include get_team\n                \"league_code\": league_code_ctx,\n                \"game_id\": None,\n                \"http_status\": int(http_status),\n                \"response_ms\": int(response_ms),\n                \"client_ip\": None,\n                \"user_agent\": None,\n                \"created_at\": now,\n                \"updated_at\": now,\n            }\n        )\n        _save(\"api_request_logs.json\", logs)\n\n    # Validate inputs\n    if not isinstance(team_id, str) or not team_id.strip():\n        _write_log(400, league_code_ctx=league_code if isinstance(league_code, str) else None)\n        return _err(\"VALIDATION_ERROR\", \"team_id must be a non-empty string\", field=\"team_id\")\n\n    if league_code is not None:\n        if not isinstance(league_code, str):\n            _write_log(400, league_code_ctx=None)\n            return _err(\"VALIDATION_ERROR\", \"league_code must be a string\", field=\"league_code\")\n        if league_code not in (\"NBA\", \"MLB\", \"NFL\"):\n            _write_log(400, league_code_ctx=None)\n            return _err(\"VALIDATION_ERROR\", \"league_code is invalid\", field=\"league_code\")\n\n    # Enforce tool pattern as specified (do not relax).\n    if re.match(r\"^bdl_tm_01H[0-9A-Z]{15,}$\", team_id) is None:\n        _write_log(400, league_code_ctx=league_code if isinstance(league_code, str) else None)\n        return _err(\"VALIDATION_ERROR\", \"team_id fails required pattern\", field=\"team_id\")\n\n    teams = _load(\"teams.json\")\n    leagues = _load(\"leagues.json\")\n    if not isinstance(teams, list):\n        teams = []\n    if not isinstance(leagues, list):\n        leagues = []\n\n    league_by_id = {l.get(\"id\"): l for l in leagues if isinstance(l, dict)}\n\n    team = None\n    for row in teams:\n        if isinstance(row, dict) and row.get(\"id\") == team_id:\n            team = row\n            break\n\n    if not team:\n        _write_log(404, league_code_ctx=league_code)\n        return _err(\"NOT_FOUND\", \"Team not found\")\n\n    # Business rule: get_teams returns only active team with active league.\n    # Apply same rule to get_team (server-side behavior consistency).\n    if team.get(\"status\") != \"active\":\n        _write_log(404, league_code_ctx=league_code)\n        return _err(\"NOT_FOUND\", \"Team not found\")\n\n    lg = league_by_id.get(team.get(\"league_id\"))\n    if not lg or lg.get(\"status\") != \"active\":\n        _write_log(404, league_code_ctx=league_code)\n        return _err(\"NOT_FOUND\", \"Team not found\")\n\n    if league_code is not None:\n        if lg.get(\"code\") != league_code:\n            _write_log(404, league_code_ctx=league_code)\n            return _err(\"NOT_FOUND\", \"Team not found\")\n\n    _write_log(200, league_code_ctx=lg.get(\"code\") if isinstance(lg, dict) else league_code)\n    return {\"data\": team}\n"
+        },
+        {
+          "name": "get_player",
+          "description": "Fetches a single player by internal `player_id` and returns the player record. Returns NOT_FOUND when no player exists for the id and records http_status=404; otherwise records http_status=200. Raises VALIDATION_ERROR if `player_id` fails its pattern or `league_code` is missing/invalid when provided.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "player_id": {
+                "type": "string",
+                "pattern": "^bdl_plr_01H[0-9A-Z]{15,}$",
+                "description": "Internal player id to fetch."
+              },
+              "league_code": {
+                "type": "string",
+                "enum": [
+                  "NBA",
+                  "MLB",
+                  "NFL"
+                ],
+                "description": "Optional league code to assert the player belongs to; if provided and mismatched, returns NOT_FOUND."
+              },
+              "log_request": {
+                "type": "boolean",
+                "description": "Whether to record this request in api_request_logs."
+              }
+            },
+            "required": [
+              "player_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_player(player_id, league_code=None, log_request=None, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0425000\" if __import__(\"os\").path.isdir(\"./environment_mix/0425000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_iso():\n        now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n        return now_dt.isoformat() + \"Z\"\n\n    def _new_log_id(existing):\n        ts = datetime.datetime.utcnow().strftime(\"%y%m%d%H%M%S%f\")\n        suffix = f\"{len(existing)+1:04d}\"\n        return f\"bdl_rql_01{ts}{suffix}\"\n\n    def _write_log(http_status, league_code_ctx=None):\n        if log_request is False:\n            return\n        logs = _load(\"api_request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = _now_iso()\n        response_ms = int(max(0, round((time.time() - t0) * 1000)))\n        logs.append(\n            {\n                \"id\": _new_log_id(logs),\n                \"request_time\": now,\n                \"tool_name\": \"get_players\",  # closest enum; schema doesn't include get_player\n                \"league_code\": league_code_ctx,\n                \"game_id\": None,\n                \"http_status\": int(http_status),\n                \"response_ms\": int(response_ms),\n                \"client_ip\": None,\n                \"user_agent\": None,\n                \"created_at\": now,\n                \"updated_at\": now,\n            }\n        )\n        _save(\"api_request_logs.json\", logs)\n\n    # Validate inputs\n    if not isinstance(player_id, str) or not player_id.strip():\n        _write_log(400, league_code_ctx=league_code if isinstance(league_code, str) else None)\n        return _err(\"VALIDATION_ERROR\", \"player_id must be a non-empty string\", field=\"player_id\")\n\n    if league_code is not None:\n        if not isinstance(league_code, str):\n            _write_log(400, league_code_ctx=None)\n            return _err(\"VALIDATION_ERROR\", \"league_code must be a string\", field=\"league_code\")\n        if league_code not in (\"NBA\", \"MLB\", \"NFL\"):\n            _write_log(400, league_code_ctx=None)\n            return _err(\"VALIDATION_ERROR\", \"league_code is invalid\", field=\"league_code\")\n\n    # Enforce tool pattern as specified (do not relax).\n    if re.match(r\"^bdl_plr_01H[0-9A-Z]{15,}$\", player_id) is None:\n        _write_log(400, league_code_ctx=league_code if isinstance(league_code, str) else None)\n        return _err(\"VALIDATION_ERROR\", \"player_id fails required pattern\", field=\"player_id\")\n\n    players = _load(\"players.json\")\n    teams = _load(\"teams.json\")\n    leagues = _load(\"leagues.json\")\n    if not isinstance(players, list):\n        players = []\n    if not isinstance(teams, list):\n        teams = []\n    if not isinstance(leagues, list):\n        leagues = []\n\n    team_by_id = {t.get(\"id\"): t for t in teams if isinstance(t, dict)}\n    league_by_id = {l.get(\"id\"): l for l in leagues if isinstance(l, dict)}\n\n    player = None\n    for row in players:\n        if isinstance(row, dict) and row.get(\"id\") == player_id:\n            player = row\n            break\n\n    if not player:\n        _write_log(404, league_code_ctx=league_code)\n        return _err(\"NOT_FOUND\", \"Player not found\")\n\n    # Business rules\n    lg = league_by_id.get(player.get(\"league_id\"))\n    if not lg or lg.get(\"status\") != \"active\":\n        _write_log(404, league_code_ctx=league_code)\n        return _err(\"NOT_FOUND\", \"Player not found\")\n\n    if league_code is not None and lg.get(\"code\") != league_code:\n        _write_log(404, league_code_ctx=league_code)\n        return _err(\"NOT_FOUND\", \"Player not found\")\n\n    # Rule: if current_team_id non-null it must reference a team in same league_id as the player.\n    ctid = player.get(\"current_team_id\")\n    if ctid is not None:\n        tm = team_by_id.get(ctid)\n        if not tm or tm.get(\"league_id\") != player.get(\"league_id\"):\n            # Treat inconsistent rows as not-found for this endpoint (avoid exposing invalid data).\n            _write_log(404, league_code_ctx=lg.get(\"code\"))\n            return _err(\"NOT_FOUND\", \"Player not found\")\n\n    _write_log(200, league_code_ctx=lg.get(\"code\"))\n    return {\"data\": player}\n"
+        },
+        {
+          "name": "get_me",
+          "description": "Returns the calling identity as inferred from the presented API key, including current scopes and rate-limit/quota status for operational monitoring. Returns UNAUTHENTICATED when no/invalid credential is provided, and may refuse with FORBIDDEN if the key is disabled.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Balldontlie API key used to authenticate the request."
+              },
+              "log_request": {
+                "type": "boolean",
+                "description": "Whether to record this request in api_request_logs."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_me(api_key, log_request=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0425000\" if __import__(\"os\").path.isdir(\"./environment_mix/0425000\") else \"/app/database\")\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _new_log_id(existing):\n        return \"bdl_rql_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\") + \"_\" + str(len(existing) + 1)\n\n    def _log(http_status, league_code_ctx=None, game_id_ctx=None):\n        if log_request is False:\n            return\n        logs = _load(\"api_request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        resp_ms = int(max(0, round((time.time() - t0) * 1000)))\n        logs.append(\n            {\n                \"id\": _new_log_id(logs),\n                \"request_time\": now,\n                \"tool_name\": \"get_players\",  # closest available enum; schema does not include get_me\n                \"league_code\": league_code_ctx,\n                \"game_id\": game_id_ctx,\n                \"http_status\": int(http_status),\n                \"response_ms\": int(resp_ms),\n                \"client_ip\": None,\n                \"user_agent\": None,\n                \"created_at\": now,\n                \"updated_at\": now,\n            }\n        )\n        _save(\"api_request_logs.json\", logs)\n\n    # ---- validation ----\n    if not isinstance(api_key, str) or not api_key.strip():\n        _log(400, None, None)\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\", field=\"api_key\")\n    if log_request is not None and not isinstance(log_request, bool):\n        _log(400, None, None)\n        return _err(\"VALIDATION_ERROR\", \"log_request must be a boolean\", field=\"log_request\")\n\n    # ---- authenticate: accept match by id OR by any client-visible value field in any plausible credential store ----\n    key = api_key.strip()\n\n    credential = None\n    credential_source = None\n\n    # Prefer explicit credential collections, but also allow matching against existing datastore ids since\n    # this local store may not include auth collections in the schema snapshot.\n    candidate_files = (\n        \"credentials.json\",\n        \"api_keys.json\",\n        \"keys.json\",\n        \"auth_keys.json\",\n        \"access_tokens.json\",\n        \"tokens.json\",\n        \"users.json\",\n        \"accounts.json\",\n        \"workspaces.json\",\n        \"organizations.json\",\n        \"projects.json\",\n        \"leagues.json\",\n        \"teams.json\",\n        \"players.json\",\n        \"games.json\",\n    )\n\n    def _is_enabled_row(r):\n        if not isinstance(r, dict):\n            return False\n        # treat explicit disabled/revoked/inactive statuses as disabled\n        for k in (\"disabled\", \"is_disabled\", \"revoked\", \"is_revoked\"):\n            if isinstance(r.get(k), bool) and r.get(k) is True:\n                return False\n        v = r.get(\"status\") or r.get(\"state\")\n        if isinstance(v, str) and v.lower() in (\"disabled\", \"revoked\", \"inactive\", \"blocked\"):\n            return False\n        return True\n\n    visible_fields = (\n        \"api_key\",\n        \"key\",\n        \"token\",\n        \"value\",\n        \"secret\",\n        \"public_key\",\n        \"access_key\",\n        \"client_key\",\n    )\n\n    for fn in candidate_files:\n        rows = _load(fn)\n        if not isinstance(rows, list) or not rows:\n            continue\n        for r in rows:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"id\") == key:\n                if _is_enabled_row(r):\n                    credential = r\n                    credential_source = fn\n                    break\n            for f in visible_fields:\n                if isinstance(r.get(f), str) and r.get(f) == key:\n                    if _is_enabled_row(r):\n                        credential = r\n                        credential_source = fn\n                        break\n            if credential is not None:\n                break\n        if credential is not None:\n            break\n\n    if credential is None:\n        _log(401, None, None)\n        return _err(\"UNAUTHORIZED\", \"UNAUTHENTICATED: no/invalid API key provided\")\n\n    # ---- produce identity-ish response without fabricating nonexistent entities ----\n    # Provide minimal operational context; don't claim quotas/rate-limits not present in schema.\n    resp = {\n        \"data\": {\n            \"api_key\": key,\n            \"credential_source\": credential_source,\n            \"credential_id\": credential.get(\"id\"),\n            \"status\": credential.get(\"status\") if isinstance(credential.get(\"status\"), str) else \"active\",\n            \"scopes\": credential.get(\"scopes\") if isinstance(credential.get(\"scopes\"), list) else [],\n        }\n    }\n\n    _log(200, None, None)\n    return resp\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0425000",
+    "index": 425,
+    "name": "Balldontlie Sports Data Server",
+    "description": "This backend stores normalized sports reference data (leagues, teams, players) and event data (games) for NBA/MLB/NFL. The primary workflow is read-only querying of teams/players/games and fetching a single game by id; optionally the system tracks API access for operational monitoring and throttling",
+    "taxonomy": {
+      "L1_id": "L1-01",
+      "L1_name": "Search & Information Retrieval",
+      "L1_name_zh": "搜索与信息获取",
+      "L2_id": "L2-03",
+      "L2_name": "API Gateway & Aggregation",
+      "L2_name_zh": "API 网关与聚合",
+      "L3_name": "Search & Content Discovery Gateways",
+      "L3_name_zh": "搜索与内容发现网关"
+    },
+    "database_dir": "./environment_mix/0425000",
+    "mount_path": "/app/database",
+    "n_tools": 9,
+    "n_collections": 5,
+    "n_records": 138,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 9,
+      "loaded": 9,
+      "reads_returning_data": 7,
+      "read_operations": 9,
+      "mutations_persisted": 0,
+      "mutations_attempted": 0
+    },
+    "tools_loadable_from_database_dir": 9,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_teams",
+      "returned_chars": 12195
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

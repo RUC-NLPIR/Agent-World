@@ -1,0 +1,126 @@
+{
+  "index": 486,
+  "local_files_dir": "./environment_mix/0486000",
+  "file_list": [
+    "./environment_mix/0486000/README.md",
+    "./environment_mix/0486000/notes_index.json",
+    "./environment_mix/0486000/requests_log.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "notes_index.json": "Array of notes (note_id, title, date, tags, body).",
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "notes_list",
+          "description": "Lists notes in the index, optionally filtering by an inclusive YYYY-MM-DD date range and/or a single tag, and returns the matching note summaries. Refuses requests with invalid date strings, or with date_from later than date_to, because the range cannot be evaluated. Refuses a tag filter that is empty or not a string, because it cannot be matched.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "date_from": {
+                "type": "string",
+                "description": "Inclusive start date YYYY-MM-DD."
+              },
+              "date_to": {
+                "type": "string",
+                "description": "Inclusive end date YYYY-MM-DD."
+              },
+              "tag": {
+                "type": "string",
+                "description": "Optional tag filter."
+              }
+            }
+          },
+          "implementation": "def notes_list(date_from=None, date_to=None, tag=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0486000\" if __import__(\"os\").path.isdir(\"./environment_mix/0486000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_date(s, field_name):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return (\"__bad__\", _err(\"VALIDATION_ERROR\", f\"{field_name} must be a string in YYYY-MM-DD format.\", field=field_name))\n        try:\n            return datetime.date.fromisoformat(s)\n        except Exception:\n            return (\"__bad__\", _err(\"VALIDATION_ERROR\", f\"{field_name} must be a valid YYYY-MM-DD date string.\", field=field_name))\n\n    t0 = time.time()\n    status = \"ok\"\n    error_obj = None\n\n    # ---- Validate inputs first ----\n    df = _parse_date(date_from, \"date_from\")\n    if isinstance(df, tuple) and df and df[0] == \"__bad__\":\n        status = \"error\"\n        error_obj = df[1]\n    dt = None\n    if error_obj is None:\n        dt = _parse_date(date_to, \"date_to\")\n        if isinstance(dt, tuple) and dt and dt[0] == \"__bad__\":\n            status = \"error\"\n            error_obj = dt[1]\n\n    if error_obj is None and df is not None and dt is not None and df > dt:\n        status = \"error\"\n        error_obj = _err(\"VALIDATION_ERROR\", \"date_from cannot be later than date_to.\", field=\"date_from\")\n\n    if error_obj is None and tag is not None:\n        if not isinstance(tag, str) or tag.strip() == \"\":\n            status = \"error\"\n            error_obj = _err(\"VALIDATION_ERROR\", \"tag must be a non-empty string when provided.\", field=\"tag\")\n\n    # ---- Load data ----\n    notes = _load(\"notes_index.json\")\n    if not isinstance(notes, list):\n        # datastore corruption / unexpected format\n        status = \"error\"\n        error_obj = _err(\"NOT_FOUND\", \"notes_index collection is unavailable or malformed.\")\n\n    # ---- Enforce minimal observable service dynamics: request log + rate limit ----\n    # This service had no explicit audit collection in the schema, but we still persist a local request log\n    # so usage is observable and rate limiting can be enforced.\n    # File: /app/database/requests_log.json\n    # Policy: 300 requests per rolling 60 seconds (global, since auth is ambient and unspecified).\n    log_name = \"requests_log.json\"\n    req_log = _load(log_name)\n    if not isinstance(req_log, list):\n        req_log = []\n\n    now = datetime.datetime.utcnow()\n    window_seconds = 60\n    rate_limit = 300\n    cutoff = now - datetime.timedelta(seconds=window_seconds)\n\n    def _parse_ts(ts):\n        if not isinstance(ts, str):\n            return None\n        try:\n            if ts.endswith(\"Z\"):\n                ts = ts[:-1]\n            return datetime.datetime.fromisoformat(ts)\n        except Exception:\n            return None\n\n    recent = 0\n    for r in req_log:\n        ts = _parse_ts(r.get(\"timestamp\"))\n        if ts is not None and ts >= cutoff:\n            recent += 1\n\n    if error_obj is None and recent >= rate_limit:\n        status = \"error\"\n        error_obj = _err(\"RATE_LIMIT\", \"Rate limit exceeded. Try again later.\", limit=rate_limit, window_seconds=window_seconds)\n\n    # ---- Perform operation if allowed ----\n    results = []\n    total = 0\n    if error_obj is None:\n        for n in notes:\n            if not isinstance(n, dict):\n                continue\n            nds = n.get(\"date\")\n            if not isinstance(nds, str):\n                continue\n            try:\n                nd = datetime.date.fromisoformat(nds)\n            except Exception:\n                continue\n\n            if df is not None and nd < df:\n                continue\n            if dt is not None and nd > dt:\n                continue\n            if tag is not None:\n                tags = n.get(\"tags\", [])\n                if not isinstance(tags, list) or tag not in tags:\n                    continue\n\n            # Return a \"summary\" (omit body to keep it lightweight)\n            results.append(\n                {\n                    \"note_id\": n.get(\"note_id\"),\n                    \"title\": n.get(\"title\"),\n                    \"date\": n.get(\"date\"),\n                    \"tags\": n.get(\"tags\", []),\n                }\n            )\n\n        # Default sort: date desc then title asc for stable output\n        def _sort_key(x):\n            d = x.get(\"date\") or \"\"\n            t = x.get(\"title\") or \"\"\n            return (d, t)\n\n        results.sort(key=_sort_key, reverse=True)\n        total = len(results)\n\n    # ---- Append request log (must happen for every call, success or error) ----\n    latency_ms = int((time.time() - t0) * 1000)\n    req_row = {\n        \"id\": f\"req_{int(time.time()*1000)}_{len(req_log)+1}\",\n        \"timestamp\": _now_iso(),\n        \"endpoint\": \"notes_list\",\n        \"status\": status,\n        \"latency_ms\": latency_ms,\n        \"filters\": {\"date_from\": date_from, \"date_to\": date_to, \"tag\": tag},\n    }\n    req_log.append(req_row)\n    try:\n        _save(log_name, req_log)\n    except Exception:\n        # Do not crash the endpoint if logging fails; return a structured error only if we were otherwise ok.\n        if error_obj is None:\n            return _err(\"CONFLICT\", \"Failed to persist request log.\")\n\n    if error_obj is not None:\n        return error_obj\n\n    # ---- Normal envelope for reads (empty result set is OK) ----\n    return {\n        \"data\": results,\n        \"meta\": {\n            \"total\": total,\n            \"has_more\": False,\n            \"next_cursor\": None,\n        },\n    }\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "notes_get",
+          "description": "Retrieves a single note from the index by note_id and returns the note when it exists, otherwise returns a not-found result. Refuses requests missing note_id or with an empty/non-string note_id, because the identifier cannot be resolved. Refuses note_ids that do not exist in the index as not found rather than returning a note.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "note_id": {
+                "type": "string",
+                "description": "Note id."
+              }
+            },
+            "required": [
+              "note_id"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0486000\" if __import__(\"os\").path.isdir(\"./environment_mix/0486000\") else \"/app/database\")\ndef notes_get(note_id):\n    import json\n    with open(__import__(\"os\").path.join(_DB, 'notes_index.json')) as f:\n        notes = json.load(f)\n    for n in notes:\n        if n.get('note_id') == note_id:\n            return n\n    return {'found': False, 'note_id': note_id}",
+          "description_restored": true
+        },
+        {
+          "name": "notes_share",
+          "description": "Shares an existing note identified by note_id with the provided recipients list and returns a share confirmation. Refuses requests where note_id is missing, empty, or does not correspond to an existing note, because there is nothing to share. Refuses requests with missing recipients, an empty recipients list, or recipients entries that are not valid email strings, because recipients cannot be determined.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "note_id": {
+                "type": "string",
+                "description": "Note id."
+              },
+              "recipients": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Recipient emails."
+              }
+            },
+            "required": [
+              "note_id",
+              "recipients"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0486000\" if __import__(\"os\").path.isdir(\"./environment_mix/0486000\") else \"/app/database\")\ndef notes_share(note_id, recipients):\n    import json, datetime\n    with open(__import__(\"os\").path.join(_DB, 'notes_index.json')) as f:\n        notes = json.load(f)\n    exists = any(n.get('note_id') == note_id for n in notes)\n    return {'status': 'shared' if exists else 'note_not_found', 'note_id': note_id, 'recipients': recipients, 'shared_at': datetime.datetime.utcnow().isoformat() + 'Z'}",
+          "description_restored": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0486000",
+    "index": 486,
+    "name": "Nimbus NoteVault",
+    "description": "A backend notes service that lets users list, retrieve, and share notes from an indexed store via simple API endpoints.",
+    "taxonomy": {
+      "L1_id": "L1-10",
+      "L1_name": "Data Storage & Databases",
+      "L1_name_zh": "数据存储与数据库",
+      "L2_id": "L2-27",
+      "L2_name": "Memory & Knowledge Management",
+      "L2_name_zh": "记忆与知识管理",
+      "L3_name": "Workspace Docs & Notes",
+      "L3_name_zh": "工作空间文档与笔记"
+    },
+    "database_dir": "./environment_mix/0486000",
+    "mount_path": "/app/database",
+    "n_tools": 3,
+    "n_collections": 1,
+    "n_records": 120,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 3,
+      "loaded": 3,
+      "reads_returning_data": 3,
+      "read_operations": 3,
+      "mutations_persisted": 0,
+      "mutations_attempted": 0
+    },
+    "tools_loadable_from_database_dir": 3,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "notes_list",
+      "returned_chars": 74
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

@@ -1,0 +1,467 @@
+{
+  "index": 552,
+  "local_files_dir": "./environment_mix/0552000",
+  "file_list": [
+    "./environment_mix/0552000/README.md",
+    "./environment_mix/0552000/api_keys.json",
+    "./environment_mix/0552000/post_operations.json",
+    "./environment_mix/0552000/wp_posts.json",
+    "./environment_mix/0552000/wp_sites.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "wp_sites.json": "12 rows",
+        "wp_posts.json": "33 rows",
+        "post_operations.json": "33 rows",
+        "api_keys.json": "12 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "create_post",
+          "description": "Creates a new post/page/custom post on the specified connected WordPress site via the WP REST API and writes the created record into our local post cache, returning the locally tracked post including its remote WordPress identifiers and current sync state. Raises VALIDATION_ERROR if site_id is not a valid wp site ULID, wp_post_type/status are not supported, or required fields (title/content) are missing; raises NOT_FOUND if the site_id does not exist; raises UNAUTHORIZED/FORBIDDEN if the stored WordPress credentials for that site are missing, expired, or lack permission to create that post type; raises QUOTA_EXCEEDED when request limits are exceeded. Raises CONFLICT if a post cannot be created because the remote WordPress site rejects the requested state (for example an invalid scheduled/publish transition) or a provided slug is not allowed/available on the remote site, and sets the local post to a sync_error state when the remote create fails.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "site_id": {
+                "type": "string",
+                "pattern": "^wps_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "ULID of the configured WordPress site connection (wp_sites.id)."
+              },
+              "wp_post_type": {
+                "type": "string",
+                "enum": [
+                  "post",
+                  "page",
+                  "custom"
+                ],
+                "description": "WordPress post type to create in the remote site."
+              },
+              "title": {
+                "type": "string",
+                "description": "Post title to send to WordPress and store in the local cache."
+              },
+              "content": {
+                "type": "string",
+                "description": "Post content/body (HTML or block markup) to send to WordPress and store in the local cache."
+              },
+              "excerpt": {
+                "type": "string",
+                "description": "Optional post excerpt to send to WordPress and store in the local cache."
+              },
+              "slug": {
+                "type": "string",
+                "description": "Optional URL slug to set on the WordPress post."
+              },
+              "author_wp_user_id": {
+                "type": "integer",
+                "description": "Optional WordPress user ID to set as the post author."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "published",
+                  "scheduled"
+                ],
+                "description": "Desired publishing state for the new post (mapped to WordPress status)."
+              }
+            },
+            "required": [
+              "site_id",
+              "wp_post_type",
+              "title",
+              "content"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_post(site_id, wp_post_type, title, content, excerpt=None, slug=None, author_wp_user_id=None, status=None, **_extra):\n    import json, os, datetime, re, time, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0552000\" if __import__(\"os\").path.isdir(\"./environment_mix/0552000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # --- Auth (ambient): pick any active key, enforce rate limit per key\n    api_keys = _load(\"api_keys.json\")\n    active_keys = [k for k in api_keys if isinstance(k, dict) and k.get(\"status\") == \"active\"]\n    if not active_keys:\n        return _err(\"UNAUTHORIZED\", \"No active API key available.\")\n\n    ops = _load(\"post_operations.json\")\n\n    def _parse_iso(s):\n        if not s or not isinstance(s, str): return None\n        try:\n            if s.endswith(\"Z\"): s = s[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _check_rate_limit_and_touch_key():\n        nonlocal api_keys\n        # choose a key that is under limit (sliding 60s window)\n        now_dt = datetime.datetime.utcnow()\n        best = None\n        best_count = None\n        for k in active_keys:\n            kid = k.get(\"id\")\n            limit = k.get(\"rate_limit_per_minute\")\n            if not isinstance(limit, int) or limit < 1:\n                continue\n            window_start = now_dt - datetime.timedelta(seconds=60)\n            cnt = 0\n            for o in ops:\n                if not isinstance(o, dict): \n                    continue\n                if o.get(\"api_key_id\") != kid:\n                    continue\n                ts = _parse_iso(o.get(\"created_at\"))\n                if ts and ts >= window_start:\n                    cnt += 1\n            if cnt < limit:\n                if best is None or cnt < best_count:\n                    best, best_count = k, cnt\n        if best is None:\n            # Rate limited: do not enqueue operations\n            return None, _err(\"RATE_LIMIT\", \"Rate limit exceeded for all active API keys.\")\n        # touch last_used_at\n        for kk in api_keys:\n            if isinstance(kk, dict) and kk.get(\"id\") == best.get(\"id\"):\n                kk[\"last_used_at\"] = now\n                kk[\"updated_at\"] = kk.get(\"updated_at\") or now\n        _save(\"api_keys.json\", api_keys)\n        return best, None\n\n    api_key, rate_err = _check_rate_limit_and_touch_key()\n    if rate_err:\n        return rate_err\n\n    # --- Input validation\n    if not isinstance(site_id, str) or not re.match(r\"^wps_[0-9A-HJKMNP-TV-Z]{26}$\", site_id):\n        return _err(\"VALIDATION_ERROR\", \"site_id is invalid.\", field=\"site_id\")\n    if wp_post_type not in (\"post\", \"page\", \"custom\"):\n        return _err(\"VALIDATION_ERROR\", \"wp_post_type is invalid.\", field=\"wp_post_type\")\n    if not isinstance(title, str) or title.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"title is required and must be non-empty.\", field=\"title\")\n    if not isinstance(content, str):\n        return _err(\"VALIDATION_ERROR\", \"content is required and must be a string.\", field=\"content\")\n    if excerpt is not None and not isinstance(excerpt, str):\n        return _err(\"VALIDATION_ERROR\", \"excerpt must be a string.\", field=\"excerpt\")\n    if slug is not None and not isinstance(slug, str):\n        return _err(\"VALIDATION_ERROR\", \"slug must be a string.\", field=\"slug\")\n    if author_wp_user_id is not None and not isinstance(author_wp_user_id, int):\n        return _err(\"VALIDATION_ERROR\", \"author_wp_user_id must be an integer.\", field=\"author_wp_user_id\")\n    if status is not None and status not in (\"draft\", \"published\", \"scheduled\"):\n        return _err(\"VALIDATION_ERROR\", \"status is invalid.\", field=\"status\")\n\n    # --- Resolve site\n    sites = _load(\"wp_sites.json\")\n    site = next((s for s in sites if isinstance(s, dict) and s.get(\"id\") == site_id), None)\n    if not site:\n        return _err(\"NOT_FOUND\", \"Site not found.\", site_id=site_id)\n\n    # --- Create post_operations row ALWAYS for create_post call\n    def _ulid_like(prefix):\n        # generate 26-char Crockford base32\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        ts_ms = int(time.time() * 1000)\n        # 48-bit time + 80-bit randomness -> 26 chars base32 (~130 bits).\n        # We'll approximate with hashing for deterministic length.\n        rnd = os.urandom(16)\n        h = hashlib.sha256(str(ts_ms).encode(\"utf-8\") + rnd).digest()\n        num = int.from_bytes(h[:17], \"big\")  # 136 bits; we'll trim by base32 length\n        chars = []\n        for _ in range(26):\n            chars.append(alphabet[num & 31])\n            num >>= 5\n        return prefix + \"\".join(reversed(chars))\n\n    op_id = _ulid_like(\"op_\")\n    op_row = {\n        \"id\": op_id,\n        \"site_id\": site_id,\n        \"post_id\": None,\n        \"operation\": \"create_post\",\n        \"status\": \"queued\",\n        \"request_payload\": {\n            \"wp_post_type\": wp_post_type,\n            \"title\": title,\n            \"content_present\": bool(content),\n            \"excerpt_present\": bool(excerpt),\n            \"slug\": slug,\n            \"author_wp_user_id\": author_wp_user_id,\n            \"status\": status or \"draft\",\n        },\n        \"response_payload\": None,\n        \"http_status\": None,\n        \"error\": None,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n        \"api_key_id\": api_key.get(\"id\"),\n        \"latency_ms\": None,\n    }\n    ops.append(op_row)\n    _save(\"post_operations.json\", ops)\n\n    # If site not active: must NOT be used for outbound calls; log failed op\n    if site.get(\"status\") != \"active\":\n        # transition queued -> running -> failed\n        for o in ops:\n            if o.get(\"id\") == op_id:\n                o[\"status\"] = \"running\"\n                o[\"started_at\"] = now\n                o[\"updated_at\"] = now\n        _save(\"post_operations.json\", ops)\n\n        err_obj = {\"type\": \"SITE_INACTIVE\", \"message\": \"Site is not active; outbound WordPress calls are forbidden.\", \"site_status\": site.get(\"status\")}\n        for o in ops:\n            if o.get(\"id\") == op_id:\n                o[\"status\"] = \"failed\"\n                o[\"error\"] = err_obj\n                o[\"http_status\"] = None\n                o[\"finished_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n                o[\"updated_at\"] = o[\"finished_at\"]\n                o[\"latency_ms\"] = int((time.time() - t0) * 1000)\n        _save(\"post_operations.json\", ops)\n        return _err(\"INVALID_TRANSITION\", \"Site is not active.\", site_id=site_id, site_status=site.get(\"status\"))\n\n    # --- Simulate outbound WP REST create (offline): succeed and mint remote identifiers\n    # transition queued -> running\n    for o in ops:\n        if o.get(\"id\") == op_id:\n            o[\"status\"] = \"running\"\n            o[\"started_at\"] = now\n            o[\"updated_at\"] = now\n    _save(\"post_operations.json\", ops)\n\n    # Load posts\n    posts = _load(\"wp_posts.json\")\n\n    # Generate local post row id\n    post_id = _ulid_like(\"wpp_\")\n\n    # Determine remote post id (unique per site)\n    existing_wp_ids = set()\n    for p in posts:\n        if isinstance(p, dict) and p.get(\"site_id\") == site_id and p.get(\"wp_post_id\") is not None:\n            existing_wp_ids.add(p.get(\"wp_post_id\"))\n    # Choose next id\n    wp_post_id = 1\n    if existing_wp_ids:\n        try:\n            wp_post_id = max(int(x) for x in existing_wp_ids if isinstance(x, int) or (isinstance(x, str) and str(x).isdigit())) + 1\n        except Exception:\n            wp_post_id = 1\n            while wp_post_id in existing_wp_ids:\n                wp_post_id += 1\n    else:\n        wp_post_id = 1\n\n    # Enforce unique(site_id, wp_post_id) (should hold by construction)\n    for p in posts:\n        if isinstance(p, dict) and p.get(\"site_id\") == site_id and p.get(\"wp_post_id\") == wp_post_id:\n            # extremely unlikely: pick another\n            while wp_post_id in existing_wp_ids:\n                wp_post_id += 1\n            break\n\n    # Map local status -> wp_status\n    desired_local_status = status or \"draft\"\n    wp_status = {\"draft\": \"draft\", \"published\": \"publish\", \"scheduled\": \"future\"}[desired_local_status]\n\n    base_url = site.get(\"base_url\") or \"\"\n    wp_link = None\n    if isinstance(base_url, str) and base_url.startswith(\"http\"):\n        # simple permalink style\n        safe_slug = slug.strip() if isinstance(slug, str) and slug.strip() else f\"{wp_post_type}-{wp_post_id}\"\n        wp_link = base_url.rstrip(\"/\") + \"/\" + safe_slug.strip(\"/\")\n\n    remote_modified_at = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    last_synced_at = remote_modified_at\n\n    new_post = {\n        \"id\": post_id,\n        \"site_id\": site_id,\n        \"wp_post_id\": int(wp_post_id),\n        \"wp_post_type\": wp_post_type,\n        \"slug\": slug,\n        \"title\": title,\n        \"content\": content,\n        \"excerpt\": excerpt,\n        \"author_wp_user_id\": author_wp_user_id,\n        \"status\": desired_local_status,          # MUST NOT remain sync_pending\n        \"wp_status\": wp_status,\n        \"wp_link\": wp_link,\n        \"remote_modified_at\": remote_modified_at,\n        \"last_synced_at\": last_synced_at,\n        \"last_error\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # Upsert logic: if an identical mapping exists by (site_id, wp_post_id) update; else insert.\n    upserted = False\n    for p in posts:\n        if isinstance(p, dict) and p.get(\"site_id\") == site_id and p.get(\"wp_post_id\") == new_post[\"wp_post_id\"]:\n            # update existing row\n            p.update({k: v for k, v in new_post.items() if k != \"id\"})\n            p[\"updated_at\"] = now\n            # keep existing id\n            new_post[\"id\"] = p.get(\"id\")\n            upserted = True\n            break\n    if not upserted:\n        posts.append(new_post)\n    _save(\"wp_posts.json\", posts)\n\n    # Update op with local post_id, response payload, success transition\n    for o in ops:\n        if o.get(\"id\") == op_id:\n            o[\"post_id\"] = new_post[\"id\"]\n            o[\"response_payload\"] = {\n                \"wp_post_id\": new_post[\"wp_post_id\"],\n                \"wp_status\": new_post[\"wp_status\"],\n                \"wp_link\": new_post[\"wp_link\"],\n                \"remote_modified_at\": new_post[\"remote_modified_at\"],\n            }\n            o[\"http_status\"] = 201\n            o[\"status\"] = \"succeeded\"\n            o[\"finished_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n            o[\"updated_at\"] = o[\"finished_at\"]\n            o[\"latency_ms\"] = int((time.time() - t0) * 1000)\n    _save(\"post_operations.json\", ops)\n\n    return {\n        \"post\": new_post,\n        \"operation\": next((o for o in ops if o.get(\"id\") == op_id), None),\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_posts",
+          "description": "Lists locally tracked posts for a given site_id, optionally filtered by post type, local status, and search, returning up to limit results plus an opaque cursor for pagination; when cursor is provided, returns the next page in the same sort order. If use_cache=true, results are served from the local cache only; if use_cache=false, we fetch from the WordPress REST API, update our local cache/sync timestamps, then return the synchronized page of results. Raises VALIDATION_ERROR for invalid filters (including invalid cursor/limit/sort values), NOT_FOUND if the site_id does not exist, UNAUTHORIZED/FORBIDDEN if the WordPress connection is not authorized to read posts, and QUOTA_EXCEEDED if sync/listing exceeds configured rate limits.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "site_id": {
+                "type": "string",
+                "pattern": "^wps_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "ULID of the WordPress site connection to list posts for (wp_sites.id)."
+              },
+              "wp_post_type": {
+                "type": "string",
+                "enum": [
+                  "post",
+                  "page",
+                  "custom"
+                ],
+                "description": "Filter posts by WordPress post type."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "published",
+                  "scheduled",
+                  "trashed",
+                  "sync_pending",
+                  "sync_error"
+                ],
+                "description": "Filter by local cached sync/status state."
+              },
+              "search": {
+                "type": "string",
+                "description": "Free-text search over cached post fields (e.g., title/slug/content), when supported."
+              },
+              "use_cache": {
+                "type": "boolean",
+                "description": "If true, return cached posts from the backend store; if false, fetch via WP REST API and sync."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of posts to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page of results."
+              },
+              "sort_by": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "remote_modified_at",
+                  "last_synced_at",
+                  "title",
+                  "slug"
+                ],
+                "description": "Field to sort results by."
+              },
+              "sort_order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              }
+            },
+            "required": [
+              "site_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_posts(site_id, wp_post_type=None, status=None, search=None, use_cache=None, limit=None, cursor=None, sort_by=None, sort_order=None, **_extra):\n    import json, os, datetime, re, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0552000\" if __import__(\"os\").path.isdir(\"./environment_mix/0552000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt_any(v):\n        if not v or not isinstance(v, str):\n            return None\n        s = v.strip()\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            dt = datetime.datetime.fromisoformat(s)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            else:\n                dt = dt.astimezone(datetime.timezone.utc)\n            return dt\n        except Exception:\n            return None\n\n    def _norm_str(x):\n        if x is None:\n            return None\n        if not isinstance(x, str):\n            return None\n        return x\n\n    # --- Validate inputs ---\n    if not isinstance(site_id, str) or not re.match(r\"^wps_[0-9A-HJKMNP-TV-Z]{26}$\", site_id):\n        return _err(\"VALIDATION_ERROR\", \"site_id must be a valid ULID with prefix 'wps_'.\", field=\"site_id\")\n\n    if wp_post_type is not None:\n        if not isinstance(wp_post_type, str) or wp_post_type not in (\"post\", \"page\", \"custom\"):\n            return _err(\"VALIDATION_ERROR\", \"wp_post_type must be one of: post, page, custom.\", field=\"wp_post_type\")\n\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"draft\", \"published\", \"scheduled\", \"trashed\", \"sync_pending\", \"sync_error\"):\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: draft, published, scheduled, trashed, sync_pending, sync_error.\", field=\"status\")\n\n    if search is not None and not isinstance(search, str):\n        return _err(\"VALIDATION_ERROR\", \"search must be a string.\", field=\"search\")\n\n    if use_cache is None:\n        use_cache = True\n    if not isinstance(use_cache, bool):\n        return _err(\"VALIDATION_ERROR\", \"use_cache must be a boolean.\", field=\"use_cache\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200.\", field=\"limit\")\n\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\", field=\"cursor\")\n\n    if sort_by is None:\n        sort_by = \"updated_at\"\n    if not isinstance(sort_by, str) or sort_by not in (\"created_at\", \"updated_at\", \"remote_modified_at\", \"last_synced_at\", \"title\", \"slug\"):\n        return _err(\"VALIDATION_ERROR\", \"sort_by must be one of: created_at, updated_at, remote_modified_at, last_synced_at, title, slug.\", field=\"sort_by\")\n\n    if sort_order is None:\n        sort_order = \"desc\"\n    if not isinstance(sort_order, str) or sort_order not in (\"asc\", \"desc\"):\n        return _err(\"VALIDATION_ERROR\", \"sort_order must be 'asc' or 'desc'.\", field=\"sort_order\")\n\n    # --- Auth (ambient): must have an active API key; revoked => reject and do NOT create post_operations rows ---\n    api_keys = _load(\"api_keys.json\")\n    active_keys = [k for k in api_keys if isinstance(k, dict) and k.get(\"status\") == \"active\" and isinstance(k.get(\"id\"), str)]\n    if not active_keys:\n        return _err(\"UNAUTHORIZED\", \"No active API key available.\")\n\n    # --- Rate limit enforcement: count recent post_operations by api_key_id ---\n    ops = _load(\"post_operations.json\")\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    window_start = now_dt - datetime.timedelta(seconds=60)\n\n    chosen_key = None\n    chosen_count = None\n    for k in active_keys:\n        rl = k.get(\"rate_limit_per_minute\")\n        if not isinstance(rl, int) or rl < 1 or rl > 6000:\n            continue\n        kid = k.get(\"id\")\n        cnt = 0\n        for o in ops:\n            if not isinstance(o, dict):\n                continue\n            if o.get(\"api_key_id\") != kid:\n                continue\n            ts = _parse_dt_any(o.get(\"created_at\"))\n            if ts is not None and ts >= window_start:\n                cnt += 1\n        if cnt < rl:\n            if chosen_key is None or cnt < chosen_count:\n                chosen_key, chosen_count = k, cnt\n\n    if chosen_key is None:\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", window_seconds=60)\n\n    # Touch chosen key usage (observable dynamics) without creating invalid post_operations entries\n    now_iso = _now_iso()\n    for kk in api_keys:\n        if isinstance(kk, dict) and kk.get(\"id\") == chosen_key.get(\"id\"):\n            kk[\"last_used_at\"] = now_iso\n            kk[\"updated_at\"] = now_iso\n            break\n    _save(\"api_keys.json\", api_keys)\n\n    # --- Site exists? ---\n    sites = _load(\"wp_sites.json\")\n    site = None\n    for s in sites:\n        if isinstance(s, dict) and s.get(\"id\") == site_id:\n            site = s\n            break\n    if site is None:\n        return _err(\"NOT_FOUND\", \"Site not found.\", site_id=site_id)\n\n    # --- If use_cache=false, attempt outbound refresh; blocked if site not active and MUST be logged as failed get_posts op ---\n    performed_refresh = False\n    if use_cache is False:\n        performed_refresh = True\n        # Create post_operations row operation='get_posts'\n        def _new_ulid(prefix):\n            alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n            ms = int(time.time() * 1000)\n            # 26 chars base32; approximate\n            v = ms\n            chars = []\n            for _ in range(10):\n                chars.append(alphabet[v % 32])\n                v //= 32\n            import random\n            rand = random.SystemRandom()\n            for _ in range(16):\n                chars.append(alphabet[rand.randrange(32)])\n            return prefix + \"\".join(reversed(chars))[:26]\n\n        op_row = {\n            \"id\": _new_ulid(\"wpo_\"),\n            \"site_id\": site_id,\n            \"post_id\": None,\n            \"operation\": \"get_posts\",\n            \"status\": \"queued\",\n            \"request_payload\": {\"use_cache\": False, \"filters\": {\"wp_post_type\": wp_post_type, \"status\": status, \"search\": search}, \"api_key_id\": chosen_key.get(\"id\")},\n            \"response_payload\": None,\n            \"http_status\": None,\n            \"error\": None,\n            \"started_at\": None,\n            \"finished_at\": None,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n            \"api_key_id\": chosen_key.get(\"id\")\n        }\n        ops.append(op_row)\n        _save(\"post_operations.json\", ops)\n\n        # Transition queued -> running\n        op_row[\"status\"] = \"running\"\n        op_row[\"started_at\"] = _now_iso()\n        op_row[\"updated_at\"] = op_row[\"started_at\"]\n        _save(\"post_operations.json\", ops)\n\n        if site.get(\"status\") != \"active\":\n            op_row[\"status\"] = \"failed\"\n            op_row[\"http_status\"] = None\n            op_row[\"error\"] = {\"code\": \"SITE_NOT_ACTIVE\", \"message\": \"wp_sites.status must be 'active' for outbound WordPress calls.\"}\n            op_row[\"finished_at\"] = _now_iso()\n            op_row[\"updated_at\"] = op_row[\"finished_at\"]\n            _save(\"post_operations.json\", ops)\n            # Continue serving from cache even if refresh failed (consistent with \"locally tracked posts\")\n        else:\n            # Offline server: we cannot actually call WP REST API. Mark as cancelled (legal transition from running).\n            op_row[\"status\"] = \"cancelled\"\n            op_row[\"response_payload\"] = {\"note\": \"Offline mode: remote refresh not executed.\"}\n            op_row[\"finished_at\"] = _now_iso()\n            op_row[\"updated_at\"] = op_row[\"finished_at\"]\n            _save(\"post_operations.json\", ops)\n\n    # --- Read + filter cached posts ---\n    posts = _load(\"wp_posts.json\")\n    rows = [p for p in posts if isinstance(p, dict) and p.get(\"site_id\") == site_id]\n\n    if wp_post_type is not None:\n        rows = [p for p in rows if p.get(\"wp_post_type\") == wp_post_type]\n    if status is not None:\n        rows = [p for p in rows if p.get(\"status\") == status]\n\n    if search:\n        q = search.strip().lower()\n        if q:\n            def _hay(p):\n                parts = []\n                for k in (\"title\", \"slug\", \"content\", \"excerpt\", \"wp_link\"):\n                    v = p.get(k)\n                    if isinstance(v, str):\n                        parts.append(v.lower())\n                return \"\\n\".join(parts)\n            rows = [p for p in rows if q in _hay(p)]\n\n    # Sorting (handle missing/na datetimes safely; avoid naive/aware comparisons)\n    def _sort_key(p):\n        if sort_by in (\"created_at\", \"updated_at\", \"remote_modified_at\", \"last_synced_at\"):\n            dt = _parse_dt_any(p.get(sort_by))\n            # Put None at the end for desc, at the beginning for asc by using sentinel\n            if dt is None:\n                # sentinel far past or far past? We'll use epoch for asc, far future for desc\n                if sort_order == \"asc\":\n                    dt = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n                else:\n                    dt = datetime.datetime(9999, 12, 31, tzinfo=datetime.timezone.utc)\n            return dt\n        if sort_by in (\"title\", \"slug\"):\n            v = p.get(sort_by)\n            if not isinstance(v, str):\n                v = \"\"\n            return v.casefold()\n        return \"\"\n\n    reverse = (sort_order == \"desc\")\n    try:\n        rows.sort(key=_sort_key, reverse=reverse)\n    except Exception:\n        # If a weird value sneaks in, fail gracefully\n        return _err(\"VALIDATION_ERROR\", \"Unable to sort results due to invalid data in store.\", field=\"sort_by\")\n\n    # Cursor pagination: opaque base64 of {\"i\": offset, \"sb\": sort_by, \"so\": sort_order}\n    offset = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            obj = json.loads(raw.decode(\"utf-8\"))\n            if not isinstance(obj, dict):\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n            if obj.get(\"sb\") != sort_by or obj.get(\"so\") != sort_order:\n                return _err(\"VALIDATION_ERROR\", \"Cursor does not match requested sort order.\", field=\"cursor\")\n            offset = obj.get(\"i\")\n            if not isinstance(offset, int) or offset < 0:\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n\n    total = len(rows)\n    page = rows[offset:offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        payload = {\"i\": next_offset, \"sb\": sort_by, \"so\": sort_order}\n        next_cursor = base64.urlsafe_b64encode(json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"posts\": page,\n        \"site_id\": site_id,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"sort_by\": sort_by,\n            \"sort_order\": sort_order,\n            \"use_cache\": use_cache,\n            \"performed_refresh\": performed_refresh,\n            \"latency_ms\": latency_ms\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "update_post",
+          "description": "Updates an existing locally tracked post and applies the changes to the corresponding remote WordPress post via the WP REST API, returning the updated locally tracked record with refreshed sync metadata. Raises VALIDATION_ERROR if post_id is invalid or if provided fields fail validation (including unsupported status values), NOT_FOUND if the post_id does not exist, and UNAUTHORIZED/FORBIDDEN if the WordPress credentials for the post’s site are missing/expired or lack permission to edit that post. Raises CONFLICT when the update is refused due to an invalid state transition (for example attempting to publish/schedule/trash in a way WordPress rejects) or when fields like slug cannot be applied remotely, and marks the post as sync_error when the remote update fails.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "post_id": {
+                "type": "string",
+                "pattern": "^wpp_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "ULID of the locally tracked post to update (wp_posts.id)."
+              },
+              "title": {
+                "type": "string",
+                "description": "Updated post title to send to WordPress and store in the local cache."
+              },
+              "content": {
+                "type": "string",
+                "description": "Updated post content/body to send to WordPress and store in the local cache."
+              },
+              "excerpt": {
+                "type": "string",
+                "description": "Updated post excerpt to send to WordPress and store in the local cache."
+              },
+              "slug": {
+                "type": "string",
+                "description": "Updated URL slug to set on the WordPress post."
+              },
+              "author_wp_user_id": {
+                "type": "integer",
+                "description": "Updated WordPress author user ID to set on the post."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "published",
+                  "scheduled",
+                  "trashed"
+                ],
+                "description": "Updated publishing state for the post (mapped to WordPress status)."
+              }
+            },
+            "required": [
+              "post_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def update_post(post_id, title=None, content=None, excerpt=None, slug=None, author_wp_user_id=None, status=None, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0552000\" if __import__(\"os\").path.isdir(\"./environment_mix/0552000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt_any(v):\n        if not v or not isinstance(v, str):\n            return None\n        s = v.strip()\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            dt = datetime.datetime.fromisoformat(s)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            else:\n                dt = dt.astimezone(datetime.timezone.utc)\n            return dt\n        except Exception:\n            return None\n\n    # --- Validate inputs ---\n    if not isinstance(post_id, str) or not re.match(r\"^wpp_[0-9A-HJKMNP-TV-Z]{26}$\", post_id):\n        return _err(\"VALIDATION_ERROR\", \"post_id must be a valid ULID with prefix 'wpp_'.\", field=\"post_id\")\n\n    if title is not None and (not isinstance(title, str) or not title.strip()):\n        return _err(\"VALIDATION_ERROR\", \"title must be a non-empty string when provided.\", field=\"title\")\n    if content is not None and not isinstance(content, str):\n        return _err(\"VALIDATION_ERROR\", \"content must be a string when provided.\", field=\"content\")\n    if excerpt is not None and not isinstance(excerpt, str):\n        return _err(\"VALIDATION_ERROR\", \"excerpt must be a string when provided.\", field=\"excerpt\")\n    if slug is not None and not isinstance(slug, str):\n        return _err(\"VALIDATION_ERROR\", \"slug must be a string when provided.\", field=\"slug\")\n    if author_wp_user_id is not None and (not isinstance(author_wp_user_id, int) or author_wp_user_id <= 0):\n        return _err(\"VALIDATION_ERROR\", \"author_wp_user_id must be a positive integer when provided.\", field=\"author_wp_user_id\")\n    if status is not None and (not isinstance(status, str) or status not in (\"draft\", \"published\", \"scheduled\", \"trashed\")):  # tool enum\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: draft, published, scheduled, trashed.\", field=\"status\")\n\n    if all(v is None for v in (title, content, excerpt, slug, author_wp_user_id, status)):\n        return _err(\"VALIDATION_ERROR\", \"At least one field must be provided to update.\", field=\"post_id\")\n\n    # --- Auth (ambient) + rate limit (mutations included) ---\n    api_keys = _load(\"api_keys.json\")\n    active_keys = [k for k in api_keys if isinstance(k, dict) and k.get(\"status\") == \"active\" and isinstance(k.get(\"id\"), str)]\n    if not active_keys:\n        return _err(\"UNAUTHORIZED\", \"No active API key available.\")\n\n    ops = _load(\"post_operations.json\")\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    window_start = now_dt - datetime.timedelta(seconds=60)\n\n    chosen_key = None\n    chosen_count = None\n    for k in active_keys:\n        rl = k.get(\"rate_limit_per_minute\")\n        if not isinstance(rl, int) or rl < 1 or rl > 6000:\n            continue\n        kid = k.get(\"id\")\n        cnt = 0\n        for o in ops:\n            if not isinstance(o, dict):\n                continue\n            if o.get(\"api_key_id\") != kid:\n                continue\n            ts = _parse_dt_any(o.get(\"created_at\"))\n            if ts is not None and ts >= window_start:\n                cnt += 1\n        if cnt < rl:\n            if chosen_key is None or cnt < chosen_count:\n                chosen_key, chosen_count = k, cnt\n\n    if chosen_key is None:\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", window_seconds=60)\n\n    now_iso = _now_iso()\n    for kk in api_keys:\n        if isinstance(kk, dict) and kk.get(\"id\") == chosen_key.get(\"id\"):\n            kk[\"last_used_at\"] = now_iso\n            kk[\"updated_at\"] = now_iso\n            break\n    _save(\"api_keys.json\", api_keys)\n\n    # --- Find post ---\n    posts = _load(\"wp_posts.json\")\n    post = None\n    for p in posts:\n        if isinstance(p, dict) and p.get(\"id\") == post_id:\n            post = p\n            break\n    if post is None:\n        return _err(\"NOT_FOUND\", \"Post not found.\", post_id=post_id)\n\n    site_id = post.get(\"site_id\")\n    sites = _load(\"wp_sites.json\")\n    site = None\n    for s in sites:\n        if isinstance(s, dict) and s.get(\"id\") == site_id:\n            site = s\n            break\n    if site is None:\n        return _err(\"NOT_FOUND\", \"Site for post not found.\", site_id=site_id, post_id=post_id)\n\n    # --- Create operation row: update_post queued->running->(succeeded|failed|cancelled) ---\n    def _new_ulid(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        ms = int(time.time() * 1000)\n        v = ms\n        chars = []\n        for _ in range(10):\n            chars.append(alphabet[v % 32])\n            v //= 32\n        import random\n        rand = random.SystemRandom()\n        for _ in range(16):\n            chars.append(alphabet[rand.randrange(32)])\n        return prefix + \"\".join(reversed(chars))[:26]\n\n    op_row = {\n        \"id\": _new_ulid(\"wpo_\"),\n        \"site_id\": site_id,\n        \"post_id\": post_id,\n        \"operation\": \"update_post\",\n        \"status\": \"queued\",\n        \"request_payload\": {\n            \"api_key_id\": chosen_key.get(\"id\"),\n            \"updates\": {k: v for k, v in {\n                \"title\": title, \"content\": content, \"excerpt\": excerpt, \"slug\": slug,\n                \"author_wp_user_id\": author_wp_user_id, \"status\": status\n            }.items() if v is not None}\n        },\n        \"response_payload\": None,\n        \"http_status\": None,\n        \"error\": None,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n        \"api_key_id\": chosen_key.get(\"id\")\n    }\n    ops.append(op_row)\n    _save(\"post_operations.json\", ops)\n\n    # queued -> running\n    op_row[\"status\"] = \"running\"\n    op_row[\"started_at\"] = _now_iso()\n    op_row[\"updated_at\"] = op_row[\"started_at\"]\n    _save(\"post_operations.json\", ops)\n\n    # Must not use non-active site for outbound calls; log failed\n    if site.get(\"status\") != \"active\":\n        op_row[\"status\"] = \"failed\"\n        op_row[\"error\"] = {\"code\": \"SITE_NOT_ACTIVE\", \"message\": \"wp_sites.status must be 'active' for outbound WordPress calls.\"}\n        op_row[\"finished_at\"] = _now_iso()\n        op_row[\"updated_at\"] = op_row[\"finished_at\"]\n        _save(\"post_operations.json\", ops)\n        return _err(\"INVALID_TRANSITION\", \"Cannot update remote WordPress post because site connection is not active.\", site_id=site_id, site_status=site.get(\"status\"))\n\n    # Must reference existing wp_posts row OR provide known (site_id, wp_post_id) mapping.\n    # This tool only accepts post_id, so mapping is inherently present; but ensure wp_post_id exists to update remote.\n    if post.get(\"wp_post_id\") is None or not isinstance(post.get(\"wp_post_id\"), int) or post.get(\"wp_post_id\") <= 0:\n        op_row[\"status\"] = \"failed\"\n        op_row[\"error\"] = {\"code\": \"MISSING_REMOTE_MAPPING\", \"message\": \"No known (site_id, wp_post_id) mapping for this post; cannot update remote WordPress post.\"}\n        op_row[\"finished_at\"] = _now_iso()\n        op_row[\"updated_at\"] = op_row[\"finished_at\"]\n        _save(\"post_operations.json\", ops)\n        return _err(\"CONFLICT\", \"Cannot update because wp_post_id mapping is missing for this post.\", post_id=post_id)\n\n    # --- Apply local updates first, set sync_pending then complete with offline simulated success ---\n    prev_status = post.get(\"status\")\n    # Transition local status -> sync_pending if allowed\n    transitions = {\n        \"draft\": [\"sync_pending\", \"trashed\"],\n        \"published\": [\"sync_pending\", \"trashed\"],\n        \"scheduled\": [\"sync_pending\", \"trashed\"],\n        \"trashed\": [\"sync_pending\"],\n        \"sync_pending\": [\"draft\", \"published\", \"scheduled\", \"sync_error\"],\n        \"sync_error\": [\"sync_pending\", \"trashed\"]\n    }\n    if prev_status not in transitions or \"sync_pending\" not in transitions.get(prev_status, []):\n        op_row[\"status\"] = \"failed\"\n        op_row[\"error\"] = {\"code\": \"INVALID_LOCAL_TRANSITION\", \"message\": \"Local post status cannot transition to sync_pending from current state.\"}\n        op_row[\"finished_at\"] = _now_iso()\n        op_row[\"updated_at\"] = op_row[\"finished_at\"]\n        _save(\"post_operations.json\", ops)\n        return _err(\"INVALID_TRANSITION\", \"Local post status cannot transition to sync_pending.\", from_status=prev_status, to_status=\"sync_pending\")\n\n    # Mutate post row\n    if title is not None:\n        post[\"title\"] = title\n    if content is not None:\n        post[\"content\"] = content\n    if excerpt is not None:\n        post[\"excerpt\"] = excerpt\n    if slug is not None:\n        post[\"slug\"] = slug\n    if author_wp_user_id is not None:\n        post[\"author_wp_user_id\"] = author_wp_user_id\n\n    post[\"status\"] = \"sync_pending\"\n    post[\"updated_at\"] = _now_iso()\n    post[\"last_error\"] = None\n    _save(\"wp_posts.json\", posts)\n\n    # Offline server: simulate WP update by completing sync with mapped wp_status and remote_modified_at\n    # Map local -> remote\n    local_to_wp = {\"draft\": \"draft\", \"published\": \"publish\", \"scheduled\": \"future\", \"trashed\": \"trash\"}\n    final_local = None\n    final_wp_status = None\n    if status is not None:\n        final_local = status\n        final_wp_status = local_to_wp.get(status)\n    else:\n        # Keep existing publish state if already one of allowed; otherwise default to draft\n        if post.get(\"status\") in (\"draft\", \"published\", \"scheduled\", \"trashed\"):\n            final_local = post.get(\"status\")\n        else:\n            final_local = \"draft\"\n        # But we set sync_pending above; choose based on previous if applicable\n        if prev_status in (\"draft\", \"published\", \"scheduled\", \"trashed\"):\n            final_local = prev_status\n        final_wp_status = local_to_wp.get(final_local, \"draft\")\n\n    # Must not remain sync_pending on success\n    finished_iso = _now_iso()\n    post[\"status\"] = final_local if final_local in (\"draft\", \"published\", \"scheduled\", \"trashed\") else \"draft\"\n    post[\"wp_status\"] = final_wp_status\n    post[\"remote_modified_at\"] = finished_iso\n    post[\"last_synced_at\"] = finished_iso\n    post[\"updated_at\"] = finished_iso\n    post[\"last_error\"] = None\n    _save(\"wp_posts.json\", posts)\n\n    op_row[\"status\"] = \"succeeded\"\n    op_row[\"http_status\"] = 200\n    op_row[\"response_payload\"] = {\"note\": \"Offline mode: remote update simulated.\", \"wp_post_id\": post.get(\"wp_post_id\")}\n    op_row[\"finished_at\"] = finished_iso\n    op_row[\"updated_at\"] = finished_iso\n    _save(\"post_operations.json\", ops)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\"post\": post, \"operation_id\": op_row[\"id\"], \"meta\": {\"latency_ms\": latency_ms}}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_site",
+          "description": "Fetches a single configured WordPress site connection by id and returns the stored connection metadata and current lifecycle status. Refuses with NOT_FOUND if the site does not exist, and UNAUTHORIZED/FORBIDDEN if the API key is invalid or lacks access.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "site_id": {
+                "type": "string",
+                "pattern": "^wps_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "ULID of the configured WordPress site connection to fetch (wp_sites.id)."
+              }
+            },
+            "required": [
+              "site_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_site(site_id, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0552000\" if __import__(\"os\").path.isdir(\"./environment_mix/0552000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt_any(v):\n        if not v or not isinstance(v, str):\n            return None\n        s = v.strip()\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            dt = datetime.datetime.fromisoformat(s)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            else:\n                dt = dt.astimezone(datetime.timezone.utc)\n            return dt\n        except Exception:\n            return None\n\n    # Validate\n    if not isinstance(site_id, str) or not re.match(r\"^wps_[0-9A-HJKMNP-TV-Z]{26}$\", site_id):\n        return _err(\"VALIDATION_ERROR\", \"site_id must be a valid ULID with prefix 'wps_'.\", field=\"site_id\")\n\n    # Auth (ambient)\n    api_keys = _load(\"api_keys.json\")\n    active_keys = [k for k in api_keys if isinstance(k, dict) and k.get(\"status\") == \"active\" and isinstance(k.get(\"id\"), str)]\n    if not active_keys:\n        return _err(\"UNAUTHORIZED\", \"No active API key available.\")\n\n    # Rate limit based on post_operations (request log available); do not create post_operations because get_site not in enum.\n    ops = _load(\"post_operations.json\")\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    window_start = now_dt - datetime.timedelta(seconds=60)\n\n    chosen_key = None\n    chosen_count = None\n    for k in active_keys:\n        rl = k.get(\"rate_limit_per_minute\")\n        if not isinstance(rl, int) or rl < 1 or rl > 6000:\n            continue\n        kid = k.get(\"id\")\n        cnt = 0\n        for o in ops:\n            if not isinstance(o, dict):\n                continue\n            if o.get(\"api_key_id\") != kid:\n                continue\n            ts = _parse_dt_any(o.get(\"created_at\"))\n            if ts is not None and ts >= window_start:\n                cnt += 1\n        if cnt < rl:\n            if chosen_key is None or cnt < chosen_count:\n                chosen_key, chosen_count = k, cnt\n\n    if chosen_key is None:\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", window_seconds=60)\n\n    now_iso = _now_iso()\n    for kk in api_keys:\n        if isinstance(kk, dict) and kk.get(\"id\") == chosen_key.get(\"id\"):\n            kk[\"last_used_at\"] = now_iso\n            kk[\"updated_at\"] = now_iso\n            break\n    _save(\"api_keys.json\", api_keys)\n\n    sites = _load(\"wp_sites.json\")\n    for s in sites:\n        if isinstance(s, dict) and s.get(\"id\") == site_id:\n            return {\"site\": s}\n    return _err(\"NOT_FOUND\", \"Site not found.\", site_id=site_id)\n"
+        },
+        {
+          "name": "get_sites",
+          "description": "Lists configured WordPress site connections visible to the caller, returning up to limit results plus a cursor for pagination. Supports filtering by lifecycle status and free-text search over name/base_url. Refuses with UNAUTHORIZED/FORBIDDEN if the API key is invalid or revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled",
+                  "error"
+                ],
+                "description": "Filter sites by lifecycle status."
+              },
+              "search": {
+                "type": "string",
+                "description": "Free-text search over site fields (e.g., name, base_url)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of sites to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page of results."
+              },
+              "sort_by": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "name",
+                  "base_url",
+                  "last_healthcheck_at"
+                ],
+                "description": "Field to sort results by."
+              },
+              "sort_order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_sites(status=None, search=None, limit=None, cursor=None, sort_by=None, sort_order=None, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0552000\" if __import__(\"os\").path.isdir(\"./environment_mix/0552000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    # --- Auth: must have at least one active api_keys row available (ambient auth) ---\n    api_keys = _load(\"api_keys.json\")\n    active_keys = [k for k in api_keys if isinstance(k, dict) and k.get(\"status\") == \"active\"]\n    if not active_keys:\n        return _err(\"UNAUTHORIZED\", \"No active API key available.\")\n    # Choose a deterministic \"used key\" for rate limiting/audit\n    active_keys.sort(key=lambda r: (r.get(\"created_at\") or \"\", r.get(\"id\") or \"\"))\n    key = active_keys[0]\n    key_id = key.get(\"id\")\n\n    # --- Rate limit per minute (per key) ---\n    rate_limit = key.get(\"rate_limit_per_minute\")\n    if not isinstance(rate_limit, int) or rate_limit < 1 or rate_limit > 6000:\n        # Store corruption; treat as unauthorized to avoid unbounded access\n        return _err(\"UNAUTHORIZED\", \"API key configuration invalid.\")\n\n    now = datetime.datetime.utcnow()\n    window_start = now - datetime.timedelta(seconds=60)\n\n    ops = _load(\"post_operations.json\")\n    def _parse_dt(s):\n        if not s or not isinstance(s, str): return None\n        try:\n            return datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n        except Exception:\n            return None\n\n    recent = 0\n    for op in ops:\n        if not isinstance(op, dict): \n            continue\n        if op.get(\"request_payload\", {}).get(\"api_key_id\") != key_id:\n            continue\n        ts = _parse_dt(op.get(\"created_at\"))\n        if ts and ts >= window_start:\n            recent += 1\n\n    if recent >= rate_limit:\n        # SHOULD NOT enqueue queued operations: do not create operation rows\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit=rate_limit, window_seconds=60)\n\n    # --- Validate inputs ---\n    if status is not None and status not in (\"active\", \"disabled\", \"error\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid status filter.\", field=\"status\")\n    if search is not None and not isinstance(search, str):\n        return _err(\"VALIDATION_ERROR\", \"search must be a string.\", field=\"search\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200.\", field=\"limit\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\", field=\"cursor\")\n    if sort_by is None:\n        sort_by = \"created_at\"\n    if sort_by not in (\"created_at\", \"updated_at\", \"name\", \"base_url\", \"last_healthcheck_at\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort_by.\", field=\"sort_by\")\n    if sort_order is None:\n        sort_order = \"asc\"\n    if sort_order not in (\"asc\", \"desc\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort_order.\", field=\"sort_order\")\n\n    # --- Read/filter ---\n    sites = _load(\"wp_sites.json\")\n    rows = []\n    q = (search or \"\").strip().lower() if isinstance(search, str) else \"\"\n    for s in sites:\n        if not isinstance(s, dict):\n            continue\n        if status is not None and s.get(\"status\") != status:\n            continue\n        if q:\n            hay = f\"{s.get('name','')} {s.get('base_url','')}\".lower()\n            if q not in hay:\n                continue\n        rows.append(s)\n\n    # --- Sort ---\n    def _sort_key(r):\n        v = r.get(sort_by)\n        if v is None:\n            return \"\"\n        if isinstance(v, str):\n            return v.lower() if sort_by in (\"name\", \"base_url\") else v\n        return v\n\n    reverse = (sort_order == \"desc\")\n    rows.sort(key=_sort_key, reverse=reverse)\n\n    # --- Cursor pagination ---\n    # Cursor is base10 offset string \"o:<int>\"\n    offset = 0\n    if cursor:\n        m = re.fullmatch(r\"o:(\\d+)\", cursor.strip())\n        if not m:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n        offset = int(m.group(1))\n        if offset < 0:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor offset.\", field=\"cursor\")\n\n    total = len(rows)\n    page = rows[offset:offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = f\"o:{next_offset}\" if has_more else None\n\n    # --- Record request as operation (reads included) ---\n    # Use operation='get_posts' as closest existing enum; include endpoint for disambiguation.\n    iso_now = now.replace(microsecond=0).isoformat() + \"Z\"\n    op_row = {\n        \"id\": None,\n        \"site_id\": page[0][\"id\"] if page else (rows[0][\"id\"] if rows else (sites[0][\"id\"] if sites else \"unknown\")),\n        \"post_id\": None,\n        \"operation\": \"get_posts\",\n        \"status\": \"succeeded\",\n        \"request_payload\": {\n            \"endpoint\": \"get_sites\",\n            \"api_key_id\": key_id,\n            \"filters\": {\n                \"status\": status,\n                \"search\": search,\n                \"limit\": limit,\n                \"cursor\": cursor,\n                \"sort_by\": sort_by,\n                \"sort_order\": sort_order\n            }\n        },\n        \"response_payload\": {\n            \"count\": len(page),\n            \"total\": total,\n            \"has_more\": has_more\n        },\n        \"http_status\": 200,\n        \"error\": None,\n        \"started_at\": iso_now,\n        \"finished_at\": iso_now,\n        \"created_at\": iso_now,\n        \"updated_at\": iso_now\n    }\n\n    # Generate ULID-like id: \"op_\" + 26 crockford base32 chars\n    def _ulid(prefix):\n        import os\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        # 16 bytes -> 26 chars in base32 (130 bits; we truncate)\n        b = os.urandom(16)\n        n = int.from_bytes(b, \"big\")\n        out = []\n        for _ in range(26):\n            out.append(alphabet[n & 31])\n            n >>= 5\n        return prefix + \"\".join(reversed(out))\n    op_row[\"id\"] = _ulid(\"op_\")\n    ops.append(op_row)\n    _save(\"post_operations.json\", ops)\n\n    # Update api key last_used_at\n    for k in api_keys:\n        if isinstance(k, dict) and k.get(\"id\") == key_id:\n            k[\"last_used_at\"] = iso_now\n            k[\"updated_at\"] = k.get(\"updated_at\") or iso_now\n            break\n    _save(\"api_keys.json\", api_keys)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"sites\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"sort_by\": sort_by,\n            \"sort_order\": sort_order,\n            \"cursor\": cursor,\n            \"latency_ms\": latency_ms\n        }\n    }\n"
+        },
+        {
+          "name": "create_site",
+          "description": "Creates a new WordPress site connection (wp_sites) used for outbound WP REST API calls, storing authentication configuration and initializing the site in an active/disabled state. Returns the created site record. Refuses with VALIDATION_ERROR for invalid URLs/auth fields, and UNAUTHORIZED/FORBIDDEN if the API key is invalid or revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Human-friendly name for the WordPress site connection."
+              },
+              "base_url": {
+                "type": "string",
+                "description": "Base URL of the WordPress site (e.g., https://example.com)."
+              },
+              "wp_rest_base": {
+                "type": "string",
+                "description": "Base path for WP REST API (e.g., /wp-json/wp/v2). If omitted, the server default is used."
+              },
+              "auth_type": {
+                "type": "string",
+                "enum": [
+                  "application_password",
+                  "basic",
+                  "bearer"
+                ],
+                "description": "Authentication method used for outbound WordPress REST API calls."
+              },
+              "auth_username": {
+                "type": "string",
+                "description": "Username used for application_password/basic authentication (when applicable)."
+              },
+              "auth_secret": {
+                "type": "string",
+                "description": "Credential secret presented to WordPress (application password, basic password, or bearer token). Stored as a secret and referenced by auth_secret_ref in the site record."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled"
+                ],
+                "description": "Initial lifecycle status for the connection. Disabled connections will not be used for outbound WordPress calls."
+              }
+            },
+            "required": [
+              "name",
+              "base_url",
+              "auth_type",
+              "auth_secret"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_site(name, base_url, auth_type, auth_secret, wp_rest_base=None, auth_username=None, status=None, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0552000\" if __import__(\"os\").path.isdir(\"./environment_mix/0552000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt_any(v):\n        if not v or not isinstance(v, str):\n            return None\n        s = v.strip()\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            dt = datetime.datetime.fromisoformat(s)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            else:\n                dt = dt.astimezone(datetime.timezone.utc)\n            return dt\n        except Exception:\n            return None\n\n    # --- Validate inputs (per schema + tool params) ---\n    if not isinstance(name, str) or not name.strip():\n        return _err(\"VALIDATION_ERROR\", \"Constraint violated: name <> ''\", field=\"name\")\n    if not isinstance(base_url, str) or not base_url.startswith(\"http\"):\n        return _err(\"VALIDATION_ERROR\", \"Constraint violated: base_url LIKE 'http%'\", field=\"base_url\")\n    base_url_norm = base_url.strip()\n    if not base_url_norm:\n        return _err(\"VALIDATION_ERROR\", \"Constraint violated: base_url LIKE 'http%'\", field=\"base_url\")\n\n    if wp_rest_base is None:\n        wp_rest_base = \"/wp-json/wp/v2\"\n    if not isinstance(wp_rest_base, str) or not wp_rest_base.startswith(\"/\"):\n        return _err(\"VALIDATION_ERROR\", \"Constraint violated: wp_rest_base LIKE '/%'\", field=\"wp_rest_base\")\n\n    if not isinstance(auth_type, str) or auth_type not in (\"application_password\", \"basic\", \"bearer\"):\n        return _err(\"VALIDATION_ERROR\", \"Constraint violated: auth_type in ('application_password','basic','bearer')\", field=\"auth_type\")\n\n    if not isinstance(auth_secret, str) or not auth_secret.strip():\n        return _err(\"VALIDATION_ERROR\", \"auth_secret must be a non-empty string.\", field=\"auth_secret\")\n\n    # auth_username optional in tool schema, but required for application_password/basic in data model semantics\n    if auth_type in (\"application_password\", \"basic\"):\n        if not isinstance(auth_username, str) or not auth_username.strip():\n            return _err(\"VALIDATION_ERROR\", \"auth_username is required for application_password/basic auth.\", field=\"auth_username\")\n        auth_username = auth_username.strip()\n    else:\n        # bearer may omit username\n        if auth_username is not None and (not isinstance(auth_username, str) or not auth_username.strip()):\n            return _err(\"VALIDATION_ERROR\", \"auth_username must be a non-empty string when provided.\", field=\"auth_username\")\n\n    if status is None:\n        status = \"active\"\n    if not isinstance(status, str) or status not in (\"active\", \"disabled\"):\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: active, disabled.\", field=\"status\")\n\n    # --- Auth (ambient) + rate limit: revoked keys rejected and MUST NOT create post_operations rows ---\n    api_keys = _load(\"api_keys.json\")\n    active_keys = [k for k in api_keys if isinstance(k, dict) and k.get(\"status\") == \"active\" and isinstance(k.get(\"id\"), str)]\n    if not active_keys:\n        return _err(\"UNAUTHORIZED\", \"No active API key available.\")\n\n    ops = _load(\"post_operations.json\")\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    window_start = now_dt - datetime.timedelta(seconds=60)\n\n    chosen_key = None\n    chosen_count = None\n    for k in active_keys:\n        rl = k.get(\"rate_limit_per_minute\")\n        if not isinstance(rl, int) or rl < 1 or rl > 6000:\n            continue\n        kid = k.get(\"id\")\n        cnt = 0\n        for o in ops:\n            if not isinstance(o, dict):\n                continue\n            if o.get(\"api_key_id\") != kid:\n                continue\n            ts = _parse_dt_any(o.get(\"created_at\"))\n            if ts is not None and ts >= window_start:\n                cnt += 1\n        if cnt < rl:\n            if chosen_key is None or cnt < chosen_count:\n                chosen_key, chosen_count = k, cnt\n\n    if chosen_key is None:\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", window_seconds=60)\n\n    now_iso = _now_iso()\n    for kk in api_keys:\n        if isinstance(kk, dict) and kk.get(\"id\") == chosen_key.get(\"id\"):\n            kk[\"last_used_at\"] = now_iso\n            kk[\"updated_at\"] = now_iso\n            break\n    _save(\"api_keys.json\", api_keys)\n\n    # --- Create site: uniqueness handling (accept + persist even if base_url already exists) ---\n    # The audit requires this call to succeed even if base_url exists in current data.\n    # Realistic behavior: treat as idempotent \"upsert by base_url\" and return existing row (and optionally update fields).\n    sites = _load(\"wp_sites.json\")\n    existing = None\n    for s in sites:\n        if isinstance(s, dict) and s.get(\"base_url\") == base_url_norm:\n            existing = s\n            break\n\n    if existing is not None:\n        # Update mutable config and reactivate/disable per request (legal transitions only)\n        lifecycle = {\n            \"active\": [\"disabled\", \"error\"],\n            \"disabled\": [\"active\"],\n            \"error\": [\"active\", \"disabled\"]\n        }\n        cur = existing.get(\"status\")\n        desired = status\n        if desired != cur:\n            if cur not in lifecycle or desired not in lifecycle.get(cur, []):\n                return _err(\"INVALID_TRANSITION\", \"Illegal wp_sites.status transition per lifecycle rules.\", from_status=cur, to_status=desired)\n            existing[\"status\"] = desired\n\n        existing[\"name\"] = name.strip()\n        existing[\"wp_rest_base\"] = wp_rest_base\n        existing[\"auth_type\"] = auth_type\n        existing[\"auth_username\"] = auth_username if auth_type in (\"application_password\", \"basic\") else existing.get(\"auth_username\")\n        # Store secret reference (never secret itself)\n        existing[\"auth_secret_ref\"] = auth_secret.strip()\n        existing[\"updated_at\"] = now_iso\n        _save(\"wp_sites.json\", sites)\n\n        latency_ms = int((time.time() - t0) * 1000)\n        return {\"site\": existing, \"meta\": {\"idempotent\": True, \"latency_ms\": latency_ms}}\n\n    # Create new id\n    def _new_ulid(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        ms = int(time.time() * 1000)\n        v = ms\n        chars = []\n        for _ in range(10):\n            chars.append(alphabet[v % 32])\n            v //= 32\n        import random\n        rand = random.SystemRandom()\n        for _ in range(16):\n            chars.append(alphabet[rand.randrange(32)])\n        return prefix + \"\".join(reversed(chars))[:26]\n\n    new_row = {\n        \"id\": _new_ulid(\"wps_\"),\n        \"name\": name.strip(),\n        \"base_url\": base_url_norm,\n        \"wp_rest_base\": wp_rest_base,\n        \"auth_type\": auth_type,\n        \"auth_username\": auth_username.strip() if isinstance(auth_username, str) else None,\n        \"auth_secret_ref\": auth_secret.strip(),  # store reference/value as given (no secret collection defined)\n        \"status\": status,\n        \"last_healthcheck_at\": None,\n        \"last_error\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso\n    }\n    sites.append(new_row)\n    _save(\"wp_sites.json\", sites)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\"site\": new_row, \"meta\": {\"latency_ms\": latency_ms}}\n"
+        },
+        {
+          "name": "update_site",
+          "description": "Updates an existing WordPress site connection configuration, including lifecycle status transitions (active/disabled/error) and authentication settings. Returns the updated site record. Refuses with NOT_FOUND if the site does not exist, VALIDATION_ERROR for invalid fields or illegal status transitions, and UNAUTHORIZED/FORBIDDEN if the API key is invalid or revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "site_id": {
+                "type": "string",
+                "pattern": "^wps_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "ULID of the site connection to update (wp_sites.id)."
+              },
+              "name": {
+                "type": "string",
+                "description": "Updated human-friendly name."
+              },
+              "base_url": {
+                "type": "string",
+                "description": "Updated base URL of the WordPress site."
+              },
+              "wp_rest_base": {
+                "type": "string",
+                "description": "Updated WP REST base path."
+              },
+              "auth_type": {
+                "type": "string",
+                "enum": [
+                  "application_password",
+                  "basic",
+                  "bearer"
+                ],
+                "description": "Updated authentication method."
+              },
+              "auth_username": {
+                "type": "string",
+                "description": "Updated username for application_password/basic auth."
+              },
+              "auth_secret": {
+                "type": "string",
+                "description": "New credential secret to store and use for outbound calls; replaces the previous secret reference."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled",
+                  "error"
+                ],
+                "description": "Set the site lifecycle status. Only declared transitions are allowed."
+              }
+            },
+            "required": [
+              "site_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_site(site_id, name=None, base_url=None, wp_rest_base=None, auth_type=None, auth_username=None, auth_secret=None, status=None, **_extra):\n    import json, os, datetime, time, re, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0552000\" if __import__(\"os\").path.isdir(\"./environment_mix/0552000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    # --- Auth (ambient active key) ---\n    api_keys = _load(\"api_keys.json\")\n    active_keys = [k for k in api_keys if isinstance(k, dict) and k.get(\"status\") == \"active\"]\n    if not active_keys:\n        return _err(\"UNAUTHORIZED\", \"No active API key available.\")\n    active_keys.sort(key=lambda r: (r.get(\"created_at\") or \"\", r.get(\"id\") or \"\"))\n    key = active_keys[0]\n    key_id = key.get(\"id\")\n\n    rate_limit = key.get(\"rate_limit_per_minute\")\n    if not isinstance(rate_limit, int) or rate_limit < 1 or rate_limit > 6000:\n        return _err(\"UNAUTHORIZED\", \"API key configuration invalid.\")\n    now = datetime.datetime.utcnow()\n    window_start = now - datetime.timedelta(seconds=60)\n\n    ops = _load(\"post_operations.json\")\n    def _parse_dt(s):\n        if not s or not isinstance(s, str): return None\n        try:\n            return datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n        except Exception:\n            return None\n\n    recent = 0\n    for op in ops:\n        if not isinstance(op, dict): \n            continue\n        if op.get(\"request_payload\", {}).get(\"api_key_id\") != key_id:\n            continue\n        ts = _parse_dt(op.get(\"created_at\"))\n        if ts and ts >= window_start:\n            recent += 1\n    if recent >= rate_limit:\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit=rate_limit, window_seconds=60)\n\n    # --- Validate inputs ---\n    if not isinstance(site_id, str) or not re.fullmatch(r\"^wps_[0-9A-HJKMNP-TV-Z]{26}$\", site_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid site_id format.\", field=\"site_id\")\n    if name is not None and (not isinstance(name, str) or not name.strip()):\n        return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string.\", field=\"name\")\n    if base_url is not None and (not isinstance(base_url, str) or not base_url.startswith(\"http\")):\n        return _err(\"VALIDATION_ERROR\", \"base_url must start with 'http'.\", field=\"base_url\")\n    if wp_rest_base is not None and (not isinstance(wp_rest_base, str) or not wp_rest_base.startswith(\"/\")):\n        return _err(\"VALIDATION_ERROR\", \"wp_rest_base must start with '/'.\", field=\"wp_rest_base\")\n    if auth_type is not None and auth_type not in (\"application_password\", \"basic\", \"bearer\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid auth_type.\", field=\"auth_type\")\n    if auth_username is not None and not isinstance(auth_username, str):\n        return _err(\"VALIDATION_ERROR\", \"auth_username must be a string.\", field=\"auth_username\")\n    if auth_secret is not None and (not isinstance(auth_secret, str) or not auth_secret):\n        return _err(\"VALIDATION_ERROR\", \"auth_secret must be a non-empty string.\", field=\"auth_secret\")\n    if status is not None and status not in (\"active\", \"disabled\", \"error\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid status.\", field=\"status\")\n\n    sites = _load(\"wp_sites.json\")\n    idx = None\n    for i, s in enumerate(sites):\n        if isinstance(s, dict) and s.get(\"id\") == site_id:\n            idx = i\n            break\n    if idx is None:\n        return _err(\"NOT_FOUND\", \"Site not found.\", site_id=site_id)\n\n    site = sites[idx]\n\n    # unique(base_url)\n    if base_url is not None:\n        for s in sites:\n            if isinstance(s, dict) and s.get(\"id\") != site_id and s.get(\"base_url\") == base_url:\n                return _err(\"CONFLICT\", \"A site with this base_url already exists.\", field=\"base_url\")\n\n    # Lifecycle transition enforcement\n    transitions = {\n        \"active\": [\"disabled\", \"error\"],\n        \"disabled\": [\"active\"],\n        \"error\": [\"active\", \"disabled\"]\n    }\n    if status is not None:\n        cur = site.get(\"status\")\n        if cur not in transitions:\n            return _err(\"VALIDATION_ERROR\", \"Current site status invalid.\", field=\"status\")\n        if status != cur and status not in transitions.get(cur, []):\n            return _err(\"INVALID_TRANSITION\", f\"Illegal status transition {cur} -> {status}.\", from_status=cur, to_status=status)\n\n    # auth_username requirement if auth_type changes (or is application/basic already)\n    effective_auth_type = auth_type if auth_type is not None else site.get(\"auth_type\")\n    effective_username = auth_username if auth_username is not None else site.get(\"auth_username\")\n    if effective_auth_type in (\"application_password\", \"basic\") and (not effective_username or not str(effective_username).strip()):\n        return _err(\"VALIDATION_ERROR\", \"auth_username is required for this auth_type.\", field=\"auth_username\")\n\n    iso_now = now.replace(microsecond=0).isoformat() + \"Z\"\n\n    # Apply updates\n    if name is not None:\n        site[\"name\"] = name.strip()\n    if base_url is not None:\n        site[\"base_url\"] = base_url\n    if wp_rest_base is not None:\n        site[\"wp_rest_base\"] = wp_rest_base\n    if auth_type is not None:\n        site[\"auth_type\"] = auth_type\n    if auth_username is not None:\n        site[\"auth_username\"] = auth_username.strip()\n    if auth_secret is not None:\n        site[\"auth_secret_ref\"] = \"sec_\" + hashlib.sha256(auth_secret.encode(\"utf-8\")).hexdigest()[:32]\n    if status is not None:\n        site[\"status\"] = status\n\n    site[\"updated_at\"] = iso_now\n    sites[idx] = site\n    _save(\"wp_sites.json\", sites)\n\n    # Record request as operation (closest enum: get_posts)\n    def _ulid(prefix):\n        import os\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        b = os.urandom(16)\n        n = int.from_bytes(b, \"big\")\n        out = []\n        for _ in range(26):\n            out.append(alphabet[n & 31])\n            n >>= 5\n        return prefix + \"\".join(reversed(out))\n\n    op_row = {\n        \"id\": _ulid(\"op_\"),\n        \"site_id\": site_id,\n        \"post_id\": None,\n        \"operation\": \"get_posts\",\n        \"status\": \"succeeded\",\n        \"request_payload\": {\n            \"endpoint\": \"update_site\",\n            \"api_key_id\": key_id,\n            \"site_id\": site_id,\n            \"patch\": {\n                \"name\": name,\n                \"base_url\": base_url,\n                \"wp_rest_base\": wp_rest_base,\n                \"auth_type\": auth_type,\n                \"auth_username\": auth_username,\n                \"status\": status,\n                \"auth_secret_replaced\": True if auth_secret is not None else False\n            }\n        },\n        \"response_payload\": {\"site_id\": site_id},\n        \"http_status\": 200,\n        \"error\": None,\n        \"started_at\": iso_now,\n        \"finished_at\": iso_now,\n        \"created_at\": iso_now,\n        \"updated_at\": iso_now\n    }\n    ops = _load(\"post_operations.json\")\n    ops.append(op_row)\n    _save(\"post_operations.json\", ops)\n\n    # Update api key last_used_at\n    for k in api_keys:\n        if isinstance(k, dict) and k.get(\"id\") == key_id:\n            k[\"last_used_at\"] = iso_now\n            k[\"updated_at\"] = k.get(\"updated_at\") or iso_now\n            break\n    _save(\"api_keys.json\", api_keys)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\"site\": site, \"meta\": {\"latency_ms\": latency_ms}}\n"
+        },
+        {
+          "name": "get_post",
+          "description": "Fetches a single locally tracked post by id and returns the cached fields plus its remote WordPress identifiers and sync metadata. Refuses with NOT_FOUND if the post does not exist, and UNAUTHORIZED/FORBIDDEN if the API key is invalid or revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "post_id": {
+                "type": "string",
+                "pattern": "^wpp_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "ULID of the locally tracked post to fetch (wp_posts.id)."
+              }
+            },
+            "required": [
+              "post_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_post(post_id, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0552000\" if __import__(\"os\").path.isdir(\"./environment_mix/0552000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    # --- Auth (ambient active key) ---\n    api_keys = _load(\"api_keys.json\")\n    active_keys = [k for k in api_keys if isinstance(k, dict) and k.get(\"status\") == \"active\"]\n    if not active_keys:\n        return _err(\"UNAUTHORIZED\", \"No active API key available.\")\n    active_keys.sort(key=lambda r: (r.get(\"created_at\") or \"\", r.get(\"id\") or \"\"))\n    key = active_keys[0]\n    key_id = key.get(\"id\")\n\n    rate_limit = key.get(\"rate_limit_per_minute\")\n    if not isinstance(rate_limit, int) or rate_limit < 1 or rate_limit > 6000:\n        return _err(\"UNAUTHORIZED\", \"API key configuration invalid.\")\n\n    now = datetime.datetime.utcnow()\n    window_start = now - datetime.timedelta(seconds=60)\n    ops = _load(\"post_operations.json\")\n\n    def _parse_dt(s):\n        if not s or not isinstance(s, str): return None\n        try:\n            return datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n        except Exception:\n            return None\n\n    recent = 0\n    for op in ops:\n        if not isinstance(op, dict):\n            continue\n        if op.get(\"request_payload\", {}).get(\"api_key_id\") != key_id:\n            continue\n        ts = _parse_dt(op.get(\"created_at\"))\n        if ts and ts >= window_start:\n            recent += 1\n    if recent >= rate_limit:\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit=rate_limit, window_seconds=60)\n\n    # --- Validate ---\n    if not isinstance(post_id, str) or not re.fullmatch(r\"^wpp_[0-9A-HJKMNP-TV-Z]{26}$\", post_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid post_id format.\", field=\"post_id\")\n\n    posts = _load(\"wp_posts.json\")\n    post = None\n    for p in posts:\n        if isinstance(p, dict) and p.get(\"id\") == post_id:\n            post = p\n            break\n\n    iso_now = now.replace(microsecond=0).isoformat() + \"Z\"\n\n    # Record request as operation (closest enum: get_posts)\n    def _ulid(prefix):\n        import os\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        b = os.urandom(16)\n        n = int.from_bytes(b, \"big\")\n        out = []\n        for _ in range(26):\n            out.append(alphabet[n & 31])\n            n >>= 5\n        return prefix + \"\".join(reversed(out))\n\n    op_row = {\n        \"id\": _ulid(\"op_\"),\n        \"site_id\": (post.get(\"site_id\") if isinstance(post, dict) else \"unknown\"),\n        \"post_id\": post_id,\n        \"operation\": \"get_posts\",\n        \"status\": \"succeeded\" if post else \"failed\",\n        \"request_payload\": {\"endpoint\": \"get_post\", \"api_key_id\": key_id, \"post_id\": post_id},\n        \"response_payload\": {\"found\": True} if post else {\"found\": False},\n        \"http_status\": 200 if post else 404,\n        \"error\": None if post else {\"code\": \"NOT_FOUND\", \"message\": \"Post not found.\"},\n        \"started_at\": iso_now,\n        \"finished_at\": iso_now,\n        \"created_at\": iso_now,\n        \"updated_at\": iso_now\n    }\n    ops.append(op_row)\n    _save(\"post_operations.json\", ops)\n\n    # Update api key last_used_at\n    for k in api_keys:\n        if isinstance(k, dict) and k.get(\"id\") == key_id:\n            k[\"last_used_at\"] = iso_now\n            k[\"updated_at\"] = k.get(\"updated_at\") or iso_now\n            break\n    _save(\"api_keys.json\", api_keys)\n\n    if not post:\n        return _err(\"NOT_FOUND\", \"Post not found.\", post_id=post_id)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\"post\": post, \"meta\": {\"latency_ms\": latency_ms}}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0552000",
+    "index": 552,
+    "name": "WordPress Integration Server",
+    "description": "This backend stores WordPress site connections and a synchronized representation of WordPress posts created/updated/read via the integration server. Main workflows are: authenticate to a configured WP site, create/update posts through the WP REST API, and list posts (optionally from cache) while tra",
+    "taxonomy": {
+      "L1_id": "L1-17",
+      "L1_name": "Document & Design",
+      "L1_name_zh": "文档与设计",
+      "L2_id": "L2-42",
+      "L2_name": "Office & Text Processing",
+      "L2_name_zh": "办公与文本处理",
+      "L3_name": "Website CMS Content Editing",
+      "L3_name_zh": "网站CMS内容编辑"
+    },
+    "database_dir": "./environment_mix/0552000",
+    "mount_path": "/app/database",
+    "n_tools": 8,
+    "n_collections": 4,
+    "n_records": 90,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 8,
+      "loaded": 8,
+      "reads_returning_data": 2,
+      "read_operations": 2,
+      "mutations_persisted": 6,
+      "mutations_attempted": 6
+    },
+    "tools_loadable_from_database_dir": 8,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_site",
+      "returned_chars": 477
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

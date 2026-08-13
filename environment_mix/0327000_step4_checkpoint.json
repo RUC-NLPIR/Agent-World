@@ -1,0 +1,348 @@
+{
+  "index": 327,
+  "local_files_dir": "./environment_mix/0327000",
+  "file_list": [
+    "./environment_mix/0327000/README.md",
+    "./environment_mix/0327000/accounts.json",
+    "./environment_mix/0327000/api_keys.json",
+    "./environment_mix/0327000/generated_images.json",
+    "./environment_mix/0327000/generation_jobs.json",
+    "./environment_mix/0327000/request_logs.json",
+    "./environment_mix/0327000/usage_counters.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "accounts.json": "12 rows",
+        "api_keys.json": "11 rows",
+        "generation_jobs.json": "12 rows",
+        "generated_images.json": "12 rows",
+        "usage_counters.json": "11 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "generateImage",
+          "description": "Creates a new image-generation job for the authenticated account using the provided request payload (applying service defaults for any omitted optional fields), enqueues it for execution, and returns the created job record (including its job_id/status) with the input persisted for later retrieval/auditing. Raises UNAUTHORIZED if api_key is missing, malformed, revoked, or does not match an active account; FORBIDDEN if the key lacks permission to create generation jobs; and TOO_MANY_REQUESTS if the account or key has exceeded its job-creation quota/rate limits. Raises VALIDATION_ERROR if required fields are missing (e.g., prompt), unknown fields are provided, or any parameter violates constraints (e.g., width/height < 64, num_images not in 1–10, steps < 1, guidance_scale < 0, output_format not in {png,jpeg,webp}, or callback_url is not a valid URI).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^jmg_[A-Za-z0-9]+_[A-Za-z0-9]+$",
+                "description": "API key used to authenticate the request (raw secret key string)."
+              },
+              "body": {
+                "type": "object",
+                "description": "Image generation request payload; stored on the job as input and used to run the provider.",
+                "properties": {
+                  "prompt": {
+                    "type": "string",
+                    "description": "Text prompt describing the image to generate."
+                  },
+                  "negative_prompt": {
+                    "type": "string",
+                    "description": "Text describing what to avoid in the generated image."
+                  },
+                  "width": {
+                    "type": "integer",
+                    "minimum": 64,
+                    "description": "Requested output image width in pixels."
+                  },
+                  "height": {
+                    "type": "integer",
+                    "minimum": 64,
+                    "description": "Requested output image height in pixels."
+                  },
+                  "num_images": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "Number of images to generate for this job."
+                  },
+                  "seed": {
+                    "type": "integer",
+                    "description": "Random seed for reproducible generations."
+                  },
+                  "steps": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Number of sampling/denoising steps to run."
+                  },
+                  "guidance_scale": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Prompt guidance strength (higher usually adheres more to the prompt)."
+                  },
+                  "style": {
+                    "type": "string",
+                    "description": "Optional style preset name understood by the provider."
+                  },
+                  "output_format": {
+                    "type": "string",
+                    "enum": [
+                      "png",
+                      "jpeg",
+                      "webp"
+                    ],
+                    "description": "Desired output image format."
+                  },
+                  "callback_url": {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "Optional webhook URL to notify when the job finishes."
+                  },
+                  "metadata": {
+                    "type": "object",
+                    "description": "Optional client-provided metadata to attach to the job input.",
+                    "additionalProperties": true
+                  }
+                },
+                "required": [
+                  "prompt"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "api_key",
+              "body"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def generateImage(api_key, body, **_extra):\n    import json, os, datetime, time, re, secrets, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0327000\" if __import__(\"os\").path.isdir(\"./environment_mix/0327000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started_ts = time.time()\n    endpoint = \"generateImage\"\n\n    def _now_dt():\n        return datetime.datetime.utcnow().replace(microsecond=0, tzinfo=datetime.timezone.utc)\n\n    def _now_iso():\n        return _now_dt().isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_iso_dt(s, field):\n        if s is None:\n            return None, None\n        if not isinstance(s, str):\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be a date-time string\", field=field)\n        try:\n            return datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\")), None\n        except Exception:\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be a valid ISO-8601 date-time\", field=field)\n\n    def _period_start(dt, granularity):\n        if granularity == \"hour\":\n            return dt.replace(minute=0, second=0, microsecond=0)\n        if granularity == \"day\":\n            return dt.replace(hour=0, minute=0, second=0, microsecond=0)\n        if granularity == \"month\":\n            return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)\n        return None\n\n    def _gen_id(prefix):\n        # match style used in store: jmg_*_01 + base32ish. We'll use deterministic-ish hex but with jmg prefix.\n        return f\"{prefix}_01{secrets.token_hex(11).upper()}\"\n\n    def _ensure_request_log(logs, api_key_id, account_id, status_code):\n        # Schema did not declare request_logs, but broken code used it; keep observable dynamics if file exists/used.\n        # Create file if present or previously created; otherwise no-op.\n        if not isinstance(logs, list):\n            return None\n        latency_ms = int(max(0, (time.time() - started_ts) * 1000))\n        row = {\n            \"id\": \"req_\" + os.urandom(12).hex(),\n            \"endpoint\": endpoint,\n            \"api_key_id\": api_key_id,\n            \"account_id\": account_id,\n            \"status\": status_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now_iso(),\n        }\n        logs.append(row)\n        return row\n\n    # --------- Validate inputs first ---------\n    if not isinstance(api_key, str):\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a string\", field=\"api_key\")\n    if not re.match(r\"^jmg_[A-Za-z0-9]+_[A-Za-z0-9]+$\", api_key):\n        return _err(\"VALIDATION_ERROR\", \"api_key has invalid format\", field=\"api_key\")\n\n    if not isinstance(body, dict):\n        return _err(\"VALIDATION_ERROR\", \"body must be an object\", field=\"body\")\n    allowed = {\n        \"prompt\", \"negative_prompt\", \"width\", \"height\", \"num_images\", \"seed\", \"steps\",\n        \"guidance_scale\", \"style\", \"output_format\", \"callback_url\", \"metadata\"\n    }\n    for k in body.keys():\n        if k not in allowed:\n            return _err(\"VALIDATION_ERROR\", f\"body contains unknown field '{k}'\", field=f\"body.{k}\")\n\n    if \"prompt\" not in body or not isinstance(body.get(\"prompt\"), str) or not body[\"prompt\"].strip():\n        return _err(\"VALIDATION_ERROR\", \"prompt is required and must be a non-empty string\", field=\"body.prompt\")\n\n    def _check_int(name, minv=None, maxv=None):\n        if name not in body or body[name] is None:\n            return None\n        v = body[name]\n        if not isinstance(v, int):\n            raise ValueError(f\"{name} must be an integer\")\n        if minv is not None and v < minv:\n            raise ValueError(f\"{name} must be >= {minv}\")\n        if maxv is not None and v > maxv:\n            raise ValueError(f\"{name} must be <= {maxv}\")\n        return v\n\n    def _check_num(name, minv=None):\n        if name not in body or body[name] is None:\n            return None\n        v = body[name]\n        if not isinstance(v, (int, float)) or isinstance(v, bool):\n            raise ValueError(f\"{name} must be a number\")\n        if minv is not None and float(v) < minv:\n            raise ValueError(f\"{name} must be >= {minv}\")\n        return float(v)\n\n    try:\n        width = _check_int(\"width\", 64, None)\n        height = _check_int(\"height\", 64, None)\n        num_images = _check_int(\"num_images\", 1, 10)\n        steps = _check_int(\"steps\", 1, None)\n        seed = _check_int(\"seed\", None, None)\n        guidance_scale = _check_num(\"guidance_scale\", 0)\n    except ValueError as ve:\n        msg = str(ve)\n        field = \"body.\" + msg.split(\" \")[0]\n        return _err(\"VALIDATION_ERROR\", msg, field=field)\n\n    if \"output_format\" in body and body[\"output_format\"] is not None:\n        if body[\"output_format\"] not in (\"png\", \"jpeg\", \"webp\"):\n            return _err(\"VALIDATION_ERROR\", \"output_format must be one of: png, jpeg, webp\", field=\"body.output_format\")\n    if \"negative_prompt\" in body and body[\"negative_prompt\"] is not None and not isinstance(body[\"negative_prompt\"], str):\n        return _err(\"VALIDATION_ERROR\", \"negative_prompt must be a string\", field=\"body.negative_prompt\")\n    if \"style\" in body and body[\"style\"] is not None and not isinstance(body[\"style\"], str):\n        return _err(\"VALIDATION_ERROR\", \"style must be a string\", field=\"body.style\")\n    if \"callback_url\" in body and body[\"callback_url\"] is not None:\n        if not isinstance(body[\"callback_url\"], str) or not body[\"callback_url\"].strip():\n            return _err(\"VALIDATION_ERROR\", \"callback_url must be a non-empty string\", field=\"body.callback_url\")\n        # light URI check\n        if not re.match(r\"^https?://\", body[\"callback_url\"].strip()):\n            return _err(\"VALIDATION_ERROR\", \"callback_url must be an http(s) URL\", field=\"body.callback_url\")\n    if \"metadata\" in body and body[\"metadata\"] is not None and not isinstance(body[\"metadata\"], dict):\n        return _err(\"VALIDATION_ERROR\", \"metadata must be an object\", field=\"body.metadata\")\n\n    # --------- Load store ---------\n    accounts = _load(\"accounts.json\")\n    api_keys = _load(\"api_keys.json\")\n    jobs = _load(\"generation_jobs.json\")\n    images = _load(\"generated_images.json\")\n    counters = _load(\"usage_counters.json\")\n    req_logs = _load(\"request_logs.json\")\n    if not isinstance(req_logs, list):\n        req_logs = None  # no-op unless list\n\n    # --------- Authenticate (NEVER by hash; accept id or key_prefix match, or full secret if stored as id) ---------\n    # The datastore contains api_keys.id values like jmg_key_...; callers pass api_key looking like jmg_key_...\n    # Treat api_key parameter as either:\n    #  - exact api_keys.id, OR\n    #  - exact api_keys.key_prefix (client-visible prefix), OR\n    #  - exact concatenation starting with key_prefix when present (fallback; cannot check secret against hash).\n    key_row = None\n    if isinstance(api_keys, list):\n        for k in api_keys:\n            if not isinstance(k, dict):\n                continue\n            if k.get(\"status\") != \"active\":\n                continue\n            if k.get(\"id\") == api_key or k.get(\"key_prefix\") == api_key:\n                key_row = k\n                break\n        if key_row is None:\n            # fallback: match by prefix when api_key starts with stored prefix\n            for k in api_keys:\n                if not isinstance(k, dict):\n                    continue\n                if k.get(\"status\") != \"active\":\n                    continue\n                kp = k.get(\"key_prefix\")\n                if isinstance(kp, str) and kp and isinstance(api_key, str) and api_key.startswith(kp):\n                    key_row = k\n                    break\n\n    if not key_row:\n        if req_logs is not None:\n            _ensure_request_log(req_logs, None, None, \"UNAUTHORIZED\")\n            _save(\"request_logs.json\", req_logs)\n        return _err(\"UNAUTHORIZED\", \"api_key is missing, malformed, revoked, or invalid\")\n\n    acc_row = None\n    if isinstance(accounts, list):\n        for a in accounts:\n            if isinstance(a, dict) and a.get(\"id\") == key_row.get(\"account_id\"):\n                acc_row = a\n                break\n    if not acc_row or acc_row.get(\"status\") != \"active\":\n        if req_logs is not None:\n            _ensure_request_log(req_logs, key_row.get(\"id\"), key_row.get(\"account_id\"), \"UNAUTHORIZED\")\n            _save(\"request_logs.json\", req_logs)\n        return _err(\"UNAUTHORIZED\", \"api_key belongs to a non-active account\")\n\n    # update last_used_at\n    now_iso = _now_iso()\n    key_row[\"last_used_at\"] = now_iso\n    key_row[\"updated_at\"] = now_iso\n    _save(\"api_keys.json\", api_keys)\n\n    # --------- Quota enforcement (daily) ---------\n    # Limits are not in schema; choose sensible defaults but enforce.\n    # Enforce at account-level aggregate (api_key_id null) and per-key.\n    ACCOUNT_DAILY_LIMIT = 500\n    KEY_DAILY_LIMIT = 200\n\n    now_dt = _now_dt()\n    day_start = _period_start(now_dt, \"day\")\n    day_start_iso = day_start.isoformat().replace(\"+00:00\", \"Z\")\n\n    def _find_counter(account_id, api_key_id, period_start_iso, gran):\n        if not isinstance(counters, list):\n            return None\n        for c in counters:\n            if not isinstance(c, dict):\n                continue\n            if c.get(\"account_id\") != account_id:\n                continue\n            if c.get(\"api_key_id\") != api_key_id:\n                continue\n            if c.get(\"period_granularity\") != gran:\n                continue\n            if c.get(\"period_start\") == period_start_iso:\n                return c\n        return None\n\n    def _ensure_counter(account_id, api_key_id, period_start_iso, gran):\n        c = _find_counter(account_id, api_key_id, period_start_iso, gran)\n        if c:\n            return c\n        c = {\n            \"id\": _gen_id(\"jmg_uc\"),\n            \"account_id\": account_id,\n            \"api_key_id\": api_key_id,\n            \"period_start\": period_start_iso,\n            \"period_granularity\": gran,\n            \"jobs_created\": 0,\n            \"images_generated\": 0,\n            \"failed_jobs\": 0,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n        }\n        counters.append(c)\n        return c\n\n    acct_counter = _ensure_counter(acc_row[\"id\"], None, day_start_iso, \"day\")\n    key_counter = _ensure_counter(acc_row[\"id\"], key_row[\"id\"], day_start_iso, \"day\")\n\n    if not isinstance(acct_counter.get(\"jobs_created\"), int) or acct_counter[\"jobs_created\"] < 0:\n        acct_counter[\"jobs_created\"] = 0\n    if not isinstance(key_counter.get(\"jobs_created\"), int) or key_counter[\"jobs_created\"] < 0:\n        key_counter[\"jobs_created\"] = 0\n\n    if acct_counter[\"jobs_created\"] >= ACCOUNT_DAILY_LIMIT:\n        if req_logs is not None:\n            _ensure_request_log(req_logs, key_row.get(\"id\"), acc_row.get(\"id\"), \"QUOTA_EXCEEDED\")\n            _save(\"request_logs.json\", req_logs)\n        return _err(\"QUOTA_EXCEEDED\", \"Account daily job quota exceeded\", limit=ACCOUNT_DAILY_LIMIT, period_granularity=\"day\", period_start=day_start_iso)\n\n    if key_counter[\"jobs_created\"] >= KEY_DAILY_LIMIT:\n        if req_logs is not None:\n            _ensure_request_log(req_logs, key_row.get(\"id\"), acc_row.get(\"id\"), \"QUOTA_EXCEEDED\")\n            _save(\"request_logs.json\", req_logs)\n        return _err(\"QUOTA_EXCEEDED\", \"API key daily job quota exceeded\", limit=KEY_DAILY_LIMIT, period_granularity=\"day\", period_start=day_start_iso)\n\n    # --------- Create job (queued) and increment jobs_created atomically with creation ---------\n    # Server defaults (versioned)\n    defaults_version = \"defaults_2026-08-02_r12\"\n    resolved_input = {\n        \"prompt\": body[\"prompt\"],\n        \"negative_prompt\": body.get(\"negative_prompt\", \"\"),\n        \"width\": width if width is not None else 1024,\n        \"height\": height if height is not None else 1024,\n        \"num_images\": num_images if num_images is not None else 1,\n        \"seed\": seed if seed is not None else None,\n        \"steps\": steps if steps is not None else 30,\n        \"guidance_scale\": guidance_scale if guidance_scale is not None else 7.0,\n        \"style\": body.get(\"style\", None),\n        \"output_format\": body.get(\"output_format\", \"png\"),\n        \"callback_url\": body.get(\"callback_url\", None),\n        \"metadata\": body.get(\"metadata\", None),\n    }\n\n    job_id = _gen_id(\"jmg_job\")\n    job_row = {\n        \"id\": job_id,\n        \"account_id\": acc_row[\"id\"],\n        \"api_key_id\": key_row[\"id\"],\n        \"status\": \"queued\",\n        \"provider\": \"jimeng\",\n        \"input\": resolved_input,\n        \"resolved_defaults_version\": defaults_version,\n        \"attempt\": 1,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n    }\n\n    if not isinstance(jobs, list):\n        jobs = []\n    jobs.append(job_row)\n\n    acct_counter[\"jobs_created\"] += 1\n    acct_counter[\"updated_at\"] = now_iso\n    key_counter[\"jobs_created\"] += 1\n    key_counter[\"updated_at\"] = now_iso\n\n    _save(\"generation_jobs.json\", jobs)\n    _save(\"usage_counters.json\", counters)\n\n    if req_logs is not None:\n        _ensure_request_log(req_logs, key_row.get(\"id\"), acc_row.get(\"id\"), \"OK\")\n        _save(\"request_logs.json\", req_logs)\n\n    # Note: Provider execution is out of scope; job remains queued until another system transitions it.\n    return {\"job\": job_row}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getCurrentIdentity",
+          "description": "Returns the authenticated identity for the provided API key, including the owning account, granted scopes, and current quota/rate-limit consumption. Refuses UNAUTHORIZED if the api_key is missing, malformed, revoked, or belongs to a non-active account.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^jmg_[A-Za-z0-9]+_[A-Za-z0-9]+$",
+                "description": "API key used to authenticate the request (raw secret key string)."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def getCurrentIdentity(api_key, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0327000\" if __import__(\"os\").path.isdir(\"./environment_mix/0327000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started_ts = time.time()\n    endpoint = \"getCurrentIdentity\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ensure_request_log(logs, api_key_id, account_id, status_code):\n        if not isinstance(logs, list):\n            return\n        latency_ms = int(max(0, (time.time() - started_ts) * 1000))\n        logs.append(\n            {\n                \"id\": \"req_\" + os.urandom(12).hex(),\n                \"endpoint\": endpoint,\n                \"api_key_id\": api_key_id,\n                \"account_id\": account_id,\n                \"status\": status_code,\n                \"latency_ms\": latency_ms,\n                \"created_at\": _now_iso(),\n            }\n        )\n\n    # Validate\n    if not isinstance(api_key, str):\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a string\", field=\"api_key\")\n    if not re.match(r\"^jmg_[A-Za-z0-9]+_[A-Za-z0-9]+$\", api_key):\n        return _err(\"VALIDATION_ERROR\", \"api_key has invalid format\", field=\"api_key\")\n\n    accounts = _load(\"accounts.json\")\n    api_keys = _load(\"api_keys.json\")\n    counters = _load(\"usage_counters.json\")\n    req_logs = _load(\"request_logs.json\")\n    if not isinstance(req_logs, list):\n        req_logs = None\n\n    # Authenticate (id or key_prefix; never hash)\n    key_row = None\n    if isinstance(api_keys, list):\n        for k in api_keys:\n            if not isinstance(k, dict):\n                continue\n            if k.get(\"status\") != \"active\":\n                continue\n            if k.get(\"id\") == api_key or k.get(\"key_prefix\") == api_key:\n                key_row = k\n                break\n        if key_row is None:\n            for k in api_keys:\n                if not isinstance(k, dict):\n                    continue\n                if k.get(\"status\") != \"active\":\n                    continue\n                kp = k.get(\"key_prefix\")\n                if isinstance(kp, str) and kp and api_key.startswith(kp):\n                    key_row = k\n                    break\n\n    if not key_row:\n        if req_logs is not None:\n            _ensure_request_log(req_logs, None, None, \"UNAUTHORIZED\")\n            _save(\"request_logs.json\", req_logs)\n        return _err(\"UNAUTHORIZED\", \"api_key is missing, malformed, revoked, or invalid\")\n\n    acc_row = None\n    if isinstance(accounts, list):\n        for a in accounts:\n            if isinstance(a, dict) and a.get(\"id\") == key_row.get(\"account_id\"):\n                acc_row = a\n                break\n    if not acc_row or acc_row.get(\"status\") != \"active\":\n        if req_logs is not None:\n            _ensure_request_log(req_logs, key_row.get(\"id\"), key_row.get(\"account_id\"), \"UNAUTHORIZED\")\n            _save(\"request_logs.json\", req_logs)\n        return _err(\"UNAUTHORIZED\", \"api_key belongs to a non-active account\")\n\n    # Update last_used_at\n    now = _now_iso()\n    key_row[\"last_used_at\"] = now\n    key_row[\"updated_at\"] = now\n    _save(\"api_keys.json\", api_keys)\n\n    # Usage: current day aggregate + key\n    dt = datetime.datetime.utcnow()\n    day_start = dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + \"Z\"\n\n    def _find_counter(account_id, api_key_id):\n        if not isinstance(counters, list):\n            return None\n        for c in counters:\n            if not isinstance(c, dict):\n                continue\n            if c.get(\"account_id\") == account_id and c.get(\"api_key_id\") == api_key_id and c.get(\"period_granularity\") == \"day\" and c.get(\"period_start\") == day_start:\n                return c\n        return None\n\n    acct_counter = _find_counter(acc_row[\"id\"], None) or {\"jobs_created\": 0, \"images_generated\": 0, \"failed_jobs\": 0, \"period_start\": day_start, \"period_granularity\": \"day\"}\n    key_counter = _find_counter(acc_row[\"id\"], key_row[\"id\"]) or {\"jobs_created\": 0, \"images_generated\": 0, \"failed_jobs\": 0, \"period_start\": day_start, \"period_granularity\": \"day\"}\n\n    resp = {\n        \"api_key\": {\n            \"id\": key_row.get(\"id\"),\n            \"name\": key_row.get(\"name\"),\n            \"status\": key_row.get(\"status\"),\n            \"key_prefix\": key_row.get(\"key_prefix\"),\n            \"last_used_at\": key_row.get(\"last_used_at\"),\n            \"created_at\": key_row.get(\"created_at\"),\n            \"updated_at\": key_row.get(\"updated_at\"),\n        },\n        \"account\": {\n            \"id\": acc_row.get(\"id\"),\n            \"display_name\": acc_row.get(\"display_name\"),\n            \"email\": acc_row.get(\"email\"),\n            \"status\": acc_row.get(\"status\"),\n            \"created_at\": acc_row.get(\"created_at\"),\n            \"updated_at\": acc_row.get(\"updated_at\"),\n        },\n        \"scopes\": [\"images:generate\", \"jobs:read\", \"images:read\"],\n        \"usage\": {\n            \"day\": {\n                \"period_start\": day_start,\n                \"account\": {\n                    \"jobs_created\": int(acct_counter.get(\"jobs_created\") or 0),\n                    \"images_generated\": int(acct_counter.get(\"images_generated\") or 0),\n                    \"failed_jobs\": int(acct_counter.get(\"failed_jobs\") or 0),\n                },\n                \"api_key\": {\n                    \"jobs_created\": int(key_counter.get(\"jobs_created\") or 0),\n                    \"images_generated\": int(key_counter.get(\"images_generated\") or 0),\n                    \"failed_jobs\": int(key_counter.get(\"failed_jobs\") or 0),\n                },\n            }\n        },\n        \"quota\": {\n            \"jobs_created_per_day\": {\"account_limit\": 500, \"api_key_limit\": 200}\n        },\n    }\n\n    if req_logs is not None:\n        _ensure_request_log(req_logs, key_row.get(\"id\"), acc_row.get(\"id\"), \"OK\")\n        _save(\"request_logs.json\", req_logs)\n\n    return resp\n"
+        },
+        {
+          "name": "listGenerationJobs",
+          "description": "Lists generation jobs visible to the authenticated account, optionally filtered by status and time range, ordered by created_at desc. Returns a paginated result set; refuses UNAUTHORIZED if the api_key is invalid/revoked or the account is not active.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^jmg_[A-Za-z0-9]+_[A-Za-z0-9]+$",
+                "description": "API key used to authenticate the request (raw secret key string)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "Optional job status filter."
+              },
+              "created_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional filter: include jobs created at or after this timestamp (inclusive)."
+              },
+              "created_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional filter: include jobs created before this timestamp (exclusive)."
+              },
+              "page_size": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of jobs to return per page."
+              },
+              "page_token": {
+                "type": "string",
+                "description": "Opaque pagination token returned from a previous call."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def listGenerationJobs(api_key, status=None, created_after=None, created_before=None, page_size=None, page_token=None, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0327000\" if __import__(\"os\").path.isdir(\"./environment_mix/0327000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started_ts = time.time()\n    endpoint = \"listGenerationJobs\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ensure_request_log(logs, api_key_id, account_id, status_code):\n        if not isinstance(logs, list):\n            return\n        latency_ms = int(max(0, (time.time() - started_ts) * 1000))\n        logs.append(\n            {\n                \"id\": \"req_\" + os.urandom(12).hex(),\n                \"endpoint\": endpoint,\n                \"api_key_id\": api_key_id,\n                \"account_id\": account_id,\n                \"status\": status_code,\n                \"latency_ms\": latency_ms,\n                \"created_at\": _now_iso(),\n            }\n        )\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None, None\n        if not isinstance(s, str):\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be a date-time string\", field=field)\n        try:\n            return datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\")), None\n        except Exception:\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be a valid ISO-8601 date-time\", field=field)\n\n    # Validate inputs\n    if not isinstance(api_key, str):\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a string\", field=\"api_key\")\n    if not re.match(r\"^jmg_[A-Za-z0-9]+_[A-Za-z0-9]+$\", api_key):\n        return _err(\"VALIDATION_ERROR\", \"api_key has invalid format\", field=\"api_key\")\n\n    if status is not None and status not in (\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"):\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: queued, running, succeeded, failed, cancelled\", field=\"status\")\n\n    if page_size is None:\n        page_size = 50\n    if not isinstance(page_size, int) or page_size < 1 or page_size > 200:\n        return _err(\"VALIDATION_ERROR\", \"page_size must be an integer between 1 and 200\", field=\"page_size\")\n\n    ca, e = _parse_dt(created_after, \"created_after\")\n    if e:\n        return e\n    cb, e = _parse_dt(created_before, \"created_before\")\n    if e:\n        return e\n\n    if page_token is not None and (not isinstance(page_token, str) or not page_token.strip()):\n        return _err(\"VALIDATION_ERROR\", \"page_token must be a non-empty string when provided\", field=\"page_token\")\n\n    accounts = _load(\"accounts.json\")\n    api_keys = _load(\"api_keys.json\")\n    jobs = _load(\"generation_jobs.json\")\n    req_logs = _load(\"request_logs.json\")\n    if not isinstance(req_logs, list):\n        req_logs = None\n\n    # Authenticate (id or prefix)\n    key_row = None\n    if isinstance(api_keys, list):\n        for k in api_keys:\n            if isinstance(k, dict) and k.get(\"status\") == \"active\" and (k.get(\"id\") == api_key or k.get(\"key_prefix\") == api_key):\n                key_row = k\n                break\n        if key_row is None:\n            for k in api_keys:\n                if not isinstance(k, dict):\n                    continue\n                if k.get(\"status\") != \"active\":\n                    continue\n                kp = k.get(\"key_prefix\")\n                if isinstance(kp, str) and kp and api_key.startswith(kp):\n                    key_row = k\n                    break\n    if not key_row:\n        if req_logs is not None:\n            _ensure_request_log(req_logs, None, None, \"UNAUTHORIZED\")\n            _save(\"request_logs.json\", req_logs)\n        return _err(\"UNAUTHORIZED\", \"api_key is invalid or revoked\")\n\n    acc_row = None\n    if isinstance(accounts, list):\n        for a in accounts:\n            if isinstance(a, dict) and a.get(\"id\") == key_row.get(\"account_id\"):\n                acc_row = a\n                break\n    if not acc_row or acc_row.get(\"status\") != \"active\":\n        if req_logs is not None:\n            _ensure_request_log(req_logs, key_row.get(\"id\"), key_row.get(\"account_id\"), \"UNAUTHORIZED\")\n            _save(\"request_logs.json\", req_logs)\n        return _err(\"UNAUTHORIZED\", \"account is not active\")\n\n    # update last_used_at\n    now = _now_iso()\n    key_row[\"last_used_at\"] = now\n    key_row[\"updated_at\"] = now\n    _save(\"api_keys.json\", api_keys)\n\n    # Filter and sort\n    if not isinstance(jobs, list):\n        jobs = []\n    rows = []\n    for j in jobs:\n        if not isinstance(j, dict):\n            continue\n        if j.get(\"account_id\") != acc_row[\"id\"]:\n            continue\n        if status is not None and j.get(\"status\") != status:\n            continue\n        if ca is not None:\n            jd, pe = _parse_dt(j.get(\"created_at\"), \"created_at\")\n            if pe:\n                continue\n            if jd < ca:\n                continue\n        if cb is not None:\n            jd, pe = _parse_dt(j.get(\"created_at\"), \"created_at\")\n            if pe:\n                continue\n            if jd >= cb:\n                continue\n        rows.append(j)\n\n    def _dt_key(row):\n        s = row.get(\"created_at\")\n        try:\n            return datetime.datetime.fromisoformat(str(s).replace(\"Z\", \"+00:00\"))\n        except Exception:\n            return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n\n    rows.sort(key=_dt_key, reverse=True)\n\n    # Pagination: page_token is last seen job id (opaque enough); start after it\n    start_idx = 0\n    if page_token:\n        for i, r in enumerate(rows):\n            if r.get(\"id\") == page_token:\n                start_idx = i + 1\n                break\n\n    page = rows[start_idx:start_idx + page_size]\n    next_cursor = None\n    has_more = start_idx + page_size < len(rows)\n    if has_more and page:\n        next_cursor = page[-1].get(\"id\")\n\n    resp = {\n        \"jobs\": page,\n        \"meta\": {\n            \"total\": len(rows),\n            \"page_size\": page_size,\n            \"has_more\": bool(has_more),\n            \"next_cursor\": next_cursor,\n        },\n    }\n\n    if req_logs is not None:\n        _ensure_request_log(req_logs, key_row.get(\"id\"), acc_row.get(\"id\"), \"OK\")\n        _save(\"request_logs.json\", req_logs)\n\n    return resp\n"
+        },
+        {
+          "name": "getGenerationJob",
+          "description": "Fetches a single generation job by id for the authenticated account, including persisted input and execution metadata. Refuses NOT_FOUND if the job does not exist for the caller, and UNAUTHORIZED if the api_key is invalid/revoked or the account is not active.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^jmg_[A-Za-z0-9]+_[A-Za-z0-9]+$",
+                "description": "API key used to authenticate the request (raw secret key string)."
+              },
+              "job_id": {
+                "type": "string",
+                "description": "Generation job id (primary key)."
+              }
+            },
+            "required": [
+              "api_key",
+              "job_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def getGenerationJob(api_key, job_id, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0327000\" if __import__(\"os\").path.isdir(\"./environment_mix/0327000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started_ts = time.time()\n    endpoint = \"getGenerationJob\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ensure_request_log(logs, api_key_id, account_id, status_code):\n        if not isinstance(logs, list):\n            return\n        latency_ms = int(max(0, (time.time() - started_ts) * 1000))\n        logs.append(\n            {\n                \"id\": \"req_\" + os.urandom(12).hex(),\n                \"endpoint\": endpoint,\n                \"api_key_id\": api_key_id,\n                \"account_id\": account_id,\n                \"status\": status_code,\n                \"latency_ms\": latency_ms,\n                \"created_at\": _now_iso(),\n            }\n        )\n\n    # Validate\n    if not isinstance(api_key, str):\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a string\", field=\"api_key\")\n    if not re.match(r\"^jmg_[A-Za-z0-9]+_[A-Za-z0-9]+$\", api_key):\n        return _err(\"VALIDATION_ERROR\", \"api_key has invalid format\", field=\"api_key\")\n    if not isinstance(job_id, str) or not job_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"job_id must be a non-empty string\", field=\"job_id\")\n\n    accounts = _load(\"accounts.json\")\n    api_keys = _load(\"api_keys.json\")\n    jobs = _load(\"generation_jobs.json\")\n    images = _load(\"generated_images.json\")\n    req_logs = _load(\"request_logs.json\")\n    if not isinstance(req_logs, list):\n        req_logs = None\n\n    # Authenticate (id or prefix; never hash)\n    key_row = None\n    if isinstance(api_keys, list):\n        for k in api_keys:\n            if isinstance(k, dict) and k.get(\"status\") == \"active\" and (k.get(\"id\") == api_key or k.get(\"key_prefix\") == api_key):\n                key_row = k\n                break\n        if key_row is None:\n            for k in api_keys:\n                if not isinstance(k, dict):\n                    continue\n                if k.get(\"status\") != \"active\":\n                    continue\n                kp = k.get(\"key_prefix\")\n                if isinstance(kp, str) and kp and api_key.startswith(kp):\n                    key_row = k\n                    break\n    if not key_row:\n        if req_logs is not None:\n            _ensure_request_log(req_logs, None, None, \"UNAUTHORIZED\")\n            _save(\"request_logs.json\", req_logs)\n        return _err(\"UNAUTHORIZED\", \"api_key is invalid or revoked\")\n\n    acc_row = None\n    if isinstance(accounts, list):\n        for a in accounts:\n            if isinstance(a, dict) and a.get(\"id\") == key_row.get(\"account_id\"):\n                acc_row = a\n                break\n    if not acc_row or acc_row.get(\"status\") != \"active\":\n        if req_logs is not None:\n            _ensure_request_log(req_logs, key_row.get(\"id\"), key_row.get(\"account_id\"), \"UNAUTHORIZED\")\n            _save(\"request_logs.json\", req_logs)\n        return _err(\"UNAUTHORIZED\", \"account is not active\")\n\n    # update last_used_at\n    now = _now_iso()\n    key_row[\"last_used_at\"] = now\n    key_row[\"updated_at\"] = now\n    _save(\"api_keys.json\", api_keys)\n\n    # Find job owned by account\n    job = None\n    if isinstance(jobs, list):\n        for j in jobs:\n            if isinstance(j, dict) and j.get(\"id\") == job_id and j.get(\"account_id\") == acc_row[\"id\"]:\n                job = j\n                break\n    if not job:\n        if req_logs is not None:\n            _ensure_request_log(req_logs, key_row.get(\"id\"), acc_row.get(\"id\"), \"NOT_FOUND\")\n            _save(\"request_logs.json\", req_logs)\n        return _err(\"NOT_FOUND\", \"generation job not found\", job_id=job_id)\n\n    # Include images for the job (only available by default)\n    job_images = []\n    if isinstance(images, list):\n        for im in images:\n            if not isinstance(im, dict):\n                continue\n            if im.get(\"job_id\") == job_id and im.get(\"account_id\") == acc_row[\"id\"] and im.get(\"status\") == \"available\":\n                job_images.append(im)\n\n    resp = {\"job\": job, \"images\": job_images}\n\n    if req_logs is not None:\n        _ensure_request_log(req_logs, key_row.get(\"id\"), acc_row.get(\"id\"), \"OK\")\n        _save(\"request_logs.json\", req_logs)\n\n    return resp\n"
+        },
+        {
+          "name": "cancelGenerationJob",
+          "description": "Requests cancellation of a queued or running generation job owned by the authenticated account by transitioning its status to cancelled. Returns the updated job record; refuses CONFLICT if the job is already terminal (succeeded/failed/cancelled) or cannot transition per lifecycle rules, and refuses NOT_FOUND/UNAUTHORIZED as applicable.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^jmg_[A-Za-z0-9]+_[A-Za-z0-9]+$",
+                "description": "API key used to authenticate the request (raw secret key string)."
+              },
+              "job_id": {
+                "type": "string",
+                "description": "Generation job id (primary key)."
+              }
+            },
+            "required": [
+              "api_key",
+              "job_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def cancelGenerationJob(api_key, job_id, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0327000\" if __import__(\"os\").path.isdir(\"./environment_mix/0327000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _log_request(requests, api_key_id, account_id, endpoint, status, started_ts):\n        ended = time.time()\n        latency_ms = int(max(0, (ended - started_ts) * 1000))\n        row = {\n            \"id\": \"req_\" + os.urandom(12).hex(),\n            \"endpoint\": endpoint,\n            \"api_key_id\": api_key_id,\n            \"account_id\": account_id,\n            \"status\": status,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now(),\n        }\n        requests.append(row)\n\n    started_ts = time.time()\n    endpoint = \"cancelGenerationJob\"\n\n    # Load store\n    accounts = _load(\"accounts.json\")\n    api_keys = _load(\"api_keys.json\")\n    jobs = _load(\"generation_jobs.json\")\n    requests = _load(\"request_logs.json\")  # may not exist per schema; still record dynamics\n    if not isinstance(requests, list):\n        requests = []\n\n    # Validate inputs\n    if not isinstance(api_key, str) or not re.match(r\"^jmg_[A-Za-z0-9]+_[A-Za-z0-9]+$\", api_key):\n        _log_request(requests, None, None, endpoint, \"VALIDATION_ERROR\", started_ts)\n        _save(\"request_logs.json\", requests)\n        return _err(\"VALIDATION_ERROR\", \"api_key is invalid format.\")\n    if not isinstance(job_id, str) or not job_id.strip():\n        _log_request(requests, None, None, endpoint, \"VALIDATION_ERROR\", started_ts)\n        _save(\"request_logs.json\", requests)\n        return _err(\"VALIDATION_ERROR\", \"job_id is required.\")\n\n    # Authenticate: must match by client-visible value or id; store has only prefix/hash.\n    # Therefore authenticate by matching api_key to api_keys.id OR api_keys.key_prefix.\n    key_row = None\n    for k in api_keys:\n        if not isinstance(k, dict):\n            continue\n        if k.get(\"id\") == api_key or k.get(\"key_prefix\") == api_key:\n            key_row = k\n            break\n    if not key_row or key_row.get(\"status\") != \"active\":\n        _log_request(requests, key_row.get(\"id\") if key_row else None, None, endpoint, \"UNAUTHORIZED\", started_ts)\n        _save(\"request_logs.json\", requests)\n        return _err(\"UNAUTHORIZED\", \"Invalid or revoked API key.\")\n\n    acct = None\n    for a in accounts:\n        if isinstance(a, dict) and a.get(\"id\") == key_row.get(\"account_id\"):\n            acct = a\n            break\n    if not acct or acct.get(\"status\") != \"active\":\n        _log_request(requests, key_row.get(\"id\"), key_row.get(\"account_id\"), endpoint, \"UNAUTHORIZED\", started_ts)\n        _save(\"request_logs.json\", requests)\n        return _err(\"UNAUTHORIZED\", \"Account is not active.\")\n\n    # Find job and enforce ownership\n    job = None\n    job_idx = None\n    for i, j in enumerate(jobs):\n        if isinstance(j, dict) and j.get(\"id\") == job_id:\n            job = j\n            job_idx = i\n            break\n    if not job or job.get(\"account_id\") != acct.get(\"id\"):\n        _log_request(requests, key_row.get(\"id\"), acct.get(\"id\"), endpoint, \"NOT_FOUND\", started_ts)\n        _save(\"request_logs.json\", requests)\n        return _err(\"NOT_FOUND\", \"Generation job not found.\")\n\n    cur = job.get(\"status\")\n    terminal = {\"succeeded\", \"failed\", \"cancelled\"}\n    if cur in terminal:\n        _log_request(requests, key_row.get(\"id\"), acct.get(\"id\"), endpoint, \"CONFLICT\", started_ts)\n        _save(\"request_logs.json\", requests)\n        return _err(\"CONFLICT\", \"Job is already in a terminal state.\", status=cur)\n\n    transitions = {\n        \"queued\": [\"running\", \"cancelled\", \"failed\"],\n        \"running\": [\"succeeded\", \"failed\", \"cancelled\"],\n        \"succeeded\": [],\n        \"failed\": [\"queued\"],\n        \"cancelled\": [],\n    }\n    if \"cancelled\" not in transitions.get(cur, []):\n        _log_request(requests, key_row.get(\"id\"), acct.get(\"id\"), endpoint, \"INVALID_TRANSITION\", started_ts)\n        _save(\"request_logs.json\", requests)\n        return _err(\"INVALID_TRANSITION\", f\"Cannot transition job from {cur} to cancelled.\")\n\n    # Apply transition\n    now = _now()\n    job = dict(job)\n    job[\"status\"] = \"cancelled\"\n    # started_at constraint: started_at must be non-null when status in running/succeeded/failed/cancelled\n    if not job.get(\"started_at\"):\n        job[\"started_at\"] = now\n    job[\"finished_at\"] = now\n    job[\"updated_at\"] = now\n    jobs[job_idx] = job\n\n    # Mark API key last used\n    key_row = dict(key_row)\n    key_row[\"last_used_at\"] = now\n    key_row[\"updated_at\"] = now\n    for i, k in enumerate(api_keys):\n        if isinstance(k, dict) and k.get(\"id\") == key_row.get(\"id\"):\n            api_keys[i] = key_row\n            break\n\n    _save(\"generation_jobs.json\", jobs)\n    _save(\"api_keys.json\", api_keys)\n\n    _log_request(requests, key_row.get(\"id\"), acct.get(\"id\"), endpoint, \"OK\", started_ts)\n    _save(\"request_logs.json\", requests)\n\n    return {\"job\": job}\n"
+        },
+        {
+          "name": "listGeneratedImages",
+          "description": "Lists generated image artifacts for the authenticated account, optionally filtered by job_id and status, ordered by created_at desc. Returns a paginated result set; refuses UNAUTHORIZED if the api_key is invalid/revoked or the account is not active.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^jmg_[A-Za-z0-9]+_[A-Za-z0-9]+$",
+                "description": "API key used to authenticate the request (raw secret key string)."
+              },
+              "job_id": {
+                "type": "string",
+                "description": "Optional filter: only images produced by the specified generation job id."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "available",
+                  "deleted"
+                ],
+                "description": "Optional image status filter."
+              },
+              "page_size": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of images to return per page."
+              },
+              "page_token": {
+                "type": "string",
+                "description": "Opaque pagination token returned from a previous call."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def listGeneratedImages(api_key, job_id=None, status=None, page_size=None, page_token=None, **_extra):\n    import json, os, datetime, re, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0327000\" if __import__(\"os\").path.isdir(\"./environment_mix/0327000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _log_request(requests, api_key_id, account_id, endpoint, status_str, started_ts):\n        latency_ms = int(max(0, (time.time() - started_ts) * 1000))\n        requests.append(\n            {\n                \"id\": \"req_\" + os.urandom(12).hex(),\n                \"endpoint\": endpoint,\n                \"api_key_id\": api_key_id,\n                \"account_id\": account_id,\n                \"status\": status_str,\n                \"latency_ms\": latency_ms,\n                \"created_at\": _now(),\n            }\n        )\n\n    started_ts = time.time()\n    endpoint = \"listGeneratedImages\"\n\n    accounts = _load(\"accounts.json\")\n    api_keys = _load(\"api_keys.json\")\n    images = _load(\"generated_images.json\")\n    requests = _load(\"request_logs.json\")\n    if not isinstance(requests, list):\n        requests = []\n\n    # Validate inputs\n    if not isinstance(api_key, str) or not re.match(r\"^jmg_[A-Za-z0-9]+_[A-Za-z0-9]+$\", api_key):\n        _log_request(requests, None, None, endpoint, \"VALIDATION_ERROR\", started_ts)\n        _save(\"request_logs.json\", requests)\n        return _err(\"VALIDATION_ERROR\", \"api_key is invalid format.\")\n    if job_id is not None and (not isinstance(job_id, str) or not job_id.strip()):\n        _log_request(requests, None, None, endpoint, \"VALIDATION_ERROR\", started_ts)\n        _save(\"request_logs.json\", requests)\n        return _err(\"VALIDATION_ERROR\", \"job_id must be a non-empty string when provided.\")\n    if status is not None and status not in (\"available\", \"deleted\"):\n        _log_request(requests, None, None, endpoint, \"VALIDATION_ERROR\", started_ts)\n        _save(\"request_logs.json\", requests)\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: available, deleted.\")\n    if page_size is None:\n        page_size = 50\n    if not isinstance(page_size, int) or page_size < 1 or page_size > 200:\n        _log_request(requests, None, None, endpoint, \"VALIDATION_ERROR\", started_ts)\n        _save(\"request_logs.json\", requests)\n        return _err(\"VALIDATION_ERROR\", \"page_size must be an integer between 1 and 200.\")\n\n    # Decode page token\n    cursor_created_at = None\n    cursor_id = None\n    if page_token is not None:\n        if not isinstance(page_token, str) or not page_token:\n            _log_request(requests, None, None, endpoint, \"VALIDATION_ERROR\", started_ts)\n            _save(\"request_logs.json\", requests)\n            return _err(\"VALIDATION_ERROR\", \"page_token must be a non-empty string when provided.\")\n        try:\n            raw = base64.urlsafe_b64decode(page_token.encode(\"utf-8\") + b\"===\")\n            tok = json.loads(raw.decode(\"utf-8\"))\n            cursor_created_at = tok.get(\"created_at\")\n            cursor_id = tok.get(\"id\")\n            if not isinstance(cursor_created_at, str) or not isinstance(cursor_id, str):\n                raise ValueError(\"bad token\")\n            if _parse_dt(cursor_created_at) is None:\n                raise ValueError(\"bad token dt\")\n        except Exception:\n            _log_request(requests, None, None, endpoint, \"VALIDATION_ERROR\", started_ts)\n            _save(\"request_logs.json\", requests)\n            return _err(\"VALIDATION_ERROR\", \"Invalid page_token.\")\n\n    # Authenticate\n    key_row = None\n    for k in api_keys:\n        if not isinstance(k, dict):\n            continue\n        if k.get(\"id\") == api_key or k.get(\"key_prefix\") == api_key:\n            key_row = k\n            break\n    if not key_row or key_row.get(\"status\") != \"active\":\n        _log_request(requests, key_row.get(\"id\") if key_row else None, None, endpoint, \"UNAUTHORIZED\", started_ts)\n        _save(\"request_logs.json\", requests)\n        return _err(\"UNAUTHORIZED\", \"Invalid or revoked API key.\")\n\n    acct = None\n    for a in accounts:\n        if isinstance(a, dict) and a.get(\"id\") == key_row.get(\"account_id\"):\n            acct = a\n            break\n    if not acct or acct.get(\"status\") != \"active\":\n        _log_request(requests, key_row.get(\"id\"), key_row.get(\"account_id\"), endpoint, \"UNAUTHORIZED\", started_ts)\n        _save(\"request_logs.json\", requests)\n        return _err(\"UNAUTHORIZED\", \"Account is not active.\")\n\n    # Mark API key last used\n    now = _now()\n    for i, k in enumerate(api_keys):\n        if isinstance(k, dict) and k.get(\"id\") == key_row.get(\"id\"):\n            nk = dict(k)\n            nk[\"last_used_at\"] = now\n            nk[\"updated_at\"] = now\n            api_keys[i] = nk\n            break\n    _save(\"api_keys.json\", api_keys)\n\n    # Filter to account + optional filters\n    acc_id = acct.get(\"id\")\n    filtered = []\n    for img in images:\n        if not isinstance(img, dict):\n            continue\n        if img.get(\"account_id\") != acc_id:\n            continue\n        if job_id is not None and img.get(\"job_id\") != job_id:\n            continue\n        if status is not None and img.get(\"status\") != status:\n            continue\n        filtered.append(img)\n\n    # Sort by created_at desc, then id desc for stability\n    def _sort_key(r):\n        dt = _parse_dt(r.get(\"created_at\")) or datetime.datetime.min\n        return (dt, str(r.get(\"id\", \"\")))\n\n    filtered.sort(key=_sort_key, reverse=True)\n\n    total = len(filtered)\n\n    # Apply cursor pagination (created_at desc)\n    if cursor_created_at is not None:\n        cdt = _parse_dt(cursor_created_at)\n        def _after_cursor(r):\n            rdt = _parse_dt(r.get(\"created_at\")) or datetime.datetime.min\n            rid = str(r.get(\"id\", \"\"))\n            # since sorted desc, we want items strictly \"after\" cursor:\n            # r comes after cursor if rdt < cdt OR (rdt == cdt and rid < cursor_id) when descending\n            if rdt < cdt:\n                return True\n            if rdt == cdt and rid < cursor_id:\n                return True\n            return False\n        filtered = [r for r in filtered if _after_cursor(r)]\n\n    page = filtered[:page_size]\n    has_more = len(filtered) > page_size\n\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        tok = {\"created_at\": last.get(\"created_at\"), \"id\": last.get(\"id\")}\n        next_cursor = base64.urlsafe_b64encode(json.dumps(tok).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    _log_request(requests, key_row.get(\"id\"), acc_id, endpoint, \"OK\", started_ts)\n    _save(\"request_logs.json\", requests)\n\n    return {\n        \"images\": page,\n        \"page\": {\n            \"total\": total,\n            \"page_size\": page_size,\n            \"has_more\": has_more,\n            \"next_page_token\": next_cursor,\n        },\n    }\n"
+        },
+        {
+          "name": "getGeneratedImage",
+          "description": "Fetches a single generated image artifact by id for the authenticated account, including storage metadata (content_type, byte_size, dimensions, and storage locator). Refuses NOT_FOUND if the image does not exist for the caller or is deleted, and refuses UNAUTHORIZED if the api_key is invalid/revoked or the account is not active.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^jmg_[A-Za-z0-9]+_[A-Za-z0-9]+$",
+                "description": "API key used to authenticate the request (raw secret key string)."
+              },
+              "image_id": {
+                "type": "string",
+                "description": "Generated image id (primary key)."
+              }
+            },
+            "required": [
+              "api_key",
+              "image_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def getGeneratedImage(api_key, image_id, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0327000\" if __import__(\"os\").path.isdir(\"./environment_mix/0327000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"getGeneratedImage\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ensure_list(x):\n        return x if isinstance(x, list) else []\n\n    def _append_log(status, api_key_id=None, account_id=None, http_status=None, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            # If logs file is missing/corrupt, create a fresh list to preserve observability\n            logs = []\n        latency_ms = int(max(0, (time.time() - t0) * 1000))\n        row = {\n            \"id\": \"req_\" + os.urandom(12).hex(),\n            \"endpoint\": endpoint,\n            \"api_key_id\": api_key_id,\n            \"account_id\": account_id,\n            \"status\": status,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now_iso(),\n        }\n        if http_status is not None:\n            row[\"http_status\"] = http_status\n        if error_code is not None:\n            row[\"error_code\"] = error_code\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    # Validate inputs (do not over-enforce: accept any non-empty string, even if it doesn't match vendor pattern)\n    if not isinstance(api_key, str) or not api_key.strip():\n        _append_log(\"VALIDATION_ERROR\", http_status=400, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\", field=\"api_key\")\n    if not isinstance(image_id, str) or not image_id.strip():\n        _append_log(\"VALIDATION_ERROR\", http_status=400, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"image_id must be a non-empty string\", field=\"image_id\")\n\n    api_key = api_key.strip()\n    image_id = image_id.strip()\n\n    accounts = _ensure_list(_load(\"accounts.json\"))\n    api_keys = _ensure_list(_load(\"api_keys.json\"))\n    images = _ensure_list(_load(\"generated_images.json\"))\n\n    # Authenticate: explicit credential parameter must match client-visible value or id.\n    # The store does NOT contain raw secrets; so we authenticate by id (best-effort).\n    # Also: search for a combination that can satisfy the request (active key + active account),\n    # and that owns the requested image when possible.\n    key_row = None\n    acct_row = None\n    img_row = None\n\n    # Locate the image first; this lets us choose the correct account/api key combination when multiple exist.\n    for r in images:\n        if isinstance(r, dict) and r.get(\"id\") == image_id:\n            img_row = r\n            break\n\n    # Helper: find account by id\n    acct_by_id = {a.get(\"id\"): a for a in accounts if isinstance(a, dict) and isinstance(a.get(\"id\"), str)}\n\n    def _is_active_account(a):\n        return isinstance(a, dict) and a.get(\"status\") == \"active\"\n\n    def _is_active_key(k):\n        return isinstance(k, dict) and k.get(\"status\") == \"active\"\n\n    # Candidate keys matching the provided api_key (id match); additionally allow key_prefix match\n    # because some clients pass prefixes/identifiers in place of raw secrets.\n    candidates = []\n    for k in api_keys:\n        if not isinstance(k, dict):\n            continue\n        if k.get(\"id\") == api_key or k.get(\"key_prefix\") == api_key:\n            candidates.append(k)\n\n    # If no candidates, unauthorized\n    if not candidates:\n        _append_log(\"UNAUTHORIZED\", http_status=401, error_code=\"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"api_key is invalid or not recognized\")\n\n    # Prefer a candidate that:\n    # 1) is active\n    # 2) has an active account\n    # 3) (if image exists) belongs to the image's account_id\n    best = None\n    for k in candidates:\n        a = acct_by_id.get(k.get(\"account_id\"))\n        if not (_is_active_key(k) and _is_active_account(a)):\n            continue\n        if img_row is not None:\n            # Only accept if it could legitimately access this image\n            if img_row.get(\"account_id\") != k.get(\"account_id\"):\n                continue\n        best = (k, a)\n        break\n\n    # If image exists but no active combination can access it, treat as NOT_FOUND (do not leak existence)\n    if img_row is not None and best is None:\n        _append_log(\"NOT_FOUND\", http_status=404, error_code=\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"generated image not found\", image_id=image_id)\n\n    # If image does not exist, still must authenticate with any working active key+account\n    if img_row is None:\n        for k in candidates:\n            a = acct_by_id.get(k.get(\"account_id\"))\n            if _is_active_key(k) and _is_active_account(a):\n                best = (k, a)\n                break\n        if best is None:\n            _append_log(\"UNAUTHORIZED\", http_status=401, error_code=\"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"api_key is invalid/revoked or account is not active\")\n\n        key_row, acct_row = best\n        _append_log(\"NOT_FOUND\", api_key_id=key_row.get(\"id\"), account_id=acct_row.get(\"id\"), http_status=404, error_code=\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"generated image not found\", image_id=image_id)\n\n    key_row, acct_row = best\n\n    # Enforce \"deleted\" refusal as NOT_FOUND\n    if img_row.get(\"status\") == \"deleted\":\n        _append_log(\"NOT_FOUND\", api_key_id=key_row.get(\"id\"), account_id=acct_row.get(\"id\"), http_status=404, error_code=\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"generated image not found\", image_id=image_id)\n\n    # Success response: return the real row with useful storage metadata\n    # (Do not fabricate; return exactly stored fields)\n    _append_log(\"OK\", api_key_id=key_row.get(\"id\"), account_id=acct_row.get(\"id\"), http_status=200)\n\n    return {\n        \"image\": img_row,\n        \"account_id\": acct_row.get(\"id\"),\n        \"api_key_id\": key_row.get(\"id\"),\n    }\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0327000",
+    "index": 327,
+    "name": "Jimeng AI Image Generation Server",
+    "description": "This backend stores accounts, API keys, image generation jobs, and generated image artifacts for the Jimeng AI Image Generation Server. The primary workflow is: an authenticated client submits a generation request (with defaults if no parameters are provided), the system enqueues/runs a job, and sto",
+    "taxonomy": {
+      "L1_id": "L1-11",
+      "L1_name": "AI & Machine Learning",
+      "L1_name_zh": "人工智能与机器学习",
+      "L2_id": "L2-29",
+      "L2_name": "Image & Multimedia Generation",
+      "L2_name_zh": "图像与多媒体生成",
+      "L3_name": "Provider-Specific Image Generation Connectors",
+      "L3_name_zh": "特定厂商/模型文生图连接器"
+    },
+    "database_dir": "./environment_mix/0327000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 5,
+    "n_records": 58,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 4,
+      "read_operations": 5,
+      "mutations_persisted": 2,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "getCurrentIdentity",
+      "returned_chars": 838
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

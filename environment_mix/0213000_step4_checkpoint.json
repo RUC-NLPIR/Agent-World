@@ -1,0 +1,261 @@
+{
+  "index": 213,
+  "local_files_dir": "./environment_mix/0213000",
+  "file_list": [
+    "./environment_mix/0213000/README.md",
+    "./environment_mix/0213000/events.json",
+    "./environment_mix/0213000/holidays.json",
+    "./environment_mix/0213000/users.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "users.json": "Array of user profiles: id, email, name, timezone (IANA).",
+        "holidays.json": "Array of all-day US 2025 holidays: event_id, title, start_time/end_time (ISO-8601 UTC), attendees, location, type.",
+        "events.json": "Array of calendar events: event_id, title, start_time/end_time (ISO-8601 UTC), attendees (emails), location.",
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "list_all_users",
+          "description": "Lists users in the directory and returns a paginated collection of user objects. You may provide a positive limit and an opaque cursor to continue a previous listing. Requests are refused when limit is less than 1, when cursor is not a string, or when any fields other than limit and cursor are provided.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of users to return.",
+                "minimum": 1
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor to continue listing from a previous response."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_all_users(limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0213000\" if __import__(\"os\").path.isdir(\"./environment_mix/0213000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    # Strict validation\n    if limit is not None:\n        if not isinstance(limit, int):\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer\", field=\"limit\")\n        if limit < 1:\n            return _err(\"VALIDATION_ERROR\", \"limit must be at least 1\", field=\"limit\", minimum=1)\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\", field=\"cursor\")\n\n    # Rate limiting / logging (create audit collection if absent)\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    audit_file = \"request_log.json\"\n    logs = _load(audit_file)\n    if not isinstance(logs, list):\n        logs = []\n\n    # Simple rolling window rate limit: 300 requests / 60 seconds\n    window_seconds = 60\n    limit_per_window = 300\n    cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=window_seconds)\n    recent = 0\n    for r in logs[-2000:]:\n        ts = r.get(\"timestamp\")\n        if isinstance(ts, str):\n            try:\n                if ts.endswith(\"Z\"):\n                    dt = datetime.datetime.fromisoformat(ts[:-1])\n                else:\n                    dt = datetime.datetime.fromisoformat(ts)\n                if dt >= cutoff:\n                    recent += 1\n            except Exception:\n                pass\n    if recent >= limit_per_window:\n        latency_ms = int((time.time() - t0) * 1000)\n        logs.append({\n            \"id\": \"req-\" + uuid.uuid4().hex[:24],\n            \"endpoint\": \"list_all_users\",\n            \"timestamp\": now,\n            \"status\": \"RATE_LIMIT\",\n            \"latency_ms\": latency_ms,\n            \"credential\": None\n        })\n        _save(audit_file, logs)\n        return _err(\"RATE_LIMIT\", \"Too many requests\")\n\n    users = _load(\"users.json\")\n    if not isinstance(users, list):\n        users = []\n\n    # Deterministic ordering for pagination\n    users_sorted = sorted(users, key=lambda r: (str(r.get(\"id\", \"\")), str(r.get(\"email\", \"\"))))\n\n    start = 0\n    if cursor:\n        # Cursor format: \"idx:<int>\"\n        if cursor.startswith(\"idx:\"):\n            try:\n                start = int(cursor.split(\":\", 1)[1])\n            except Exception:\n                return _err(\"VALIDATION_ERROR\", \"cursor is invalid\", field=\"cursor\")\n        else:\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\", field=\"cursor\")\n\n        if start < 0 or start > len(users_sorted):\n            return _err(\"VALIDATION_ERROR\", \"cursor is out of range\", field=\"cursor\")\n\n    page_size = limit if limit is not None else 100\n    end = min(start + page_size, len(users_sorted))\n    data = users_sorted[start:end]\n\n    has_more = end < len(users_sorted)\n    next_cursor = f\"idx:{end}\" if has_more else None\n\n    latency_ms = int((time.time() - t0) * 1000)\n    logs.append({\n        \"id\": \"req-\" + uuid.uuid4().hex[:24],\n        \"endpoint\": \"list_all_users\",\n        \"timestamp\": now,\n        \"status\": \"OK\",\n        \"latency_ms\": latency_ms,\n        \"credential\": None,\n        \"meta\": {\"returned\": len(data), \"total\": len(users_sorted)}\n    })\n    _save(audit_file, logs)\n\n    return {\n        \"object\": \"list\",\n        \"data\": data,\n        \"limit\": page_size,\n        \"cursor\": cursor,\n        \"next_cursor\": next_cursor,\n        \"has_more\": has_more,\n        \"total\": len(users_sorted)\n    }\n",
+          "params_reconstructed": true,
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "get_user_by_email",
+          "description": "Looks up a single user by email address and returns that user object when found. The request must include an email string. Requests are refused when email is missing or not a string, or when no user exists with that email.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "email": {
+                "type": "string",
+                "description": "The user's email address."
+              }
+            },
+            "required": [
+              "email"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0213000\" if __import__(\"os\").path.isdir(\"./environment_mix/0213000\") else \"/app/database\")\ndef get_user_by_email(email):\n    import json\n    with open(__import__(\"os\").path.join(_DB, 'users.json')) as f:\n        users = json.load(f)\n    for u in users:\n        if u.get('email','').lower() == email.lower():\n            return u\n    return None",
+          "description_restored": true
+        },
+        {
+          "name": "list_all_events",
+          "description": "Lists calendar events and returns a paginated collection of event objects. You may provide a positive limit and an opaque cursor to continue a previous listing. Requests are refused when limit is less than 1, when cursor is not a string, or when any fields other than limit and cursor are provided.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of events to return.",
+                "minimum": 1
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor to continue listing from a previous response."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_all_events(limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0213000\" if __import__(\"os\").path.isdir(\"./environment_mix/0213000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    if limit is not None:\n        if not isinstance(limit, int):\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer\", field=\"limit\")\n        if limit < 1:\n            return _err(\"VALIDATION_ERROR\", \"limit must be at least 1\", field=\"limit\", minimum=1)\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\", field=\"cursor\")\n\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    audit_file = \"request_log.json\"\n    logs = _load(audit_file)\n    if not isinstance(logs, list):\n        logs = []\n\n    window_seconds = 60\n    limit_per_window = 300\n    cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=window_seconds)\n    recent = 0\n    for r in logs[-2000:]:\n        ts = r.get(\"timestamp\")\n        if isinstance(ts, str):\n            try:\n                dt = datetime.datetime.fromisoformat(ts[:-1]) if ts.endswith(\"Z\") else datetime.datetime.fromisoformat(ts)\n                if dt >= cutoff:\n                    recent += 1\n            except Exception:\n                pass\n    if recent >= limit_per_window:\n        latency_ms = int((time.time() - t0) * 1000)\n        logs.append({\n            \"id\": \"req-\" + uuid.uuid4().hex[:24],\n            \"endpoint\": \"list_all_events\",\n            \"timestamp\": now,\n            \"status\": \"RATE_LIMIT\",\n            \"latency_ms\": latency_ms,\n            \"credential\": None\n        })\n        _save(audit_file, logs)\n        return _err(\"RATE_LIMIT\", \"Too many requests\")\n\n    events = _load(\"events.json\")\n    if not isinstance(events, list):\n        events = []\n\n    events_sorted = sorted(events, key=lambda r: (str(r.get(\"start_time\", \"\")), str(r.get(\"event_id\", \"\"))))\n\n    start = 0\n    if cursor:\n        if cursor.startswith(\"idx:\"):\n            try:\n                start = int(cursor.split(\":\", 1)[1])\n            except Exception:\n                return _err(\"VALIDATION_ERROR\", \"cursor is invalid\", field=\"cursor\")\n        else:\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\", field=\"cursor\")\n        if start < 0 or start > len(events_sorted):\n            return _err(\"VALIDATION_ERROR\", \"cursor is out of range\", field=\"cursor\")\n\n    page_size = limit if limit is not None else 100\n    end = min(start + page_size, len(events_sorted))\n    data = events_sorted[start:end]\n\n    has_more = end < len(events_sorted)\n    next_cursor = f\"idx:{end}\" if has_more else None\n\n    latency_ms = int((time.time() - t0) * 1000)\n    logs.append({\n        \"id\": \"req-\" + uuid.uuid4().hex[:24],\n        \"endpoint\": \"list_all_events\",\n        \"timestamp\": now,\n        \"status\": \"OK\",\n        \"latency_ms\": latency_ms,\n        \"credential\": None,\n        \"meta\": {\"returned\": len(data), \"total\": len(events_sorted)}\n    })\n    _save(audit_file, logs)\n\n    return {\n        \"object\": \"list\",\n        \"data\": data,\n        \"limit\": page_size,\n        \"cursor\": cursor,\n        \"next_cursor\": next_cursor,\n        \"has_more\": has_more,\n        \"total\": len(events_sorted)\n    }\n",
+          "params_reconstructed": true,
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "list_events_in_range",
+          "description": "Returns calendar events whose start date falls within the inclusive range from start_date through end_date (YYYY-MM-DD). Both dates are required and the response is the set of matching event objects. Requests are refused when either date is missing, not a string, not in YYYY-MM-DD form, or when the range is invalid (for example end_date is earlier than start_date).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "start_date": {
+                "type": "string",
+                "description": "Start date YYYY-MM-DD."
+              },
+              "end_date": {
+                "type": "string",
+                "description": "End date YYYY-MM-DD."
+              }
+            },
+            "required": [
+              "start_date",
+              "end_date"
+            ]
+          },
+          "implementation": "def list_events_in_range(start_date, end_date, **_extra):\n    import json, os, datetime, time, uuid, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0213000\" if __import__(\"os\").path.isdir(\"./environment_mix/0213000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    if not isinstance(start_date, str):\n        return _err(\"VALIDATION_ERROR\", \"start_date must be a string in YYYY-MM-DD\", field=\"start_date\")\n    if not isinstance(end_date, str):\n        return _err(\"VALIDATION_ERROR\", \"end_date must be a string in YYYY-MM-DD\", field=\"end_date\")\n\n    if not re.fullmatch(r\"\\d{4}-\\d{2}-\\d{2}\", start_date or \"\"):\n        return _err(\"VALIDATION_ERROR\", \"start_date must be in YYYY-MM-DD form\", field=\"start_date\")\n    if not re.fullmatch(r\"\\d{4}-\\d{2}-\\d{2}\", end_date or \"\"):\n        return _err(\"VALIDATION_ERROR\", \"end_date must be in YYYY-MM-DD form\", field=\"end_date\")\n\n    try:\n        s = datetime.date.fromisoformat(start_date)\n        e = datetime.date.fromisoformat(end_date)\n    except Exception:\n        return _err(\"VALIDATION_ERROR\", \"Invalid date value\", field=\"date\")\n\n    if e < s:\n        return _err(\"VALIDATION_ERROR\", \"Invalid range: end_date is earlier than start_date\", field=\"end_date\")\n\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    audit_file = \"request_log.json\"\n    logs = _load(audit_file)\n    if not isinstance(logs, list):\n        logs = []\n\n    window_seconds = 60\n    limit_per_window = 300\n    cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=window_seconds)\n    recent = 0\n    for r in logs[-2000:]:\n        ts = r.get(\"timestamp\")\n        if isinstance(ts, str):\n            try:\n                dt = datetime.datetime.fromisoformat(ts[:-1]) if ts.endswith(\"Z\") else datetime.datetime.fromisoformat(ts)\n                if dt >= cutoff:\n                    recent += 1\n            except Exception:\n                pass\n    if recent >= limit_per_window:\n        latency_ms = int((time.time() - t0) * 1000)\n        logs.append({\n            \"id\": \"req-\" + uuid.uuid4().hex[:24],\n            \"endpoint\": \"list_events_in_range\",\n            \"timestamp\": now,\n            \"status\": \"RATE_LIMIT\",\n            \"latency_ms\": latency_ms,\n            \"credential\": None\n        })\n        _save(audit_file, logs)\n        return _err(\"RATE_LIMIT\", \"Too many requests\")\n\n    events = _load(\"events.json\")\n    if not isinstance(events, list):\n        events = []\n\n    def _event_start_date(ev):\n        st = ev.get(\"start_time\")\n        if not isinstance(st, str):\n            return None\n        # Accept \"...Z\" and offsets and naive timestamps\n        try:\n            if st.endswith(\"Z\"):\n                dt = datetime.datetime.fromisoformat(st[:-1] + \"+00:00\")\n            else:\n                dt = datetime.datetime.fromisoformat(st)\n            return dt.date()\n        except Exception:\n            # Try extracting YYYY-MM-DD prefix if present\n            try:\n                if len(st) >= 10 and re.fullmatch(r\"\\d{4}-\\d{2}-\\d{2}\", st[:10]):\n                    return datetime.date.fromisoformat(st[:10])\n            except Exception:\n                return None\n        return None\n\n    out = []\n    for ev in events:\n        d = _event_start_date(ev)\n        if d is not None and s <= d <= e:\n            out.append(ev)\n\n    out = sorted(out, key=lambda r: (str(r.get(\"start_time\", \"\")), str(r.get(\"event_id\", \"\"))))\n\n    latency_ms = int((time.time() - t0) * 1000)\n    logs.append({\n        \"id\": \"req-\" + uuid.uuid4().hex[:24],\n        \"endpoint\": \"list_events_in_range\",\n        \"timestamp\": now,\n        \"status\": \"OK\",\n        \"latency_ms\": latency_ms,\n        \"credential\": None,\n        \"meta\": {\"returned\": len(out), \"start_date\": start_date, \"end_date\": end_date}\n    })\n    _save(audit_file, logs)\n\n    return {\"object\": \"list\", \"data\": out, \"total\": len(out)}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "get_event_by_id",
+          "description": "Retrieves a single calendar event by event_id and returns the event object when found. The request must include an event_id string. Requests are refused when event_id is missing or not a string, or when no event exists with that id.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "event_id": {
+                "type": "string",
+                "description": "The event's id."
+              }
+            },
+            "required": [
+              "event_id"
+            ]
+          },
+          "implementation": "def get_event_by_id(event_id, **_extra):\n    import json, os, datetime, time, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0213000\" if __import__(\"os\").path.isdir(\"./environment_mix/0213000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    if not isinstance(event_id, str):\n        return _err(\"VALIDATION_ERROR\", \"event_id must be a string\", field=\"event_id\")\n    if not event_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"event_id must not be empty\", field=\"event_id\")\n\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    audit_file = \"request_log.json\"\n    logs = _load(audit_file)\n    if not isinstance(logs, list):\n        logs = []\n\n    window_seconds = 60\n    limit_per_window = 300\n    cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=window_seconds)\n    recent = 0\n    for r in logs[-2000:]:\n        ts = r.get(\"timestamp\")\n        if isinstance(ts, str):\n            try:\n                dt = datetime.datetime.fromisoformat(ts[:-1]) if ts.endswith(\"Z\") else datetime.datetime.fromisoformat(ts)\n                if dt >= cutoff:\n                    recent += 1\n            except Exception:\n                pass\n    if recent >= limit_per_window:\n        latency_ms = int((time.time() - t0) * 1000)\n        logs.append({\n            \"id\": \"req-\" + uuid.uuid4().hex[:24],\n            \"endpoint\": \"get_event_by_id\",\n            \"timestamp\": now,\n            \"status\": \"RATE_LIMIT\",\n            \"latency_ms\": latency_ms,\n            \"credential\": None\n        })\n        _save(audit_file, logs)\n        return _err(\"RATE_LIMIT\", \"Too many requests\")\n\n    events = _load(\"events.json\")\n    if not isinstance(events, list):\n        events = []\n\n    found = None\n    for ev in events:\n        if ev.get(\"event_id\") == event_id:\n            found = ev\n            break\n\n    latency_ms = int((time.time() - t0) * 1000)\n    if found is None:\n        logs.append({\n            \"id\": \"req-\" + uuid.uuid4().hex[:24],\n            \"endpoint\": \"get_event_by_id\",\n            \"timestamp\": now,\n            \"status\": \"NOT_FOUND\",\n            \"latency_ms\": latency_ms,\n            \"credential\": None,\n            \"meta\": {\"event_id\": event_id}\n        })\n        _save(audit_file, logs)\n        return _err(\"NOT_FOUND\", \"No event exists with that id\", event_id=event_id)\n\n    logs.append({\n        \"id\": \"req-\" + uuid.uuid4().hex[:24],\n        \"endpoint\": \"get_event_by_id\",\n        \"timestamp\": now,\n        \"status\": \"OK\",\n        \"latency_ms\": latency_ms,\n        \"credential\": None,\n        \"meta\": {\"event_id\": event_id}\n    })\n    _save(audit_file, logs)\n\n    return found\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "list_user_events_on_date",
+          "description": "Returns the events attended by the specified user on the given date (YYYY-MM-DD). It returns the collection of matching event objects for that attendee and date. Requests are refused when user_email or date is missing, when either is not a string, when date is not in YYYY-MM-DD form, or when the user_email does not belong to a known user.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "user_email": {
+                "type": "string",
+                "description": "User's email."
+              },
+              "date": {
+                "type": "string",
+                "description": "Target date YYYY-MM-DD."
+              }
+            },
+            "required": [
+              "user_email",
+              "date"
+            ]
+          },
+          "implementation": "def list_user_events_on_date(user_email, date, **_extra):\n    import json, os, datetime, time, uuid, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0213000\" if __import__(\"os\").path.isdir(\"./environment_mix/0213000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    if not isinstance(user_email, str):\n        return _err(\"VALIDATION_ERROR\", \"user_email must be a string\", field=\"user_email\")\n    if not isinstance(date, str):\n        return _err(\"VALIDATION_ERROR\", \"date must be a string in YYYY-MM-DD\", field=\"date\")\n\n    email = user_email.strip()\n    if not email:\n        return _err(\"VALIDATION_ERROR\", \"user_email must not be empty\", field=\"user_email\")\n\n    if not re.fullmatch(r\"\\d{4}-\\d{2}-\\d{2}\", date or \"\"):\n        return _err(\"VALIDATION_ERROR\", \"date must be in YYYY-MM-DD form\", field=\"date\")\n    try:\n        target = datetime.date.fromisoformat(date)\n    except Exception:\n        return _err(\"VALIDATION_ERROR\", \"Invalid date value\", field=\"date\")\n\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    audit_file = \"request_log.json\"\n    logs = _load(audit_file)\n    if not isinstance(logs, list):\n        logs = []\n\n    window_seconds = 60\n    limit_per_window = 300\n    cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=window_seconds)\n    recent = 0\n    for r in logs[-2000:]:\n        ts = r.get(\"timestamp\")\n        if isinstance(ts, str):\n            try:\n                dt = datetime.datetime.fromisoformat(ts[:-1]) if ts.endswith(\"Z\") else datetime.datetime.fromisoformat(ts)\n                if dt >= cutoff:\n                    recent += 1\n            except Exception:\n                pass\n    if recent >= limit_per_window:\n        latency_ms = int((time.time() - t0) * 1000)\n        logs.append({\n            \"id\": \"req-\" + uuid.uuid4().hex[:24],\n            \"endpoint\": \"list_user_events_on_date\",\n            \"timestamp\": now,\n            \"status\": \"RATE_LIMIT\",\n            \"latency_ms\": latency_ms,\n            \"credential\": None\n        })\n        _save(audit_file, logs)\n        return _err(\"RATE_LIMIT\", \"Too many requests\")\n\n    users = _load(\"users.json\")\n    if not isinstance(users, list):\n        users = []\n\n    known = False\n    email_l = email.lower()\n    for u in users:\n        em = u.get(\"email\")\n        if isinstance(em, str) and em.lower() == email_l:\n            known = True\n            break\n    if not known:\n        latency_ms = int((time.time() - t0) * 1000)\n        logs.append({\n            \"id\": \"req-\" + uuid.uuid4().hex[:24],\n            \"endpoint\": \"list_user_events_on_date\",\n            \"timestamp\": now,\n            \"status\": \"NOT_FOUND\",\n            \"latency_ms\": latency_ms,\n            \"credential\": None,\n            \"meta\": {\"user_email\": email, \"date\": date}\n        })\n        _save(audit_file, logs)\n        return _err(\"NOT_FOUND\", \"user_email does not belong to a known user\", user_email=email)\n\n    events = _load(\"events.json\")\n    if not isinstance(events, list):\n        events = []\n\n    def _start_date(st):\n        if not isinstance(st, str):\n            return None\n        try:\n            if st.endswith(\"Z\"):\n                dt = datetime.datetime.fromisoformat(st[:-1] + \"+00:00\")\n            else:\n                dt = datetime.datetime.fromisoformat(st)\n            return dt.date()\n        except Exception:\n            try:\n                if len(st) >= 10 and re.fullmatch(r\"\\d{4}-\\d{2}-\\d{2}\", st[:10]):\n                    return datetime.date.fromisoformat(st[:10])\n            except Exception:\n                return None\n        return None\n\n    out = []\n    for ev in events:\n        attendees = ev.get(\"attendees\", [])\n        if isinstance(attendees, list):\n            if any(isinstance(a, str) and a.lower() == email_l for a in attendees):\n                d = _start_date(ev.get(\"start_time\"))\n                if d == target:\n                    out.append(ev)\n\n    out = sorted(out, key=lambda r: (str(r.get(\"start_time\", \"\")), str(r.get(\"event_id\", \"\"))))\n\n    latency_ms = int((time.time() - t0) * 1000)\n    logs.append({\n        \"id\": \"req-\" + uuid.uuid4().hex[:24],\n        \"endpoint\": \"list_user_events_on_date\",\n        \"timestamp\": now,\n        \"status\": \"OK\",\n        \"latency_ms\": latency_ms,\n        \"credential\": None,\n        \"meta\": {\"returned\": len(out), \"user_email\": email, \"date\": date}\n    })\n    _save(audit_file, logs)\n\n    return {\"object\": \"list\", \"data\": out, \"total\": len(out)}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "search_events_by_title",
+          "description": "Searches event titles for a case-insensitive substring and returns the matching event objects. The request must include a query string to search for. Requests are refused when query is missing or not a string, or when query is empty or only whitespace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Substring to search for in event titles."
+              }
+            },
+            "required": [
+              "query"
+            ]
+          },
+          "implementation": "def search_events_by_title(query, **_extra):\n    import json, os, datetime, time, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0213000\" if __import__(\"os\").path.isdir(\"./environment_mix/0213000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    if not isinstance(query, str):\n        return _err(\"VALIDATION_ERROR\", \"query must be a string\", field=\"query\")\n    q = query.strip()\n    if not q:\n        return _err(\"VALIDATION_ERROR\", \"query must not be empty\", field=\"query\")\n\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    audit_file = \"request_log.json\"\n    logs = _load(audit_file)\n    if not isinstance(logs, list):\n        logs = []\n\n    window_seconds = 60\n    limit_per_window = 300\n    cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=window_seconds)\n    recent = 0\n    for r in logs[-2000:]:\n        ts = r.get(\"timestamp\")\n        if isinstance(ts, str):\n            try:\n                dt = datetime.datetime.fromisoformat(ts[:-1]) if ts.endswith(\"Z\") else datetime.datetime.fromisoformat(ts)\n                if dt >= cutoff:\n                    recent += 1\n            except Exception:\n                pass\n    if recent >= limit_per_window:\n        latency_ms = int((time.time() - t0) * 1000)\n        logs.append({\n            \"id\": \"req-\" + uuid.uuid4().hex[:24],\n            \"endpoint\": \"search_events_by_title\",\n            \"timestamp\": now,\n            \"status\": \"RATE_LIMIT\",\n            \"latency_ms\": latency_ms,\n            \"credential\": None\n        })\n        _save(audit_file, logs)\n        return _err(\"RATE_LIMIT\", \"Too many requests\")\n\n    events = _load(\"events.json\")\n    if not isinstance(events, list):\n        events = []\n\n    ql = q.lower()\n    out = []\n    for ev in events:\n        title = ev.get(\"title\", \"\")\n        if isinstance(title, str) and ql in title.lower():\n            out.append(ev)\n\n    out = sorted(out, key=lambda r: (str(r.get(\"start_time\", \"\")), str(r.get(\"event_id\", \"\"))))\n\n    latency_ms = int((time.time() - t0) * 1000)\n    logs.append({\n        \"id\": \"req-\" + uuid.uuid4().hex[:24],\n        \"endpoint\": \"search_events_by_title\",\n        \"timestamp\": now,\n        \"status\": \"OK\",\n        \"latency_ms\": latency_ms,\n        \"credential\": None,\n        \"meta\": {\"returned\": len(out), \"query\": q}\n    })\n    _save(audit_file, logs)\n\n    return {\"object\": \"list\", \"data\": out, \"total\": len(out)}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "list_all_holidays",
+          "description": "Lists holidays and returns a paginated collection of holiday objects. You may provide a positive limit and an opaque cursor to continue a previous listing. Requests are refused when limit is less than 1, when cursor is not a string, or when any fields other than limit and cursor are provided.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of holidays to return.",
+                "minimum": 1
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor to continue listing from a previous response."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_all_holidays(limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0213000\" if __import__(\"os\").path.isdir(\"./environment_mix/0213000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    if limit is not None:\n        if not isinstance(limit, int):\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer\", field=\"limit\")\n        if limit < 1:\n            return _err(\"VALIDATION_ERROR\", \"limit must be at least 1\", field=\"limit\", minimum=1)\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\", field=\"cursor\")\n\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    audit_file = \"request_log.json\"\n    logs = _load(audit_file)\n    if not isinstance(logs, list):\n        logs = []\n\n    window_seconds = 60\n    limit_per_window = 300\n    cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=window_seconds)\n    recent = 0\n    for r in logs[-2000:]:\n        ts = r.get(\"timestamp\")\n        if isinstance(ts, str):\n            try:\n                dt = datetime.datetime.fromisoformat(ts[:-1]) if ts.endswith(\"Z\") else datetime.datetime.fromisoformat(ts)\n                if dt >= cutoff:\n                    recent += 1\n            except Exception:\n                pass\n    if recent >= limit_per_window:\n        latency_ms = int((time.time() - t0) * 1000)\n        logs.append({\n            \"id\": \"req-\" + uuid.uuid4().hex[:24],\n            \"endpoint\": \"list_all_holidays\",\n            \"timestamp\": now,\n            \"status\": \"RATE_LIMIT\",\n            \"latency_ms\": latency_ms,\n            \"credential\": None\n        })\n        _save(audit_file, logs)\n        return _err(\"RATE_LIMIT\", \"Too many requests\")\n\n    holidays = _load(\"holidays.json\")\n    if not isinstance(holidays, list):\n        holidays = []\n\n    holidays_sorted = sorted(holidays, key=lambda r: (str(r.get(\"start_time\", \"\")), str(r.get(\"event_id\", \"\"))))\n\n    start = 0\n    if cursor:\n        if cursor.startswith(\"idx:\"):\n            try:\n                start = int(cursor.split(\":\", 1)[1])\n            except Exception:\n                return _err(\"VALIDATION_ERROR\", \"cursor is invalid\", field=\"cursor\")\n        else:\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\", field=\"cursor\")\n        if start < 0 or start > len(holidays_sorted):\n            return _err(\"VALIDATION_ERROR\", \"cursor is out of range\", field=\"cursor\")\n\n    page_size = limit if limit is not None else 100\n    end = min(start + page_size, len(holidays_sorted))\n    data = holidays_sorted[start:end]\n\n    has_more = end < len(holidays_sorted)\n    next_cursor = f\"idx:{end}\" if has_more else None\n\n    latency_ms = int((time.time() - t0) * 1000)\n    logs.append({\n        \"id\": \"req-\" + uuid.uuid4().hex[:24],\n        \"endpoint\": \"list_all_holidays\",\n        \"timestamp\": now,\n        \"status\": \"OK\",\n        \"latency_ms\": latency_ms,\n        \"credential\": None,\n        \"meta\": {\"returned\": len(data), \"total\": len(holidays_sorted)}\n    })\n    _save(audit_file, logs)\n\n    return {\n        \"object\": \"list\",\n        \"data\": data,\n        \"limit\": page_size,\n        \"cursor\": cursor,\n        \"next_cursor\": next_cursor,\n        \"has_more\": has_more,\n        \"total\": len(holidays_sorted)\n    }\n",
+          "params_reconstructed": true,
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "list_holidays_in_range",
+          "description": "Returns holidays whose start date falls within the inclusive range from start_date through end_date (YYYY-MM-DD). Both dates are required and the response is the set of matching holiday objects. Requests are refused when either date is missing, not a string, not in YYYY-MM-DD form, or when the range is invalid (for example end_date is earlier than start_date).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "start_date": {
+                "type": "string",
+                "description": "Start date YYYY-MM-DD."
+              },
+              "end_date": {
+                "type": "string",
+                "description": "End date YYYY-MM-DD."
+              }
+            },
+            "required": [
+              "start_date",
+              "end_date"
+            ]
+          },
+          "implementation": "def list_holidays_in_range(start_date, end_date, **_extra):\n    import json, os, datetime, time, uuid, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0213000\" if __import__(\"os\").path.isdir(\"./environment_mix/0213000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    if not isinstance(start_date, str):\n        return _err(\"VALIDATION_ERROR\", \"start_date must be a string in YYYY-MM-DD\", field=\"start_date\")\n    if not isinstance(end_date, str):\n        return _err(\"VALIDATION_ERROR\", \"end_date must be a string in YYYY-MM-DD\", field=\"end_date\")\n\n    if not re.fullmatch(r\"\\d{4}-\\d{2}-\\d{2}\", start_date or \"\"):\n        return _err(\"VALIDATION_ERROR\", \"start_date must be in YYYY-MM-DD form\", field=\"start_date\")\n    if not re.fullmatch(r\"\\d{4}-\\d{2}-\\d{2}\", end_date or \"\"):\n        return _err(\"VALIDATION_ERROR\", \"end_date must be in YYYY-MM-DD form\", field=\"end_date\")\n\n    try:\n        s = datetime.date.fromisoformat(start_date)\n        e = datetime.date.fromisoformat(end_date)\n    except Exception:\n        return _err(\"VALIDATION_ERROR\", \"Invalid date value\", field=\"date\")\n\n    if e < s:\n        return _err(\"VALIDATION_ERROR\", \"Invalid range: end_date is earlier than start_date\", field=\"end_date\")\n\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    audit_file = \"request_log.json\"\n    logs = _load(audit_file)\n    if not isinstance(logs, list):\n        logs = []\n\n    window_seconds = 60\n    limit_per_window = 300\n    cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=window_seconds)\n    recent = 0\n    for r in logs[-2000:]:\n        ts = r.get(\"timestamp\")\n        if isinstance(ts, str):\n            try:\n                dt = datetime.datetime.fromisoformat(ts[:-1]) if ts.endswith(\"Z\") else datetime.datetime.fromisoformat(ts)\n                if dt >= cutoff:\n                    recent += 1\n            except Exception:\n                pass\n    if recent >= limit_per_window:\n        latency_ms = int((time.time() - t0) * 1000)\n        logs.append({\n            \"id\": \"req-\" + uuid.uuid4().hex[:24],\n            \"endpoint\": \"list_holidays_in_range\",\n            \"timestamp\": now,\n            \"status\": \"RATE_LIMIT\",\n            \"latency_ms\": latency_ms,\n            \"credential\": None\n        })\n        _save(audit_file, logs)\n        return _err(\"RATE_LIMIT\", \"Too many requests\")\n\n    holidays = _load(\"holidays.json\")\n    if not isinstance(holidays, list):\n        holidays = []\n\n    def _holiday_start_date(h):\n        st = h.get(\"start_time\")\n        if not isinstance(st, str):\n            return None\n        try:\n            if st.endswith(\"Z\"):\n                dt = datetime.datetime.fromisoformat(st[:-1] + \"+00:00\")\n            else:\n                dt = datetime.datetime.fromisoformat(st)\n            return dt.date()\n        except Exception:\n            try:\n                if len(st) >= 10 and re.fullmatch(r\"\\d{4}-\\d{2}-\\d{2}\", st[:10]):\n                    return datetime.date.fromisoformat(st[:10])\n            except Exception:\n                return None\n        return None\n\n    out = []\n    for h in holidays:\n        d = _holiday_start_date(h)\n        if d is not None and s <= d <= e:\n            out.append(h)\n\n    out = sorted(out, key=lambda r: (str(r.get(\"start_time\", \"\")), str(r.get(\"event_id\", \"\"))))\n\n    latency_ms = int((time.time() - t0) * 1000)\n    logs.append({\n        \"id\": \"req-\" + uuid.uuid4().hex[:24],\n        \"endpoint\": \"list_holidays_in_range\",\n        \"timestamp\": now,\n        \"status\": \"OK\",\n        \"latency_ms\": latency_ms,\n        \"credential\": None,\n        \"meta\": {\"returned\": len(out), \"start_date\": start_date, \"end_date\": end_date}\n    })\n    _save(audit_file, logs)\n\n    return {\"object\": \"list\", \"data\": out, \"total\": len(out)}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0213000",
+    "index": 213,
+    "name": "Keystone Calendar Directory",
+    "description": "A lightweight calendar directory service that lets users look up people and query events and holidays by date range, attendee, or title.",
+    "taxonomy": {
+      "L1_id": "L1-20",
+      "L1_name": "Communication & General Utilities",
+      "L1_name_zh": "通信与通用工具",
+      "L2_id": "L2-49",
+      "L2_name": "Time, Calendar & Scheduling",
+      "L2_name_zh": "时间、日历与调度",
+      "L3_name": "Calendar Events & Directories",
+      "L3_name_zh": "日历事件与目录查询"
+    },
+    "database_dir": "./environment_mix/0213000",
+    "mount_path": "/app/database",
+    "n_tools": 9,
+    "n_collections": 3,
+    "n_records": 248,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 9,
+      "loaded": 9,
+      "reads_returning_data": 2,
+      "read_operations": 9,
+      "mutations_persisted": 0,
+      "mutations_attempted": 0
+    },
+    "tools_loadable_from_database_dir": 9,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_all_users",
+      "returned_chars": 90
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

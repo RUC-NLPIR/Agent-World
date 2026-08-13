@@ -1,0 +1,425 @@
+{
+  "index": 431,
+  "local_files_dir": "./environment_mix/0431000",
+  "file_list": [
+    "./environment_mix/0431000/README.md",
+    "./environment_mix/0431000/alerts.json",
+    "./environment_mix/0431000/campgrounds.json",
+    "./environment_mix/0431000/events.json",
+    "./environment_mix/0431000/parks.json",
+    "./environment_mix/0431000/request_logs.json",
+    "./environment_mix/0431000/visitor_centers.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "parks.json": "21 rows",
+        "alerts.json": "20 rows",
+        "visitor_centers.json": "21 rows",
+        "campgrounds.json": "19 rows",
+        "events.json": "21 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "findParks",
+          "description": "Searches and lists park records matching the provided text query and/or filters (park_code, state/states, designation, status, source), returning results sorted as requested and paged with cursor-based pagination (pass limit to cap the page size and cursor to fetch the next page). Raises VALIDATION_ERROR if any filter value is invalid (including limit out of range, an unsupported sort, or malformed inputs) or if additional properties are supplied. Raises UNAUTHORIZED if the caller is not permitted to read parks, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Free-text search across park name/full name/description."
+              },
+              "park_code": {
+                "type": "string",
+                "description": "Filter by NPS-style park code."
+              },
+              "state": {
+                "type": "string",
+                "description": "Filter by a single US state/territory code contained in the park's states list (e.g., CA)."
+              },
+              "states": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Filter by one or more state/territory codes; matches parks containing any of the provided codes."
+              },
+              "designation": {
+                "type": "string",
+                "description": "Filter by park designation (e.g., National Park, National Monument)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "inactive",
+                  "deleted"
+                ],
+                "description": "Filter by park record status."
+              },
+              "source": {
+                "type": "string",
+                "enum": [
+                  "nps_api",
+                  "manual"
+                ],
+                "description": "Filter by upstream source."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "name",
+                  "-name",
+                  "full_name",
+                  "-full_name",
+                  "updated_at",
+                  "-updated_at"
+                ],
+                "description": "Sort order for results."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of parks to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor from a previous response."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def findParks(query=None, park_code=None, state=None, states=None, designation=None, status=None, source=None, sort=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0431000\" if __import__(\"os\").path.isdir(\"./environment_mix/0431000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s if s.tzinfo else s.replace(tzinfo=datetime.timezone.utc)\n        if not isinstance(s, str):\n            return None\n        try:\n            ss = s.strip()\n            if ss.endswith(\"Z\"):\n                ss = ss[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(ss)\n        except Exception:\n            return None\n\n    def _severity_rank(val):\n        order = {\"low\": 1, \"medium\": 2, \"high\": 3, \"critical\": 4}\n        return order.get(val, 0)\n\n    def _b64e(obj):\n        raw = json.dumps(obj, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"ascii\").rstrip(\"=\")\n\n    def _b64d(s):\n        if not isinstance(s, str) or not s:\n            return None\n        pad = \"=\" * (-len(s) % 4)\n        try:\n            raw = base64.urlsafe_b64decode((s + pad).encode(\"ascii\"))\n            return json.loads(raw.decode(\"utf-8\"))\n        except Exception:\n            return None\n\n    def _log(endpoint, status, credential_id=None, extra=None):\n        # Optional observable dynamics if request log exists\n        logs = _load(\"request_logs.json\")\n        if isinstance(logs, list):\n            row = {\n                \"id\": f\"req_{int(time.time()*1000)}_{os.getpid()}_{len(logs)+1}\",\n                \"endpoint\": endpoint,\n                \"credential_id\": credential_id,\n                \"status\": status,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": _now(),\n            }\n            if extra:\n                row.update(extra)\n            logs.append(row)\n            _save(\"request_logs.json\", logs)\n\n    # Validate inputs\n    if query is not None and not isinstance(query, str):\n        _log(\"findParks\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"query must be a string\")\n    if park_code is not None and not isinstance(park_code, str):\n        _log(\"findParks\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"park_code must be a string\")\n    if state is not None and not isinstance(state, str):\n        _log(\"findParks\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"state must be a string\")\n    if states is not None:\n        if not isinstance(states, list) or any(not isinstance(x, str) for x in states):\n            _log(\"findParks\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"states must be an array of strings\")\n    if designation is not None and not isinstance(designation, str):\n        _log(\"findParks\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"designation must be a string\")\n    if status is not None and status not in (\"active\", \"inactive\", \"deleted\"):\n        _log(\"findParks\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid status\", allowed=[\"active\", \"inactive\", \"deleted\"])\n    if source is not None and source not in (\"nps_api\", \"manual\"):\n        _log(\"findParks\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid source\", allowed=[\"nps_api\", \"manual\"])\n    if sort is not None and sort not in (\"name\", \"-name\", \"full_name\", \"-full_name\", \"updated_at\", \"-updated_at\"):\n        _log(\"findParks\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort\", allowed=[\"name\", \"-name\", \"full_name\", \"-full_name\", \"updated_at\", \"-updated_at\"])\n    if limit is not None:\n        if not isinstance(limit, int):\n            _log(\"findParks\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n        if limit < 1 or limit > 100:\n            _log(\"findParks\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"limit out of range\", minimum=1, maximum=100)\n    else:\n        limit = 20\n    if cursor is not None and not isinstance(cursor, str):\n        _log(\"findParks\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n\n    # Business rule: public findParks returns only active parks ordered by full_name;\n    # tool surface provides filters but public rule overrides status filter unless explicitly internal (not available here).\n    parks = _load(\"parks.json\")\n    if not isinstance(parks, list):\n        parks = []\n\n    def _matches(p):\n        if not isinstance(p, dict):\n            return False\n        # Must not return deleted; and per business rule return active only\n        if p.get(\"status\") != \"active\":\n            return False\n\n        if park_code is not None and str(p.get(\"park_code\", \"\")).lower() != park_code.lower():\n            return False\n\n        if designation is not None:\n            if (p.get(\"designation\") or \"\") != designation:\n                return False\n\n        if source is not None and p.get(\"source\") != source:\n            return False\n\n        # Ignore \"status\" filter due to business rule of findParks (active-only)\n        # State filters\n        st_list = p.get(\"states\")\n        if not isinstance(st_list, list):\n            st_list = []\n        st_set = {str(x).upper() for x in st_list if isinstance(x, str)}\n        if state is not None and state.upper() not in st_set:\n            return False\n        if states is not None:\n            wanted = {x.upper() for x in states if isinstance(x, str)}\n            if wanted and st_set.isdisjoint(wanted):\n                return False\n\n        if query is not None and query.strip() != \"\":\n            q = query.strip().lower()\n            hay = \" \".join([\n                str(p.get(\"name\", \"\") or \"\"),\n                str(p.get(\"full_name\", \"\") or \"\"),\n                str(p.get(\"description\", \"\") or \"\"),\n                str(p.get(\"designation\", \"\") or \"\"),\n                \" \".join(sorted(st_set)),\n                str(p.get(\"park_code\", \"\") or \"\"),\n            ]).lower()\n            if q not in hay:\n                return False\n\n        return True\n\n    matched = [p for p in parks if _matches(p)]\n\n    # Sorting\n    eff_sort = sort or \"full_name\"\n    desc = eff_sort.startswith(\"-\")\n    key = eff_sort[1:] if desc else eff_sort\n\n    def _keyfn(p):\n        if key in (\"name\", \"full_name\"):\n            return (str(p.get(key, \"\") or \"\").lower(), str(p.get(\"id\", \"\") or \"\"))\n        if key == \"updated_at\":\n            dt = _parse_dt(p.get(\"updated_at\"))\n            # None sorts last in asc\n            return (dt or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), str(p.get(\"id\", \"\") or \"\"))\n        return (str(p.get(\"full_name\", \"\") or \"\").lower(), str(p.get(\"id\", \"\") or \"\"))\n\n    matched.sort(key=_keyfn, reverse=desc)\n\n    # Cursor pagination using offset + sort fingerprint\n    start = 0\n    if cursor:\n        c = _b64d(cursor)\n        if not isinstance(c, dict) or c.get(\"v\") != 1 or c.get(\"sort\") != eff_sort:\n            _log(\"findParks\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n        if not isinstance(c.get(\"offset\"), int) or c[\"offset\"] < 0:\n            _log(\"findParks\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor offset\")\n        start = c[\"offset\"]\n\n    total = len(matched)\n    page = matched[start:start + limit]\n    next_cursor = None\n    has_more = start + limit < total\n    if has_more:\n        next_cursor = _b64e({\"v\": 1, \"sort\": eff_sort, \"offset\": start + limit})\n\n    _log(\"findParks\", \"ok\")\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"sort\": eff_sort,\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getParkDetails",
+          "description": "Returns the full public detail record for a single park, looked up by park_id or by park_code. Raises VALIDATION_ERROR if neither identifier is provided, if park_id does not match the required format, or if unexpected properties are included. Raises NOT_FOUND if no park exists for the provided identifier, UNAUTHORIZED if the caller cannot read parks, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "park_id": {
+                "type": "string",
+                "pattern": "^nps_park_[0-9A-HJKMNP-TV-Z]{18,}$",
+                "description": "Internal park id."
+              },
+              "park_code": {
+                "type": "string",
+                "description": "NPS-style park code (alternative to park_id)."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def getParkDetails(park_id=None, park_code=None, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0431000\" if __import__(\"os\").path.isdir(\"./environment_mix/0431000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _log(endpoint, status, credential_id=None, extra=None):\n        logs = _load(\"request_logs.json\")\n        if isinstance(logs, list):\n            row = {\n                \"id\": f\"req_{int(time.time()*1000)}_{os.getpid()}_{len(logs)+1}\",\n                \"endpoint\": endpoint,\n                \"credential_id\": credential_id,\n                \"status\": status,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": _now(),\n            }\n            if extra:\n                row.update(extra)\n            logs.append(row)\n            _save(\"request_logs.json\", logs)\n\n    # Validate inputs\n    if park_id is not None:\n        if not isinstance(park_id, str):\n            _log(\"getParkDetails\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"park_id must be a string\")\n        if not re.match(r\"^nps_park_[0-9A-HJKMNP-TV-Z]{18,}$\", park_id):\n            _log(\"getParkDetails\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"park_id has invalid format\")\n    if park_code is not None and not isinstance(park_code, str):\n        _log(\"getParkDetails\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"park_code must be a string\")\n\n    parks = _load(\"parks.json\")\n    if not isinstance(parks, list):\n        parks = []\n\n    # Business rule: if request does not specify identifier, choose deterministic default (first active by full_name)\n    # and must not return deleted.\n    target = None\n    if park_id is None and park_code is None:\n        active = [p for p in parks if isinstance(p, dict) and p.get(\"status\") == \"active\"]\n        active.sort(key=lambda p: (str(p.get(\"full_name\", \"\") or \"\").lower(), str(p.get(\"id\", \"\") or \"\")))\n        target = active[0] if active else None\n        if target is None:\n            _log(\"getParkDetails\", \"error\")\n            return _err(\"NOT_FOUND\", \"No parks available\")\n        _log(\"getParkDetails\", \"ok\", extra={\"default_selected\": True})\n        return {\"data\": target}\n\n    # Lookup by id or code\n    if park_id is not None:\n        for p in parks:\n            if isinstance(p, dict) and p.get(\"id\") == park_id:\n                target = p\n                break\n    elif park_code is not None:\n        pc = park_code.lower()\n        for p in parks:\n            if isinstance(p, dict) and str(p.get(\"park_code\", \"\")).lower() == pc:\n                target = p\n                break\n\n    if target is None:\n        _log(\"getParkDetails\", \"error\")\n        return _err(\"NOT_FOUND\", \"Park not found\")\n\n    if target.get(\"status\") == \"deleted\":\n        _log(\"getParkDetails\", \"error\")\n        return _err(\"NOT_FOUND\", \"Park not found\")\n\n    _log(\"getParkDetails\", \"ok\")\n    return {\"data\": target}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getAlerts",
+          "description": "Lists alerts, optionally scoped to a park (park_id or park_code) and filtered by category, severity, status, and/or effective_at, returning results sorted as requested and paged with cursor-based pagination (limit + cursor). Raises VALIDATION_ERROR for invalid enum values, malformed timestamps, invalid limit/sort, or unexpected properties, and NOT_FOUND if a specified park_id/park_code does not resolve to a park. Raises UNAUTHORIZED if the caller cannot read alerts, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "park_id": {
+                "type": "string",
+                "pattern": "^nps_park_[0-9A-HJKMNP-TV-Z]{18,}$",
+                "description": "Return alerts for a specific park id."
+              },
+              "park_code": {
+                "type": "string",
+                "description": "Return alerts for a specific park code."
+              },
+              "category": {
+                "type": "string",
+                "enum": [
+                  "closure",
+                  "hazard",
+                  "information",
+                  "caution",
+                  "weather",
+                  "other"
+                ],
+                "description": "Filter alerts by category."
+              },
+              "severity": {
+                "type": "string",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high",
+                  "critical"
+                ],
+                "description": "Filter alerts by severity."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "expired",
+                  "retracted"
+                ],
+                "description": "Filter alerts by status."
+              },
+              "effective_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only include alerts effective at this timestamp."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "effective_start",
+                  "-effective_start",
+                  "severity",
+                  "-severity",
+                  "updated_at",
+                  "-updated_at"
+                ],
+                "description": "Sort order for results."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of alerts to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor from a previous response."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def getAlerts(park_id=None, park_code=None, category=None, severity=None, status=None, effective_at=None, sort=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0431000\" if __import__(\"os\").path.isdir(\"./environment_mix/0431000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s if s.tzinfo else s.replace(tzinfo=datetime.timezone.utc)\n        if not isinstance(s, str):\n            return None\n        try:\n            ss = s.strip()\n            if ss.endswith(\"Z\"):\n                ss = ss[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(ss)\n        except Exception:\n            return None\n\n    def _sev_rank(val):\n        return {\"low\": 1, \"medium\": 2, \"high\": 3, \"critical\": 4}.get(val, 0)\n\n    def _b64e(obj):\n        raw = json.dumps(obj, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"ascii\").rstrip(\"=\")\n\n    def _b64d(s):\n        if not isinstance(s, str) or not s:\n            return None\n        pad = \"=\" * (-len(s) % 4)\n        try:\n            raw = base64.urlsafe_b64decode((s + pad).encode(\"ascii\"))\n            return json.loads(raw.decode(\"utf-8\"))\n        except Exception:\n            return None\n\n    def _log(endpoint, status_s, credential_id=None, extra=None):\n        logs = _load(\"request_logs.json\")\n        if isinstance(logs, list):\n            row = {\n                \"id\": f\"req_{int(time.time()*1000)}_{os.getpid()}_{len(logs)+1}\",\n                \"endpoint\": endpoint,\n                \"credential_id\": credential_id,\n                \"status\": status_s,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": _now(),\n            }\n            if extra:\n                row.update(extra)\n            logs.append(row)\n            _save(\"request_logs.json\", logs)\n\n    # Validate\n    if park_id is not None:\n        if not isinstance(park_id, str):\n            _log(\"getAlerts\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"park_id must be a string\")\n        if not re.match(r\"^nps_park_[0-9A-HJKMNP-TV-Z]{18,}$\", park_id):\n            _log(\"getAlerts\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"park_id has invalid format\")\n    if park_code is not None and not isinstance(park_code, str):\n        _log(\"getAlerts\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"park_code must be a string\")\n    if category is not None and category not in (\"closure\", \"hazard\", \"information\", \"caution\", \"weather\", \"other\"):\n        _log(\"getAlerts\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid category\")\n    if severity is not None and severity not in (\"low\", \"medium\", \"high\", \"critical\"):\n        _log(\"getAlerts\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid severity\")\n    if status is not None and status not in (\"active\", \"expired\", \"retracted\"):\n        _log(\"getAlerts\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid status\")\n    eff_dt = None\n    if effective_at is not None:\n        if not isinstance(effective_at, str):\n            _log(\"getAlerts\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"effective_at must be an ISO 8601 string\")\n        eff_dt = _parse_dt(effective_at)\n        if eff_dt is None:\n            _log(\"getAlerts\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"effective_at is malformed\")\n    if sort is not None and sort not in (\"effective_start\", \"-effective_start\", \"severity\", \"-severity\", \"updated_at\", \"-updated_at\"):\n        _log(\"getAlerts\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort\")\n    if limit is not None:\n        if not isinstance(limit, int):\n            _log(\"getAlerts\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n        if limit < 1 or limit > 100:\n            _log(\"getAlerts\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"limit out of range\", minimum=1, maximum=100)\n    else:\n        limit = 20\n    if cursor is not None and not isinstance(cursor, str):\n        _log(\"getAlerts\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n\n    parks = _load(\"parks.json\")\n    if not isinstance(parks, list):\n        parks = []\n    alerts = _load(\"alerts.json\")\n    if not isinstance(alerts, list):\n        alerts = []\n\n    # Resolve park if specified\n    park = None\n    if park_id is not None or park_code is not None:\n        if park_id is not None:\n            park = next((p for p in parks if isinstance(p, dict) and p.get(\"id\") == park_id), None)\n        else:\n            pc = park_code.lower()\n            park = next((p for p in parks if isinstance(p, dict) and str(p.get(\"park_code\", \"\")).lower() == pc), None)\n        if park is None:\n            _log(\"getAlerts\", \"error\")\n            return _err(\"NOT_FOUND\", \"Park not found\")\n        # public requires active park\n        if park.get(\"status\") != \"active\":\n            _log(\"getAlerts\", \"ok\")\n            return {\"data\": [], \"meta\": {\"total\": 0, \"limit\": limit, \"cursor\": cursor, \"next_cursor\": None, \"has_more\": False, \"sort\": (sort or \"-effective_start\")}}\n\n    active_park_ids = {p.get(\"id\") for p in parks if isinstance(p, dict) and p.get(\"status\") == \"active\"}\n\n    # Business rule: return only alerts where park active and alert active; ignore requested status unless internal/debug (not available)\n    def _is_effective(a):\n        if eff_dt is None:\n            return True\n        sdt = _parse_dt(a.get(\"effective_start\"))\n        edt = _parse_dt(a.get(\"effective_end\"))\n        if sdt and eff_dt < sdt:\n            return False\n        if edt and eff_dt > edt:\n            return False\n        return True\n\n    def _matches(a):\n        if not isinstance(a, dict):\n            return False\n        pid = a.get(\"park_id\")\n        if pid not in active_park_ids:\n            return False\n        if park is not None and pid != park.get(\"id\"):\n            return False\n        # public: active only\n        if a.get(\"status\") != \"active\":\n            return False\n        if category is not None and a.get(\"category\") != category:\n            return False\n        if severity is not None and a.get(\"severity\") != severity:\n            return False\n        # ignore requested status due to public rule\n        if not _is_effective(a):\n            return False\n        return True\n\n    matched = [a for a in alerts if _matches(a)]\n\n    eff_sort = sort or \"-effective_start\"\n    desc = eff_sort.startswith(\"-\")\n    key = eff_sort[1:] if desc else eff_sort\n\n    def _keyfn(a):\n        if key == \"effective_start\":\n            dt = _parse_dt(a.get(\"effective_start\"))\n            # None sorts last in asc, first in desc (by using min/max)\n            base = dt or (datetime.datetime.min.replace(tzinfo=datetime.timezone.utc) if not desc else datetime.datetime.max.replace(tzinfo=datetime.timezone.utc))\n            return (base, str(a.get(\"id\", \"\") or \"\"))\n        if key == \"updated_at\":\n            dt = _parse_dt(a.get(\"updated_at\"))\n            base = dt or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n            return (base, str(a.get(\"id\", \"\") or \"\"))\n        if key == \"severity\":\n            return (_sev_rank(a.get(\"severity\")), str(a.get(\"id\", \"\") or \"\"))\n        return (_parse_dt(a.get(\"effective_start\")) or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), str(a.get(\"id\", \"\") or \"\"))\n\n    matched.sort(key=_keyfn, reverse=desc)\n\n    start = 0\n    if cursor:\n        c = _b64d(cursor)\n        if not isinstance(c, dict) or c.get(\"v\") != 1 or c.get(\"sort\") != eff_sort:\n            _log(\"getAlerts\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n        if not isinstance(c.get(\"offset\"), int) or c[\"offset\"] < 0:\n            _log(\"getAlerts\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor offset\")\n        start = c[\"offset\"]\n\n    total = len(matched)\n    page = matched[start:start + limit]\n    has_more = start + limit < total\n    next_cursor = _b64e({\"v\": 1, \"sort\": eff_sort, \"offset\": start + limit}) if has_more else None\n\n    _log(\"getAlerts\", \"ok\")\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"sort\": eff_sort,\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getVisitorCenters",
+          "description": "Lists visitor centers, optionally scoped to a park (park_id or park_code) and filtered by operating status, returning results sorted as requested and paged with cursor-based pagination (limit + cursor). Raises VALIDATION_ERROR for an invalid park_id format, invalid enum/sort/limit, or unexpected properties, and NOT_FOUND if a specified park_id/park_code does not resolve to a park. Raises UNAUTHORIZED if the caller cannot read visitor centers, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "park_id": {
+                "type": "string",
+                "pattern": "^nps_park_[0-9A-HJKMNP-TV-Z]{18,}$",
+                "description": "Return visitor centers for a specific park id."
+              },
+              "park_code": {
+                "type": "string",
+                "description": "Return visitor centers for a specific park code."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "open",
+                  "seasonal",
+                  "closed",
+                  "inactive"
+                ],
+                "description": "Filter visitor centers by operating status."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "name",
+                  "-name",
+                  "updated_at",
+                  "-updated_at"
+                ],
+                "description": "Sort order for results."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of visitor centers to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor from a previous response."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def getVisitorCenters(park_id=None, park_code=None, status=None, sort=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0431000\" if __import__(\"os\").path.isdir(\"./environment_mix/0431000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s if s.tzinfo else s.replace(tzinfo=datetime.timezone.utc)\n        if not isinstance(s, str):\n            return None\n        try:\n            ss = s.strip()\n            if ss.endswith(\"Z\"):\n                ss = ss[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(ss)\n        except Exception:\n            return None\n\n    def _b64e(obj):\n        raw = json.dumps(obj, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"ascii\").rstrip(\"=\")\n\n    def _b64d(s):\n        if not isinstance(s, str) or not s:\n            return None\n        pad = \"=\" * (-len(s) % 4)\n        try:\n            raw = base64.urlsafe_b64decode((s + pad).encode(\"ascii\"))\n            return json.loads(raw.decode(\"utf-8\"))\n        except Exception:\n            return None\n\n    def _log(endpoint, status_s, credential_id=None, extra=None):\n        logs = _load(\"request_logs.json\")\n        if isinstance(logs, list):\n            row = {\n                \"id\": f\"req_{int(time.time()*1000)}_{os.getpid()}_{len(logs)+1}\",\n                \"endpoint\": endpoint,\n                \"credential_id\": credential_id,\n                \"status\": status_s,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": _now(),\n            }\n            if extra:\n                row.update(extra)\n            logs.append(row)\n            _save(\"request_logs.json\", logs)\n\n    # Validate\n    if park_id is not None:\n        if not isinstance(park_id, str):\n            _log(\"getVisitorCenters\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"park_id must be a string\")\n        if not re.match(r\"^nps_park_[0-9A-HJKMNP-TV-Z]{18,}$\", park_id):\n            _log(\"getVisitorCenters\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"park_id has invalid format\")\n    if park_code is not None and not isinstance(park_code, str):\n        _log(\"getVisitorCenters\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"park_code must be a string\")\n    if status is not None and status not in (\"open\", \"seasonal\", \"closed\", \"inactive\"):\n        _log(\"getVisitorCenters\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid status\")\n    if sort is not None and sort not in (\"name\", \"-name\", \"updated_at\", \"-updated_at\"):\n        _log(\"getVisitorCenters\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort\")\n    if limit is not None:\n        if not isinstance(limit, int):\n            _log(\"getVisitorCenters\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n        if limit < 1 or limit > 100:\n            _log(\"getVisitorCenters\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"limit out of range\", minimum=1, maximum=100)\n    else:\n        limit = 20\n    if cursor is not None and not isinstance(cursor, str):\n        _log(\"getVisitorCenters\", \"error\")\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n\n    parks = _load(\"parks.json\")\n    if not isinstance(parks, list):\n        parks = []\n    vcs = _load(\"visitor_centers.json\")\n    if not isinstance(vcs, list):\n        vcs = []\n\n    # Resolve park if specified\n    park = None\n    if park_id is not None or park_code is not None:\n        if park_id is not None:\n            park = next((p for p in parks if isinstance(p, dict) and p.get(\"id\") == park_id), None)\n        else:\n            pc = park_code.lower()\n            park = next((p for p in parks if isinstance(p, dict) and str(p.get(\"park_code\", \"\")).lower() == pc), None)\n        if park is None:\n            _log(\"getVisitorCenters\", \"error\")\n            return _err(\"NOT_FOUND\", \"Park not found\")\n        if park.get(\"status\") != \"active\":\n            _log(\"getVisitorCenters\", \"ok\")\n            return {\"data\": [], \"meta\": {\"total\": 0, \"limit\": limit, \"cursor\": cursor, \"next_cursor\": None, \"has_more\": False, \"sort\": (sort or \"name\")}}\n\n    active_park_ids = {p.get(\"id\") for p in parks if isinstance(p, dict) and p.get(\"status\") == \"active\"}\n\n    allowed_public_status = {\"open\", \"seasonal\", \"closed\"}  # exclude inactive\n    def _matches(v):\n        if not isinstance(v, dict):\n            return False\n        pid = v.get(\"park_id\")\n        if pid not in active_park_ids:\n            return False\n        if park is not None and pid != park.get(\"id\"):\n            return False\n        st = v.get(\"status\")\n        if st not in allowed_public_status:\n            return False\n        if status is not None:\n            # If caller asks for inactive, public must exclude -> empty set (not error)\n            if status == \"inactive\":\n                return False\n            if st != status:\n                return False\n        return True\n\n    matched = [v for v in vcs if _matches(v)]\n\n    eff_sort = sort or \"name\"\n    desc = eff_sort.startswith(\"-\")\n    key = eff_sort[1:] if desc else eff_sort\n\n    def _keyfn(v):\n        if key == \"name\":\n            return (str(v.get(\"name\", \"\") or \"\").lower(), str(v.get(\"id\", \"\") or \"\"))\n        if key == \"updated_at\":\n            dt = _parse_dt(v.get(\"updated_at\"))\n            return (dt or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), str(v.get(\"id\", \"\") or \"\"))\n        return (str(v.get(\"name\", \"\") or \"\").lower(), str(v.get(\"id\", \"\") or \"\"))\n\n    matched.sort(key=_keyfn, reverse=desc)\n\n    start = 0\n    if cursor:\n        c = _b64d(cursor)\n        if not isinstance(c, dict) or c.get(\"v\") != 1 or c.get(\"sort\") != eff_sort:\n            _log(\"getVisitorCenters\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n        if not isinstance(c.get(\"offset\"), int) or c[\"offset\"] < 0:\n            _log(\"getVisitorCenters\", \"error\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor offset\")\n        start = c[\"offset\"]\n\n    total = len(matched)\n    page = matched[start:start + limit]\n    has_more = start + limit < total\n    next_cursor = _b64e({\"v\": 1, \"sort\": eff_sort, \"offset\": start + limit}) if has_more else None\n\n    _log(\"getVisitorCenters\", \"ok\")\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"sort\": eff_sort,\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getCampgrounds",
+          "description": "Lists campgrounds, optionally scoped to a park (park_id or park_code) and filtered by operating status, returning results sorted as requested and paged with cursor-based pagination (limit + cursor). Raises VALIDATION_ERROR for an invalid park_id format, invalid enum/sort/limit, or unexpected properties, and NOT_FOUND if a specified park_id/park_code does not resolve to a park. Raises UNAUTHORIZED if the caller cannot read campgrounds, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "park_id": {
+                "type": "string",
+                "pattern": "^nps_park_[0-9A-HJKMNP-TV-Z]{18,}$",
+                "description": "Return campgrounds for a specific park id."
+              },
+              "park_code": {
+                "type": "string",
+                "description": "Return campgrounds for a specific park code."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "open",
+                  "seasonal",
+                  "closed",
+                  "inactive"
+                ],
+                "description": "Filter campgrounds by operating status."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "name",
+                  "-name",
+                  "updated_at",
+                  "-updated_at"
+                ],
+                "description": "Sort order for results."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of campgrounds to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor from a previous response."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def getCampgrounds(park_id=None, park_code=None, status=None, sort=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0431000\" if __import__(\"os\").path.isdir(\"./environment_mix/0431000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start_t = time.time()\n    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n    endpoint = \"getCampgrounds\"\n\n    def _log(status_code, message=None, cursor_out=None):\n        # best-effort; never fail the request because logging failed\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            row = {\n                \"id\": f\"req_{int(time.time()*1000)}_{os.getpid()}\",\n                \"endpoint\": endpoint,\n                \"status\": status_code,\n                \"message\": message,\n                \"latency_ms\": int((time.time() - start_t) * 1000),\n                \"timestamp\": now.isoformat(),\n            }\n            if cursor_out is not None:\n                row[\"next_cursor\"] = cursor_out\n            logs.append(row)\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    # ---- validation (relaxed: accept any string park_id; validate existence instead of strict pattern) ----\n    if park_id is not None and not isinstance(park_id, str):\n        _log(\"VALIDATION_ERROR\", \"park_id must be a string\")\n        return _err(\"VALIDATION_ERROR\", \"park_id must be a string\")\n    if park_code is not None and not isinstance(park_code, str):\n        _log(\"VALIDATION_ERROR\", \"park_code must be a string\")\n        return _err(\"VALIDATION_ERROR\", \"park_code must be a string\")\n\n    allowed_status = (\"open\", \"seasonal\", \"closed\", \"inactive\")\n    if status is not None:\n        if not isinstance(status, str):\n            _log(\"VALIDATION_ERROR\", \"status must be a string\")\n            return _err(\"VALIDATION_ERROR\", \"status must be a string\")\n        if status not in allowed_status:\n            _log(\"VALIDATION_ERROR\", \"status must be one of: open, seasonal, closed, inactive\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: open, seasonal, closed, inactive\")\n\n    allowed_sort = (\"name\", \"-name\", \"updated_at\", \"-updated_at\")\n    if sort is None:\n        sort = \"name\"\n    else:\n        if not isinstance(sort, str):\n            _log(\"VALIDATION_ERROR\", \"sort must be a string\")\n            return _err(\"VALIDATION_ERROR\", \"sort must be a string\")\n        if sort not in allowed_sort:\n            _log(\"VALIDATION_ERROR\", \"sort must be one of: name, -name, updated_at, -updated_at\")\n            return _err(\"VALIDATION_ERROR\", \"sort must be one of: name, -name, updated_at, -updated_at\")\n\n    if limit is None:\n        limit = 20\n    else:\n        if not isinstance(limit, int):\n            _log(\"VALIDATION_ERROR\", \"limit must be an integer\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n        if limit < 1 or limit > 100:\n            _log(\"VALIDATION_ERROR\", \"limit must be between 1 and 100\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 100\")\n\n    if cursor is not None and not isinstance(cursor, str):\n        _log(\"VALIDATION_ERROR\", \"cursor must be a string\")\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n\n    # ---- load data ----\n    parks = _load(\"parks.json\")\n    campgrounds = _load(\"campgrounds.json\")\n\n    if isinstance(parks, dict) and \"rows\" in parks and isinstance(parks.get(\"rows\"), list):\n        parks = parks[\"rows\"]\n    if isinstance(campgrounds, dict) and \"rows\" in campgrounds and isinstance(campgrounds.get(\"rows\"), list):\n        campgrounds = campgrounds[\"rows\"]\n\n    if not isinstance(parks, list):\n        parks = []\n    if not isinstance(campgrounds, list):\n        campgrounds = []\n\n    parks_by_id = {p.get(\"id\"): p for p in parks if isinstance(p, dict) and isinstance(p.get(\"id\"), str)}\n    parks_by_code = {}\n    for p in parks:\n        if isinstance(p, dict):\n            pc = p.get(\"park_code\")\n            if isinstance(pc, str):\n                parks_by_code[pc.lower()] = p\n\n    # ---- resolve park scope ----\n    resolved_park = None\n    if park_id is not None:\n        resolved_park = parks_by_id.get(park_id)\n        if not resolved_park:\n            _log(\"NOT_FOUND\", \"park_id did not resolve to a park\")\n            return _err(\"NOT_FOUND\", \"park_id did not resolve to a park\")\n    if resolved_park is None and park_code is not None:\n        resolved_park = parks_by_code.get(park_code.lower())\n        if not resolved_park:\n            _log(\"NOT_FOUND\", \"park_code did not resolve to a park\")\n            return _err(\"NOT_FOUND\", \"park_code did not resolve to a park\")\n\n    # Public rule: join to parks where parks.status='active'; exclude inactive campgrounds\n    active_park_ids = {p.get(\"id\") for p in parks if isinstance(p, dict) and p.get(\"status\") == \"active\" and isinstance(p.get(\"id\"), str)}\n\n    if resolved_park is not None and resolved_park.get(\"status\") != \"active\":\n        # The park exists but is not eligible for public join; behave as not found for public endpoint\n        _log(\"NOT_FOUND\", \"park is not available\")\n        return _err(\"NOT_FOUND\", \"park is not available\")\n\n    allowed_public_cg_status = {\"open\", \"seasonal\", \"closed\"}  # exclude 'inactive'\n\n    filtered = []\n    for cg in campgrounds:\n        if not isinstance(cg, dict):\n            continue\n        pid = cg.get(\"park_id\")\n        if not isinstance(pid, str):\n            continue\n        if pid not in active_park_ids:\n            continue\n        if resolved_park is not None and pid != resolved_park.get(\"id\"):\n            continue\n\n        cg_status = cg.get(\"status\")\n        if cg_status not in allowed_public_cg_status:\n            continue\n        if status is not None and cg_status != status:\n            continue\n\n        filtered.append(cg)\n\n    # ---- sorting ----\n    def _dt_key(v):\n        if not isinstance(v, str) or not v:\n            return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n        try:\n            return datetime.datetime.fromisoformat(v.replace(\"Z\", \"+00:00\"))\n        except Exception:\n            return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n\n    reverse = sort.startswith(\"-\")\n    sort_field = sort[1:] if reverse else sort\n    if sort_field == \"name\":\n        filtered.sort(key=lambda r: (str(r.get(\"name\") or \"\").casefold(), str(r.get(\"id\") or \"\")), reverse=reverse)\n    else:  # updated_at\n        filtered.sort(key=lambda r: (_dt_key(r.get(\"updated_at\")), str(r.get(\"id\") or \"\")), reverse=reverse)\n\n    # ---- cursor pagination (cursor is last seen id in the sorted list) ----\n    start_idx = 0\n    if cursor:\n        # find first element strictly after cursor id\n        for i, row in enumerate(filtered):\n            if row.get(\"id\") == cursor:\n                start_idx = i + 1\n                break\n\n    page = filtered[start_idx:start_idx + limit]\n    has_more = start_idx + limit < len(filtered)\n    next_cursor = page[-1].get(\"id\") if (has_more and page and isinstance(page[-1], dict)) else None\n\n    _log(\"OK\", None, cursor_out=next_cursor)\n    return {\n        \"campgrounds\": page,\n        \"total\": len(filtered),\n        \"limit\": limit,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getEvents",
+          "description": "Lists events, optionally scoped to a park (park_id or park_code) and filtered by status, category, and start_after/start_before, returning results sorted as requested and paged with cursor-based pagination (limit + cursor). Raises VALIDATION_ERROR for an invalid park_id format, malformed timestamps, invalid enum/sort/limit, or unexpected properties, and NOT_FOUND if a specified park_id/park_code does not resolve to a park. Raises UNAUTHORIZED if the caller cannot read events, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "park_id": {
+                "type": "string",
+                "pattern": "^nps_park_[0-9A-HJKMNP-TV-Z]{18,}$",
+                "description": "Return events for a specific park id."
+              },
+              "park_code": {
+                "type": "string",
+                "description": "Return events for a specific park code."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "scheduled",
+                  "cancelled",
+                  "completed",
+                  "inactive"
+                ],
+                "description": "Filter events by status."
+              },
+              "category": {
+                "type": "string",
+                "description": "Filter events by category."
+              },
+              "start_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only include events starting at or after this timestamp."
+              },
+              "start_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only include events starting before or at this timestamp."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "start_at",
+                  "-start_at",
+                  "updated_at",
+                  "-updated_at"
+                ],
+                "description": "Sort order for results."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of events to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor from a previous response."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def getEvents(park_id=None, park_code=None, status=None, category=None, start_after=None, start_before=None, sort=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0431000\" if __import__(\"os\").path.isdir(\"./environment_mix/0431000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start_t = time.time()\n    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n    endpoint = \"getEvents\"\n\n    def _log(status_code, message=None, cursor_out=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            row = {\n                \"id\": f\"req_{int(time.time()*1000)}_{os.getpid()}\",\n                \"endpoint\": endpoint,\n                \"status\": status_code,\n                \"message\": message,\n                \"latency_ms\": int((time.time() - start_t) * 1000),\n                \"timestamp\": now.isoformat(),\n            }\n            if cursor_out is not None:\n                row[\"next_cursor\"] = cursor_out\n            logs.append(row)\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None, None\n        if not isinstance(s, str):\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be a string\")\n        try:\n            dt = datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt, None\n        except Exception:\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be an ISO-8601 date-time\")\n\n    # ---- validation (relaxed: accept any string park_id; validate existence instead of strict pattern) ----\n    if park_id is not None and not isinstance(park_id, str):\n        _log(\"VALIDATION_ERROR\", \"park_id must be a string\")\n        return _err(\"VALIDATION_ERROR\", \"park_id must be a string\")\n    if park_code is not None and not isinstance(park_code, str):\n        _log(\"VALIDATION_ERROR\", \"park_code must be a string\")\n        return _err(\"VALIDATION_ERROR\", \"park_code must be a string\")\n\n    allowed_status = (\"scheduled\", \"cancelled\", \"completed\", \"inactive\")\n    if status is not None:\n        if not isinstance(status, str):\n            _log(\"VALIDATION_ERROR\", \"status must be a string\")\n            return _err(\"VALIDATION_ERROR\", \"status must be a string\")\n        if status not in allowed_status:\n            _log(\"VALIDATION_ERROR\", \"status must be one of: scheduled, cancelled, completed, inactive\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: scheduled, cancelled, completed, inactive\")\n\n    if category is not None and not isinstance(category, str):\n        _log(\"VALIDATION_ERROR\", \"category must be a string\")\n        return _err(\"VALIDATION_ERROR\", \"category must be a string\")\n\n    start_after_dt, err = _parse_dt(start_after, \"start_after\")\n    if err:\n        _log(\"VALIDATION_ERROR\", err[\"error\"][\"message\"])\n        return err\n    start_before_dt, err = _parse_dt(start_before, \"start_before\")\n    if err:\n        _log(\"VALIDATION_ERROR\", err[\"error\"][\"message\"])\n        return err\n\n    allowed_sort = (\"start_at\", \"-start_at\", \"updated_at\", \"-updated_at\")\n    if sort is None:\n        sort = \"start_at\"\n    else:\n        if not isinstance(sort, str):\n            _log(\"VALIDATION_ERROR\", \"sort must be a string\")\n            return _err(\"VALIDATION_ERROR\", \"sort must be a string\")\n        if sort not in allowed_sort:\n            _log(\"VALIDATION_ERROR\", \"sort must be one of: start_at, -start_at, updated_at, -updated_at\")\n            return _err(\"VALIDATION_ERROR\", \"sort must be one of: start_at, -start_at, updated_at, -updated_at\")\n\n    if limit is None:\n        limit = 20\n    else:\n        if not isinstance(limit, int):\n            _log(\"VALIDATION_ERROR\", \"limit must be an integer\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n        if limit < 1 or limit > 100:\n            _log(\"VALIDATION_ERROR\", \"limit must be between 1 and 100\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 100\")\n\n    if cursor is not None and not isinstance(cursor, str):\n        _log(\"VALIDATION_ERROR\", \"cursor must be a string\")\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n\n    # ---- load data ----\n    parks = _load(\"parks.json\")\n    events = _load(\"events.json\")\n\n    if isinstance(parks, dict) and \"rows\" in parks and isinstance(parks.get(\"rows\"), list):\n        parks = parks[\"rows\"]\n    if isinstance(events, dict) and \"rows\" in events and isinstance(events.get(\"rows\"), list):\n        events = events[\"rows\"]\n\n    if not isinstance(parks, list):\n        parks = []\n    if not isinstance(events, list):\n        events = []\n\n    parks_by_id = {p.get(\"id\"): p for p in parks if isinstance(p, dict) and isinstance(p.get(\"id\"), str)}\n    parks_by_code = {}\n    for p in parks:\n        if isinstance(p, dict):\n            pc = p.get(\"park_code\")\n            if isinstance(pc, str):\n                parks_by_code[pc.lower()] = p\n\n    resolved_park = None\n    if park_id is not None:\n        resolved_park = parks_by_id.get(park_id)\n        if not resolved_park:\n            _log(\"NOT_FOUND\", \"park_id did not resolve to a park\")\n            return _err(\"NOT_FOUND\", \"park_id did not resolve to a park\")\n    if resolved_park is None and park_code is not None:\n        resolved_park = parks_by_code.get(park_code.lower())\n        if not resolved_park:\n            _log(\"NOT_FOUND\", \"park_code did not resolve to a park\")\n            return _err(\"NOT_FOUND\", \"park_code did not resolve to a park\")\n\n    active_park_ids = {p.get(\"id\") for p in parks if isinstance(p, dict) and p.get(\"status\") == \"active\" and isinstance(p.get(\"id\"), str)}\n\n    if resolved_park is not None and resolved_park.get(\"status\") != \"active\":\n        _log(\"NOT_FOUND\", \"park is not available\")\n        return _err(\"NOT_FOUND\", \"park is not available\")\n\n    # Public rule: join to active parks; default include only scheduled\n    effective_status = status if status is not None else \"scheduled\"\n\n    def _dt(v):\n        if not isinstance(v, str) or not v:\n            return None\n        try:\n            dt = datetime.datetime.fromisoformat(v.replace(\"Z\", \"+00:00\"))\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt\n        except Exception:\n            return None\n\n    filtered = []\n    for ev in events:\n        if not isinstance(ev, dict):\n            continue\n        pid = ev.get(\"park_id\")\n        if not isinstance(pid, str) or pid not in active_park_ids:\n            continue\n        if resolved_park is not None and pid != resolved_park.get(\"id\"):\n            continue\n\n        ev_status = ev.get(\"status\")\n        if ev_status != effective_status:\n            continue\n\n        if category is not None:\n            ev_cat = ev.get(\"category\")\n            if ev_cat != category:\n                continue\n\n        ev_start = _dt(ev.get(\"start_at\"))\n        if ev_start is None:\n            continue\n        if start_after_dt is not None and ev_start < start_after_dt:\n            continue\n        if start_before_dt is not None and ev_start > start_before_dt:\n            continue\n\n        filtered.append(ev)\n\n    def _dt_key(v):\n        dtv = _dt(v)\n        if dtv is None:\n            return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n        return dtv\n\n    reverse = sort.startswith(\"-\")\n    sort_field = sort[1:] if reverse else sort\n    if sort_field == \"start_at\":\n        filtered.sort(key=lambda r: (_dt_key(r.get(\"start_at\")), str(r.get(\"id\") or \"\")), reverse=reverse)\n    else:  # updated_at\n        filtered.sort(key=lambda r: (_dt_key(r.get(\"updated_at\")), str(r.get(\"id\") or \"\")), reverse=reverse)\n\n    # ---- cursor pagination ----\n    start_idx = 0\n    if cursor:\n        for i, row in enumerate(filtered):\n            if row.get(\"id\") == cursor:\n                start_idx = i + 1\n                break\n\n    page = filtered[start_idx:start_idx + limit]\n    has_more = start_idx + limit < len(filtered)\n    next_cursor = page[-1].get(\"id\") if (has_more and page and isinstance(page[-1], dict)) else None\n\n    _log(\"OK\", None, cursor_out=next_cursor)\n    return {\n        \"events\": page,\n        \"total\": len(filtered),\n        \"limit\": limit,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0431000",
+    "index": 431,
+    "name": "National Parks Information Server",
+    "description": "This backend stores normalized National Park Service-style content: parks, their public details, and related operational information such as alerts, visitor centers, campgrounds, and events. Primary workflows are read-heavy lookups and listings (find parks, then fetch park-specific related resources",
+    "taxonomy": {
+      "L1_id": "L1-16",
+      "L1_name": "Travel & Transportation",
+      "L1_name_zh": "旅行与出行",
+      "L2_id": "L2-41",
+      "L2_name": "Transit, Navigation & Vehicles",
+      "L2_name_zh": "交通、导航与车辆",
+      "L3_name": "Parks & Visitor Destination Information",
+      "L3_name_zh": "公园与游客目的地信息"
+    },
+    "database_dir": "./environment_mix/0431000",
+    "mount_path": "/app/database",
+    "n_tools": 6,
+    "n_collections": 5,
+    "n_records": 102,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 6,
+      "loaded": 6,
+      "reads_returning_data": 6,
+      "read_operations": 6,
+      "mutations_persisted": 0,
+      "mutations_attempted": 0
+    },
+    "tools_loadable_from_database_dir": 6,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "findParks",
+      "returned_chars": 124
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

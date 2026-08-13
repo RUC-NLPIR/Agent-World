@@ -1,0 +1,218 @@
+{
+  "index": 1,
+  "local_files_dir": "./environment_mix/0001000",
+  "file_list": [
+    "./environment_mix/0001000/README.md",
+    "./environment_mix/0001000/trending_datasets.json",
+    "./environment_mix/0001000/trending_models.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "trending_datasets.json": "An array of the top 20 trending datasets on Hugging Face (sorted by trendingScore). Each object contains the fields: _id, id, author, disabled, gated, lastModified, likes, trendingScore, private, sha, description, downloads, tags, createdAt, key. The dataset entries include diverse domains such as coding agent logs, code generation, reasoning, terminal interaction, source code corpora, route planning, video reasoning, document QA, travel recommendation, theorem proving, and more. This file is located at /app/database/trending_datasets.json.",
+        "trending_models.json": "An array of the top 20 trending models on Hugging Face (sorted by trendingScore). Each object includes the fields: _id, id, likes, trendingScore, private, downloads, tags, pipeline_tag, library_name, createdAt, modelId. The models span large language models (Qwen, LiquidAI, GLM, Nanbeige, MiniMax, etc.), both base and fine‑tuned variants, and GGUF quantized versions, covering image‑text‑to‑text, text generation, and multimodal tasks. This file is located at /app/database/trending_models.json.",
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "get_trending_datasets",
+          "description": "Retrieve a list of trending datasets from the local file `/app/database/trending_datasets.json`. Allows optional filtering by author or tags, sorting by a selected field, and pagination via `limit` and `offset`.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of dataset entries to return.",
+                "default": 20,
+                "minimum": 1
+              },
+              "offset": {
+                "type": "integer",
+                "description": "Number of entries to skip (for pagination).",
+                "default": 0,
+                "minimum": 0
+              },
+              "sort_by": {
+                "type": "string",
+                "description": "Field to sort by. Defaults to `trendingScore`.",
+                "enum": [
+                  "trendingScore",
+                  "downloads",
+                  "likes",
+                  "createdAt",
+                  "lastModified"
+                ],
+                "default": "trendingScore"
+              },
+              "order": {
+                "type": "string",
+                "description": "Sort direction.",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "default": "desc"
+              },
+              "author": {
+                "type": "string",
+                "description": "Filter results to datasets created by this author (exact match)."
+              },
+              "tags": {
+                "type": "array",
+                "description": "Filter results to datasets that contain **all** of these tags.",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": []
+          },
+          "implementation": "def get_trending_datasets(limit=20, offset=0, sort_by='trendingScore', order='desc', author=None, tags=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0001000\" if __import__(\"os\").path.isdir(\"./environment_mix/0001000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    # Validate pagination\n    if limit is None:\n        limit = 20\n    if offset is None:\n        offset = 0\n    if not isinstance(limit, int) or limit < 1:\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer >= 1\", field=\"limit\")\n    if not isinstance(offset, int) or offset < 0:\n        return _err(\"VALIDATION_ERROR\", \"offset must be an integer >= 0\", field=\"offset\")\n\n    allowed_sort = {\"trendingScore\", \"downloads\", \"likes\", \"createdAt\", \"lastModified\"}\n    if sort_by is None:\n        sort_by = \"trendingScore\"\n    if not isinstance(sort_by, str) or sort_by not in allowed_sort:\n        return _err(\"VALIDATION_ERROR\", \"Unsupported sort_by value\", field=\"sort_by\", allowed=sorted(allowed_sort))\n\n    if order is None:\n        order = \"desc\"\n    if not isinstance(order, str) or order not in {\"asc\", \"desc\"}:\n        return _err(\"VALIDATION_ERROR\", \"order must be 'asc' or 'desc'\", field=\"order\", allowed=[\"asc\", \"desc\"])\n\n    if author is not None and (not isinstance(author, str) or not author.strip()):\n        return _err(\"VALIDATION_ERROR\", \"author must be a non-empty string when provided\", field=\"author\")\n\n    if tags is not None:\n        if not isinstance(tags, list):\n            return _err(\"VALIDATION_ERROR\", \"tags must be an array of strings when provided\", field=\"tags\")\n        for i, t in enumerate(tags):\n            if not isinstance(t, str) or not t.strip():\n                return _err(\"VALIDATION_ERROR\", \"tags must contain only non-empty strings\", field=\"tags\", index=i)\n\n    rows = _load(\"trending_datasets.json\")\n    if not isinstance(rows, list):\n        rows = []\n\n    # Filters\n    if author is not None:\n        rows = [r for r in rows if isinstance(r, dict) and r.get(\"author\") == author]\n    if tags:\n        req = set(tags)\n        def _has_all_tags(r):\n            rt = r.get(\"tags\", [])\n            if not isinstance(rt, list):\n                return False\n            return req.issubset(set([x for x in rt if isinstance(x, str)]))\n        rows = [r for r in rows if isinstance(r, dict) and _has_all_tags(r)]\n\n    # Sorting helpers\n    def _parse_dt(s):\n        if not isinstance(s, str) or not s.strip():\n            return None\n        s2 = s.strip()\n        try:\n            if s2.endswith(\"Z\"):\n                s2 = s2[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(s2)\n        except Exception:\n            return None\n\n    reverse = (order == \"desc\")\n\n    if sort_by in {\"createdAt\", \"lastModified\"}:\n        def _sort_key(r):\n            dt = _parse_dt(r.get(sort_by))\n            # Put missing/unparseable dates at the end regardless of direction\n            missing = (dt is None)\n            val = dt.timestamp() if dt is not None else 0.0\n            return (missing, val)\n    else:\n        def _sort_key(r):\n            v = r.get(sort_by)\n            if isinstance(v, bool):\n                v = int(v)\n            if isinstance(v, (int, float)):\n                return v\n            return -10**30 if reverse else 10**30\n\n    try:\n        rows_sorted = sorted([r for r in rows if isinstance(r, dict)], key=_sort_key, reverse=reverse)\n    except Exception:\n        # If sorting fails due to mixed incomparable keys, fall back to stable order\n        rows_sorted = [r for r in rows if isinstance(r, dict)]\n\n    total = len(rows_sorted)\n    start = offset\n    end = offset + limit\n    page = rows_sorted[start:end]\n    has_more = end < total\n    next_cursor = str(end) if has_more else None\n\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"offset\": offset,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"sort_by\": sort_by,\n            \"order\": order,\n        },\n    }\n",
+          "implementation_repaired": true
+        },
+        {
+          "name": "get_trending_models",
+          "description": "Returns a paginated list of trending models, optionally filtered by author (exact match), required tags (model must include all), pipeline tag, and library name, and sorted by the requested field and order. It refuses requests with invalid pagination (limit < 1 or offset < 0), an unsupported sort_by value, or an order other than \"asc\"/\"desc\". It also refuses malformed filter values such as non-string items in tags when tags is provided.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of model entries to return.",
+                "default": 20,
+                "minimum": 1
+              },
+              "offset": {
+                "type": "integer",
+                "description": "Number of entries to skip (for pagination).",
+                "default": 0,
+                "minimum": 0
+              },
+              "sort_by": {
+                "type": "string",
+                "description": "Field to sort by. Defaults to `trendingScore`.",
+                "enum": [
+                  "trendingScore",
+                  "downloads",
+                  "likes",
+                  "createdAt",
+                  "lastModified"
+                ],
+                "default": "trendingScore"
+              },
+              "order": {
+                "type": "string",
+                "description": "Sort direction.",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "default": "desc"
+              },
+              "author": {
+                "type": "string",
+                "description": "Filter results to models created by this author (exact match)."
+              },
+              "tags": {
+                "type": "array",
+                "description": "Filter results to models that contain **all** of these tags.",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "pipeline_tag": {
+                "type": "string",
+                "description": "Filter results to models with this pipeline tag (e.g., `text-generation`)."
+              },
+              "library_name": {
+                "type": "string",
+                "description": "Filter results to models that use this library (e.g., `transformers`)."
+              }
+            },
+            "required": []
+          },
+          "implementation": "def get_trending_models(limit=20, offset=0, sort_by='trendingScore', order='desc', author=None, tags=None, pipeline_tag=None, library_name=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0001000\" if __import__(\"os\").path.isdir(\"./environment_mix/0001000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    # Validate pagination\n    if limit is None:\n        limit = 20\n    if offset is None:\n        offset = 0\n    if not isinstance(limit, int) or limit < 1:\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer >= 1\", field=\"limit\")\n    if not isinstance(offset, int) or offset < 0:\n        return _err(\"VALIDATION_ERROR\", \"offset must be an integer >= 0\", field=\"offset\")\n\n    allowed_sort = {\"trendingScore\", \"downloads\", \"likes\", \"createdAt\", \"lastModified\"}\n    if sort_by is None:\n        sort_by = \"trendingScore\"\n    if not isinstance(sort_by, str) or sort_by not in allowed_sort:\n        return _err(\"VALIDATION_ERROR\", \"Unsupported sort_by value\", field=\"sort_by\", allowed=sorted(allowed_sort))\n\n    if order is None:\n        order = \"desc\"\n    if not isinstance(order, str) or order not in {\"asc\", \"desc\"}:\n        return _err(\"VALIDATION_ERROR\", \"order must be 'asc' or 'desc'\", field=\"order\", allowed=[\"asc\", \"desc\"])\n\n    if author is not None and (not isinstance(author, str) or not author.strip()):\n        return _err(\"VALIDATION_ERROR\", \"author must be a non-empty string when provided\", field=\"author\")\n\n    if tags is not None:\n        if not isinstance(tags, list):\n            return _err(\"VALIDATION_ERROR\", \"tags must be an array of strings when provided\", field=\"tags\")\n        for i, t in enumerate(tags):\n            if not isinstance(t, str) or not t.strip():\n                return _err(\"VALIDATION_ERROR\", \"tags must contain only non-empty strings\", field=\"tags\", index=i)\n\n    allowed_pipeline = {\"image-text-to-text\", \"text-generation\"}\n    if pipeline_tag is not None:\n        if not isinstance(pipeline_tag, str) or pipeline_tag not in allowed_pipeline:\n            return _err(\"VALIDATION_ERROR\", \"pipeline_tag is invalid\", field=\"pipeline_tag\", allowed=sorted(allowed_pipeline))\n\n    if library_name is not None and (not isinstance(library_name, str) or not library_name.strip()):\n        return _err(\"VALIDATION_ERROR\", \"library_name must be a non-empty string when provided\", field=\"library_name\")\n\n    rows = _load(\"trending_models.json\")\n    if not isinstance(rows, list):\n        rows = []\n\n    # Filters\n    if author is not None:\n        # Note: current store may not have 'author' for models, but filter must still work.\n        rows = [r for r in rows if isinstance(r, dict) and r.get(\"author\") == author]\n    if tags:\n        req = set(tags)\n        def _has_all_tags(r):\n            rt = r.get(\"tags\", [])\n            if not isinstance(rt, list):\n                return False\n            return req.issubset(set([x for x in rt if isinstance(x, str)]))\n        rows = [r for r in rows if isinstance(r, dict) and _has_all_tags(r)]\n    if pipeline_tag is not None:\n        rows = [r for r in rows if isinstance(r, dict) and r.get(\"pipeline_tag\") == pipeline_tag]\n    if library_name is not None:\n        rows = [r for r in rows if isinstance(r, dict) and r.get(\"library_name\") == library_name]\n\n    # Sorting helpers\n    def _parse_dt(s):\n        if not isinstance(s, str) or not s.strip():\n            return None\n        s2 = s.strip()\n        try:\n            if s2.endswith(\"Z\"):\n                s2 = s2[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(s2)\n        except Exception:\n            return None\n\n    reverse = (order == \"desc\")\n    if sort_by in {\"createdAt\", \"lastModified\"}:\n        def _sort_key(r):\n            dt = _parse_dt(r.get(sort_by))\n            missing = (dt is None)\n            val = dt.timestamp() if dt is not None else 0.0\n            return (missing, val)\n    else:\n        def _sort_key(r):\n            v = r.get(sort_by)\n            if isinstance(v, bool):\n                v = int(v)\n            if isinstance(v, (int, float)):\n                return v\n            return -10**30 if reverse else 10**30\n\n    try:\n        rows_sorted = sorted([r for r in rows if isinstance(r, dict)], key=_sort_key, reverse=reverse)\n    except Exception:\n        rows_sorted = [r for r in rows if isinstance(r, dict)]\n\n    total = len(rows_sorted)\n    start = offset\n    end = offset + limit\n    page = rows_sorted[start:end]\n    has_more = end < total\n    next_cursor = str(end) if has_more else None\n\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"offset\": offset,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"sort_by\": sort_by,\n            \"order\": order,\n        },\n    }\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "get_dataset_by_id",
+          "description": "Looks up and returns the full trending dataset record whose identifier matches the provided dataset_id against either the dataset’s _id or id field. It refuses requests that omit dataset_id or provide a non-string/empty identifier. It also refuses the lookup when no dataset exists with a matching identifier.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "dataset_id": {
+                "type": "string",
+                "description": "The dataset identifier to look up (matches `_id` or `id`)."
+              }
+            },
+            "required": [
+              "dataset_id"
+            ]
+          },
+          "implementation": "def get_dataset_by_id(dataset_id, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0001000\" if __import__(\"os\").path.isdir(\"./environment_mix/0001000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    if dataset_id is None or not isinstance(dataset_id, str) or not dataset_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"dataset_id must be a non-empty string\", field=\"dataset_id\")\n\n    rows = _load(\"trending_datasets.json\")\n    if not isinstance(rows, list):\n        rows = []\n\n    target = dataset_id.strip()\n    for r in rows:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"_id\") == target or r.get(\"id\") == target:\n            return {\"data\": r}\n\n    return _err(\"NOT_FOUND\", \"Dataset not found\", dataset_id=target)\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "get_model_by_id",
+          "description": "Looks up and returns the full trending model record whose identifier matches the provided model_id against the model’s _id, id, or modelId field. It refuses requests that omit model_id or provide a non-string/empty identifier. It also refuses the lookup when no model exists with a matching identifier.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "model_id": {
+                "type": "string",
+                "description": "The model identifier to look up (matches `_id`, `id`, or `modelId`)."
+              }
+            },
+            "required": [
+              "model_id"
+            ]
+          },
+          "implementation": "def get_model_by_id(model_id, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0001000\" if __import__(\"os\").path.isdir(\"./environment_mix/0001000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    if model_id is None or not isinstance(model_id, str) or not model_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"model_id must be a non-empty string\", field=\"model_id\")\n\n    rows = _load(\"trending_models.json\")\n    if not isinstance(rows, list):\n        rows = []\n\n    target = model_id.strip()\n    for r in rows:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"_id\") == target or r.get(\"id\") == target or r.get(\"modelId\") == target:\n            return {\"data\": r}\n\n    return _err(\"NOT_FOUND\", \"Model not found\", model_id=target)\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0001000",
+    "index": 1,
+    "name": "PulseShelf Catalog Browser",
+    "description": "Provides a lightweight API to browse locally stored trending dataset and model listings with lookup by ID plus basic filtering, sorting, and pagination.",
+    "taxonomy": {
+      "L1_id": "L1-10",
+      "L1_name": "Data Storage & Databases",
+      "L1_name_zh": "数据存储与数据库",
+      "L2_id": "L2-27",
+      "L2_name": "Memory & Knowledge Management",
+      "L2_name_zh": "记忆与知识管理",
+      "L3_name": "Knowledge Base & Documentation Indexing",
+      "L3_name_zh": "知识库与文档索引"
+    },
+    "database_dir": "./environment_mix/0001000",
+    "mount_path": "/app/database",
+    "n_tools": 4,
+    "n_collections": 2,
+    "n_records": 36,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 4,
+      "loaded": 4,
+      "reads_returning_data": 3,
+      "read_operations": 4,
+      "mutations_persisted": 0,
+      "mutations_attempted": 0
+    },
+    "tools_loadable_from_database_dir": 4,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_trending_datasets",
+      "returned_chars": 14715
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

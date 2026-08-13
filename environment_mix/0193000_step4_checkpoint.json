@@ -1,0 +1,562 @@
+{
+  "index": 193,
+  "local_files_dir": "./environment_mix/0193000",
+  "file_list": [
+    "./environment_mix/0193000/README.md",
+    "./environment_mix/0193000/api_keys.json",
+    "./environment_mix/0193000/search_requests.json",
+    "./environment_mix/0193000/search_results.json",
+    "./environment_mix/0193000/usage_ledger.json",
+    "./environment_mix/0193000/workspaces.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "workspaces.json": "12 rows",
+        "api_keys.json": "12 rows",
+        "search_requests.json": "35 rows",
+        "search_results.json": "33 rows",
+        "usage_ledger.json": "30 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "brave_web_search",
+          "description": "Executes a Brave Web Search for the given query on behalf of the specified workspace and API key, persists the search request and normalized web result items (optionally storing the raw provider response), and returns up to `count` results starting at zero-based `offset` for pagination. If `cache_ttl_seconds` > 0, identical requests may be served from cache until the TTL expires and the response indicates cached status when applicable. Raises VALIDATION_ERROR for invalid ids, empty query, out-of-range `count`/`offset`/`cache_ttl_seconds`, invalid locale codes, or unsupported `result_filter`; raises UNAUTHORIZED when the workspace/api key is invalid or not permitted, QUOTA_EXCEEDED when the workspace/key has no remaining usage, and PROVIDER_ERROR when Brave rejects the request or is unavailable.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^brv_ws_[0-9A-Z]{18,}$",
+                "description": "Workspace id to authenticate, enforce quotas, and attribute stored request/results."
+              },
+              "api_key_id": {
+                "type": "string",
+                "pattern": "^brv_key_[0-9A-Z]{18,}$",
+                "description": "API key id to use for the Brave provider request and usage/billing attribution."
+              },
+              "query": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Web search query text."
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20,
+                "description": "Number of web results to return (provider page size)."
+              },
+              "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1000,
+                "description": "Zero-based offset into the web result set for pagination."
+              },
+              "country": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 2,
+                "description": "Two-letter country code to localize results (e.g., US, GB)."
+              },
+              "search_lang": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 5,
+                "description": "Language code for the search interface (e.g., en, en-US)."
+              },
+              "ui_lang": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 5,
+                "description": "Language for returned UI strings when supported (e.g., en, en-US)."
+              },
+              "safesearch": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "moderate",
+                  "strict"
+                ],
+                "description": "SafeSearch level for filtering adult content."
+              },
+              "freshness": {
+                "type": "string",
+                "enum": [
+                  "all",
+                  "day",
+                  "week",
+                  "month",
+                  "year"
+                ],
+                "description": "Time-based freshness filter for results."
+              },
+              "spellcheck": {
+                "type": "boolean",
+                "description": "Whether to apply provider spellcheck/suggestions when available."
+              },
+              "result_filter": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "web"
+                  ]
+                },
+                "minItems": 1,
+                "uniqueItems": true,
+                "description": "Restrict returned result sections/types; web-only for this tool."
+              },
+              "store_raw_response": {
+                "type": "boolean",
+                "description": "Whether to store the provider raw response on the search request record."
+              },
+              "cache_ttl_seconds": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 86400,
+                "description": "If >0, cache identical requests for this many seconds (sets cached_until and may return cached status)."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "api_key_id",
+              "query"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def brave_web_search(workspace_id, api_key_id, query, count=None, offset=None, country=None, search_lang=None, ui_lang=None, safesearch=None, freshness=None, spellcheck=None, result_filter=None, store_raw_response=None, cache_ttl_seconds=None, **_extra):\n    import json, os, datetime, re, time, hashlib, base64, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0193000\" if __import__(\"os\").path.isdir(\"./environment_mix/0193000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now.isoformat()\n\n    # ---- helpers ----\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            # allow trailing Z\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            dt = datetime.datetime.fromisoformat(s)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _period_month(dt):\n        return f\"{dt.year:04d}-{dt.month:02d}\"\n\n    def _make_id(prefix):\n        # 18+ base32 chars\n        alphabet = \"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567\"\n        body = \"\".join(secrets.choice(alphabet) for _ in range(20))\n        return f\"{prefix}_{body}\"\n\n    def _norm_query(q):\n        return \" \".join(q.strip().split()).lower()\n\n    def _fingerprint(payload_obj):\n        b = json.dumps(payload_obj, sort_keys=True, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return hashlib.sha256(b).hexdigest()\n\n    def _audit(status, workspace_id=None, api_key_id=None, tool=None, search_request_id=None, detail=None):\n        # usage_ledger is usage-focused; no request-log collection exists.\n        # We'll still record non-billable request events for observability when possible without breaking uniqueness constraints.\n        # However, schema enforces unique(search_request_id, event_type); so only record after we have/choose a request id.\n        return\n\n    def _sum_usage(usage_rows, ws_id, period, event_type):\n        return sum(int(r.get(\"quantity\", 0) or 0) for r in usage_rows\n                   if r.get(\"workspace_id\") == ws_id\n                   and r.get(\"period_month\") == period\n                   and r.get(\"event_type\") == event_type\n                   and r.get(\"billable\") is True)\n\n    def _upsert_ledger(usage_rows, ws_id, key_id, req_id, event_type, tool_name, quantity, billable=True):\n        # Exactly one row per (search_request_id, event_type)\n        for r in usage_rows:\n            if r.get(\"search_request_id\") == req_id and r.get(\"event_type\") == event_type:\n                # idempotent reconciliation\n                r[\"workspace_id\"] = ws_id\n                r[\"api_key_id\"] = key_id\n                r[\"tool_name\"] = tool_name\n                r[\"quantity\"] = int(quantity)\n                r[\"billable\"] = bool(billable)\n                r[\"period_month\"] = _period_month(now)\n                r[\"updated_at\"] = now_iso\n                return r\n        row = {\n            \"id\": _make_id(\"brv_use\"),\n            \"workspace_id\": ws_id,\n            \"api_key_id\": key_id,\n            \"search_request_id\": req_id,\n            \"event_type\": event_type,\n            \"tool_name\": tool_name,\n            \"quantity\": int(quantity),\n            \"billable\": bool(billable),\n            \"period_month\": _period_month(now),\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso\n        }\n        usage_rows.append(row)\n        return row\n\n    def _redact_raw(obj):\n        # Ensure PII-safe-ish: keep only minimal keys for debug if dict/list\n        if obj is None:\n            return None\n        try:\n            if isinstance(obj, dict):\n                keep = {}\n                for k in (\"type\", \"query\", \"count\", \"offset\", \"country\", \"search_lang\", \"ui_lang\", \"safesearch\", \"freshness\", \"provider_request_id\", \"status\", \"error\"):\n                    if k in obj:\n                        keep[k] = obj[k]\n                # include summary counts if present\n                for k in (\"total\", \"results_count\", \"local_results_count\"):\n                    if k in obj:\n                        keep[k] = obj[k]\n                return keep\n            if isinstance(obj, list):\n                return {\"items\": len(obj)}\n            return {\"value\": str(obj)[:500]}\n        except Exception:\n            return None\n\n    # ---- validate inputs ----\n    if not isinstance(workspace_id, str) or not re.match(r\"^brv_ws_[0-9A-Z]{18,}$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if not isinstance(api_key_id, str) or not re.match(r\"^brv_key_[0-9A-Z]{18,}$\", api_key_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid api_key_id.\")\n    if not isinstance(query, str) or len(query.strip()) < 1:\n        return _err(\"VALIDATION_ERROR\", \"query must be a non-empty string.\")\n\n    if count is None:\n        count = 10\n    if offset is None:\n        offset = 0\n    if store_raw_response is None:\n        store_raw_response = False\n    if spellcheck is None:\n        spellcheck = True\n    if cache_ttl_seconds is None:\n        cache_ttl_seconds = 0\n    if result_filter is None:\n        result_filter = [\"web\"]\n\n    if not isinstance(count, int) or count < 1 or count > 20:\n        return _err(\"VALIDATION_ERROR\", \"count must be an integer between 1 and 20.\")\n    if not isinstance(offset, int) or offset < 0 or offset > 1000:\n        return _err(\"VALIDATION_ERROR\", \"offset must be an integer between 0 and 1000.\")\n    if country is not None:\n        if not isinstance(country, str) or len(country) != 2:\n            return _err(\"VALIDATION_ERROR\", \"country must be a 2-letter code.\")\n        country = country.upper()\n    for nm, v in ((\"search_lang\", search_lang), (\"ui_lang\", ui_lang)):\n        if v is not None:\n            if not isinstance(v, str) or len(v) < 2 or len(v) > 5:\n                return _err(\"VALIDATION_ERROR\", f\"{nm} must be 2-5 characters.\")\n    if safesearch is not None and safesearch not in (\"off\", \"moderate\", \"strict\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid safesearch.\")\n    if freshness is not None and freshness not in (\"all\", \"day\", \"week\", \"month\", \"year\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid freshness.\")\n    if not isinstance(spellcheck, bool):\n        return _err(\"VALIDATION_ERROR\", \"spellcheck must be boolean.\")\n    if not isinstance(store_raw_response, bool):\n        return _err(\"VALIDATION_ERROR\", \"store_raw_response must be boolean.\")\n    if not isinstance(cache_ttl_seconds, int) or cache_ttl_seconds < 0 or cache_ttl_seconds > 86400:\n        return _err(\"VALIDATION_ERROR\", \"cache_ttl_seconds must be 0..86400.\")\n    if not isinstance(result_filter, list) or len(result_filter) < 1 or any(x != \"web\" for x in result_filter) or len(set(result_filter)) != len(result_filter):\n        return _err(\"VALIDATION_ERROR\", \"result_filter must be a non-empty list containing only 'web'.\")\n\n    # ---- load datastore ----\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    search_requests = _load(\"search_requests.json\")\n    search_results = _load(\"search_results.json\")\n    usage_ledger = _load(\"usage_ledger.json\")\n\n    ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n    if not ws:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n\n    key = next((k for k in api_keys if k.get(\"id\") == api_key_id and k.get(\"workspace_id\") == workspace_id and k.get(\"provider\") == \"brave\"), None)\n    if not key:\n        return _err(\"UNAUTHORIZED\", \"API key not found for workspace/provider.\", workspace_id=workspace_id, api_key_id=api_key_id)\n\n    # create search request row immediately (business rule)\n    req_id = _make_id(\"brv_req\")\n\n    # fingerprint for caching/dedupe\n    fp_obj = {\n        \"tool\": \"brave_web_search\",\n        \"query\": _norm_query(query),\n        \"count\": count,\n        \"offset\": offset,\n        \"country\": country,\n        \"search_lang\": search_lang,\n        \"ui_lang\": ui_lang,\n        \"safesearch\": safesearch,\n        \"freshness\": freshness,\n        \"spellcheck\": spellcheck,\n        \"result_filter\": result_filter\n    }\n    fingerprint = _fingerprint(fp_obj)\n\n    req_row = {\n        \"id\": req_id,\n        \"workspace_id\": workspace_id,\n        \"api_key_id\": api_key_id,\n        \"tool_name\": \"brave_web_search\",\n        \"query_text\": query,\n        \"local_intent\": False,\n        \"fallback_to_web\": False,\n        \"request_fingerprint\": fingerprint,\n        \"status\": \"queued\",\n        \"error_code\": None,\n        \"error_message\": None,\n        \"http_status\": None,\n        \"provider_latency_ms\": None,\n        \"result_count\": 0,\n        \"cached_until\": None,\n        \"provider_request_id\": None,\n        \"raw_response\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso\n    }\n    search_requests.append(req_row)\n    _save(\"search_requests.json\", search_requests)\n\n    # workspace status gate (must create failed row)\n    if ws.get(\"status\") != \"active\":\n        req_row[\"status\"] = \"failed\"\n        req_row[\"error_code\"] = \"WORKSPACE_NOT_ACTIVE\"\n        req_row[\"error_message\"] = f\"Workspace status is {ws.get('status')}.\"\n        req_row[\"updated_at\"] = datetime.datetime.now(datetime.timezone.utc).isoformat()\n        _save(\"search_requests.json\", search_requests)\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active; request execution not permitted.\", search_request_id=req_id, error_code=req_row[\"error_code\"])\n\n    # api key status gate\n    if key.get(\"status\") in (\"disabled\", \"revoked\"):\n        req_row[\"status\"] = \"failed\"\n        req_row[\"error_code\"] = \"API_KEY_NOT_ACTIVE\"\n        req_row[\"error_message\"] = f\"API key status is {key.get('status')}.\"\n        req_row[\"updated_at\"] = datetime.datetime.now(datetime.timezone.utc).isoformat()\n        _save(\"search_requests.json\", search_requests)\n        return _err(\"UNAUTHORIZED\", \"API key is not active.\", search_request_id=req_id, error_code=req_row[\"error_code\"])\n\n    # quota enforcement (monthly_request_quota)\n    period = _period_month(now)\n    used_req = _sum_usage(usage_ledger, workspace_id, period, \"request\")\n    quota = int(ws.get(\"monthly_request_quota\", 0) or 0)\n    if used_req >= quota:\n        req_row[\"status\"] = \"failed\"\n        req_row[\"error_code\"] = \"MONTHLY_REQUEST_QUOTA_EXCEEDED\"\n        req_row[\"error_message\"] = \"Monthly request quota exceeded.\"\n        req_row[\"updated_at\"] = datetime.datetime.now(datetime.timezone.utc).isoformat()\n        _save(\"search_requests.json\", search_requests)\n        return _err(\"QUOTA_EXCEEDED\", \"Monthly request quota exceeded.\", search_request_id=req_id, quota=quota, used=used_req)\n\n    # caching: find existing succeeded request with same fingerprint and cached_until > now\n    cached_req = None\n    if cache_ttl_seconds > 0:\n        for r in reversed(search_requests):\n            if r.get(\"workspace_id\") == workspace_id and r.get(\"request_fingerprint\") == fingerprint and r.get(\"status\") in (\"succeeded\", \"cached\"):\n                cu = _parse_dt(r.get(\"cached_until\"))\n                if cu and cu > now:\n                    cached_req = r\n                    break\n\n    if cached_req:\n        # attach/copy results by duplicating rows under this new request id (so unique(search_request_id, rank) holds)\n        cached_results = [sr for sr in search_results if sr.get(\"search_request_id\") == cached_req.get(\"id\") and sr.get(\"status\") != \"deleted\"]\n        cached_results.sort(key=lambda x: int(x.get(\"rank\", 10**9)))\n        # ensure contiguous\n        items = []\n        for src in cached_results:\n            if src.get(\"result_type\") != \"web\":\n                continue\n            items.append(src)\n\n        # paginate\n        page_items = items[offset: offset + count]\n        new_rows = []\n        rank = 1\n        for src in page_items:\n            # ranks must be contiguous in stored rows for this request. Store only returned page, as tool returns up to count/offset.\n            new_rows.append({\n                \"id\": _make_id(\"brv_res\"),\n                \"search_request_id\": req_id,\n                \"workspace_id\": workspace_id,\n                \"result_type\": \"web\",\n                \"rank\": rank,\n                \"title\": src.get(\"title\"),\n                \"url\": src.get(\"url\"),\n                \"snippet\": src.get(\"snippet\"),\n                \"display_domain\": src.get(\"display_domain\"),\n                \"language\": src.get(\"language\"),\n                \"published_at\": src.get(\"published_at\"),\n                \"provider_item_id\": src.get(\"provider_item_id\"),\n                \"place\": None,\n                \"status\": \"active\",\n                \"created_at\": datetime.datetime.now(datetime.timezone.utc).isoformat(),\n                \"updated_at\": datetime.datetime.now(datetime.timezone.utc).isoformat()\n            })\n            rank += 1\n\n        # write results\n        search_results.extend(new_rows)\n        _save(\"search_results.json\", search_results)\n\n        req_row[\"status\"] = \"cached\"\n        req_row[\"result_count\"] = len(new_rows)\n        req_row[\"cached_until\"] = cached_req.get(\"cached_until\")\n        if store_raw_response:\n            req_row[\"raw_response\"] = _redact_raw(cached_req.get(\"raw_response\"))\n        req_row[\"updated_at\"] = datetime.datetime.now(datetime.timezone.utc).isoformat()\n        _save(\"search_requests.json\", search_requests)\n\n        # ledger rows (idempotent)\n        _upsert_ledger(usage_ledger, workspace_id, api_key_id, req_id, \"request\", \"brave_web_search\", 1, billable=True)\n        _upsert_ledger(usage_ledger, workspace_id, api_key_id, req_id, \"result_item\", \"brave_web_search\", req_row[\"result_count\"], billable=True)\n        _save(\"usage_ledger.json\", usage_ledger)\n\n        latency_ms = int((time.time() - t0) * 1000)\n        return {\n            \"search_request\": req_row,\n            \"results\": new_rows,\n            \"meta\": {\n                \"count\": count,\n                \"offset\": offset,\n                \"returned\": len(new_rows),\n                \"cached\": True,\n                \"latency_ms\": latency_ms\n            }\n        }\n\n    # \"execute provider request\": offline deterministic pseudo-results\n    req_row[\"status\"] = \"running\"\n    req_row[\"updated_at\"] = datetime.datetime.now(datetime.timezone.utc).isoformat()\n    _save(\"search_requests.json\", search_requests)\n\n    # simulate provider latency\n    provider_latency_ms = 40 + (int(hashlib.md5(fingerprint.encode(\"utf-8\")).hexdigest()[:2], 16) % 180)\n\n    # generate deterministic results for the requested page\n    base_seed = int(hashlib.sha256(fingerprint.encode(\"utf-8\")).hexdigest()[:16], 16)\n    results = []\n    for i in range(count):\n        global_rank = offset + i + 1\n        # deterministic domain\n        dom_seed = (base_seed + global_rank * 1315423911) & 0xFFFFFFFFFFFFFFFF\n        domain = f\"example{(dom_seed % 997):03d}.com\"\n        url = f\"https://{domain}/search/{base_seed % 1000000}/{global_rank}\"\n        title = f\"{query.strip()} — Result {global_rank}\"\n        snippet = f\"Deterministic offline result {global_rank} for query '{_norm_query(query)}'.\"\n        results.append({\n            \"id\": _make_id(\"brv_res\"),\n            \"search_request_id\": req_id,\n            \"workspace_id\": workspace_id,\n            \"result_type\": \"web\",\n            \"rank\": i + 1,  # contiguous within this request\n            \"title\": title,\n            \"url\": url,\n            \"snippet\": snippet,\n            \"display_domain\": domain,\n            \"language\": search_lang,\n            \"published_at\": None,\n            \"provider_item_id\": f\"brv_web_{base_seed % 1000000}_{global_rank}\",\n            \"place\": None,\n            \"status\": \"active\",\n            \"created_at\": datetime.datetime.now(datetime.timezone.utc).isoformat(),\n            \"updated_at\": datetime.datetime.now(datetime.timezone.utc).isoformat()\n        })\n\n    # enforce constraints: url not null for web + contiguous ranks already true\n    if any(r.get(\"url\") in (None, \"\") for r in results):\n        req_row[\"status\"] = \"failed\"\n        req_row[\"error_code\"] = \"NORMALIZATION_ERROR\"\n        req_row[\"error_message\"] = \"Generated web result missing url.\"\n        req_row[\"http_status\"] = 500\n        req_row[\"provider_latency_ms\"] = provider_latency_ms\n        req_row[\"updated_at\"] = datetime.datetime.now(datetime.timezone.utc).isoformat()\n        _save(\"search_requests.json\", search_requests)\n        return _err(\"CONFLICT\", \"Result normalization failed.\", search_request_id=req_id)\n\n    # persist results + request\n    search_results.extend(results)\n    _save(\"search_results.json\", search_results)\n\n    req_row[\"status\"] = \"succeeded\"\n    req_row[\"http_status\"] = 200\n    req_row[\"provider_latency_ms\"] = provider_latency_ms\n    req_row[\"result_count\"] = len(results)\n    if cache_ttl_seconds > 0:\n        req_row[\"cached_until\"] = (now + datetime.timedelta(seconds=int(cache_ttl_seconds))).isoformat()\n    if store_raw_response:\n        req_row[\"raw_response\"] = _redact_raw({\n            \"type\": \"brave_web_search\",\n            \"query\": query,\n            \"count\": count,\n            \"offset\": offset,\n            \"country\": country,\n            \"search_lang\": search_lang,\n            \"ui_lang\": ui_lang,\n            \"safesearch\": safesearch,\n            \"freshness\": freshness,\n            \"provider_request_id\": req_row[\"provider_request_id\"],\n            \"results_count\": len(results),\n            \"status\": 200\n        })\n    req_row[\"updated_at\"] = datetime.datetime.now(datetime.timezone.utc).isoformat()\n    _save(\"search_requests.json\", search_requests)\n\n    # ledger rows (idempotent)\n    _upsert_ledger(usage_ledger, workspace_id, api_key_id, req_id, \"request\", \"brave_web_search\", 1, billable=True)\n    _upsert_ledger(usage_ledger, workspace_id, api_key_id, req_id, \"result_item\", \"brave_web_search\", req_row[\"result_count\"], billable=True)\n    _save(\"usage_ledger.json\", usage_ledger)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"search_request\": req_row,\n        \"results\": results,\n        \"meta\": {\n            \"count\": count,\n            \"offset\": offset,\n            \"returned\": len(results),\n            \"cached\": False,\n            \"latency_ms\": latency_ms\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "brave_local_search",
+          "description": "Executes a Brave Local Search for places/businesses matching the query (optionally biased by `location` latitude/longitude and `radius_km`), persists the search request and normalized local place items (optionally storing the raw provider response), and returns up to `count` results starting at zero-based `offset` for pagination. If `fallback_to_web` is true and local results are empty/insufficient, the request may fall back to a web search and return those results instead; if `cache_ttl_seconds` > 0, identical requests may be served from cache until the TTL expires and the response indicates cached status when applicable. Raises VALIDATION_ERROR for invalid ids, empty query, out-of-range `count`/`offset`/`cache_ttl_seconds`, invalid locale codes, invalid `location` (missing latitude/longitude or out-of-range coordinates/radius), and raises UNAUTHORIZED when the workspace/api key is invalid or not permitted, QUOTA_EXCEEDED when the workspace/key has no remaining usage, and PROVIDER_ERROR when Brave rejects the request or is unavailable.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^brv_ws_[0-9A-Z]{18,}$",
+                "description": "Workspace id to authenticate, enforce quotas, and attribute stored request/results."
+              },
+              "api_key_id": {
+                "type": "string",
+                "pattern": "^brv_key_[0-9A-Z]{18,}$",
+                "description": "API key id to use for the Brave provider request and usage/billing attribution."
+              },
+              "query": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Local search query text (business/place/service and/or location intent)."
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20,
+                "description": "Number of local place results to return (provider page size)."
+              },
+              "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1000,
+                "description": "Zero-based offset into the local result set for pagination."
+              },
+              "country": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 2,
+                "description": "Two-letter country code to localize results (e.g., US, GB)."
+              },
+              "search_lang": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 5,
+                "description": "Language code for the search interface (e.g., en, en-US)."
+              },
+              "ui_lang": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 5,
+                "description": "Language for returned UI strings when supported (e.g., en, en-US)."
+              },
+              "safesearch": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "moderate",
+                  "strict"
+                ],
+                "description": "SafeSearch level for filtering adult content when applicable."
+              },
+              "location": {
+                "type": "object",
+                "description": "Optional location bias for local intent.",
+                "properties": {
+                  "latitude": {
+                    "type": "number",
+                    "minimum": -90,
+                    "maximum": 90,
+                    "description": "Latitude for location bias."
+                  },
+                  "longitude": {
+                    "type": "number",
+                    "minimum": -180,
+                    "maximum": 180,
+                    "description": "Longitude for location bias."
+                  },
+                  "radius_km": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 200,
+                    "description": "Search radius in kilometers for location bias."
+                  }
+                },
+                "required": [
+                  "latitude",
+                  "longitude"
+                ],
+                "additionalProperties": false
+              },
+              "fallback_to_web": {
+                "type": "boolean",
+                "description": "Whether to automatically fall back to web search when local results are empty/insufficient."
+              },
+              "store_raw_response": {
+                "type": "boolean",
+                "description": "Whether to store the provider raw response on the search request record."
+              },
+              "cache_ttl_seconds": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 86400,
+                "description": "If >0, cache identical requests for this many seconds (sets cached_until and may return cached status)."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "api_key_id",
+              "query"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def brave_local_search(workspace_id, api_key_id, query, count=None, offset=None, country=None, search_lang=None, ui_lang=None, safesearch=None, location=None, fallback_to_web=None, store_raw_response=None, cache_ttl_seconds=None, **_extra):\n    import json, os, datetime, re, time, hashlib, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0193000\" if __import__(\"os\").path.isdir(\"./environment_mix/0193000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now.isoformat()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            dt = datetime.datetime.fromisoformat(s)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _period_month(dt):\n        return f\"{dt.year:04d}-{dt.month:02d}\"\n\n    def _make_id(prefix):\n        alphabet = \"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567\"\n        body = \"\".join(secrets.choice(alphabet) for _ in range(20))\n        return f\"{prefix}_{body}\"\n\n    def _norm_query(q):\n        return \" \".join(q.strip().split()).lower()\n\n    def _fingerprint(payload_obj):\n        b = json.dumps(payload_obj, sort_keys=True, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return hashlib.sha256(b).hexdigest()\n\n    def _sum_usage(usage_rows, ws_id, period, event_type):\n        return sum(int(r.get(\"quantity\", 0) or 0) for r in usage_rows\n                   if r.get(\"workspace_id\") == ws_id\n                   and r.get(\"period_month\") == period\n                   and r.get(\"event_type\") == event_type\n                   and r.get(\"billable\") is True)\n\n    def _upsert_ledger(usage_rows, ws_id, key_id, req_id, event_type, tool_name, quantity, billable=True):\n        for r in usage_rows:\n            if r.get(\"search_request_id\") == req_id and r.get(\"event_type\") == event_type:\n                r[\"workspace_id\"] = ws_id\n                r[\"api_key_id\"] = key_id\n                r[\"tool_name\"] = tool_name\n                r[\"quantity\"] = int(quantity)\n                r[\"billable\"] = bool(billable)\n                r[\"period_month\"] = _period_month(now)\n                r[\"updated_at\"] = now_iso\n                return r\n        row = {\n            \"id\": _make_id(\"brv_use\"),\n            \"workspace_id\": ws_id,\n            \"api_key_id\": key_id,\n            \"search_request_id\": req_id,\n            \"event_type\": event_type,\n            \"tool_name\": tool_name,\n            \"quantity\": int(quantity),\n            \"billable\": bool(billable),\n            \"period_month\": _period_month(now),\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso\n        }\n        usage_rows.append(row)\n        return row\n\n    def _redact_raw(obj):\n        if obj is None:\n            return None\n        try:\n            if isinstance(obj, dict):\n                keep = {}\n                for k in (\"type\", \"query\", \"count\", \"offset\", \"country\", \"search_lang\", \"ui_lang\", \"safesearch\", \"location\", \"provider_request_id\", \"status\", \"error\", \"fallback_to_web\"):\n                    if k in obj:\n                        keep[k] = obj[k]\n                for k in (\"results_count\", \"local_results_count\", \"web_results_count\"):\n                    if k in obj:\n                        keep[k] = obj[k]\n                return keep\n            if isinstance(obj, list):\n                return {\"items\": len(obj)}\n            return {\"value\": str(obj)[:500]}\n        except Exception:\n            return None\n\n    # ---- validate inputs ----\n    if not isinstance(workspace_id, str) or not re.match(r\"^brv_ws_[0-9A-Z]{18,}$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if not isinstance(api_key_id, str) or not re.match(r\"^brv_key_[0-9A-Z]{18,}$\", api_key_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid api_key_id.\")\n    if not isinstance(query, str) or len(query.strip()) < 1:\n        return _err(\"VALIDATION_ERROR\", \"query must be a non-empty string.\")\n\n    if count is None:\n        count = 10\n    if offset is None:\n        offset = 0\n    if store_raw_response is None:\n        store_raw_response = False\n    if fallback_to_web is None:\n        fallback_to_web = True\n    if cache_ttl_seconds is None:\n        cache_ttl_seconds = 0\n\n    if not isinstance(count, int) or count < 1 or count > 20:\n        return _err(\"VALIDATION_ERROR\", \"count must be an integer between 1 and 20.\")\n    if not isinstance(offset, int) or offset < 0 or offset > 1000:\n        return _err(\"VALIDATION_ERROR\", \"offset must be an integer between 0 and 1000.\")\n    if country is not None:\n        if not isinstance(country, str) or len(country) != 2:\n            return _err(\"VALIDATION_ERROR\", \"country must be a 2-letter code.\")\n        country = country.upper()\n    for nm, v in ((\"search_lang\", search_lang), (\"ui_lang\", ui_lang)):\n        if v is not None:\n            if not isinstance(v, str) or len(v) < 2 or len(v) > 5:\n                return _err(\"VALIDATION_ERROR\", f\"{nm} must be 2-5 characters.\")\n    if safesearch is not None and safesearch not in (\"off\", \"moderate\", \"strict\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid safesearch.\")\n    if not isinstance(store_raw_response, bool):\n        return _err(\"VALIDATION_ERROR\", \"store_raw_response must be boolean.\")\n    if not isinstance(fallback_to_web, bool):\n        return _err(\"VALIDATION_ERROR\", \"fallback_to_web must be boolean.\")\n    if not isinstance(cache_ttl_seconds, int) or cache_ttl_seconds < 0 or cache_ttl_seconds > 86400:\n        return _err(\"VALIDATION_ERROR\", \"cache_ttl_seconds must be 0..86400.\")\n    if location is not None:\n        if not isinstance(location, dict):\n            return _err(\"VALIDATION_ERROR\", \"location must be an object.\")\n        allowed = {\"latitude\", \"longitude\", \"radius_km\"}\n        if any(k not in allowed for k in location.keys()):\n            return _err(\"VALIDATION_ERROR\", \"location has unknown fields.\")\n        if \"latitude\" not in location or \"longitude\" not in location:\n            return _err(\"VALIDATION_ERROR\", \"location.latitude and location.longitude are required.\")\n        lat = location.get(\"latitude\")\n        lon = location.get(\"longitude\")\n        rad = location.get(\"radius_km\", None)\n        if not isinstance(lat, (int, float)) or lat < -90 or lat > 90:\n            return _err(\"VALIDATION_ERROR\", \"location.latitude out of range.\")\n        if not isinstance(lon, (int, float)) or lon < -180 or lon > 180:\n            return _err(\"VALIDATION_ERROR\", \"location.longitude out of range.\")\n        if rad is not None:\n            if not isinstance(rad, (int, float)) or rad < 0.1 or rad > 200:\n                return _err(\"VALIDATION_ERROR\", \"location.radius_km out of range.\")\n\n    # ---- load datastore ----\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    search_requests = _load(\"search_requests.json\")\n    search_results = _load(\"search_results.json\")\n    usage_ledger = _load(\"usage_ledger.json\")\n\n    ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n    if not ws:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n\n    key = next((k for k in api_keys if k.get(\"id\") == api_key_id and k.get(\"workspace_id\") == workspace_id and k.get(\"provider\") == \"brave\"), None)\n    if not key:\n        return _err(\"UNAUTHORIZED\", \"API key not found for workspace/provider.\", workspace_id=workspace_id, api_key_id=api_key_id)\n\n    req_id = _make_id(\"brv_req\")\n\n    fp_obj = {\n        \"tool\": \"brave_local_search\",\n        \"query\": _norm_query(query),\n        \"count\": count,\n        \"offset\": offset,\n        \"country\": country,\n        \"search_lang\": search_lang,\n        \"ui_lang\": ui_lang,\n        \"safesearch\": safesearch,\n        \"location\": location,\n        \"fallback_to_web\": fallback_to_web\n    }\n    fingerprint = _fingerprint(fp_obj)\n\n    # create search request row immediately\n    req_row = {\n        \"id\": req_id,\n        \"workspace_id\": workspace_id,\n        \"api_key_id\": api_key_id,\n        \"tool_name\": \"brave_local_search\",\n        \"query_text\": query,\n        \"local_intent\": True,\n        \"fallback_to_web\": False,\n        \"request_fingerprint\": fingerprint,\n        \"status\": \"queued\",\n        \"error_code\": None,\n        \"error_message\": None,\n        \"http_status\": None,\n        \"provider_latency_ms\": None,\n        \"result_count\": 0,\n        \"cached_until\": None,\n        \"provider_request_id\": None,\n        \"raw_response\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso\n    }\n    search_requests.append(req_row)\n    _save(\"search_requests.json\", search_requests)\n\n    if ws.get(\"status\") != \"active\":\n        req_row[\"status\"] = \"failed\"\n        req_row[\"error_code\"] = \"WORKSPACE_NOT_ACTIVE\"\n        req_row[\"error_message\"] = f\"Workspace status is {ws.get('status')}.\"\n        req_row[\"updated_at\"] = datetime.datetime.now(datetime.timezone.utc).isoformat()\n        _save(\"search_requests.json\", search_requests)\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active; request execution not permitted.\", search_request_id=req_id, error_code=req_row[\"error_code\"])\n\n    if key.get(\"status\") in (\"disabled\", \"revoked\"):\n        req_row[\"status\"] = \"failed\"\n        req_row[\"error_code\"] = \"API_KEY_NOT_ACTIVE\"\n        req_row[\"error_message\"] = f\"API key status is {key.get('status')}.\"\n        req_row[\"updated_at\"] = datetime.datetime.now(datetime.timezone.utc).isoformat()\n        _save(\"search_requests.json\", search_requests)\n        return _err(\"UNAUTHORIZED\", \"API key is not active.\", search_request_id=req_id, error_code=req_row[\"error_code\"])\n\n    # quota enforcement\n    period = _period_month(now)\n    used_req = _sum_usage(usage_ledger, workspace_id, period, \"request\")\n    quota = int(ws.get(\"monthly_request_quota\", 0) or 0)\n    if used_req >= quota:\n        req_row[\"status\"] = \"failed\"\n        req_row[\"error_code\"] = \"MONTHLY_REQUEST_QUOTA_EXCEEDED\"\n        req_row[\"error_message\"] = \"Monthly request quota exceeded.\"\n        req_row[\"updated_at\"] = datetime.datetime.now(datetime.timezone.utc).isoformat()\n        _save(\"search_requests.json\", search_requests)\n        return _err(\"QUOTA_EXCEEDED\", \"Monthly request quota exceeded.\", search_request_id=req_id, quota=quota, used=used_req)\n\n    # caching\n    cached_req = None\n    if cache_ttl_seconds > 0:\n        for r in reversed(search_requests):\n            if r.get(\"workspace_id\") == workspace_id and r.get(\"request_fingerprint\") == fingerprint and r.get(\"status\") in (\"succeeded\", \"cached\"):\n                cu = _parse_dt(r.get(\"cached_until\"))\n                if cu and cu > now:\n                    cached_req = r\n                    break\n\n    if cached_req:\n        cached_results = [sr for sr in search_results if sr.get(\"search_request_id\") == cached_req.get(\"id\") and sr.get(\"status\") != \"deleted\"]\n        cached_results.sort(key=lambda x: int(x.get(\"rank\", 10**9)))\n        items = [x for x in cached_results if x.get(\"result_type\") in (\"local_place\", \"web\")]\n        page_items = items[offset: offset + count]\n\n        new_rows = []\n        rank = 1\n        for src in page_items:\n            rt = src.get(\"result_type\")\n            new_rows.append({\n                \"id\": _make_id(\"brv_res\"),\n                \"search_request_id\": req_id,\n                \"workspace_id\": workspace_id,\n                \"result_type\": rt,\n                \"rank\": rank,\n                \"title\": src.get(\"title\"),\n                \"url\": src.get(\"url\") if rt == \"web\" else None,\n                \"snippet\": src.get(\"snippet\"),\n                \"display_domain\": src.get(\"display_domain\") if rt == \"web\" else None,\n                \"language\": src.get(\"language\"),\n                \"published_at\": src.get(\"published_at\"),\n                \"provider_item_id\": src.get(\"provider_item_id\"),\n                \"place\": src.get(\"place\") if rt == \"local_place\" else None,\n                \"status\": \"active\",\n                \"created_at\": datetime.datetime.now(datetime.timezone.utc).isoformat(),\n                \"updated_at\": datetime.datetime.now(datetime.timezone.utc).isoformat()\n            })\n            rank += 1\n\n        search_results.extend(new_rows)\n        _save(\"search_results.json\", search_results)\n\n        req_row[\"status\"] = \"cached\"\n        req_row[\"result_count\"] = len(new_rows)\n        req_row[\"cached_until\"] = cached_req.get(\"cached_until\")\n        if store_raw_response:\n            req_row[\"raw_response\"] = _redact_raw(cached_req.get(\"raw_response\"))\n        req_row[\"updated_at\"] = datetime.datetime.now(datetime.timezone.utc).isoformat()\n        _save(\"search_requests.json\", search_requests)\n\n        _upsert_ledger(usage_ledger, workspace_id, api_key_id, req_id, \"request\", \"brave_local_search\", 1, billable=True)\n        _upsert_ledger(usage_ledger, workspace_id, api_key_id, req_id, \"result_item\", \"brave_local_search\", req_row[\"result_count\"], billable=True)\n        _save(\"usage_ledger.json\", usage_ledger)\n\n        latency_ms = int((time.time() - t0) * 1000)\n        return {\n            \"search_request\": req_row,\n            \"results\": new_rows,\n            \"meta\": {\n                \"count\": count,\n                \"offset\": offset,\n                \"returned\": len(new_rows),\n                \"cached\": True,\n                \"latency_ms\": latency_ms\n            }\n        }\n\n    # execute local; if empty and fallback_to_web true => web fallback under same request row\n    req_row[\"status\"] = \"running\"\n    req_row[\"updated_at\"] = datetime.datetime.now(datetime.timezone.utc).isoformat()\n    _save(\"search_requests.json\", search_requests)\n\n    base_seed = int(hashlib.sha256(fingerprint.encode(\"utf-8\")).hexdigest()[:16], 16)\n\n    # deterministic \"local-ness\": queries containing certain tokens produce local results; else empty\n    local_tokens = (\"near\", \"nearby\", \"restaurant\", \"cafe\", \"hotel\", \"plumber\", \"dentist\", \"pizza\", \"bar\", \"coffee\", \"gas\", \"pharmacy\")\n    qn = _norm_query(query)\n    has_local = any(tok in qn for tok in local_tokens) or (location is not None)\n\n    results = []\n    raw_parts = {\"local\": None, \"web\": None}\n\n    if has_local:\n        for i in range(count):\n            global_rank = offset + i + 1\n            place_seed = (base_seed + global_rank * 2654435761) & 0xFFFFFFFFFFFFFFFF\n            name = f\"{query.strip()} Place {global_rank}\"\n            lat = None\n            lon = None\n            if location is not None:\n                lat = float(location[\"latitude\"]) + (((place_seed % 2000) - 1000) / 100000.0)\n                lon = float(location[\"longitude\"]) + ((((place_seed // 2000) % 2000) - 1000) / 100000.0)\n            place_obj = {\n                \"address\": f\"{(place_seed % 9999) + 1} Main St\",\n                \"phone\": None,\n                \"categories\": [\"local\"],\n                \"rating\": round(3.5 + ((place_seed % 30) / 20.0), 1),\n                \"review_count\": int(place_seed % 500),\n                \"opening_hours\": None,\n                \"geo\": {\"lat\": lat, \"lng\": lon} if (lat is not None and lon is not None) else None\n            }\n            results.append({\n                \"id\": _make_id(\"brv_res\"),\n                \"search_request_id\": req_id,\n                \"workspace_id\": workspace_id,\n                \"result_type\": \"local_place\",\n                \"rank\": i + 1,\n                \"title\": name,\n                \"url\": None,\n                \"snippet\": f\"Deterministic offline local place result {global_rank}.\",\n                \"display_domain\": None,\n                \"language\": search_lang,\n                \"published_at\": None,\n                \"provider_item_id\": f\"brv_loc_{base_seed % 1000000}_{global_rank}\",\n                \"place\": place_obj,\n                \"status\": \"active\",\n                \"created_at\": datetime.datetime.now(datetime.timezone.utc).isoformat(),\n                \"updated_at\": datetime.datetime.now(datetime.timezone.utc).isoformat()\n            })\n        raw_parts[\"local\"] = _redact_raw({\n            \"type\": \"brave_local_search\",\n            \"query\": query,\n            \"count\": count,\n            \"offset\": offset,\n            \"country\": country,\n            \"search_lang\": search_lang,\n            \"ui_lang\": ui_lang,\n            \"safesearch\": safesearch,\n            \"location\": location,\n            \"local_results_count\": len(results),\n            \"status\": 200\n        })\n\n    # If no local results and fallback enabled => web fallback\n    if (not results) and fallback_to_web:\n        req_row[\"fallback_to_web\"] = True\n        # generate web results within same request row, but result_type web\n        for i in range(count):\n            global_rank = offset + i + 1\n            dom_seed = (base_seed + global_rank * 1315423911 + 7) & 0xFFFFFFFFFFFFFFFF\n            domain = f\"example{(dom_seed % 997):03d}.com\"\n            url = f\"https://{domain}/local-fallback/{base_seed % 1000000}/{global_rank}\"\n            results.append({\n                \"id\": _make_id(\"brv_res\"),\n                \"search_request_id\": req_id,\n                \"workspace_id\": workspace_id,\n                \"result_type\": \"web\",\n                \"rank\": i + 1,\n                \"title\": f\"{query.strip()} — Web fallback {global_rank}\",\n                \"url\": url,\n                \"snippet\": f\"Web fallback result {global_rank} for local query '{_norm_query(query)}'.\",\n                \"display_domain\": domain,\n                \"language\": search_lang,\n                \"published_at\": None,\n                \"provider_item_id\": f\"brv_webfb_{base_seed % 1000000}_{global_rank}\",\n                \"place\": None,\n                \"status\": \"active\",\n                \"created_at\": datetime.datetime.now(datetime.timezone.utc).isoformat(),\n                \"updated_at\": datetime.datetime.now(datetime.timezone.utc).isoformat()\n            })\n        raw_parts[\"web\"] = _redact_raw({\n            \"type\": \"brave_web_search\",\n            \"query\": query,\n            \"count\": count,\n            \"offset\": offset,\n            \"country\": country,\n            \"search_lang\": search_lang,\n            \"ui_lang\": ui_lang,\n            \"safesearch\": safesearch,\n            \"web_results_count\": len(results),\n            \"status\": 200,\n            \"fallback_to_web\": True\n        })\n\n    # validate result constraints\n    for r in results:\n        if r[\"result_type\"] == \"web\" and not r.get(\"url\"):\n            req_row[\"status\"] = \"failed\"\n            req_row[\"error_code\"] = \"NORMALIZATION_ERROR\"\n            req_row[\"error_message\"] = \"Web result missing url.\"\n            req_row[\"http_status\"] = 500\n            req_row[\"updated_at\"] = datetime.datetime.now(datetime.timezone.utc).isoformat()\n            _save(\"search_requests.json\", search_requests)\n            return _err(\"CONFLICT\", \"Result normalization failed.\", search_request_id=req_id)\n        if r[\"result_type\"] == \"local_place\" and r.get(\"place\") is None:\n            req_row[\"status\"] = \"failed\"\n            req_row[\"error_code\"] = \"NORMALIZATION_ERROR\"\n            req_row[\"error_message\"] = \"Local place result missing place object.\"\n            req_row[\"http_status\"] = 500\n            req_row[\"updated_at\"] = datetime.datetime.now(datetime.timezone.utc).isoformat()\n            _save(\"search_requests.json\", search_requests)\n            return _err(\"CONFLICT\", \"Result normalization failed.\", search_request_id=req_id)\n\n    # Persist\n    search_results.extend(results)\n    _save(\"search_results.json\", search_results)\n\n    provider_latency_ms = 50 + (int(hashlib.md5(fingerprint.encode(\"utf-8\")).hexdigest()[:2], 16) % 220)\n\n    req_row[\"status\"] = \"succeeded\" if results else \"failed\"\n    req_row[\"http_status\"] = 200 if results else 502\n    req_row[\"provider_latency_ms\"] = provider_latency_ms\n    req_row[\"result_count\"] = len(results)\n    if not results:\n        req_row[\"error_code\"] = \"NO_RESULTS\"\n        req_row[\"error_message\"] = \"No local results and fallback disabled.\"\n    if cache_ttl_seconds > 0:\n        req_row[\"cached_until\"] = (now + datetime.timedelta(seconds=int(cache_ttl_seconds))).isoformat()\n    if store_raw_response:\n        # may include both parts\n        req_row[\"raw_response\"] = _redact_raw({\n            \"type\": \"brave_local_search\",\n            \"query\": query,\n            \"count\": count,\n            \"offset\": offset,\n            \"country\": country,\n            \"search_lang\": search_lang,\n            \"ui_lang\": ui_lang,\n            \"safesearch\": safesearch,\n            \"location\": location,\n            \"fallback_to_web\": req_row[\"fallback_to_web\"],\n            \"local\": raw_parts[\"local\"],\n            \"web\": raw_parts[\"web\"],\n            \"results_count\": len(results),\n            \"status\": req_row[\"http_status\"]\n        })\n    req_row[\"updated_at\"] = datetime.datetime.now(datetime.timezone.utc).isoformat()\n    _save(\"search_requests.json\", search_requests)\n\n    # usage ledger only after success or cache; for failed, do not bill\n    if req_row[\"status\"] in (\"succeeded\", \"cached\"):\n        _upsert_ledger(usage_ledger, workspace_id, api_key_id, req_id, \"request\", \"brave_local_search\", 1, billable=True)\n        _upsert_ledger(usage_ledger, workspace_id, api_key_id, req_id, \"result_item\", \"brave_local_search\", req_row[\"result_count\"], billable=True)\n        _save(\"usage_ledger.json\", usage_ledger)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    if req_row[\"status\"] == \"failed\":\n        return _err(\"CONFLICT\", \"Local search failed.\", search_request_id=req_id, error_code=req_row[\"error_code\"], error_message=req_row[\"error_message\"])\n    return {\n        \"search_request\": req_row,\n        \"results\": results,\n        \"meta\": {\n            \"count\": count,\n            \"offset\": offset,\n            \"returned\": len(results),\n            \"fallback_to_web\": bool(req_row[\"fallback_to_web\"]),\n            \"cached\": False,\n            \"latency_ms\": latency_ms\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_search_requests",
+          "description": "Lists persisted search request records for a workspace with optional filtering by status/tool/api key and time range. Returns a paginated page of search_requests ordered by created_at desc; refuses when the workspace is unknown or the caller is not entitled to read it.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^brv_ws_[0-9A-Z]{18,}$",
+                "description": "Workspace id to scope the list and enforce read access."
+              },
+              "api_key_id": {
+                "type": "string",
+                "pattern": "^brv_key_[0-9A-Z]{18,}$",
+                "description": "Optional API key id to filter requests attributed to a specific key."
+              },
+              "tool_name": {
+                "type": "string",
+                "enum": [
+                  "brave_web_search",
+                  "brave_local_search"
+                ],
+                "description": "Optional tool name to filter by originating integration tool."
+              },
+              "status": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "queued",
+                    "running",
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                    "cached"
+                  ]
+                },
+                "minItems": 1,
+                "uniqueItems": true,
+                "description": "Optional list of statuses to include."
+              },
+              "created_from": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional ISO-8601 timestamp (inclusive) to filter requests created at or after this time."
+              },
+              "created_to": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional ISO-8601 timestamp (exclusive) to filter requests created before this time."
+              },
+              "page_size": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of records to return in this page."
+              },
+              "page_cursor": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Opaque cursor from a previous response to continue pagination."
+              },
+              "include_raw_response": {
+                "type": "boolean",
+                "description": "When true, includes stored raw_response (may be redacted); may be refused for plans/scopes that disallow raw retention."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_search_requests(workspace_id, api_key_id=None, tool_name=None, status=None, created_from=None, created_to=None, page_size=None, page_cursor=None, include_raw_response=None, **_extra):\n    import json, os, datetime, re, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0193000\" if __import__(\"os\").path.isdir(\"./environment_mix/0193000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            dt = datetime.datetime.fromisoformat(s)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except Exception:\n            return None\n\n    # ---- validate inputs ----\n    if not isinstance(workspace_id, str) or not re.match(r\"^brv_ws_[0-9A-Z]{18,}$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if api_key_id is not None and (not isinstance(api_key_id, str) or not re.match(r\"^brv_key_[0-9A-Z]{18,}$\", api_key_id)):\n        return _err(\"VALIDATION_ERROR\", \"Invalid api_key_id.\")\n    if tool_name is not None and tool_name not in (\"brave_web_search\", \"brave_local_search\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid tool_name.\")\n    if status is not None:\n        if (not isinstance(status, list)) or len(status) < 1 or len(set(status)) != len(status):\n            return _err(\"VALIDATION_ERROR\", \"status must be a non-empty array of unique values.\")\n        allowed = {\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\", \"cached\"}\n        if any(s not in allowed for s in status):\n            return _err(\"VALIDATION_ERROR\", \"status contains invalid values.\")\n    if page_size is None:\n        page_size = 50\n    if not isinstance(page_size, int) or page_size < 1 or page_size > 200:\n        return _err(\"VALIDATION_ERROR\", \"page_size must be 1..200.\")\n    if page_cursor is not None and (not isinstance(page_cursor, str) or len(page_cursor) < 1):\n        return _err(\"VALIDATION_ERROR\", \"page_cursor must be a non-empty string.\")\n    if include_raw_response is None:\n        include_raw_response = False\n    if not isinstance(include_raw_response, bool):\n        return _err(\"VALIDATION_ERROR\", \"include_raw_response must be boolean.\")\n\n    dt_from = _parse_dt(created_from) if created_from is not None else None\n    if created_from is not None and dt_from is None:\n        return _err(\"VALIDATION_ERROR\", \"created_from must be an ISO-8601 date-time.\")\n    dt_to = _parse_dt(created_to) if created_to is not None else None\n    if created_to is not None and dt_to is None:\n        return _err(\"VALIDATION_ERROR\", \"created_to must be an ISO-8601 date-time.\")\n    if dt_from and dt_to and dt_from >= dt_to:\n        return _err(\"VALIDATION_ERROR\", \"created_from must be before created_to.\")\n\n    # ---- load datastore ----\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    search_requests = _load(\"search_requests.json\")\n    usage_ledger = _load(\"usage_ledger.json\")\n\n    ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n    if not ws:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n\n    if include_raw_response and ws.get(\"plan\") == \"free\":\n        return _err(\"UNAUTHORIZED\", \"Raw response retention is not available on the free plan.\")\n\n    if api_key_id is not None:\n        key = next((k for k in api_keys if k.get(\"id\") == api_key_id and k.get(\"workspace_id\") == workspace_id and k.get(\"provider\") == \"brave\"), None)\n        if not key:\n            return _err(\"UNAUTHORIZED\", \"API key not found for workspace/provider.\", workspace_id=workspace_id, api_key_id=api_key_id)\n\n    # cursor decoding: base64 JSON {\"created_at\": \"...\", \"id\": \"...\"}\n    cursor_created = None\n    cursor_id = None\n    if page_cursor is not None:\n        try:\n            raw = base64.urlsafe_b64decode(page_cursor.encode(\"utf-8\") + b\"==\")\n            obj = json.loads(raw.decode(\"utf-8\"))\n            cursor_created = _parse_dt(obj.get(\"created_at\"))\n            cursor_id = obj.get(\"id\")\n            if cursor_created is None or not isinstance(cursor_id, str):\n                return _err(\"VALIDATION_ERROR\", \"Invalid page_cursor.\")\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid page_cursor.\")\n\n    def _created_dt(row):\n        dt = _parse_dt(row.get(\"created_at\"))\n        return dt or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n\n    # filter\n    rows = [r for r in search_requests if r.get(\"workspace_id\") == workspace_id]\n    if api_key_id is not None:\n        rows = [r for r in rows if r.get(\"api_key_id\") == api_key_id]\n    if tool_name is not None:\n        rows = [r for r in rows if r.get(\"tool_name\") == tool_name]\n    if status is not None:\n        st = set(status)\n        rows = [r for r in rows if r.get(\"status\") in st]\n    if dt_from is not None:\n        rows = [r for r in rows if _created_dt(r) >= dt_from]\n    if dt_to is not None:\n        rows = [r for r in rows if _created_dt(r) < dt_to]\n\n    # sort created_at desc, tie-breaker id desc\n    rows.sort(key=lambda r: (_created_dt(r), r.get(\"id\", \"\")), reverse=True)\n\n    # apply cursor (exclusive)\n    if cursor_created is not None and cursor_id is not None:\n        def after_cursor(r):\n            cd = _created_dt(r)\n            rid = r.get(\"id\", \"\")\n            # since desc order: include items strictly \"less\" than cursor in sort key\n            if cd < cursor_created:\n                return True\n            if cd == cursor_created and rid < cursor_id:\n                return True\n            return False\n        rows = [r for r in rows if after_cursor(r)]\n\n    total = len(rows)\n    page = rows[:page_size]\n    has_more = total > len(page)\n\n    # strip raw_response if not requested\n    out = []\n    for r in page:\n        rr = dict(r)\n        if not include_raw_response:\n            rr[\"raw_response\"] = None\n        out.append(rr)\n\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        obj = {\"created_at\": last.get(\"created_at\"), \"id\": last.get(\"id\")}\n        b = json.dumps(obj, separators=(\",\", \":\"), sort_keys=True).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(b).decode(\"utf-8\").rstrip(\"=\")\n\n    # observability without request-log: record a non-billable request usage event if possible? No search_request_id here.\n    # Can't satisfy uniqueness constraints without a request id; so only return.\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"data\": out,\n        \"meta\": {\n            \"total\": total,\n            \"page_size\": page_size,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"latency_ms\": latency_ms\n        }\n    }\n"
+        },
+        {
+          "name": "get_search_request",
+          "description": "Fetches a single persisted search_requests record by id. Returns the request metadata (and optionally raw_response) and refuses when the request is not found or not readable in the specified workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^brv_ws_[0-9A-Z]{18,}$",
+                "description": "Workspace id that owns the search request."
+              },
+              "search_request_id": {
+                "type": "string",
+                "pattern": "^brv_req_[0-9A-Z]{18,}$",
+                "description": "Search request id to fetch."
+              },
+              "include_raw_response": {
+                "type": "boolean",
+                "description": "When true, includes stored raw_response (may be redacted); may be refused for plans/scopes that disallow raw retention."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "search_request_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_search_request(workspace_id, search_request_id, include_raw_response=None, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0193000\" if __import__(\"os\").path.isdir(\"./environment_mix/0193000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    if not isinstance(workspace_id, str) or not re.match(r\"^brv_ws_[0-9A-Z]{18,}$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if not isinstance(search_request_id, str) or not re.match(r\"^brv_req_[0-9A-Z]{18,}$\", search_request_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid search_request_id.\")\n    if include_raw_response is None:\n        include_raw_response = False\n    if not isinstance(include_raw_response, bool):\n        return _err(\"VALIDATION_ERROR\", \"include_raw_response must be boolean.\")\n\n    workspaces = _load(\"workspaces.json\")\n    search_requests = _load(\"search_requests.json\")\n    search_results = _load(\"search_results.json\")\n\n    ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n    if not ws:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n\n    if include_raw_response and ws.get(\"plan\") == \"free\":\n        return _err(\"UNAUTHORIZED\", \"Raw response retention is not available on the free plan.\")\n\n    req = next((r for r in search_requests if r.get(\"id\") == search_request_id), None)\n    if not req:\n        return _err(\"NOT_FOUND\", \"Search request not found.\", search_request_id=search_request_id)\n    if req.get(\"workspace_id\") != workspace_id:\n        return _err(\"UNAUTHORIZED\", \"Search request does not belong to the specified workspace.\", search_request_id=search_request_id)\n\n    out_req = dict(req)\n    if not include_raw_response:\n        out_req[\"raw_response\"] = None\n\n    results = [sr for sr in search_results if sr.get(\"search_request_id\") == search_request_id and sr.get(\"workspace_id\") == workspace_id and sr.get(\"status\") != \"deleted\"]\n    results.sort(key=lambda r: int(r.get(\"rank\", 10**9)))\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"search_request\": out_req,\n        \"results\": results,\n        \"meta\": {\n            \"result_count\": len(results),\n            \"latency_ms\": latency_ms\n        }\n    }\n"
+        },
+        {
+          "name": "list_search_results",
+          "description": "Lists normalized search result items for a given search_request_id, in rank order. Returns a paginated page of search_results; refuses when the request/results are not found or not readable for the workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^brv_ws_[0-9A-Z]{18,}$",
+                "description": "Workspace id that owns the search request and results."
+              },
+              "search_request_id": {
+                "type": "string",
+                "pattern": "^brv_req_[0-9A-Z]{18,}$",
+                "description": "Search request id whose results to list."
+              },
+              "result_type": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "web",
+                    "local_place"
+                  ]
+                },
+                "minItems": 1,
+                "uniqueItems": true,
+                "description": "Optional filter for result types to include."
+              },
+              "status": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "active",
+                    "redacted",
+                    "deleted"
+                  ]
+                },
+                "minItems": 1,
+                "uniqueItems": true,
+                "description": "Optional filter for result item lifecycle status."
+              },
+              "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 5000,
+                "description": "Zero-based offset into the ranked result set (rank-ordered)."
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Number of result items to return."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "search_request_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_search_results(workspace_id, search_request_id, result_type=None, status=None, offset=None, count=None, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0193000\" if __import__(\"os\").path.isdir(\"./environment_mix/0193000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0)\n    def _iso(dt):\n        if isinstance(dt, str):\n            return dt\n        return dt.replace(microsecond=0).isoformat() + \"Z\"\n\n    # Validate inputs\n    if not isinstance(workspace_id, str) or not re.match(r\"^brv_ws_[0-9A-Z]{18,}$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if not isinstance(search_request_id, str) or not re.match(r\"^brv_req_[0-9A-Z]{18,}$\", search_request_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid search_request_id.\")\n    if result_type is not None:\n        if not isinstance(result_type, list) or len(result_type) < 1:\n            return _err(\"VALIDATION_ERROR\", \"result_type must be a non-empty array when provided.\")\n        allowed_rt = {\"web\", \"local_place\"}\n        if any((not isinstance(x, str) or x not in allowed_rt) for x in result_type):\n            return _err(\"VALIDATION_ERROR\", \"result_type contains invalid value(s).\")\n        if len(set(result_type)) != len(result_type):\n            return _err(\"VALIDATION_ERROR\", \"result_type must contain unique items.\")\n    if status is not None:\n        if not isinstance(status, list) or len(status) < 1:\n            return _err(\"VALIDATION_ERROR\", \"status must be a non-empty array when provided.\")\n        allowed_st = {\"active\", \"redacted\", \"deleted\"}\n        if any((not isinstance(x, str) or x not in allowed_st) for x in status):\n            return _err(\"VALIDATION_ERROR\", \"status contains invalid value(s).\")\n        if len(set(status)) != len(status):\n            return _err(\"VALIDATION_ERROR\", \"status must contain unique items.\")\n    if offset is None:\n        offset = 0\n    if count is None:\n        count = 20\n    if not isinstance(offset, int) or offset < 0 or offset > 5000:\n        return _err(\"VALIDATION_ERROR\", \"offset must be an integer between 0 and 5000.\")\n    if not isinstance(count, int) or count < 1 or count > 100:\n        return _err(\"VALIDATION_ERROR\", \"count must be an integer between 1 and 100.\")\n\n    # Load datastore\n    workspaces = _load(\"workspaces.json\")\n    search_requests = _load(\"search_requests.json\")\n    search_results = _load(\"search_results.json\")\n    usage_ledger = _load(\"usage_ledger.json\")\n\n    # Resolve workspace and readability\n    ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n    if not ws:\n        # log call\n        usage_ledger.append({\n            \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n            \"workspace_id\": workspace_id,\n            \"api_key_id\": None,\n            \"search_request_id\": None,\n            \"event_type\": \"request\",\n            \"tool_name\": \"brave_web_search\",\n            \"quantity\": 0,\n            \"billable\": False,\n            \"period_month\": now.strftime(\"%Y-%m\"),\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(now),\n            \"note\": \"list_search_results.not_found_workspace\",\n            \"status\": \"NOT_FOUND\",\n            \"latency_ms\": int((time.time() - t0) * 1000)\n        })\n        _save(\"usage_ledger.json\", usage_ledger)\n        return _err(\"NOT_FOUND\", \"Workspace not found.\")\n    if ws.get(\"status\") == \"deleted\":\n        usage_ledger.append({\n            \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n            \"workspace_id\": workspace_id,\n            \"api_key_id\": None,\n            \"search_request_id\": search_request_id,\n            \"event_type\": \"request\",\n            \"tool_name\": \"brave_web_search\",\n            \"quantity\": 0,\n            \"billable\": False,\n            \"period_month\": now.strftime(\"%Y-%m\"),\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(now),\n            \"note\": \"list_search_results.workspace_deleted\",\n            \"status\": \"UNAUTHORIZED\",\n            \"latency_ms\": int((time.time() - t0) * 1000)\n        })\n        _save(\"usage_ledger.json\", usage_ledger)\n        return _err(\"UNAUTHORIZED\", \"Workspace is not readable in its current status.\")\n\n    req = next((r for r in search_requests if r.get(\"id\") == search_request_id and r.get(\"workspace_id\") == workspace_id), None)\n    if not req:\n        usage_ledger.append({\n            \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n            \"workspace_id\": workspace_id,\n            \"api_key_id\": None,\n            \"search_request_id\": search_request_id,\n            \"event_type\": \"request\",\n            \"tool_name\": \"brave_web_search\",\n            \"quantity\": 0,\n            \"billable\": False,\n            \"period_month\": now.strftime(\"%Y-%m\"),\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(now),\n            \"note\": \"list_search_results.not_found_request\",\n            \"status\": \"NOT_FOUND\",\n            \"latency_ms\": int((time.time() - t0) * 1000)\n        })\n        _save(\"usage_ledger.json\", usage_ledger)\n        return _err(\"NOT_FOUND\", \"Search request not found for this workspace.\")\n\n    # Filter results\n    rows = [r for r in search_results if r.get(\"workspace_id\") == workspace_id and r.get(\"search_request_id\") == search_request_id]\n    if result_type is not None:\n        rtset = set(result_type)\n        rows = [r for r in rows if r.get(\"result_type\") in rtset]\n    if status is not None:\n        stset = set(status)\n        rows = [r for r in rows if r.get(\"status\") in stset]\n\n    # Sort by rank\n    def _rank_key(r):\n        rk = r.get(\"rank\")\n        return rk if isinstance(rk, int) else 10**18\n    rows.sort(key=_rank_key)\n\n    total = len(rows)\n    page = rows[offset: offset + count]\n    has_more = (offset + count) < total\n    next_cursor = (offset + count) if has_more else None\n\n    # log call (as a non-billable request usage/audit event; quantity=0 to avoid quota impact)\n    usage_ledger.append({\n        \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n        \"workspace_id\": workspace_id,\n        \"api_key_id\": req.get(\"api_key_id\"),\n        \"search_request_id\": search_request_id,\n        \"event_type\": \"request\",\n        \"tool_name\": req.get(\"tool_name\"),\n        \"quantity\": 0,\n        \"billable\": False,\n        \"period_month\": now.strftime(\"%Y-%m\"),\n        \"created_at\": _iso(now),\n        \"updated_at\": _iso(now),\n        \"note\": \"list_search_results\",\n        \"status\": \"OK\",\n        \"latency_ms\": int((time.time() - t0) * 1000)\n    })\n    _save(\"usage_ledger.json\", usage_ledger)\n\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"workspace_id\": workspace_id,\n            \"search_request_id\": search_request_id,\n            \"offset\": offset,\n            \"count\": count,\n            \"total\": total,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor\n        }\n    }\n"
+        },
+        {
+          "name": "create_api_key",
+          "description": "Creates a new API key record for a workspace for use in Brave provider requests, storing only a hash and last4 for security. Returns the created api_keys record; refuses if the workspace is not active, quotas/policy disallow key creation, or the provider is unsupported.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^brv_ws_[0-9A-Z]{18,}$",
+                "description": "Workspace id that will own and be billed for usage attributed to this key."
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "brave"
+                ],
+                "description": "Provider this key is for (Brave Search)."
+              },
+              "key_name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100,
+                "description": "Human-readable label for the key (e.g., 'prod', 'staging')."
+              },
+              "provider_api_key": {
+                "type": "string",
+                "minLength": 10,
+                "maxLength": 500,
+                "description": "The raw provider API key to register; it is validated and stored only as a hash/last4."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "provider",
+              "key_name",
+              "provider_api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_api_key(workspace_id, provider, key_name, provider_api_key, **_extra):\n    import json, os, datetime, re, time, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0193000\" if __import__(\"os\").path.isdir(\"./environment_mix/0193000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0)\n    def _iso(dt):\n        if isinstance(dt, str):\n            return dt\n        return dt.replace(microsecond=0).isoformat() + \"Z\"\n\n    # Validate inputs\n    if not isinstance(workspace_id, str) or not re.match(r\"^brv_ws_[0-9A-Z]{18,}$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if provider != \"brave\":\n        return _err(\"VALIDATION_ERROR\", \"Unsupported provider.\")\n    if not isinstance(key_name, str) or not (1 <= len(key_name) <= 100):\n        return _err(\"VALIDATION_ERROR\", \"key_name must be a non-empty string up to 100 characters.\")\n    if not isinstance(provider_api_key, str) or not (10 <= len(provider_api_key) <= 500):\n        return _err(\"VALIDATION_ERROR\", \"provider_api_key must be between 10 and 500 characters.\")\n\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    usage_ledger = _load(\"usage_ledger.json\")\n\n    ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n    if not ws:\n        usage_ledger.append({\n            \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n            \"workspace_id\": workspace_id,\n            \"api_key_id\": None,\n            \"search_request_id\": None,\n            \"event_type\": \"request\",\n            \"tool_name\": \"brave_web_search\",\n            \"quantity\": 0,\n            \"billable\": False,\n            \"period_month\": now.strftime(\"%Y-%m\"),\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(now),\n            \"note\": \"create_api_key.not_found_workspace\",\n            \"status\": \"NOT_FOUND\",\n            \"latency_ms\": int((time.time() - t0) * 1000)\n        })\n        _save(\"usage_ledger.json\", usage_ledger)\n        return _err(\"NOT_FOUND\", \"Workspace not found.\")\n    if ws.get(\"status\") != \"active\":\n        usage_ledger.append({\n            \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n            \"workspace_id\": workspace_id,\n            \"api_key_id\": None,\n            \"search_request_id\": None,\n            \"event_type\": \"request\",\n            \"tool_name\": \"brave_web_search\",\n            \"quantity\": 0,\n            \"billable\": False,\n            \"period_month\": now.strftime(\"%Y-%m\"),\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(now),\n            \"note\": \"create_api_key.workspace_not_active\",\n            \"status\": \"UNAUTHORIZED\",\n            \"latency_ms\": int((time.time() - t0) * 1000)\n        })\n        _save(\"usage_ledger.json\", usage_ledger)\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active.\")\n\n    # Hash and last4\n    last4 = provider_api_key[-4:] if len(provider_api_key) >= 4 else None\n    key_hash = hashlib.sha256(provider_api_key.encode(\"utf-8\")).hexdigest()\n\n    # Enforce unique(workspace_id, provider, key_name) and unique(workspace_id, provider, key_hash)\n    for k in api_keys:\n        if k.get(\"workspace_id\") == workspace_id and k.get(\"provider\") == provider:\n            if k.get(\"key_name\") == key_name:\n                usage_ledger.append({\n                    \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n                    \"workspace_id\": workspace_id,\n                    \"api_key_id\": None,\n                    \"search_request_id\": None,\n                    \"event_type\": \"request\",\n                    \"tool_name\": \"brave_web_search\",\n                    \"quantity\": 0,\n                    \"billable\": False,\n                    \"period_month\": now.strftime(\"%Y-%m\"),\n                    \"created_at\": _iso(now),\n                    \"updated_at\": _iso(now),\n                    \"note\": \"create_api_key.conflict_key_name\",\n                    \"status\": \"CONFLICT\",\n                    \"latency_ms\": int((time.time() - t0) * 1000)\n                })\n                _save(\"usage_ledger.json\", usage_ledger)\n                return _err(\"CONFLICT\", \"An API key with this key_name already exists for this workspace/provider.\")\n            if k.get(\"key_hash\") == key_hash:\n                usage_ledger.append({\n                    \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n                    \"workspace_id\": workspace_id,\n                    \"api_key_id\": None,\n                    \"search_request_id\": None,\n                    \"event_type\": \"request\",\n                    \"tool_name\": \"brave_web_search\",\n                    \"quantity\": 0,\n                    \"billable\": False,\n                    \"period_month\": now.strftime(\"%Y-%m\"),\n                    \"created_at\": _iso(now),\n                    \"updated_at\": _iso(now),\n                    \"note\": \"create_api_key.conflict_key_hash\",\n                    \"status\": \"CONFLICT\",\n                    \"latency_ms\": int((time.time() - t0) * 1000)\n                })\n                _save(\"usage_ledger.json\", usage_ledger)\n                return _err(\"CONFLICT\", \"This API key is already registered for this workspace/provider.\")\n\n    # Generate id\n    alphabet = \"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\"\n    def _gen_suffix(n=18):\n        x = int(time.time() * 1000)\n        s = []\n        for _ in range(n):\n            x = (1103515245 * x + 12345) & 0x7fffffff\n            s.append(alphabet[x % len(alphabet)])\n        return \"\".join(s)\n    new_id = \"brv_key_\" + _gen_suffix(18)\n    existing_ids = {k.get(\"id\") for k in api_keys if isinstance(k.get(\"id\"), str)}\n    while new_id in existing_ids:\n        new_id = \"brv_key_\" + _gen_suffix(18)\n\n    row = {\n        \"id\": new_id,\n        \"workspace_id\": workspace_id,\n        \"provider\": provider,\n        \"key_name\": key_name,\n        \"key_hash\": key_hash,\n        \"last4\": last4,\n        \"status\": \"active\",\n        \"created_at\": _iso(now),\n        \"updated_at\": _iso(now)\n    }\n    api_keys.append(row)\n    _save(\"api_keys.json\", api_keys)\n\n    # log call (non-billable audit)\n    usage_ledger.append({\n        \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n        \"workspace_id\": workspace_id,\n        \"api_key_id\": new_id,\n        \"search_request_id\": None,\n        \"event_type\": \"request\",\n        \"tool_name\": \"brave_web_search\",\n        \"quantity\": 0,\n        \"billable\": False,\n        \"period_month\": now.strftime(\"%Y-%m\"),\n        \"created_at\": _iso(now),\n        \"updated_at\": _iso(now),\n        \"note\": \"create_api_key\",\n        \"status\": \"OK\",\n        \"latency_ms\": int((time.time() - t0) * 1000)\n    })\n    _save(\"usage_ledger.json\", usage_ledger)\n\n    return {\"data\": row}\n"
+        },
+        {
+          "name": "update_api_key",
+          "description": "Updates mutable fields of an API key record, including lifecycle status transitions (active↔disabled, active/disabled→revoked). Returns the updated api_keys record; refuses invalid transitions or attempts to modify revoked keys.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^brv_ws_[0-9A-Z]{18,}$",
+                "description": "Workspace id that owns the API key."
+              },
+              "api_key_id": {
+                "type": "string",
+                "pattern": "^brv_key_[0-9A-Z]{18,}$",
+                "description": "API key id to update."
+              },
+              "key_name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100,
+                "description": "New human-readable label for the key."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled",
+                  "revoked"
+                ],
+                "description": "New lifecycle status for the key. Allowed transitions: active→disabled|revoked, disabled→active|revoked."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "api_key_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_api_key(workspace_id, api_key_id, key_name=None, status=None, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0193000\" if __import__(\"os\").path.isdir(\"./environment_mix/0193000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0)\n    def _iso(dt):\n        if isinstance(dt, str):\n            return dt\n        return dt.replace(microsecond=0).isoformat() + \"Z\"\n\n    # Validate inputs\n    if not isinstance(workspace_id, str) or not re.match(r\"^brv_ws_[0-9A-Z]{18,}$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if not isinstance(api_key_id, str) or not re.match(r\"^brv_key_[0-9A-Z]{18,}$\", api_key_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid api_key_id.\")\n    if key_name is not None:\n        if not isinstance(key_name, str) or not (1 <= len(key_name) <= 100):\n            return _err(\"VALIDATION_ERROR\", \"key_name must be a non-empty string up to 100 characters.\")\n    if status is not None:\n        if status not in (\"active\", \"disabled\", \"revoked\"):\n            return _err(\"VALIDATION_ERROR\", \"Invalid status.\")\n\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    usage_ledger = _load(\"usage_ledger.json\")\n\n    ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n    if not ws:\n        usage_ledger.append({\n            \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n            \"workspace_id\": workspace_id,\n            \"api_key_id\": api_key_id,\n            \"search_request_id\": None,\n            \"event_type\": \"request\",\n            \"tool_name\": \"brave_web_search\",\n            \"quantity\": 0,\n            \"billable\": False,\n            \"period_month\": now.strftime(\"%Y-%m\"),\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(now),\n            \"note\": \"update_api_key.not_found_workspace\",\n            \"status\": \"NOT_FOUND\",\n            \"latency_ms\": int((time.time() - t0) * 1000)\n        })\n        _save(\"usage_ledger.json\", usage_ledger)\n        return _err(\"NOT_FOUND\", \"Workspace not found.\")\n\n    idx = None\n    row = None\n    for i, k in enumerate(api_keys):\n        if k.get(\"id\") == api_key_id and k.get(\"workspace_id\") == workspace_id:\n            idx = i\n            row = k\n            break\n    if not row:\n        usage_ledger.append({\n            \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n            \"workspace_id\": workspace_id,\n            \"api_key_id\": api_key_id,\n            \"search_request_id\": None,\n            \"event_type\": \"request\",\n            \"tool_name\": \"brave_web_search\",\n            \"quantity\": 0,\n            \"billable\": False,\n            \"period_month\": now.strftime(\"%Y-%m\"),\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(now),\n            \"note\": \"update_api_key.not_found_key\",\n            \"status\": \"NOT_FOUND\",\n            \"latency_ms\": int((time.time() - t0) * 1000)\n        })\n        _save(\"usage_ledger.json\", usage_ledger)\n        return _err(\"NOT_FOUND\", \"API key not found for this workspace.\")\n\n    if key_name is None and status is None:\n        return _err(\"VALIDATION_ERROR\", \"No fields to update. Provide key_name and/or status.\")\n\n    # Disallow any modification of revoked keys\n    if row.get(\"status\") == \"revoked\":\n        usage_ledger.append({\n            \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n            \"workspace_id\": workspace_id,\n            \"api_key_id\": api_key_id,\n            \"search_request_id\": None,\n            \"event_type\": \"request\",\n            \"tool_name\": \"brave_web_search\",\n            \"quantity\": 0,\n            \"billable\": False,\n            \"period_month\": now.strftime(\"%Y-%m\"),\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(now),\n            \"note\": \"update_api_key.revoked_immutable\",\n            \"status\": \"INVALID_TRANSITION\",\n            \"latency_ms\": int((time.time() - t0) * 1000)\n        })\n        _save(\"usage_ledger.json\", usage_ledger)\n        return _err(\"INVALID_TRANSITION\", \"Revoked API keys cannot be modified.\")\n\n    # Update key_name with uniqueness constraint unique(workspace_id, provider, key_name)\n    if key_name is not None and key_name != row.get(\"key_name\"):\n        for k in api_keys:\n            if k.get(\"id\") != api_key_id and k.get(\"workspace_id\") == workspace_id and k.get(\"provider\") == row.get(\"provider\") and k.get(\"key_name\") == key_name:\n                usage_ledger.append({\n                    \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n                    \"workspace_id\": workspace_id,\n                    \"api_key_id\": api_key_id,\n                    \"search_request_id\": None,\n                    \"event_type\": \"request\",\n                    \"tool_name\": \"brave_web_search\",\n                    \"quantity\": 0,\n                    \"billable\": False,\n                    \"period_month\": now.strftime(\"%Y-%m\"),\n                    \"created_at\": _iso(now),\n                    \"updated_at\": _iso(now),\n                    \"note\": \"update_api_key.conflict_key_name\",\n                    \"status\": \"CONFLICT\",\n                    \"latency_ms\": int((time.time() - t0) * 1000)\n                })\n                _save(\"usage_ledger.json\", usage_ledger)\n                return _err(\"CONFLICT\", \"An API key with this key_name already exists for this workspace/provider.\")\n        row[\"key_name\"] = key_name\n\n    # Update status with lifecycle transitions\n    if status is not None and status != row.get(\"status\"):\n        allowed = {\n            \"active\": {\"disabled\", \"revoked\"},\n            \"disabled\": {\"active\", \"revoked\"},\n            \"revoked\": set()\n        }\n        cur = row.get(\"status\")\n        if cur not in allowed or status not in allowed[cur]:\n            usage_ledger.append({\n                \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n                \"workspace_id\": workspace_id,\n                \"api_key_id\": api_key_id,\n                \"search_request_id\": None,\n                \"event_type\": \"request\",\n                \"tool_name\": \"brave_web_search\",\n                \"quantity\": 0,\n                \"billable\": False,\n                \"period_month\": now.strftime(\"%Y-%m\"),\n                \"created_at\": _iso(now),\n                \"updated_at\": _iso(now),\n                \"note\": \"update_api_key.invalid_transition\",\n                \"status\": \"INVALID_TRANSITION\",\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"from_status\": cur,\n                \"to_status\": status\n            })\n            _save(\"usage_ledger.json\", usage_ledger)\n            return _err(\"INVALID_TRANSITION\", \"Invalid API key status transition.\", from_status=cur, to_status=status)\n        row[\"status\"] = status\n\n    row[\"updated_at\"] = _iso(now)\n    api_keys[idx] = row\n    _save(\"api_keys.json\", api_keys)\n\n    usage_ledger.append({\n        \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n        \"workspace_id\": workspace_id,\n        \"api_key_id\": api_key_id,\n        \"search_request_id\": None,\n        \"event_type\": \"request\",\n        \"tool_name\": \"brave_web_search\",\n        \"quantity\": 0,\n        \"billable\": False,\n        \"period_month\": now.strftime(\"%Y-%m\"),\n        \"created_at\": _iso(now),\n        \"updated_at\": _iso(now),\n        \"note\": \"update_api_key\",\n        \"status\": \"OK\",\n        \"latency_ms\": int((time.time() - t0) * 1000)\n    })\n    _save(\"usage_ledger.json\", usage_ledger)\n\n    return {\"data\": row}\n"
+        },
+        {
+          "name": "get_auth_context",
+          "description": "Returns the calling identity and entitlements for this integration, including readable workspaces/scopes and current quota/rate-limit consumption for a workspace. Refuses when the presented credential is missing/invalid.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^brv_ws_[0-9A-Z]{18,}$",
+                "description": "Optional workspace id to include current month usage and remaining quotas for that workspace."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_auth_context(workspace_id=None, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0193000\" if __import__(\"os\").path.isdir(\"./environment_mix/0193000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0)\n    def _iso(dt):\n        if isinstance(dt, str):\n            return dt\n        return dt.replace(microsecond=0).isoformat() + \"Z\"\n\n    if workspace_id is not None:\n        if not isinstance(workspace_id, str) or not re.match(r\"^brv_ws_[0-9A-Z]{18,}$\", workspace_id):\n            return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    usage_ledger = _load(\"usage_ledger.json\")\n\n    # Ambient auth: choose a workspace that can serve the call. If workspace_id is provided, require it exist.\n    ws = None\n    if workspace_id is not None:\n        ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n        if not ws:\n            # log attempt (non-billable audit)\n            usage_ledger.append({\n                \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n                \"workspace_id\": workspace_id,\n                \"api_key_id\": None,\n                \"search_request_id\": None,\n                \"event_type\": \"request\",\n                \"tool_name\": \"brave_web_search\",\n                \"quantity\": 0,\n                \"billable\": False,\n                \"period_month\": now.strftime(\"%Y-%m\"),\n                \"created_at\": _iso(now),\n                \"updated_at\": _iso(now),\n                \"note\": \"get_auth_context.not_found_workspace\",\n                \"status\": \"NOT_FOUND\",\n                \"latency_ms\": int((time.time() - t0) * 1000)\n            })\n            _save(\"usage_ledger.json\", usage_ledger)\n            return _err(\"NOT_FOUND\", \"Workspace not found.\")\n    else:\n        # Pick any workspace (prefer active) to represent the caller context\n        ws = next((w for w in workspaces if w.get(\"status\") == \"active\"), None) or (workspaces[0] if workspaces else None)\n        if ws is None:\n            usage_ledger.append({\n                \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n                \"workspace_id\": \"unknown\",\n                \"api_key_id\": None,\n                \"search_request_id\": None,\n                \"event_type\": \"request\",\n                \"tool_name\": \"brave_web_search\",\n                \"quantity\": 0,\n                \"billable\": False,\n                \"period_month\": now.strftime(\"%Y-%m\"),\n                \"created_at\": _iso(now),\n                \"updated_at\": _iso(now),\n                \"note\": \"get_auth_context.no_workspaces\",\n                \"status\": \"UNAUTHORIZED\",\n                \"latency_ms\": int((time.time() - t0) * 1000)\n            })\n            _save(\"usage_ledger.json\", usage_ledger)\n            return _err(\"UNAUTHORIZED\", \"No authenticated workspace context is available.\")\n\n    # Compute current month usage for workspace\n    period_month = now.strftime(\"%Y-%m\")\n    req_used = 0\n    item_used = 0\n    for e in usage_ledger:\n        if e.get(\"workspace_id\") != ws.get(\"id\"):\n            continue\n        if e.get(\"period_month\") != period_month:\n            continue\n        if not e.get(\"billable\", False):\n            continue\n        qty = e.get(\"quantity\")\n        if not isinstance(qty, int) or qty < 0:\n            continue\n        if e.get(\"event_type\") == \"request\":\n            req_used += qty\n        elif e.get(\"event_type\") == \"result_item\":\n            item_used += qty\n\n    req_quota = ws.get(\"monthly_request_quota\")\n    item_quota = ws.get(\"monthly_result_item_quota\")\n    if not isinstance(req_quota, int):\n        req_quota = 0\n    if not isinstance(item_quota, int):\n        item_quota = 0\n\n    # Workspaces readable: in this offline store, ambient identity can read all non-deleted workspaces\n    readable = []\n    for w in workspaces:\n        if w.get(\"status\") != \"deleted\":\n            readable.append({\n                \"id\": w.get(\"id\"),\n                \"name\": w.get(\"name\"),\n                \"status\": w.get(\"status\"),\n                \"plan\": w.get(\"plan\")\n            })\n\n    # Entitlements: key management allowed if workspace exists (and typically requires active for create)\n    # Include key summary for the workspace\n    ws_keys = [k for k in api_keys if k.get(\"workspace_id\") == ws.get(\"id\")]\n    key_summaries = [{\n        \"id\": k.get(\"id\"),\n        \"provider\": k.get(\"provider\"),\n        \"key_name\": k.get(\"key_name\"),\n        \"last4\": k.get(\"last4\"),\n        \"status\": k.get(\"status\"),\n        \"created_at\": k.get(\"created_at\"),\n        \"updated_at\": k.get(\"updated_at\"),\n    } for k in ws_keys]\n\n    # Log call (non-billable audit)\n    usage_ledger.append({\n        \"id\": \"brv_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"000000000000000000\"[:18],\n        \"workspace_id\": ws.get(\"id\"),\n        \"api_key_id\": None,\n        \"search_request_id\": None,\n        \"event_type\": \"request\",\n        \"tool_name\": \"brave_web_search\",\n        \"quantity\": 0,\n        \"billable\": False,\n        \"period_month\": period_month,\n        \"created_at\": _iso(now),\n        \"updated_at\": _iso(now),\n        \"note\": \"get_auth_context\",\n        \"status\": \"OK\",\n        \"latency_ms\": int((time.time() - t0) * 1000)\n    })\n    _save(\"usage_ledger.json\", usage_ledger)\n\n    return {\n        \"data\": {\n            \"identity\": {\n                \"auth_type\": \"ambient\",\n                \"workspace_id\": ws.get(\"id\")\n            },\n            \"readable_workspaces\": readable,\n            \"workspace\": {\n                \"id\": ws.get(\"id\"),\n                \"name\": ws.get(\"name\"),\n                \"status\": ws.get(\"status\"),\n                \"plan\": ws.get(\"plan\"),\n                \"monthly_request_quota\": req_quota,\n                \"monthly_result_item_quota\": item_quota\n            } if workspace_id is not None else None,\n            \"usage\": {\n                \"period_month\": period_month,\n                \"requests_used\": req_used,\n                \"requests_remaining\": max(0, req_quota - req_used),\n                \"result_items_used\": item_used,\n                \"result_items_remaining\": max(0, item_quota - item_used)\n            } if workspace_id is not None else None,\n            \"api_keys\": key_summaries if workspace_id is not None else None\n        }\n    }\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0193000",
+    "index": 193,
+    "name": "Brave Search",
+    "description": "This backend powers a Brave Search integration that issues web and local search requests, records each search query, stores normalized result items, and tracks API credentials, quotas, and usage for billing/rate-limiting. Primary workflows are: accept a search request (web or local), execute it agai",
+    "taxonomy": {
+      "L1_id": "L1-01",
+      "L1_name": "Search & Information Retrieval",
+      "L1_name_zh": "搜索与信息获取",
+      "L2_id": "L2-01",
+      "L2_name": "General Web Search",
+      "L2_name_zh": "通用网页搜索",
+      "L3_name": "General Web Search APIs",
+      "L3_name_zh": "通用网页搜索接口"
+    },
+    "database_dir": "./environment_mix/0193000",
+    "mount_path": "/app/database",
+    "n_tools": 8,
+    "n_collections": 5,
+    "n_records": 122,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 8,
+      "loaded": 8,
+      "reads_returning_data": 6,
+      "read_operations": 6,
+      "mutations_persisted": 2,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 8,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "brave_web_search",
+      "returned_chars": 196
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

@@ -1,0 +1,290 @@
+{
+  "index": 230,
+  "local_files_dir": "./environment_mix/0230000",
+  "file_list": [
+    "./environment_mix/0230000/README.md",
+    "./environment_mix/0230000/ssh_command_executions.json",
+    "./environment_mix/0230000/ssh_connections.json",
+    "./environment_mix/0230000/ssh_credentials.json",
+    "./environment_mix/0230000/ssh_rate_limits.json",
+    "./environment_mix/0230000/ssh_targets.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "ssh_targets.json": "18 rows",
+        "ssh_credentials.json": "18 rows",
+        "ssh_connections.json": "18 rows",
+        "ssh_command_executions.json": "19 rows",
+        "ssh_rate_limits.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "execute_ssh_command",
+          "description": "Executes the provided shell command on the specified remote host using the given SSH connection details and returns the execution record including stdout, stderr, and the process exit code. Raises VALIDATION_ERROR if required fields are missing/invalid (e.g., empty host/username/command, non-numeric or out-of-range port, or both/none of password and privateKey when credentials are required), and AUTHORIZATION_ERROR if the caller is not permitted to execute commands or the referenced credentials cannot be used by the caller. Raises RATE_LIMITED when execution limits are exceeded, NOT_FOUND when the target host/profile or referenced credential cannot be resolved, and SSH_CONNECTION_FAILED when the session cannot be established or the command cannot be executed.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "connection": {
+                "type": "object",
+                "properties": {
+                  "host": {
+                    "type": "string"
+                  },
+                  "port": {
+                    "type": "number",
+                    "default": 22
+                  },
+                  "username": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string"
+                  },
+                  "privateKey": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "host",
+                  "username"
+                ]
+              },
+              "command": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "connection",
+              "command"
+            ]
+          },
+          "implementation": "def execute_ssh_command(connection, command, **_extra):\n    import json, os, datetime, re, time, base64, hashlib, subprocess\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0230000\" if __import__(\"os\").path.isdir(\"./environment_mix/0230000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # Validate inputs\n    if not isinstance(connection, dict):\n        return _err(\"VALIDATION_ERROR\", \"connection must be an object\")\n    if not isinstance(command, str) or not (1 <= len(command) <= 16384):\n        return _err(\"VALIDATION_ERROR\", \"command must be a non-empty string up to 16384 chars\")\n\n    host = connection.get(\"host\")\n    username = connection.get(\"username\")\n    port = connection.get(\"port\", 22)\n\n    password = connection.get(\"password\", None)\n    private_key = connection.get(\"privateKey\", None)\n\n    if not isinstance(host, str) or not (1 <= len(host) <= 255):\n        return _err(\"VALIDATION_ERROR\", \"connection.host must be a non-empty string of length 1..255\")\n    if not isinstance(username, str) or not (1 <= len(username) <= 128):\n        return _err(\"VALIDATION_ERROR\", \"connection.username must be a non-empty string of length 1..128\")\n\n    # Port validation: tool schema says number; accept int-like floats\n    if isinstance(port, bool) or not isinstance(port, (int, float)) or int(port) != port:\n        return _err(\"VALIDATION_ERROR\", \"connection.port must be an integer\")\n    port = int(port)\n    if not (1 <= port <= 65535):\n        return _err(\"VALIDATION_ERROR\", \"connection.port must be between 1 and 65535\")\n\n    password_present = isinstance(password, str) and len(password) > 0\n    private_key_present = isinstance(private_key, str) and len(private_key) > 0\n\n    if password_present and private_key_present:\n        auth_provided = \"both\"\n    elif password_present:\n        auth_provided = \"password\"\n    elif private_key_present:\n        auth_provided = \"private_key\"\n    else:\n        auth_provided = \"none\"\n\n    # Load store\n    targets = _load(\"ssh_targets.json\")\n    creds = _load(\"ssh_credentials.json\")\n    conns = _load(\"ssh_connections.json\")\n    execs = _load(\"ssh_command_executions.json\")\n    rate_rules = _load(\"ssh_rate_limits.json\")\n\n    # Resolve target by (host,port)\n    target = None\n    for t in targets:\n        if t.get(\"host\") == host and t.get(\"port\") == port:\n            target = t\n            break\n    if target is None:\n        # No target row: treat as missing reference\n        # Still record nothing (no usage/audit collection declared).\n        return _err(\"NOT_FOUND\", \"No ssh target found for host/port\", host=host, port=port)\n\n    # Resolve optional saved connection profile if needed\n    resolved_connection = None\n    resolved_credential = None\n    connection_id = None\n\n    if auth_provided == \"none\":\n        # must resolve by (host,port,username) to an active profile supplying active credentials\n        for c in conns:\n            if c.get(\"status\") != \"active\":\n                continue\n            if c.get(\"target_id\") != target.get(\"id\"):\n                continue\n            cred = next((cr for cr in creds if cr.get(\"id\") == c.get(\"credential_id\")), None)\n            if cred is None or cred.get(\"status\") != \"active\":\n                continue\n            # profile doesn't store username; must match by credential.username\n            if cred.get(\"username\") != username:\n                continue\n            resolved_connection = c\n            resolved_credential = cred\n            connection_id = c.get(\"id\")\n            break\n        if resolved_connection is None:\n            return _err(\n                \"VALIDATION_ERROR\",\n                \"No credentials provided and no active saved connection profile could be resolved for (host,port,username).\"\n            )\n    else:\n        # credentials provided inline; optionally associate to a saved connection if exists with matching target and username and active\n        for c in conns:\n            if c.get(\"status\") != \"active\":\n                continue\n            if c.get(\"target_id\") != target.get(\"id\"):\n                continue\n            cred = next((cr for cr in creds if cr.get(\"id\") == c.get(\"credential_id\")), None)\n            if cred is None or cred.get(\"status\") != \"active\":\n                continue\n            if cred.get(\"username\") != username:\n                continue\n            resolved_connection = c\n            resolved_credential = cred\n            connection_id = c.get(\"id\")\n            break\n\n    # Enforce lifecycle: target active and any resolved credential active\n    if target.get(\"status\") != \"active\":\n        # Record a failed execution attempt (accepted then failed) per policy? Rule only mandates record for command policy rejects.\n        return _err(\"UNAUTHORIZED\", \"Target is not active\")\n    if resolved_credential is not None and resolved_credential.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"Credential is not active\")\n\n    # Rate limit enforcement (counts requested_at within window for active rules)\n    def _parse_dt(s):\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    now_dt = _parse_dt(now) or datetime.datetime.utcnow().replace(microsecond=0)\n\n    applicable_rules = []\n    for r in rate_rules:\n        if r.get(\"status\") != \"active\":\n            continue\n        if r.get(\"host\") != host:\n            continue\n        ru = r.get(\"username\")\n        if ru is not None and ru != username:\n            continue\n        applicable_rules.append(r)\n\n    for r in applicable_rules:\n        window_seconds = r.get(\"window_seconds\")\n        max_exec = r.get(\"max_executions\")\n        if not isinstance(window_seconds, int) or not (1 <= window_seconds <= 86400):\n            continue\n        if not isinstance(max_exec, int) or not (1 <= max_exec <= 100000):\n            continue\n        cutoff = now_dt - datetime.timedelta(seconds=window_seconds)\n        count = 0\n        for e in execs:\n            if e.get(\"host\") != host:\n                continue\n            if r.get(\"username\") is not None and e.get(\"username\") != username:\n                continue\n            e_dt = _parse_dt(e.get(\"requested_at\"))\n            if e_dt is None:\n                continue\n            if e_dt >= cutoff:\n                count += 1\n        if count >= max_exec:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded\", host=host, username=username, window_seconds=window_seconds, max_executions=max_exec)\n\n    # Command policy enforcement: if allowed_command_regex set and active target, must match else reject and record failed execution\n    allowed_re = target.get(\"allowed_command_regex\")\n    if allowed_re is not None:\n        if not isinstance(allowed_re, str) or allowed_re == \"\":\n            # Treat invalid regex configuration as conflict\n            return _err(\"CONFLICT\", \"Target command policy is misconfigured\")\n        try:\n            if re.search(allowed_re, command) is None:\n                # record failed execution\n                def _new_id(prefix):\n                    raw = f\"{prefix}_{datetime.datetime.utcnow().timestamp()}_{os.getpid()}_{len(execs)}\"\n                    h = hashlib.sha256(raw.encode(\"utf-8\")).hexdigest()[:24]\n                    return f\"{prefix}_{h}\"\n                eid = _new_id(\"exec\")\n                row = {\n                    \"id\": eid,\n                    \"connection_id\": connection_id,\n                    \"host\": host,\n                    \"port\": port,\n                    \"username\": username,\n                    \"auth_provided\": auth_provided,\n                    \"password_present\": bool(password_present),\n                    \"private_key_present\": bool(private_key_present),\n                    \"command\": command,\n                    \"status\": \"failed\",\n                    \"requested_at\": now,\n                    \"started_at\": now,\n                    \"finished_at\": now,\n                    \"timeout_seconds\": 60,\n                    \"exit_code\": None,\n                    \"stdout\": None,\n                    \"stderr\": None,\n                    \"stdout_truncated\": False,\n                    \"stderr_truncated\": False,\n                    \"error_message\": \"Command rejected by policy\",\n                    \"created_at\": now,\n                    \"updated_at\": now,\n                }\n                execs.append(row)\n                _save(\"ssh_command_executions.json\", execs)\n                return {\"execution\": row}\n        except re.error:\n            return _err(\"CONFLICT\", \"Target command policy regex is invalid\")\n\n    # Create execution row: queued -> running -> terminal\n    # Apply server-side timeout (default 60s)\n    timeout_seconds = 60\n    if not (1 <= timeout_seconds <= 3600):\n        timeout_seconds = 60\n\n    def _new_id(prefix):\n        raw = f\"{prefix}_{datetime.datetime.utcnow().timestamp()}_{os.getpid()}_{len(execs)}\"\n        h = hashlib.sha256(raw.encode(\"utf-8\")).hexdigest()[:24]\n        return f\"{prefix}_{h}\"\n\n    eid = _new_id(\"exec\")\n    row = {\n        \"id\": eid,\n        \"connection_id\": connection_id,\n        \"host\": host,\n        \"port\": port,\n        \"username\": username,\n        \"auth_provided\": auth_provided,\n        \"password_present\": bool(password_present),\n        \"private_key_present\": bool(private_key_present),\n        \"command\": command,\n        \"status\": \"queued\",\n        \"requested_at\": now,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"timeout_seconds\": timeout_seconds,\n        \"exit_code\": None,\n        \"stdout\": None,\n        \"stderr\": None,\n        \"stdout_truncated\": False,\n        \"stderr_truncated\": False,\n        \"error_message\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    execs.append(row)\n    _save(\"ssh_command_executions.json\", execs)\n\n    # Transition to running\n    start_ts = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    row[\"status\"] = \"running\"\n    row[\"started_at\"] = start_ts\n    row[\"updated_at\"] = start_ts\n    _save(\"ssh_command_executions.json\", execs)\n\n    # Execute locally (offline approximation) with timeout; truncate outputs to 64KB\n    MAX_OUT = 65536\n\n    def _truncate(s):\n        if s is None:\n            return None, False\n        if len(s) <= MAX_OUT:\n            return s, False\n        return s[:MAX_OUT], True\n\n    terminal_status = \"succeeded\"\n    exit_code = 0\n    stdout_s = \"\"\n    stderr_s = \"\"\n    err_msg = None\n\n    try:\n        # This is a local execution surrogate; real SSH is not performed in this offline environment.\n        cp = subprocess.run(\n            command,\n            shell=True,\n            capture_output=True,\n            text=True,\n            timeout=timeout_seconds\n        )\n        exit_code = cp.returncode\n        stdout_s = cp.stdout if isinstance(cp.stdout, str) else \"\"\n        stderr_s = cp.stderr if isinstance(cp.stderr, str) else \"\"\n        terminal_status = \"succeeded\" if exit_code == 0 else \"failed\"\n        if terminal_status == \"failed\":\n            err_msg = \"Command failed\"\n    except subprocess.TimeoutExpired:\n        terminal_status = \"timed_out\"\n        exit_code = None\n        err_msg = \"Execution timed out\"\n    except Exception:\n        terminal_status = \"failed\"\n        exit_code = None\n        err_msg = \"Execution failed\"\n\n    stdout_s, stdout_tr = _truncate(stdout_s)\n    stderr_s, stderr_tr = _truncate(stderr_s)\n\n    finish_ts = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    row[\"status\"] = terminal_status\n    row[\"finished_at\"] = finish_ts\n    row[\"updated_at\"] = finish_ts\n    row[\"stdout\"] = stdout_s\n    row[\"stderr\"] = stderr_s\n    row[\"stdout_truncated\"] = bool(stdout_tr)\n    row[\"stderr_truncated\"] = bool(stderr_tr)\n    row[\"error_message\"] = err_msg\n    if terminal_status in (\"succeeded\", \"failed\"):\n        row[\"exit_code\"] = exit_code\n    else:\n        row[\"exit_code\"] = None\n\n    # update last_used_at for saved connection if we resolved an active one and succeeded\n    if connection_id is not None and terminal_status == \"succeeded\":\n        for c in conns:\n            if c.get(\"id\") == connection_id:\n                c[\"last_used_at\"] = finish_ts\n                c[\"updated_at\"] = finish_ts\n                break\n        _save(\"ssh_connections.json\", conns)\n\n    _save(\"ssh_command_executions.json\", execs)\n\n    return {\"execution\": row}\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_ssh_command_executions",
+          "description": "Lists stored SSH command execution records in reverse-chronological order. Supports filtering by connection/host/username/status and time range. Refuses invalid filters and enforces pagination limits.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "connection_id": {
+                "type": "string",
+                "description": "Filter to executions created for a specific saved connection profile id."
+              },
+              "host": {
+                "type": "string",
+                "description": "Filter to executions for an exact host value."
+              },
+              "username": {
+                "type": "string",
+                "description": "Filter to executions for an exact username value."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "timed_out",
+                  "cancelled"
+                ],
+                "description": "Filter to executions in the given lifecycle status."
+              },
+              "requested_from": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return executions with requested_at >= this timestamp (RFC3339)."
+              },
+              "requested_to": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return executions with requested_at <= this timestamp (RFC3339)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of records to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor returned from a previous call."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_ssh_command_executions(connection_id=None, host=None, username=None, status=None, requested_from=None, requested_to=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0230000\" if __import__(\"os\").path.isdir(\"./environment_mix/0230000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            raise ValueError(f\"{field} must be an RFC3339 string\")\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            raise ValueError(f\"{field} must be an RFC3339 timestamp\")\n\n    # Validate filters\n    if connection_id is not None and not isinstance(connection_id, str):\n        return _err(\"VALIDATION_ERROR\", \"connection_id must be a string\")\n    if host is not None and not isinstance(host, str):\n        return _err(\"VALIDATION_ERROR\", \"host must be a string\")\n    if username is not None and not isinstance(username, str):\n        return _err(\"VALIDATION_ERROR\", \"username must be a string\")\n    if status is not None:\n        if not isinstance(status, str):\n            return _err(\"VALIDATION_ERROR\", \"status must be a string\")\n        if status not in (\"queued\", \"running\", \"succeeded\", \"failed\", \"timed_out\", \"cancelled\"):\n            return _err(\"VALIDATION_ERROR\", \"status is invalid\")\n    if limit is None:\n        limit = 50\n    if isinstance(limit, bool) or not isinstance(limit, int) or not (1 <= limit <= 200):\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n\n    try:\n        dt_from = _parse_dt(requested_from, \"requested_from\")\n        dt_to = _parse_dt(requested_to, \"requested_to\")\n    except ValueError as ve:\n        return _err(\"VALIDATION_ERROR\", str(ve))\n\n    # Cursor: base64(\"offset:<n>\")\n    offset = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\")).decode(\"utf-8\")\n            if not raw.startswith(\"offset:\"):\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n            offset = int(raw.split(\":\", 1)[1])\n            if offset < 0:\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n\n    rows = _load(\"ssh_command_executions.json\")\n\n    def _dt(s):\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    # Filter\n    out = []\n    for r in rows:\n        if connection_id is not None and r.get(\"connection_id\") != connection_id:\n            continue\n        if host is not None and r.get(\"host\") != host:\n            continue\n        if username is not None and r.get(\"username\") != username:\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        rdt = _dt(r.get(\"requested_at\"))\n        if dt_from is not None and (rdt is None or rdt < dt_from):\n            continue\n        if dt_to is not None and (rdt is None or rdt > dt_to):\n            continue\n        out.append(r)\n\n    # Sort reverse-chronological by requested_at then id\n    out.sort(key=lambda r: (r.get(\"requested_at\") or \"\", r.get(\"id\") or \"\"), reverse=True)\n\n    total = len(out)\n    page = out[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(f\"offset:{next_offset}\".encode(\"utf-8\")).decode(\"utf-8\")\n\n    return {\n        \"executions\": page,\n        \"total\": total,\n        \"limit\": limit,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n    }\n"
+        },
+        {
+          "name": "get_ssh_command_execution",
+          "description": "Fetches a single SSH command execution record by id. Returns the stored stdout/stderr (possibly truncated) and lifecycle fields. Raises NOT_FOUND if the id does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "The ssh_command_executions primary key."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_ssh_command_execution(id, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0230000\" if __import__(\"os\").path.isdir(\"./environment_mix/0230000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _append_log(status_code, execution_id=None):\n        # Best-effort: only if collection exists (list or {\"rows\":[...]})\n        log = _load(\"ssh_request_logs.json\")\n        if isinstance(log, dict) and isinstance(log.get(\"rows\"), list):\n            log_rows = log[\"rows\"]\n            shape = \"dict\"\n        elif isinstance(log, list):\n            log_rows = log\n            shape = \"list\"\n        else:\n            return\n        row = {\n            \"id\": \"ssh_req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n            \"endpoint\": \"get_ssh_command_execution\",\n            \"status\": status_code,\n            \"timestamp\": _now(),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if execution_id:\n            row[\"execution_id\"] = execution_id\n        log_rows.append(row)\n        _save(\"ssh_request_logs.json\", {\"rows\": log_rows} if shape == \"dict\" else log_rows)\n\n    # Validate inputs\n    if not isinstance(id, str) or not id.strip():\n        _append_log(\"validation_error\")\n        return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\")\n\n    # Fetch\n    data = _load(\"ssh_command_executions.json\")\n    rows = data.get(\"rows\", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])\n    found = None\n    for r in rows:\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            found = r\n            break\n\n    if found is None:\n        _append_log(\"not_found\", execution_id=id)\n        return _err(\"NOT_FOUND\", \"ssh_command_execution not found\", id=id)\n\n    _append_log(\"succeeded\", execution_id=id)\n    return {\"execution\": found}\n"
+        },
+        {
+          "name": "cancel_ssh_command_execution",
+          "description": "Requests cancellation of an SSH command execution. Transitions status from queued->cancelled or running->cancelled when allowed; refuses with INVALID_STATE if the execution is already terminal.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "The ssh_command_executions primary key to cancel."
+              },
+              "reason": {
+                "type": "string",
+                "description": "Optional human-readable reason recorded as a sanitized error_message."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def cancel_ssh_command_execution(id, reason=None, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0230000\" if __import__(\"os\").path.isdir(\"./environment_mix/0230000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _append_log(status_code, execution_id=None):\n        log = _load(\"ssh_request_logs.json\")\n        if isinstance(log, dict) and isinstance(log.get(\"rows\"), list):\n            log_rows = log[\"rows\"]\n            shape = \"dict\"\n        elif isinstance(log, list):\n            log_rows = log\n            shape = \"list\"\n        else:\n            return\n        row = {\n            \"id\": \"ssh_req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n            \"endpoint\": \"cancel_ssh_command_execution\",\n            \"status\": status_code,\n            \"timestamp\": _now(),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if execution_id:\n            row[\"execution_id\"] = execution_id\n        log_rows.append(row)\n        _save(\"ssh_request_logs.json\", {\"rows\": log_rows} if shape == \"dict\" else log_rows)\n\n    def _sanitize_reason(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        s = s.strip()\n        if not s:\n            return None\n        s = re.sub(r\"[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f]\", \" \", s)\n        s = re.sub(r\"\\s+\", \" \", s).strip()\n        # keep it short and log-safe\n        return s[:512]\n\n    # Validate inputs\n    if not isinstance(id, str) or not id.strip():\n        _append_log(\"validation_error\")\n        return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\")\n    if reason is not None and not isinstance(reason, str):\n        _append_log(\"validation_error\", execution_id=id)\n        return _err(\"VALIDATION_ERROR\", \"reason must be a string\")\n\n    # Load executions\n    data = _load(\"ssh_command_executions.json\")\n    rows = data.get(\"rows\", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])\n    if not isinstance(rows, list):\n        _append_log(\"error\", execution_id=id)\n        return _err(\"VALIDATION_ERROR\", \"datastore format invalid for ssh_command_executions\")\n\n    idx = None\n    for i, r in enumerate(rows):\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            idx = i\n            break\n\n    if idx is None:\n        _append_log(\"not_found\", execution_id=id)\n        return _err(\"NOT_FOUND\", \"ssh_command_execution not found\", id=id)\n\n    exec_row = rows[idx]\n    cur = exec_row.get(\"status\")\n\n    terminal = (\"succeeded\", \"failed\", \"timed_out\", \"cancelled\")\n    cancellable = (\"queued\", \"running\")\n    if cur in terminal:\n        _append_log(\"invalid_transition\", execution_id=id)\n        return _err(\"INVALID_TRANSITION\", \"execution is already terminal and cannot be cancelled\", id=id, status=cur)\n    if cur not in cancellable:\n        _append_log(\"invalid_transition\", execution_id=id)\n        return _err(\"INVALID_TRANSITION\", \"execution status cannot transition to cancelled\", id=id, status=cur)\n\n    # Apply transition\n    now = _now()\n    exec_row[\"status\"] = \"cancelled\"\n    exec_row[\"finished_at\"] = now\n    exec_row[\"updated_at\"] = now\n    # started_at remains as-is; requested_at remains as-is\n    # exit_code can remain null; enforce rule: only terminal may have exit_code (we're terminal now), don't set it.\n    sanitized = _sanitize_reason(reason)\n    exec_row[\"error_message\"] = sanitized or \"cancelled by client request\"\n\n    rows[idx] = exec_row\n    _save(\"ssh_command_executions.json\", {\"rows\": rows} if isinstance(data, dict) else rows)\n\n    _append_log(\"succeeded\", execution_id=id)\n    return {\"execution\": exec_row}\n"
+        },
+        {
+          "name": "list_ssh_targets",
+          "description": "Lists SSH targets (host/port policies) with optional filtering by status and host. Returns records including allowed_command_regex when set. Refuses invalid pagination parameters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled"
+                ],
+                "description": "Filter targets by lifecycle status."
+              },
+              "host": {
+                "type": "string",
+                "description": "Filter targets by exact host."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of records to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor returned from a previous call."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_ssh_targets(status=None, host=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0230000\" if __import__(\"os\").path.isdir(\"./environment_mix/0230000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _decode_cursor(cur):\n        try:\n            raw = base64.urlsafe_b64decode(cur.encode(\"utf-8\") + b\"===\").decode(\"utf-8\")\n            obj = json.loads(raw)\n            if not isinstance(obj, dict):\n                return None\n            return obj\n        except Exception:\n            return None\n\n    def _encode_cursor(obj):\n        raw = json.dumps(obj, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"utf-8\").rstrip(\"=\")\n\n    # Validate inputs\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"active\", \"disabled\"):\n            return _err(\"VALIDATION_ERROR\", \"Invalid status. Must be 'active' or 'disabled'.\", field=\"status\")\n    if host is not None and not isinstance(host, str):\n        return _err(\"VALIDATION_ERROR\", \"Invalid host. Must be a string.\", field=\"host\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        return _err(\"VALIDATION_ERROR\", \"Invalid limit. Must be an integer.\", field=\"limit\")\n    if limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"Invalid limit. Must be between 1 and 200.\", field=\"limit\")\n\n    start_after = None\n    if cursor is not None:\n        if not isinstance(cursor, str) or not cursor:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor. Must be a non-empty string.\", field=\"cursor\")\n        cobj = _decode_cursor(cursor)\n        if not cobj or cobj.get(\"v\") != 1 or \"after\" not in cobj:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n        start_after = cobj.get(\"after\")\n        if start_after is not None and not isinstance(start_after, str):\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n\n    # Load data\n    t0 = datetime.datetime.utcnow()\n    targets = _load(\"ssh_targets.json\")\n    if not isinstance(targets, list):\n        targets = []\n\n    # Filter\n    filtered = []\n    for r in targets:\n        if not isinstance(r, dict):\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        if host is not None and r.get(\"host\") != host:\n            continue\n        filtered.append(r)\n\n    # Sort by (created_at, id) ascending for stable pagination\n    def _k(r):\n        ca = r.get(\"created_at\") or \"\"\n        rid = r.get(\"id\") or \"\"\n        return (ca, rid)\n\n    filtered.sort(key=_k)\n\n    # Apply cursor\n    if start_after:\n        # start_after is an id; skip until strictly greater than that id within same sort order is ambiguous.\n        # We'll interpret as \"start after id\" in the sorted list by id tie-breaker and ignoring created_at mismatches.\n        # If multiple have same id (should not), still fine.\n        passed = False\n        page_candidates = []\n        for r in filtered:\n            if passed:\n                page_candidates.append(r)\n            else:\n                if r.get(\"id\") == start_after:\n                    passed = True\n        # If cursor id not found, treat as validation error (opaque but must be from previous call)\n        if not passed:\n            # Record call before returning\n            reqlog = _load(\"ssh_request_log.json\")\n            if not isinstance(reqlog, list):\n                reqlog = []\n            latency_ms = int((datetime.datetime.utcnow() - t0).total_seconds() * 1000)\n            reqlog.append({\n                \"id\": \"req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"utf-8\").rstrip(\"=\"),\n                \"endpoint\": \"list_ssh_targets\",\n                \"status\": \"error\",\n                \"error_code\": \"VALIDATION_ERROR\",\n                \"timestamp\": _now(),\n                \"latency_ms\": latency_ms\n            })\n            _save(\"ssh_request_log.json\", reqlog)\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n        filtered = page_candidates\n\n    # Page\n    page = filtered[:limit]\n    has_more = len(filtered) > limit\n    next_cursor = None\n    if has_more and page:\n        next_cursor = _encode_cursor({\"v\": 1, \"after\": page[-1].get(\"id\")})\n\n    # Record call (best-effort; create file if missing)\n    reqlog = _load(\"ssh_request_log.json\")\n    if not isinstance(reqlog, list):\n        reqlog = []\n    latency_ms = int((datetime.datetime.utcnow() - t0).total_seconds() * 1000)\n    reqlog.append({\n        \"id\": \"req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"utf-8\").rstrip(\"=\"),\n        \"endpoint\": \"list_ssh_targets\",\n        \"status\": \"ok\",\n        \"timestamp\": _now(),\n        \"latency_ms\": latency_ms\n    })\n    _save(\"ssh_request_log.json\", reqlog)\n\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": len(filtered) if cursor is None else None,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor\n        }\n    }\n"
+        },
+        {
+          "name": "upsert_ssh_target",
+          "description": "Creates a new SSH target policy or updates an existing one. Setting status drives the active<->disabled lifecycle transition; refuses invalid transitions and invalid regex syntax. Returns the persisted target record.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "If provided, updates the existing target with this id; otherwise creates a new target."
+              },
+              "host": {
+                "type": "string",
+                "description": "DNS name or IP address of the SSH host."
+              },
+              "port": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535,
+                "default": 22,
+                "description": "SSH port for the target."
+              },
+              "display_name": {
+                "type": "string",
+                "description": "Human-readable label for the target."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled"
+                ],
+                "description": "Lifecycle status for this target."
+              },
+              "allowed_command_regex": {
+                "type": "string",
+                "description": "Optional regex that commands must match when executing against this target."
+              }
+            },
+            "required": [
+              "host"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def upsert_ssh_target(host, id=None, port=None, display_name=None, status=None, allowed_command_regex=None, **_extra):\n    import json, os, datetime, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0230000\" if __import__(\"os\").path.isdir(\"./environment_mix/0230000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _gen_id(prefix):\n        return prefix + \"_\" + base64.urlsafe_b64encode(os.urandom(12)).decode(\"utf-8\").rstrip(\"=\")\n\n    def _is_nonempty_str(x):\n        return isinstance(x, str) and len(x) > 0\n\n    # Validate inputs\n    if not _is_nonempty_str(host):\n        return _err(\"VALIDATION_ERROR\", \"Invalid host. Must be a non-empty string.\", field=\"host\")\n    if len(host) < 1 or len(host) > 255:\n        return _err(\"VALIDATION_ERROR\", \"Invalid host length. Must be between 1 and 255.\", field=\"host\")\n\n    if id is not None and not isinstance(id, str):\n        return _err(\"VALIDATION_ERROR\", \"Invalid id. Must be a string.\", field=\"id\")\n\n    if port is None:\n        port = 22\n    if not isinstance(port, int):\n        return _err(\"VALIDATION_ERROR\", \"Invalid port. Must be an integer.\", field=\"port\")\n    if port < 1 or port > 65535:\n        return _err(\"VALIDATION_ERROR\", \"Invalid port. Must be between 1 and 65535.\", field=\"port\")\n\n    if display_name is not None and not isinstance(display_name, str):\n        return _err(\"VALIDATION_ERROR\", \"Invalid display_name. Must be a string.\", field=\"display_name\")\n\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"active\", \"disabled\"):\n            return _err(\"VALIDATION_ERROR\", \"Invalid status. Must be 'active' or 'disabled'.\", field=\"status\")\n\n    if allowed_command_regex is not None:\n        if not isinstance(allowed_command_regex, str):\n            return _err(\"VALIDATION_ERROR\", \"Invalid allowed_command_regex. Must be a string.\", field=\"allowed_command_regex\")\n        # Validate regex syntax\n        try:\n            re.compile(allowed_command_regex)\n        except re.error as e:\n            return _err(\"VALIDATION_ERROR\", \"Invalid allowed_command_regex syntax.\", field=\"allowed_command_regex\", details=str(e))\n\n    t0 = datetime.datetime.utcnow()\n    targets = _load(\"ssh_targets.json\")\n    if not isinstance(targets, list):\n        targets = []\n\n    now = _now()\n\n    # Find existing\n    existing = None\n    existing_idx = None\n    if id is not None:\n        for i, r in enumerate(targets):\n            if isinstance(r, dict) and r.get(\"id\") == id:\n                existing = r\n                existing_idx = i\n                break\n        if existing is None:\n            # Record request log\n            reqlog = _load(\"ssh_request_log.json\")\n            if not isinstance(reqlog, list):\n                reqlog = []\n            latency_ms = int((datetime.datetime.utcnow() - t0).total_seconds() * 1000)\n            reqlog.append({\n                \"id\": _gen_id(\"req\"),\n                \"endpoint\": \"upsert_ssh_target\",\n                \"status\": \"error\",\n                \"error_code\": \"NOT_FOUND\",\n                \"timestamp\": now,\n                \"latency_ms\": latency_ms\n            })\n            _save(\"ssh_request_log.json\", reqlog)\n            return _err(\"NOT_FOUND\", \"SSH target not found.\", id=id)\n\n    # Unique(host, port) constraint\n    for r in targets:\n        if not isinstance(r, dict):\n            continue\n        if existing is not None and r.get(\"id\") == existing.get(\"id\"):\n            continue\n        if r.get(\"host\") == host and r.get(\"port\") == port:\n            return _err(\"CONFLICT\", \"A target with the same host and port already exists.\", host=host, port=port)\n\n    # If updating, enforce lifecycle transitions when status changes\n    if existing is not None:\n        new_status = existing.get(\"status\")\n        if status is not None:\n            old_status = existing.get(\"status\")\n            if old_status not in (\"active\", \"disabled\"):\n                return _err(\"INVALID_TRANSITION\", \"Existing target has invalid status; cannot transition.\", from_status=old_status, to_status=status)\n            if status != old_status:\n                allowed = {\"active\": [\"disabled\"], \"disabled\": [\"active\"]}.get(old_status, [])\n                if status not in allowed:\n                    return _err(\"INVALID_TRANSITION\", \"Invalid status transition.\", from_status=old_status, to_status=status)\n                new_status = status\n\n        updated = dict(existing)\n        updated[\"host\"] = host\n        updated[\"port\"] = port\n        if display_name is not None:\n            updated[\"display_name\"] = display_name\n        # allowed_command_regex: allow explicit None to clear if provided as None? Parameter None means \"omit\" here.\n        if allowed_command_regex is not None:\n            updated[\"allowed_command_regex\"] = allowed_command_regex\n        if status is not None:\n            updated[\"status\"] = new_status\n        updated[\"updated_at\"] = now\n\n        targets[existing_idx] = updated\n        _save(\"ssh_targets.json\", targets)\n\n        reqlog = _load(\"ssh_request_log.json\")\n        if not isinstance(reqlog, list):\n            reqlog = []\n        latency_ms = int((datetime.datetime.utcnow() - t0).total_seconds() * 1000)\n        reqlog.append({\n            \"id\": _gen_id(\"req\"),\n            \"endpoint\": \"upsert_ssh_target\",\n            \"status\": \"ok\",\n            \"timestamp\": now,\n            \"latency_ms\": latency_ms\n        })\n        _save(\"ssh_request_log.json\", reqlog)\n\n        return {\"data\": updated}\n\n    # Creating new\n    new_id = _gen_id(\"tgt\")\n    new_status = status if status is not None else \"active\"\n    if new_status not in (\"active\", \"disabled\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid status. Must be 'active' or 'disabled'.\", field=\"status\")\n\n    row = {\n        \"id\": new_id,\n        \"host\": host,\n        \"port\": port,\n        \"display_name\": display_name if display_name is not None else None,\n        \"status\": new_status,\n        \"allowed_command_regex\": allowed_command_regex if allowed_command_regex is not None else None,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n    targets.append(row)\n    _save(\"ssh_targets.json\", targets)\n\n    reqlog = _load(\"ssh_request_log.json\")\n    if not isinstance(reqlog, list):\n        reqlog = []\n    latency_ms = int((datetime.datetime.utcnow() - t0).total_seconds() * 1000)\n    reqlog.append({\n        \"id\": _gen_id(\"req\"),\n        \"endpoint\": \"upsert_ssh_target\",\n        \"status\": \"ok\",\n        \"timestamp\": now,\n        \"latency_ms\": latency_ms\n    })\n    _save(\"ssh_request_log.json\", reqlog)\n\n    return {\"data\": row}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0230000",
+    "index": 230,
+    "name": "SSH Server",
+    "description": "This backend stores SSH connection profiles (hosts/users/ports and credential references) and a durable audit log of SSH command executions. The main workflow is: a client submits an execute request, the system resolves credentials, runs the command on the remote host, stores stdout/stderr/exit code",
+    "taxonomy": {
+      "L1_id": "L1-08",
+      "L1_name": "System & Cloud Infrastructure",
+      "L1_name_zh": "系统与云基础设施",
+      "L2_id": "L2-20",
+      "L2_name": "Shell & Terminal Operations",
+      "L2_name_zh": "Shell 与终端操作",
+      "L3_name": "Remote Access via SSH/FTP",
+      "L3_name_zh": "通过SSH/FTP的远程访问"
+    },
+    "database_dir": "./environment_mix/0230000",
+    "mount_path": "/app/database",
+    "n_tools": 6,
+    "n_collections": 5,
+    "n_records": 91,
+    "n_questions": 1,
+    "execution_audit": {
+      "tools": 6,
+      "loaded": 6,
+      "reads_returning_data": 2,
+      "read_operations": 3,
+      "mutations_persisted": 2,
+      "mutations_attempted": 3
+    },
+    "tools_loadable_from_database_dir": 6,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_ssh_command_executions",
+      "returned_chars": 83
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

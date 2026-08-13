@@ -1,0 +1,406 @@
+{
+  "index": 302,
+  "local_files_dir": "./environment_mix/0302000",
+  "file_list": [
+    "./environment_mix/0302000/README.md",
+    "./environment_mix/0302000/cached_messages.json",
+    "./environment_mix/0302000/ingest_runs.json",
+    "./environment_mix/0302000/request_logs.json",
+    "./environment_mix/0302000/servers.json",
+    "./environment_mix/0302000/topic_subscriptions.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "servers.json": "12 rows",
+        "topic_subscriptions.json": "12 rows",
+        "cached_messages.json": "36 rows",
+        "ingest_runs.json": "30 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "ntfy_me",
+          "description": "Registers a new ntfy-me server instance and its topic subscriptions, returning the created server record and the created subscription records. Validates that `server.display_name` and `server.base_url` are provided, that any provided `server.status` is one of `provisioning|active|paused|degraded|deleted`, and that each subscription includes a `topic` and any provided subscription `status` is one of `active|paused|deleted`. Raises VALIDATION_ERROR for malformed or missing required fields, UNAUTHORIZED/FORBIDDEN if the caller cannot create deployments, and CONFLICT if the server or a subscription for the same topic already exists for this deployment.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "server": {
+                "type": "object",
+                "description": "Server instance to create/register for this ntfy-me-mcp deployment.",
+                "properties": {
+                  "display_name": {
+                    "type": "string",
+                    "description": "Human-friendly name for the server instance."
+                  },
+                  "base_url": {
+                    "type": "string",
+                    "description": "Base URL of the upstream ntfy server (e.g., https://ntfy.sh)."
+                  },
+                  "default_fetch_limit": {
+                    "type": "integer",
+                    "description": "Default maximum number of messages to fetch per retrieval/ingest cycle."
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "provisioning",
+                      "active",
+                      "paused",
+                      "degraded",
+                      "deleted"
+                    ],
+                    "description": "Lifecycle status for the server instance."
+                  }
+                },
+                "required": [
+                  "display_name",
+                  "base_url"
+                ],
+                "additionalProperties": false
+              },
+              "subscriptions": {
+                "type": "array",
+                "description": "List of topic subscriptions to create for the server instance.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "topic": {
+                      "type": "string",
+                      "description": "ntfy topic name to subscribe to."
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "active",
+                        "paused",
+                        "deleted"
+                      ],
+                      "description": "Subscription status."
+                    },
+                    "since_event_id": {
+                      "type": "string",
+                      "description": "Upstream event id to resume ingestion from (if known)."
+                    }
+                  },
+                  "required": [
+                    "topic"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "server",
+              "subscriptions"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def ntfy_me(server, subscriptions, **_extra):\n    import json, os, datetime, re, time, base64, secrets, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0302000\" if __import__(\"os\").path.isdir(\"./environment_mix/0302000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _record_audit(endpoint, status, server_id=None, detail=None):\n        # Best-effort: service may not have an audit collection in this schema batch\n        try:\n            audits = _load(\"request_logs.json\")\n            if not isinstance(audits, list):\n                audits = []\n            audits.append({\n                \"id\": \"req_\" + secrets.token_hex(12),\n                \"endpoint\": endpoint,\n                \"server_id\": server_id,\n                \"status\": status,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"detail\": detail,\n                \"timestamp\": _now()\n            })\n            _save(\"request_logs.json\", audits)\n        except Exception:\n            return\n\n    # Validation\n    if not isinstance(server, dict):\n        _record_audit(\"ntfy_me\", \"error\", detail=\"server not object\")\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'server' must be an object.\")\n    if not isinstance(subscriptions, list):\n        _record_audit(\"ntfy_me\", \"error\", detail=\"subscriptions not array\")\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'subscriptions' must be an array.\")\n\n    allowed_server_keys = {\"display_name\", \"base_url\", \"default_fetch_limit\", \"status\"}\n    if any(k not in allowed_server_keys for k in server.keys()):\n        _record_audit(\"ntfy_me\", \"error\", detail=\"server additionalProperties\")\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'server' contains unknown fields.\")\n    if \"display_name\" not in server or \"base_url\" not in server:\n        _record_audit(\"ntfy_me\", \"error\", detail=\"missing required server fields\")\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'server.display_name' and 'server.base_url' are required.\")\n    if not isinstance(server.get(\"display_name\"), str) or not server[\"display_name\"].strip():\n        _record_audit(\"ntfy_me\", \"error\", detail=\"bad display_name\")\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'server.display_name' must be a non-empty string.\")\n    if not isinstance(server.get(\"base_url\"), str) or not server[\"base_url\"].strip():\n        _record_audit(\"ntfy_me\", \"error\", detail=\"bad base_url\")\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'server.base_url' must be a non-empty string.\")\n    if not server[\"base_url\"].startswith(\"http\"):\n        _record_audit(\"ntfy_me\", \"error\", detail=\"base_url constraint\")\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'server.base_url' must start with 'http'.\")\n\n    srv_status = server.get(\"status\", \"provisioning\")\n    if srv_status not in [\"provisioning\", \"active\", \"paused\", \"degraded\", \"deleted\"]:\n        _record_audit(\"ntfy_me\", \"error\", detail=\"bad server status\")\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'server.status' must be one of provisioning|active|paused|degraded|deleted.\")\n\n    dfl = server.get(\"default_fetch_limit\", 50)\n    if dfl is None:\n        dfl = 50\n    if not isinstance(dfl, int):\n        _record_audit(\"ntfy_me\", \"error\", detail=\"bad default_fetch_limit type\")\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'server.default_fetch_limit' must be an integer.\")\n    if dfl < 1 or dfl > 500:\n        _record_audit(\"ntfy_me\", \"error\", detail=\"default_fetch_limit range\")\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'server.default_fetch_limit' must be between 1 and 500.\")\n\n    # Validate subscriptions list\n    seen_topics = set()\n    norm_subs = []\n    for i, sub in enumerate(subscriptions):\n        if not isinstance(sub, dict):\n            _record_audit(\"ntfy_me\", \"error\", detail=f\"subscription[{i}] not object\")\n            return _err(\"VALIDATION_ERROR\", f\"subscriptions[{i}] must be an object.\")\n        allowed_sub_keys = {\"topic\", \"status\", \"since_event_id\"}\n        if any(k not in allowed_sub_keys for k in sub.keys()):\n            _record_audit(\"ntfy_me\", \"error\", detail=f\"subscription[{i}] additionalProperties\")\n            return _err(\"VALIDATION_ERROR\", f\"subscriptions[{i}] contains unknown fields.\")\n        if \"topic\" not in sub:\n            _record_audit(\"ntfy_me\", \"error\", detail=f\"subscription[{i}] missing topic\")\n            return _err(\"VALIDATION_ERROR\", f\"subscriptions[{i}].topic is required.\")\n        if not isinstance(sub[\"topic\"], str) or sub[\"topic\"] == \"\":\n            _record_audit(\"ntfy_me\", \"error\", detail=f\"subscription[{i}] empty topic\")\n            return _err(\"VALIDATION_ERROR\", f\"subscriptions[{i}].topic must be a non-empty string.\")\n        topic = sub[\"topic\"]\n        if topic in seen_topics:\n            _record_audit(\"ntfy_me\", \"error\", detail=f\"duplicate topic in request: {topic}\")\n            return _err(\"VALIDATION_ERROR\", f\"Duplicate topic in subscriptions: '{topic}'.\")\n        seen_topics.add(topic)\n\n        st = sub.get(\"status\", \"active\")\n        if st not in [\"active\", \"paused\", \"deleted\"]:\n            _record_audit(\"ntfy_me\", \"error\", detail=f\"subscription[{i}] bad status\")\n            return _err(\"VALIDATION_ERROR\", f\"subscriptions[{i}].status must be one of active|paused|deleted.\")\n        since_event_id = sub.get(\"since_event_id\", None)\n        if since_event_id is not None and not isinstance(since_event_id, str):\n            _record_audit(\"ntfy_me\", \"error\", detail=f\"subscription[{i}] bad since_event_id\")\n            return _err(\"VALIDATION_ERROR\", f\"subscriptions[{i}].since_event_id must be a string if provided.\")\n\n        norm_subs.append({\"topic\": topic, \"status\": st, \"since_event_id\": since_event_id})\n\n    servers = _load(\"servers.json\")\n    subs_store = _load(\"topic_subscriptions.json\")\n\n    if not isinstance(servers, list): servers = []\n    if not isinstance(subs_store, list): subs_store = []\n\n    def _gen_id(prefix):\n        # Uppercase base32-ish token to satisfy ^ntfy_srv_[0-9A-Z]{18,}$\n        raw = secrets.token_bytes(16)\n        token = base64.b32encode(raw).decode(\"ascii\").rstrip(\"=\")\n        return f\"{prefix}{token}\"\n\n    # Idempotency/fingerprint: base_url + display_name\n    fingerprint = hashlib.sha256((server[\"display_name\"].strip() + \"|\" + server[\"base_url\"].strip()).encode(\"utf-8\")).hexdigest()\n\n    # Find an existing active server matching the same display_name OR fingerprint/base_url+display_name\n    existing_active = None\n    for s in servers:\n        try:\n            if s.get(\"status\") == \"active\" and (s.get(\"display_name\") == server[\"display_name\"]):\n                existing_active = s\n                break\n        except Exception:\n            continue\n\n    # If active server exists, be idempotent and return it (and ensure requested subscriptions exist; create missing)\n    # Also honor unique(display_name) constraint: if display_name already exists with non-deleted status, reuse that server.\n    reuse_server = existing_active\n    if reuse_server is None:\n        for s in servers:\n            if s.get(\"display_name\") == server[\"display_name\"] and s.get(\"status\") != \"deleted\":\n                reuse_server = s\n                break\n\n    created_subs = []\n    updated_subs = []\n    created_server = False\n    now = _now()\n\n    if reuse_server is None:\n        srv_id = _gen_id(\"ntfy_srv_\")\n        # Start in provisioning; will promote to active only after at least one active subscription exists.\n        new_srv = {\n            \"id\": srv_id,\n            \"display_name\": server[\"display_name\"],\n            \"base_url\": server[\"base_url\"],\n            \"default_fetch_limit\": dfl,\n            \"status\": \"provisioning\" if srv_status == \"active\" else srv_status,\n            \"last_ingest_at\": None,\n            \"created_at\": now,\n            \"updated_at\": now\n        }\n        # Enforce unique(display_name)\n        if any(s.get(\"display_name\") == new_srv[\"display_name\"] and s.get(\"status\") != \"deleted\" for s in servers):\n            _record_audit(\"ntfy_me\", \"error\", detail=\"unique(display_name) conflict\")\n            return _err(\"CONFLICT\", \"A server with this display_name already exists.\")\n        servers.append(new_srv)\n        reuse_server = new_srv\n        created_server = True\n    else:\n        # Update selected configuration fields idempotently (do not violate transitions)\n        changed = False\n        if reuse_server.get(\"base_url\") != server[\"base_url\"]:\n            # For safety, treat as conflict if attempting to change base_url for same display_name.\n            _record_audit(\"ntfy_me\", \"error\", server_id=reuse_server.get(\"id\"), detail=\"attempt base_url change\")\n            return _err(\"CONFLICT\", \"A server with this display_name already exists with a different base_url.\")\n        if reuse_server.get(\"default_fetch_limit\") != dfl:\n            reuse_server[\"default_fetch_limit\"] = dfl\n            changed = True\n        # We won't force status to requested if it would be illegal; ntfy_me owns activation rule.\n        if changed:\n            reuse_server[\"updated_at\"] = now\n\n    # Create or update subscriptions\n    # Enforce unique(server_id, topic)\n    srv = reuse_server\n    srv_id = srv[\"id\"]\n\n    def _subscription_for(server_id, topic):\n        for r in subs_store:\n            if r.get(\"server_id\") == server_id and r.get(\"topic\") == topic and r.get(\"status\") != \"deleted\":\n                return r\n        return None\n\n    for sub in norm_subs:\n        existing = _subscription_for(srv_id, sub[\"topic\"])\n        if existing is None:\n            # If subscription wants to be active, parent server must be active or degraded\n            # But if server currently provisioning/paused, we can still create subscription as paused unless requested active.\n            desired_status = sub[\"status\"]\n            if desired_status == \"active\" and srv.get(\"status\") not in [\"active\", \"degraded\", \"provisioning\"]:\n                _record_audit(\"ntfy_me\", \"error\", server_id=srv_id, detail=\"cannot activate subscription for paused/deleted server\")\n                return _err(\"INVALID_TRANSITION\", \"Cannot create an active subscription for a paused/deleted server.\")\n            if desired_status == \"active\" and srv.get(\"status\") in [\"paused\", \"deleted\"]:\n                _record_audit(\"ntfy_me\", \"error\", server_id=srv_id, detail=\"cannot activate subscription for paused/deleted server\")\n                return _err(\"INVALID_TRANSITION\", \"Cannot create an active subscription for a paused/deleted server.\")\n            # If server is provisioning and sub is active, allow creation but server will be promoted to active after creation.\n            sub_id = _gen_id(\"ntfy_sub_\")\n            row = {\n                \"id\": sub_id,\n                \"server_id\": srv_id,\n                \"topic\": sub[\"topic\"],\n                \"status\": desired_status,\n                \"since_event_id\": sub.get(\"since_event_id\"),\n                \"last_polled_at\": None,\n                \"created_at\": now,\n                \"updated_at\": now\n            }\n            subs_store.append(row)\n            created_subs.append(row)\n        else:\n            # Idempotent update of since_event_id and status if legal\n            changed = False\n            if sub.get(\"since_event_id\") is not None and existing.get(\"since_event_id\") != sub.get(\"since_event_id\"):\n                existing[\"since_event_id\"] = sub.get(\"since_event_id\")\n                changed = True\n            desired_status = sub[\"status\"]\n            if desired_status != existing.get(\"status\"):\n                transitions = {\n                    \"active\": [\"paused\", \"deleted\"],\n                    \"paused\": [\"active\", \"deleted\"],\n                    \"deleted\": []\n                }\n                cur = existing.get(\"status\")\n                if desired_status not in transitions.get(cur, []):\n                    _record_audit(\"ntfy_me\", \"error\", server_id=srv_id, detail=\"illegal subscription transition\")\n                    return _err(\"INVALID_TRANSITION\", f\"Illegal subscription status transition {cur} -> {desired_status}.\")\n                # If activating, parent server must be active or degraded (or provisioning will be promoted by this operation)\n                if desired_status == \"active\" and srv.get(\"status\") in [\"paused\", \"deleted\"]:\n                    _record_audit(\"ntfy_me\", \"error\", server_id=srv_id, detail=\"activate subscription blocked by server status\")\n                    return _err(\"INVALID_TRANSITION\", \"Cannot activate a subscription for a paused/deleted server.\")\n                existing[\"status\"] = desired_status\n                changed = True\n            if changed:\n                existing[\"updated_at\"] = now\n                updated_subs.append(existing)\n\n    # Enforce server activation rule:\n    # server.status becomes active only after at least one active subscription exists\n    has_active_sub = any(r.get(\"server_id\") == srv_id and r.get(\"status\") == \"active\" for r in subs_store)\n    if has_active_sub:\n        # Only move to active if not deleted and transition is legal\n        cur = srv.get(\"status\")\n        transitions_srv = {\n            \"provisioning\": [\"active\", \"degraded\", \"deleted\"],\n            \"active\": [\"paused\", \"degraded\", \"deleted\"],\n            \"paused\": [\"active\", \"deleted\"],\n            \"degraded\": [\"active\", \"paused\", \"deleted\"],\n            \"deleted\": []\n        }\n        if cur != \"active\":\n            if \"active\" in transitions_srv.get(cur, []):\n                srv[\"status\"] = \"active\"\n                srv[\"updated_at\"] = _now()\n            # else leave as-is (e.g., deleted)\n    else:\n        # If requested active but we failed to create any active subs, leave server non-active (paused/degraded/provisioning)\n        if srv.get(\"status\") == \"active\":\n            # Should not happen: only promote after active subs\n            srv[\"status\"] = \"provisioning\"\n            srv[\"updated_at\"] = _now()\n\n    _save(\"servers.json\", servers)\n    _save(\"topic_subscriptions.json\", subs_store)\n\n    # Return all relevant subscriptions for this server (non-deleted), similar to \"created subscription records\"\n    all_subs = [r for r in subs_store if r.get(\"server_id\") == srv_id and r.get(\"status\") != \"deleted\"]\n\n    _record_audit(\"ntfy_me\", \"ok\", server_id=srv_id)\n    return {\n        \"server\": srv,\n        \"subscriptions\": all_subs,\n        \"created\": {\"server\": created_server, \"subscriptions\": len(created_subs)},\n        \"updated\": {\"subscriptions\": len(updated_subs)}\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "ntfy_me_fetch",
+          "description": "Returns cached notifications for the specified server instance as a paged list, honoring `limit` (or the server’s configured default) and `cursor` to continue from a prior page; the response includes a next cursor when more results are available. Raises VALIDATION_ERROR if `server_id` does not match `^ntfy_srv_[0-9A-Z]{18,}$`, if `limit` is not a positive integer, or if `cursor` is invalid for the requested server. Raises NOT_FOUND if `server_id` does not exist (or has been deleted), FORBIDDEN if the caller cannot read that server’s cache, and CONFLICT if the server is not in a readable state (for example, still provisioning).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "server_id": {
+                "type": "string",
+                "pattern": "^ntfy_srv_[0-9A-Z]{18,}$",
+                "description": "ID of the ntfy-me server instance whose cached messages should be fetched."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of cached messages to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for continuing a previous fetch."
+              }
+            },
+            "required": [
+              "server_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def ntfy_me_fetch(server_id, limit=None, cursor=None, **_extra):\n    import json, os, datetime, re, time, base64, secrets\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0302000\" if __import__(\"os\").path.isdir(\"./environment_mix/0302000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _record_audit(endpoint, status, server_id=None, detail=None):\n        try:\n            audits = _load(\"request_logs.json\")\n            if not isinstance(audits, list):\n                audits = []\n            audits.append({\n                \"id\": \"req_\" + secrets.token_hex(12),\n                \"endpoint\": endpoint,\n                \"server_id\": server_id,\n                \"status\": status,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"detail\": detail,\n                \"timestamp\": _now()\n            })\n            _save(\"request_logs.json\", audits)\n        except Exception:\n            return\n\n    if not isinstance(server_id, str) or not re.match(r\"^ntfy_srv_[0-9A-Z]{18,}$\", server_id):\n        _record_audit(\"ntfy_me_fetch\", \"error\", detail=\"bad server_id format\")\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'server_id' is invalid.\", field=\"server_id\")\n\n    if limit is not None:\n        if not isinstance(limit, int) or limit <= 0:\n            _record_audit(\"ntfy_me_fetch\", \"error\", server_id=server_id, detail=\"bad limit\")\n            return _err(\"VALIDATION_ERROR\", \"Parameter 'limit' must be a positive integer.\", field=\"limit\")\n\n    if cursor is not None and not isinstance(cursor, str):\n        _record_audit(\"ntfy_me_fetch\", \"error\", server_id=server_id, detail=\"cursor not string\")\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'cursor' must be a string.\", field=\"cursor\")\n\n    servers = _load(\"servers.json\")\n    cached = _load(\"cached_messages.json\")\n    if not isinstance(servers, list): servers = []\n    if not isinstance(cached, list): cached = []\n\n    srv = next((s for s in servers if s.get(\"id\") == server_id), None)\n    if srv is None:\n        _record_audit(\"ntfy_me_fetch\", \"error\", server_id=server_id, detail=\"server not found\")\n        return _err(\"NOT_FOUND\", \"Server not found.\", server_id=server_id)\n\n    # Business rule: fetch only for active server\n    if srv.get(\"status\") != \"active\":\n        _record_audit(\"ntfy_me_fetch\", \"ok\", server_id=server_id, detail=\"server not active => empty\")\n        return {\"server_id\": server_id, \"messages\": [], \"total\": 0, \"has_more\": False, \"next_cursor\": None}\n\n    eff_limit = limit if limit is not None else srv.get(\"default_fetch_limit\", 50)\n    if not isinstance(eff_limit, int) or eff_limit <= 0:\n        eff_limit = 50\n\n    # Cursor format: base64url of \"received_at|id\"\n    def _encode_cursor(received_at, mid):\n        payload = (received_at or \"\") + \"|\" + (mid or \"\")\n        return base64.urlsafe_b64encode(payload.encode(\"utf-8\")).decode(\"ascii\").rstrip(\"=\")\n\n    def _decode_cursor(c):\n        try:\n            pad = \"=\" * (-len(c) % 4)\n            raw = base64.urlsafe_b64decode((c + pad).encode(\"ascii\")).decode(\"utf-8\")\n            parts = raw.split(\"|\", 1)\n            if len(parts) != 2:\n                return None\n            return {\"received_at\": parts[0], \"id\": parts[1]}\n        except Exception:\n            return None\n\n    anchor = None\n    if cursor:\n        anchor = _decode_cursor(cursor)\n        if not anchor or \"received_at\" not in anchor or \"id\" not in anchor:\n            _record_audit(\"ntfy_me_fetch\", \"error\", server_id=server_id, detail=\"invalid cursor decode\")\n            return _err(\"VALIDATION_ERROR\", \"Parameter 'cursor' is invalid.\", field=\"cursor\")\n\n    # Filter: server_id, not deleted\n    rows = [m for m in cached if m.get(\"server_id\") == server_id and m.get(\"status\") != \"deleted\"]\n\n    # Sort newest first by received_at then id\n    def _key(m):\n        return (m.get(\"received_at\") or \"\", m.get(\"id\") or \"\")\n    rows.sort(key=_key, reverse=True)\n\n    if anchor:\n        # Start after anchor in the sorted order\n        a_rec = anchor[\"received_at\"]\n        a_id = anchor[\"id\"]\n        def _after(m):\n            return _key(m) < (a_rec, a_id)  # because list is reverse-sorted\n        rows = [m for m in rows if _after(m)]\n\n    page = rows[:eff_limit]\n    has_more = len(rows) > len(page)\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        next_cursor = _encode_cursor(last.get(\"received_at\"), last.get(\"id\"))\n\n    _record_audit(\"ntfy_me_fetch\", \"ok\", server_id=server_id)\n    return {\n        \"server_id\": server_id,\n        \"messages\": page,\n        \"total\": len(rows) + (0 if anchor is None else 0),  # total remaining from cursor position\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n        \"limit\": eff_limit\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "ntfy_me_servers_list",
+          "description": "Lists registered ntfy-me server instances visible to the caller, optionally filtered by lifecycle status and paged with limit/cursor; returns server records and a next cursor when more results are available, and refuses invalid status values or cursors.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "provisioning",
+                  "active",
+                  "paused",
+                  "degraded",
+                  "deleted"
+                ],
+                "description": "If provided, only return servers in this lifecycle status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of servers to return (default 50)."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a prior list response."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def ntfy_me_servers_list(status=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, secrets, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0302000\" if __import__(\"os\").path.isdir(\"./environment_mix/0302000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _record_log(status_s, error=None, extra=None):\n        # Best-effort: absence/parse errors must not break endpoint.\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": \"req_\" + secrets.token_hex(12),\n            \"endpoint\": \"ntfy_me_servers_list\",\n            \"status\": status_s,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": _now_iso(),\n        }\n        if error is not None:\n            row[\"error\"] = error\n        if extra is not None:\n            row[\"detail\"] = extra\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    # Validate inputs (relaxed cursor acceptance: allow opaque cursor values like server ids,\n    # or base64 cursors from prior implementations; only reject non-strings)\n    allowed_status = [\"provisioning\", \"active\", \"paused\", \"degraded\", \"deleted\"]\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            e = _err(\"VALIDATION_ERROR\", \"Parameter 'status' is invalid.\", field=\"status\")\n            _record_log(\"error\", error=e[\"error\"])\n            return e\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        e = _err(\"VALIDATION_ERROR\", \"Parameter 'limit' must be an integer between 1 and 200.\", field=\"limit\")\n        _record_log(\"error\", error=e[\"error\"])\n        return e\n\n    if cursor is not None and not isinstance(cursor, str):\n        e = _err(\"VALIDATION_ERROR\", \"Parameter 'cursor' must be a string.\", field=\"cursor\")\n        _record_log(\"error\", error=e[\"error\"])\n        return e\n\n    servers = _load(\"servers.json\")\n    if isinstance(servers, dict) and \"rows\" in servers:\n        # Defensive: some stores might wrap; but schema expects list. If this happens, treat as empty.\n        servers = []\n    if not isinstance(servers, list):\n        servers = []\n\n    # Filter by status\n    filtered = []\n    for s in servers:\n        if not isinstance(s, dict):\n            continue\n        if status is not None and s.get(\"status\") != status:\n            continue\n        filtered.append(s)\n\n    # Stable sort: created_at desc, then id desc (string compare as tie-breaker)\n    def _key(row):\n        ca = row.get(\"created_at\")\n        if not isinstance(ca, str):\n            ca = \"\"\n        rid = row.get(\"id\")\n        if not isinstance(rid, str):\n            rid = \"\"\n        return (ca, rid)\n\n    filtered.sort(key=_key, reverse=True)\n\n    # Cursor handling:\n    # - Accept either:\n    #   a) an opaque base64url cursor encoding \"created_at|id\" (legacy)\n    #   b) a raw server id (as seen in audit defect example)\n    # In either case, if it doesn't match any row, return empty page (not an error).\n    start_index = 0\n    if cursor:\n        decoded_ca = None\n        decoded_id = None\n\n        # Try base64url decode first; if that fails, treat cursor as raw id\n        try:\n            pad = \"=\" * (-len(cursor) % 4)\n            payload = base64.urlsafe_b64decode((cursor + pad).encode(\"ascii\")).decode(\"utf-8\", \"strict\")\n            if \"|\" in payload:\n                parts = payload.split(\"|\", 1)\n                decoded_ca = parts[0] if parts[0] != \"\" else None\n                decoded_id = parts[1] if parts[1] != \"\" else None\n        except Exception:\n            decoded_ca = None\n            decoded_id = None\n\n        if decoded_ca is not None or decoded_id is not None:\n            # Find the row matching the decoded pair; then start after it\n            found = False\n            for i, r in enumerate(filtered):\n                if (decoded_ca is None or r.get(\"created_at\") == decoded_ca) and (decoded_id is None or r.get(\"id\") == decoded_id):\n                    start_index = i + 1\n                    found = True\n                    break\n            if not found:\n                # Not an error; empty results for cursor beyond dataset\n                start_index = len(filtered)\n        else:\n            # Treat as raw id\n            found = False\n            for i, r in enumerate(filtered):\n                if r.get(\"id\") == cursor:\n                    start_index = i + 1\n                    found = True\n                    break\n            if not found:\n                start_index = len(filtered)\n\n    page = filtered[start_index:start_index + limit]\n\n    # Next cursor if more results\n    next_cursor = None\n    has_more = start_index + limit < len(filtered)\n    if has_more and page:\n        last = page[-1]\n        # Emit base64url cursor of \"created_at|id\" (opaque)\n        ca = last.get(\"created_at\") if isinstance(last.get(\"created_at\"), str) else \"\"\n        sid = last.get(\"id\") if isinstance(last.get(\"id\"), str) else \"\"\n        payload = f\"{ca}|{sid}\".encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(payload).decode(\"ascii\").rstrip(\"=\")\n\n    resp = {\n        \"servers\": page,\n        \"total\": len(filtered),\n        \"limit\": limit,\n        \"has_more\": bool(has_more),\n        \"next_cursor\": next_cursor\n    }\n    _record_log(\"ok\")\n    return resp\n"
+        },
+        {
+          "name": "ntfy_me_servers_get",
+          "description": "Fetches a single ntfy-me server instance by id; returns the server record if found and visible to the caller, or refuses with NOT_FOUND if the id does not exist/ is not accessible and VALIDATION_ERROR if the id format is invalid.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "server_id": {
+                "type": "string",
+                "pattern": "^ntfy_srv_[0-9A-Z]{18,}$",
+                "description": "ID of the ntfy-me server instance to retrieve."
+              }
+            },
+            "required": [
+              "server_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def ntfy_me_servers_get(server_id, **_extra):\n    import json, os, datetime, re, time, secrets\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0302000\" if __import__(\"os\").path.isdir(\"./environment_mix/0302000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _record_audit(endpoint, status, server_id=None, detail=None):\n        try:\n            audits = _load(\"request_logs.json\")\n            if not isinstance(audits, list):\n                audits = []\n            audits.append({\n                \"id\": \"req_\" + secrets.token_hex(12),\n                \"endpoint\": endpoint,\n                \"server_id\": server_id,\n                \"status\": status,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"detail\": detail,\n                \"timestamp\": _now()\n            })\n            _save(\"request_logs.json\", audits)\n        except Exception:\n            return\n\n    if not isinstance(server_id, str) or not re.match(r\"^ntfy_srv_[0-9A-Z]{18,}$\", server_id):\n        _record_audit(\"ntfy_me_servers_get\", \"error\", detail=\"bad server_id format\")\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'server_id' is invalid.\", field=\"server_id\")\n\n    servers = _load(\"servers.json\")\n    if not isinstance(servers, list): servers = []\n\n    srv = next((s for s in servers if s.get(\"id\") == server_id), None)\n    if srv is None:\n        _record_audit(\"ntfy_me_servers_get\", \"error\", server_id=server_id, detail=\"not found\")\n        return _err(\"NOT_FOUND\", \"Server not found.\", server_id=server_id)\n\n    _record_audit(\"ntfy_me_servers_get\", \"ok\", server_id=server_id)\n    return {\"server\": srv}\n"
+        },
+        {
+          "name": "ntfy_me_servers_update",
+          "description": "Updates mutable fields of an existing ntfy-me server instance and/or drives allowed lifecycle transitions via `status`; returns the updated server record and refuses invalid transitions (e.g., deleted is terminal) or invalid field values.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "server_id": {
+                "type": "string",
+                "pattern": "^ntfy_srv_[0-9A-Z]{18,}$",
+                "description": "ID of the ntfy-me server instance to update."
+              },
+              "display_name": {
+                "type": "string",
+                "description": "New human-friendly name for the server instance."
+              },
+              "base_url": {
+                "type": "string",
+                "description": "New base URL of the upstream ntfy server."
+              },
+              "default_fetch_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "New default maximum number of messages to fetch per retrieval/ingest cycle."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "provisioning",
+                  "active",
+                  "paused",
+                  "degraded",
+                  "deleted"
+                ],
+                "description": "New lifecycle status for the server instance; must be a valid transition from the current status."
+              }
+            },
+            "required": [
+              "server_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def ntfy_me_servers_update(server_id, display_name=None, base_url=None, default_fetch_limit=None, status=None, **_extra):\n    import json, os, datetime, time, re, uuid\n\n    _t0 = time.time()\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0302000\" if __import__(\"os\").path.isdir(\"./environment_mix/0302000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status_code, server_id=None, resource_id=None, details=None):\n        # Best-effort request logging if a log collection exists; ignore if not part of schema.\n        fname_candidates = [\"request_logs.json\", \"requests.json\", \"audit_logs.json\", \"usage_logs.json\"]\n        row = {\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"status\": status_code,\n            \"server_id\": server_id,\n            \"resource_id\": resource_id,\n            \"details\": details or {},\n            \"latency_ms\": int((time.time() - _t0) * 1000),\n            \"created_at\": _now(),\n        }\n        for fn in fname_candidates:\n            p = os.path.join(_DB, fn)\n            if os.path.exists(p):\n                data = _load(fn)\n                if isinstance(data, list):\n                    data.append(row)\n                    _save(fn, data)\n                break\n\n    endpoint = \"ntfy_me_servers_update\"\n\n    # Validate inputs\n    if not isinstance(server_id, str) or not re.match(r\"^ntfy_srv_[0-9A-Z]{18,}$\", server_id):\n        _log(endpoint, \"error\", server_id=server_id, details={\"field\": \"server_id\"})\n        return _err(\"VALIDATION_ERROR\", \"Invalid server_id.\", field=\"server_id\")\n\n    if display_name is not None and not isinstance(display_name, str):\n        _log(endpoint, \"error\", server_id=server_id, details={\"field\": \"display_name\"})\n        return _err(\"VALIDATION_ERROR\", \"display_name must be a string.\", field=\"display_name\")\n\n    if base_url is not None:\n        if not isinstance(base_url, str) or not base_url.startswith(\"http\"):\n            _log(endpoint, \"error\", server_id=server_id, details={\"field\": \"base_url\"})\n            return _err(\"VALIDATION_ERROR\", \"base_url must start with 'http'.\", field=\"base_url\")\n\n    if default_fetch_limit is not None:\n        if not isinstance(default_fetch_limit, int) or isinstance(default_fetch_limit, bool):\n            _log(endpoint, \"error\", server_id=server_id, details={\"field\": \"default_fetch_limit\"})\n            return _err(\"VALIDATION_ERROR\", \"default_fetch_limit must be an integer.\", field=\"default_fetch_limit\")\n        if default_fetch_limit < 1 or default_fetch_limit > 500:\n            _log(endpoint, \"error\", server_id=server_id, details={\"field\": \"default_fetch_limit\"})\n            return _err(\"VALIDATION_ERROR\", \"default_fetch_limit must be between 1 and 500.\", field=\"default_fetch_limit\")\n\n    allowed_status = [\"provisioning\", \"active\", \"paused\", \"degraded\", \"deleted\"]\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            _log(endpoint, \"error\", server_id=server_id, details={\"field\": \"status\"})\n            return _err(\"VALIDATION_ERROR\", \"Invalid status value.\", field=\"status\")\n\n    servers = _load(\"servers.json\")\n    subs = _load(\"topic_subscriptions.json\")\n    cached = _load(\"cached_messages.json\")\n    runs = _load(\"ingest_runs.json\")\n\n    srv = next((s for s in servers if s.get(\"id\") == server_id), None)\n    if not srv:\n        _log(endpoint, \"error\", server_id=server_id)\n        return _err(\"NOT_FOUND\", \"Server not found.\", server_id=server_id)\n\n    # Uniqueness: display_name unique\n    if display_name is not None:\n        dn = display_name.strip()\n        if dn == \"\":\n            _log(endpoint, \"error\", server_id=server_id, details={\"field\": \"display_name\"})\n            return _err(\"VALIDATION_ERROR\", \"display_name must not be empty.\", field=\"display_name\")\n        conflict = next((s for s in servers if s.get(\"display_name\") == dn and s.get(\"id\") != server_id), None)\n        if conflict:\n            _log(endpoint, \"error\", server_id=server_id, details={\"field\": \"display_name\"})\n            return _err(\"CONFLICT\", \"display_name must be unique.\", field=\"display_name\")\n\n    # Lifecycle transitions\n    transitions = {\n        \"provisioning\": [\"active\", \"degraded\", \"deleted\"],\n        \"active\": [\"paused\", \"degraded\", \"deleted\"],\n        \"paused\": [\"active\", \"deleted\"],\n        \"degraded\": [\"active\", \"paused\", \"deleted\"],\n        \"deleted\": [],\n    }\n    current_status = srv.get(\"status\")\n    if current_status not in transitions:\n        _log(endpoint, \"error\", server_id=server_id)\n        return _err(\"VALIDATION_ERROR\", \"Server has invalid stored status.\", field=\"status\")\n\n    # Apply updates\n    changed = False\n    now = _now()\n\n    if display_name is not None:\n        dn = display_name.strip()\n        if srv.get(\"display_name\") != dn:\n            srv[\"display_name\"] = dn\n            changed = True\n\n    if base_url is not None:\n        if srv.get(\"base_url\") != base_url:\n            srv[\"base_url\"] = base_url\n            changed = True\n\n    if default_fetch_limit is not None:\n        if srv.get(\"default_fetch_limit\") != default_fetch_limit:\n            srv[\"default_fetch_limit\"] = default_fetch_limit\n            changed = True\n\n    if status is not None and status != current_status:\n        if status not in transitions.get(current_status, []):\n            _log(endpoint, \"error\", server_id=server_id, details={\"from\": current_status, \"to\": status})\n            return _err(\"INVALID_TRANSITION\", \"Invalid server status transition.\", from_status=current_status, to_status=status)\n\n        # Business rule: active only after at least one active subscription exists\n        if status == \"active\":\n            has_active_sub = any(\n                (r.get(\"server_id\") == server_id and r.get(\"status\") == \"active\")\n                for r in subs\n            )\n            if not has_active_sub:\n                _log(endpoint, \"error\", server_id=server_id, details={\"rule\": \"server_active_requires_active_subscription\"})\n                return _err(\"CONFLICT\", \"Cannot set server to active without at least one active subscription.\")\n\n        # Cascade on delete\n        if status == \"deleted\":\n            # mark subscriptions deleted\n            for r in subs:\n                if r.get(\"server_id\") == server_id and r.get(\"status\") != \"deleted\":\n                    # valid transitions active/paused -> deleted; deleted terminal\n                    if r.get(\"status\") in (\"active\", \"paused\"):\n                        r[\"status\"] = \"deleted\"\n                        r[\"updated_at\"] = now\n                    else:\n                        r[\"status\"] = \"deleted\"\n                        r[\"updated_at\"] = now\n            # mark cached messages deleted\n            for m in cached:\n                if m.get(\"server_id\") == server_id and m.get(\"status\") != \"deleted\":\n                    if m.get(\"status\") in (\"visible\", \"archived\"):\n                        m[\"status\"] = \"deleted\"\n                        m[\"updated_at\"] = now\n                    else:\n                        m[\"status\"] = \"deleted\"\n                        m[\"updated_at\"] = now\n            # cancel running ingest runs\n            for ir in runs:\n                if ir.get(\"server_id\") == server_id and ir.get(\"status\") == \"running\":\n                    ir[\"status\"] = \"cancelled\"\n                    ir[\"finished_at\"] = now\n                    ir[\"updated_at\"] = now\n\n            _save(\"topic_subscriptions.json\", subs)\n            _save(\"cached_messages.json\", cached)\n            _save(\"ingest_runs.json\", runs)\n\n        srv[\"status\"] = status\n        changed = True\n\n    if not changed:\n        _log(endpoint, \"ok\", server_id=server_id, resource_id=server_id, details={\"idempotent\": True})\n        return {\"server\": srv}\n\n    srv[\"updated_at\"] = now\n    _save(\"servers.json\", servers)\n\n    _log(endpoint, \"ok\", server_id=server_id, resource_id=server_id)\n    return {\"server\": srv}\n"
+        },
+        {
+          "name": "ntfy_me_subscriptions_list",
+          "description": "Lists topic subscriptions for a given server instance, optionally filtered by subscription status and paged with limit/cursor; returns subscription records and a next cursor when more results are available, and refuses invalid status values or cursors.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "server_id": {
+                "type": "string",
+                "pattern": "^ntfy_srv_[0-9A-Z]{18,}$",
+                "description": "ID of the server whose subscriptions should be listed."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "paused",
+                  "deleted"
+                ],
+                "description": "If provided, only return subscriptions in this status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of subscriptions to return (default 100)."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a prior list response."
+              }
+            },
+            "required": [
+              "server_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def ntfy_me_subscriptions_list(server_id, status=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re, uuid, base64\n\n    _t0 = time.time()\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0302000\" if __import__(\"os\").path.isdir(\"./environment_mix/0302000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status_code, server_id=None, resource_id=None, details=None):\n        fname_candidates = [\"request_logs.json\", \"requests.json\", \"audit_logs.json\", \"usage_logs.json\"]\n        row = {\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"status\": status_code,\n            \"server_id\": server_id,\n            \"resource_id\": resource_id,\n            \"details\": details or {},\n            \"latency_ms\": int((time.time() - _t0) * 1000),\n            \"created_at\": _now(),\n        }\n        for fn in fname_candidates:\n            p = os.path.join(_DB, fn)\n            if os.path.exists(p):\n                data = _load(fn)\n                if isinstance(data, list):\n                    data.append(row)\n                    _save(fn, data)\n                break\n\n    endpoint = \"ntfy_me_subscriptions_list\"\n\n    if not isinstance(server_id, str) or not re.match(r\"^ntfy_srv_[0-9A-Z]{18,}$\", server_id):\n        _log(endpoint, \"error\", server_id=server_id, details={\"field\": \"server_id\"})\n        return _err(\"VALIDATION_ERROR\", \"Invalid server_id.\", field=\"server_id\")\n\n    allowed_status = [\"active\", \"paused\", \"deleted\"]\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            _log(endpoint, \"error\", server_id=server_id, details={\"field\": \"status\"})\n            return _err(\"VALIDATION_ERROR\", \"Invalid status filter.\", field=\"status\")\n\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int) or isinstance(limit, bool):\n        _log(endpoint, \"error\", server_id=server_id, details={\"field\": \"limit\"})\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer.\", field=\"limit\")\n    if limit < 1 or limit > 200:\n        _log(endpoint, \"error\", server_id=server_id, details={\"field\": \"limit\"})\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200.\", field=\"limit\")\n\n    start = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or cursor.strip() == \"\":\n            _log(endpoint, \"error\", server_id=server_id, details={\"field\": \"cursor\"})\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            obj = json.loads(raw.decode(\"utf-8\"))\n            if obj.get(\"server_id\") != server_id or \"offset\" not in obj:\n                _log(endpoint, \"error\", server_id=server_id, details={\"field\": \"cursor\"})\n                return _err(\"VALIDATION_ERROR\", \"Cursor does not match request.\", field=\"cursor\")\n            start = int(obj[\"offset\"])\n            if start < 0:\n                raise ValueError(\"neg\")\n        except Exception:\n            _log(endpoint, \"error\", server_id=server_id, details={\"field\": \"cursor\"})\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n\n    servers = _load(\"servers.json\")\n    if not any(s.get(\"id\") == server_id for s in servers):\n        _log(endpoint, \"error\", server_id=server_id)\n        return _err(\"NOT_FOUND\", \"Server not found.\", server_id=server_id)\n\n    subs = _load(\"topic_subscriptions.json\")\n    rows = [r for r in subs if r.get(\"server_id\") == server_id]\n    if status is not None:\n        rows = [r for r in rows if r.get(\"status\") == status]\n\n    # stable sort by created_at then id\n    def _key(r):\n        return (r.get(\"created_at\") or \"\", r.get(\"id\") or \"\")\n    rows.sort(key=_key)\n\n    total = len(rows)\n    page = rows[start:start + limit]\n    next_cursor = None\n    if start + limit < total:\n        payload = {\"server_id\": server_id, \"offset\": start + limit}\n        enc = base64.urlsafe_b64encode(json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n        next_cursor = enc\n\n    _log(endpoint, \"ok\", server_id=server_id, resource_id=server_id, details={\"returned\": len(page), \"total\": total})\n    return {\n        \"subscriptions\": page,\n        \"meta\": {\"total\": total, \"has_more\": next_cursor is not None, \"next_cursor\": next_cursor, \"limit\": limit},\n    }\n"
+        },
+        {
+          "name": "ntfy_me_subscriptions_create",
+          "description": "Creates one or more topic subscriptions for an existing server instance; returns the created subscription records and refuses creation for deleted servers or activation when the parent server is paused/deleted (activation is only allowed when the server is active or degraded).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "server_id": {
+                "type": "string",
+                "pattern": "^ntfy_srv_[0-9A-Z]{18,}$",
+                "description": "ID of the server to add subscriptions to."
+              },
+              "subscriptions": {
+                "type": "array",
+                "minItems": 1,
+                "description": "Subscriptions to create for the server.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "topic": {
+                      "type": "string",
+                      "description": "ntfy topic name to subscribe to."
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "active",
+                        "paused",
+                        "deleted"
+                      ],
+                      "description": "Initial subscription status (default active)."
+                    },
+                    "since_event_id": {
+                      "type": "string",
+                      "description": "Upstream event id to resume ingestion from (if known)."
+                    },
+                    "dedupe_key": {
+                      "type": "string",
+                      "description": "Optional idempotency key for this subscription create to prevent duplicates for repeated calls."
+                    }
+                  },
+                  "required": [
+                    "topic"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "server_id",
+              "subscriptions"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def ntfy_me_subscriptions_create(server_id, subscriptions, **_extra):\n    import json, os, datetime, time, re, uuid, hashlib\n\n    _t0 = time.time()\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0302000\" if __import__(\"os\").path.isdir(\"./environment_mix/0302000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status_code, server_id=None, resource_id=None, details=None):\n        fname_candidates = [\"request_logs.json\", \"requests.json\", \"audit_logs.json\", \"usage_logs.json\"]\n        row = {\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"status\": status_code,\n            \"server_id\": server_id,\n            \"resource_id\": resource_id,\n            \"details\": details or {},\n            \"latency_ms\": int((time.time() - _t0) * 1000),\n            \"created_at\": _now(),\n        }\n        for fn in fname_candidates:\n            p = os.path.join(_DB, fn)\n            if os.path.exists(p):\n                data = _load(fn)\n                if isinstance(data, list):\n                    data.append(row)\n                    _save(fn, data)\n                break\n\n    endpoint = \"ntfy_me_subscriptions_create\"\n\n    if not isinstance(server_id, str) or not re.match(r\"^ntfy_srv_[0-9A-Z]{18,}$\", server_id):\n        _log(endpoint, \"error\", server_id=server_id, details={\"field\": \"server_id\"})\n        return _err(\"VALIDATION_ERROR\", \"Invalid server_id.\", field=\"server_id\")\n\n    if not isinstance(subscriptions, list) or len(subscriptions) < 1:\n        _log(endpoint, \"error\", server_id=server_id, details={\"field\": \"subscriptions\"})\n        return _err(\"VALIDATION_ERROR\", \"subscriptions must be a non-empty array.\", field=\"subscriptions\")\n\n    servers = _load(\"servers.json\")\n    subs = _load(\"topic_subscriptions.json\")\n\n    srv = next((s for s in servers if s.get(\"id\") == server_id), None)\n    if not srv:\n        _log(endpoint, \"error\", server_id=server_id)\n        return _err(\"NOT_FOUND\", \"Server not found.\", server_id=server_id)\n\n    if srv.get(\"status\") == \"deleted\":\n        _log(endpoint, \"error\", server_id=server_id)\n        return _err(\"INVALID_TRANSITION\", \"Cannot create subscriptions for a deleted server.\")\n\n    transitions = {\"active\": [\"paused\", \"deleted\"], \"paused\": [\"active\", \"deleted\"], \"deleted\": []}\n    allowed_status = [\"active\", \"paused\", \"deleted\"]\n\n    created = []\n    now = _now()\n\n    # helper: generate ids with prefix and uppercase base32-ish chars\n    _alphabet = \"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567\"\n    def _gen_id(prefix):\n        # 18+ chars\n        raw = uuid.uuid4().bytes + uuid.uuid4().bytes\n        n = int.from_bytes(raw, \"big\")\n        out = []\n        while n > 0 and len(out) < 22:\n            n, r = divmod(n, len(_alphabet))\n            out.append(_alphabet[r])\n        sfx = \"\".join(out)[:20].ljust(20, \"A\")\n        return f\"{prefix}_{sfx}\"\n\n    # Validate all first; also enforce unique(server_id, topic)\n    seen_topics_in_request = set()\n    for i, it in enumerate(subscriptions):\n        if not isinstance(it, dict):\n            _log(endpoint, \"error\", server_id=server_id, details={\"index\": i})\n            return _err(\"VALIDATION_ERROR\", \"Each subscription must be an object.\", index=i)\n\n        if \"topic\" not in it:\n            _log(endpoint, \"error\", server_id=server_id, details={\"index\": i, \"field\": \"topic\"})\n            return _err(\"VALIDATION_ERROR\", \"Missing required field topic.\", field=\"topic\", index=i)\n\n        topic = it.get(\"topic\")\n        if not isinstance(topic, str) or topic.strip() == \"\":\n            _log(endpoint, \"error\", server_id=server_id, details={\"index\": i, \"field\": \"topic\"})\n            return _err(\"VALIDATION_ERROR\", \"topic must be a non-empty string.\", field=\"topic\", index=i)\n        topic = topic.strip()\n\n        if topic in seen_topics_in_request:\n            _log(endpoint, \"error\", server_id=server_id, details={\"index\": i, \"field\": \"topic\"})\n            return _err(\"CONFLICT\", \"Duplicate topic in request.\", field=\"topic\", topic=topic)\n        seen_topics_in_request.add(topic)\n\n        st = it.get(\"status\", \"active\")\n        if st is None:\n            st = \"active\"\n        if not isinstance(st, str) or st not in allowed_status:\n            _log(endpoint, \"error\", server_id=server_id, details={\"index\": i, \"field\": \"status\"})\n            return _err(\"VALIDATION_ERROR\", \"Invalid subscription status.\", field=\"status\", index=i)\n\n        # rule: cannot activate subscription unless server is active or degraded\n        if st == \"active\" and srv.get(\"status\") not in (\"active\", \"degraded\"):\n            _log(endpoint, \"error\", server_id=server_id, details={\"index\": i, \"rule\": \"activate_requires_server_active_or_degraded\"})\n            return _err(\"INVALID_TRANSITION\", \"Cannot create an active subscription when server is paused.\", index=i)\n\n        since_event_id = it.get(\"since_event_id\")\n        if since_event_id is not None and not isinstance(since_event_id, str):\n            _log(endpoint, \"error\", server_id=server_id, details={\"index\": i, \"field\": \"since_event_id\"})\n            return _err(\"VALIDATION_ERROR\", \"since_event_id must be a string.\", field=\"since_event_id\", index=i)\n\n        dedupe_key = it.get(\"dedupe_key\")\n        if dedupe_key is not None and not isinstance(dedupe_key, str):\n            _log(endpoint, \"error\", server_id=server_id, details={\"index\": i, \"field\": \"dedupe_key\"})\n            return _err(\"VALIDATION_ERROR\", \"dedupe_key must be a string.\", field=\"dedupe_key\", index=i)\n\n    # Create / idempotency\n    for it in subscriptions:\n        topic = it[\"topic\"].strip()\n        st = it.get(\"status\", \"active\") or \"active\"\n        since_event_id = it.get(\"since_event_id\")\n        dedupe_key = it.get(\"dedupe_key\")\n\n        # If exists by unique(server_id, topic), be idempotent and return it\n        existing = next((r for r in subs if r.get(\"server_id\") == server_id and r.get(\"topic\") == topic), None)\n        if existing and existing.get(\"status\") != \"deleted\":\n            created.append(existing)\n            continue\n\n        # If dedupe_key provided, treat as idempotency for (server_id, topic, dedupe_key)\n        # We don't have a column for it; emulate by hashing into since_event_id only if since_event_id is None? No.\n        # Instead, detect prior creates by matching a synthetic fingerprint in error-free way: search deleted too.\n        if dedupe_key is not None:\n            fp = hashlib.sha256(f\"{server_id}|{topic}|{dedupe_key}\".encode(\"utf-8\")).hexdigest()\n            prior = next((r for r in subs if r.get(\"server_id\") == server_id and r.get(\"topic\") == topic and r.get(\"idempotency_fingerprint\") == fp), None)\n            if prior:\n                created.append(prior)\n                continue\n        else:\n            fp = None\n\n        # If existing is deleted, cannot recreate with same unique key unless we \"revive\" it.\n        if existing and existing.get(\"status\") == \"deleted\":\n            # revive allowed only if transition deleted -> ? is not allowed by lifecycle, so create a new row is safer.\n            # But unique(server_id, topic) would conflict; thus we revive by updating status if legal (it's not).\n            _log(endpoint, \"error\", server_id=server_id, details={\"topic\": topic})\n            return _err(\"CONFLICT\", \"Subscription with this topic already exists and is deleted; cannot recreate due to uniqueness constraint.\", topic=topic)\n\n        new_row = {\n            \"id\": _gen_id(\"ntfy_sub\"),\n            \"server_id\": server_id,\n            \"topic\": topic,\n            \"status\": st,\n            \"since_event_id\": since_event_id,\n            \"last_polled_at\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        if fp is not None:\n            new_row[\"idempotency_fingerprint\"] = fp  # extra field tolerated in JSON store\n\n        subs.append(new_row)\n        created.append(new_row)\n\n    # No success without effect: if all were already existing, that's still an effect? It's idempotent, allowed.\n    # But ensure at least one row matched/returned:\n    if len(created) == 0:\n        _log(endpoint, \"error\", server_id=server_id)\n        return _err(\"NOT_FOUND\", \"No subscriptions created.\")\n\n    _save(\"topic_subscriptions.json\", subs)\n\n    # Business rule: server becomes active only after at least one active subscription exists\n    if srv.get(\"status\") in (\"provisioning\", \"paused\") and any(r.get(\"status\") == \"active\" for r in created):\n        # Only allow provisioning->active, paused->active\n        transitions_srv = {\n            \"provisioning\": [\"active\", \"degraded\", \"deleted\"],\n            \"active\": [\"paused\", \"degraded\", \"deleted\"],\n            \"paused\": [\"active\", \"deleted\"],\n            \"degraded\": [\"active\", \"paused\", \"deleted\"],\n            \"deleted\": [],\n        }\n        cur = srv.get(\"status\")\n        if \"active\" in transitions_srv.get(cur, []):\n            srv[\"status\"] = \"active\"\n            srv[\"updated_at\"] = now\n            _save(\"servers.json\", servers)\n\n    _log(endpoint, \"ok\", server_id=server_id, resource_id=server_id, details={\"created_or_returned\": len(created)})\n    return {\"subscriptions\": created}\n"
+        },
+        {
+          "name": "ntfy_me_subscriptions_update",
+          "description": "Updates a topic subscription’s mutable fields and/or drives allowed lifecycle transitions via `status`; returns the updated subscription record and refuses invalid transitions or attempts to activate a subscription when the parent server is paused or deleted.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "subscription_id": {
+                "type": "string",
+                "pattern": "^ntfy_sub_[0-9A-Z]{18,}$",
+                "description": "ID of the topic subscription to update."
+              },
+              "topic": {
+                "type": "string",
+                "description": "New ntfy topic name (if supported by the deployment)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "paused",
+                  "deleted"
+                ],
+                "description": "New lifecycle status for the subscription; must be a valid transition from the current status."
+              },
+              "since_event_id": {
+                "type": "string",
+                "description": "Upstream event id to resume ingestion from (if known)."
+              }
+            },
+            "required": [
+              "subscription_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def ntfy_me_subscriptions_update(subscription_id, topic=None, status=None, since_event_id=None, **_extra):\n    import json, os, datetime, time, re, uuid\n\n    _t0 = time.time()\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0302000\" if __import__(\"os\").path.isdir(\"./environment_mix/0302000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status_code, server_id=None, resource_id=None, details=None):\n        fname_candidates = [\"request_logs.json\", \"requests.json\", \"audit_logs.json\", \"usage_logs.json\"]\n        row = {\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"status\": status_code,\n            \"server_id\": server_id,\n            \"resource_id\": resource_id,\n            \"details\": details or {},\n            \"latency_ms\": int((time.time() - _t0) * 1000),\n            \"created_at\": _now(),\n        }\n        for fn in fname_candidates:\n            p = os.path.join(_DB, fn)\n            if os.path.exists(p):\n                data = _load(fn)\n                if isinstance(data, list):\n                    data.append(row)\n                    _save(fn, data)\n                break\n\n    endpoint = \"ntfy_me_subscriptions_update\"\n\n    if not isinstance(subscription_id, str) or not re.match(r\"^ntfy_sub_[0-9A-Z]{18,}$\", subscription_id):\n        _log(endpoint, \"error\", details={\"field\": \"subscription_id\"})\n        return _err(\"VALIDATION_ERROR\", \"Invalid subscription_id.\", field=\"subscription_id\")\n\n    if topic is not None:\n        if not isinstance(topic, str) or topic.strip() == \"\":\n            _log(endpoint, \"error\", details={\"field\": \"topic\"})\n            return _err(\"VALIDATION_ERROR\", \"topic must be a non-empty string.\", field=\"topic\")\n\n    allowed_status = [\"active\", \"paused\", \"deleted\"]\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            _log(endpoint, \"error\", details={\"field\": \"status\"})\n            return _err(\"VALIDATION_ERROR\", \"Invalid status value.\", field=\"status\")\n\n    if since_event_id is not None and not isinstance(since_event_id, str):\n        _log(endpoint, \"error\", details={\"field\": \"since_event_id\"})\n        return _err(\"VALIDATION_ERROR\", \"since_event_id must be a string.\", field=\"since_event_id\")\n\n    subs = _load(\"topic_subscriptions.json\")\n    servers = _load(\"servers.json\")\n\n    sub = next((r for r in subs if r.get(\"id\") == subscription_id), None)\n    if not sub:\n        _log(endpoint, \"error\", resource_id=subscription_id)\n        return _err(\"NOT_FOUND\", \"Subscription not found.\", subscription_id=subscription_id)\n\n    server_id = sub.get(\"server_id\")\n    srv = next((s for s in servers if s.get(\"id\") == server_id), None)\n    if not srv:\n        _log(endpoint, \"error\", server_id=server_id, resource_id=subscription_id)\n        return _err(\"NOT_FOUND\", \"Parent server not found.\", server_id=server_id)\n\n    transitions = {\"active\": [\"paused\", \"deleted\"], \"paused\": [\"active\", \"deleted\"], \"deleted\": []}\n    cur_status = sub.get(\"status\")\n    if cur_status not in transitions:\n        _log(endpoint, \"error\", server_id=server_id, resource_id=subscription_id)\n        return _err(\"VALIDATION_ERROR\", \"Subscription has invalid stored status.\", field=\"status\")\n\n    now = _now()\n    changed = False\n\n    if topic is not None:\n        new_topic = topic.strip()\n        # unique(server_id, topic)\n        conflict = next((r for r in subs if r.get(\"server_id\") == server_id and r.get(\"topic\") == new_topic and r.get(\"id\") != subscription_id), None)\n        if conflict:\n            _log(endpoint, \"error\", server_id=server_id, resource_id=subscription_id, details={\"field\": \"topic\"})\n            return _err(\"CONFLICT\", \"Subscription topic must be unique per server.\", field=\"topic\")\n        if sub.get(\"topic\") != new_topic:\n            sub[\"topic\"] = new_topic\n            changed = True\n\n    if since_event_id is not None:\n        if sub.get(\"since_event_id\") != since_event_id:\n            sub[\"since_event_id\"] = since_event_id\n            changed = True\n\n    if status is not None and status != cur_status:\n        if status not in transitions.get(cur_status, []):\n            _log(endpoint, \"error\", server_id=server_id, resource_id=subscription_id, details={\"from\": cur_status, \"to\": status})\n            return _err(\"INVALID_TRANSITION\", \"Invalid subscription status transition.\", from_status=cur_status, to_status=status)\n\n        # rule: cannot activate subscription unless parent server is active or degraded\n        if status == \"active\" and srv.get(\"status\") not in (\"active\", \"degraded\"):\n            _log(endpoint, \"error\", server_id=server_id, resource_id=subscription_id, details={\"rule\": \"activate_requires_server_active_or_degraded\"})\n            return _err(\"INVALID_TRANSITION\", \"Cannot activate subscription when parent server is paused or deleted.\")\n\n        sub[\"status\"] = status\n        changed = True\n\n    if not changed:\n        _log(endpoint, \"ok\", server_id=server_id, resource_id=subscription_id, details={\"idempotent\": True})\n        return {\"subscription\": sub}\n\n    sub[\"updated_at\"] = now\n    _save(\"topic_subscriptions.json\", subs)\n\n    _log(endpoint, \"ok\", server_id=server_id, resource_id=subscription_id)\n    return {\"subscription\": sub}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0302000",
+    "index": 302,
+    "name": "ntfy-me-mcp",
+    "description": "This backend models an ntfy-me MCP deployment that subscribes to one or more ntfy topics, ingests notifications from the upstream ntfy server, and caches them for later retrieval/search. The main workflows are: (1) deploy/register a server instance and its topic subscriptions, and (2) fetch cached n",
+    "taxonomy": {
+      "L1_id": "L1-20",
+      "L1_name": "Communication & General Utilities",
+      "L1_name_zh": "通信与通用工具",
+      "L2_id": "L2-48",
+      "L2_name": "Messaging & Notification",
+      "L2_name_zh": "即时通信与通知",
+      "L3_name": "Push/Topic Notifications",
+      "L3_name_zh": "推送/主题订阅通知"
+    },
+    "database_dir": "./environment_mix/0302000",
+    "mount_path": "/app/database",
+    "n_tools": 8,
+    "n_collections": 4,
+    "n_records": 90,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 8,
+      "loaded": 8,
+      "reads_returning_data": 4,
+      "read_operations": 4,
+      "mutations_persisted": 4,
+      "mutations_attempted": 4
+    },
+    "tools_loadable_from_database_dir": 8,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "ntfy_me_fetch",
+      "returned_chars": 2403
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

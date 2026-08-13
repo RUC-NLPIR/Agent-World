@@ -1,0 +1,538 @@
+{
+  "index": 41,
+  "local_files_dir": "./environment_mix/0041000",
+  "file_list": [
+    "./environment_mix/0041000/README.md",
+    "./environment_mix/0041000/audit_log.json",
+    "./environment_mix/0041000/orders.json",
+    "./environment_mix/0041000/products.json",
+    "./environment_mix/0041000/users.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "products.json": "",
+        "orders.json": "",
+        "users.json": "",
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "calculate",
+          "description": "Evaluates a math expression string and returns the computed result. It accepts only expressions made up of numbers, + - * / operators, parentheses, and spaces. It refuses requests with a missing/empty expression or with invalid characters or malformed syntax it cannot parse or evaluate.",
+          "parameters": {
+            "properties": {
+              "expression": {
+                "description": "The mathematical expression to calculate, such as '2 + 2'. The expression can contain numbers, operators (+, -, *, /), parentheses, and spaces.",
+                "title": "Expression",
+                "type": "string"
+              }
+            },
+            "required": [
+              "expression"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0041000\" if __import__(\"os\").path.isdir(\"./environment_mix/0041000\") else \"/app/database\")\ndef calculate(expression):\n    import json, os\n    data = {'products': json.load(open(os.path.join(_DB, 'products.json'), encoding='utf-8')), 'orders': json.load(open(os.path.join(_DB, 'orders.json'), encoding='utf-8')), 'users': json.load(open(os.path.join(_DB, 'users.json'), encoding='utf-8'))}\n    if not all(char in \"0123456789+-*/(). \" for char in expression):\n        return \"Error: invalid characters in expression\"\n    try:\n        # Evaluate the mathematical expression safely\n        return str(round(float(eval(expression, {\"__builtins__\": None}, {})), 2))\n    except Exception as e:\n        return f\"Error: {e}\"\n",
+          "description_restored": true
+        },
+        {
+          "name": "cancel_pending_order",
+          "description": "Cancels an order that is still in a pending state and returns the updated order details after the cancellation is applied. It validates that the order_id is provided (including the leading '#') and that reason is one of: 'no longer needed' or 'ordered by mistake'. It refuses requests when the order cannot be found, is not pending (for example already processed or delivered), or when required fields are missing or invalid.",
+          "parameters": {
+            "properties": {
+              "order_id": {
+                "description": "The order id, such as '#W0000000'. Be careful there is a '#' symbol at the beginning of the order id.",
+                "title": "Order Id",
+                "type": "string"
+              },
+              "reason": {
+                "description": "The reason for cancellation, which should be either 'no longer needed' or 'ordered by mistake'.",
+                "title": "Reason",
+                "type": "string"
+              }
+            },
+            "required": [
+              "order_id",
+              "reason"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "def cancel_pending_order(order_id, reason, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0041000\" if __import__(\"os\").path.isdir(\"./environment_mix/0041000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ensure_audit_and_rate(endpoint, started, status=None):\n        \"\"\"\n        Minimal observable dynamics:\n        - Ensure /app/database/audit_log.json exists and append one row per call.\n        - Enforce a simple rolling per-minute rate limit based on audit_log.json.\n        \"\"\"\n        audit_file = \"audit_log.json\"\n        audit = _load(audit_file)\n        if not isinstance(audit, list):\n            audit = []\n        now_ts = _now()\n\n        # rate limit: 120 requests/minute overall\n        window_s = 60\n        limit = 120\n        try:\n            now_dt = datetime.datetime.utcnow()\n            cutoff = now_dt - datetime.timedelta(seconds=window_s)\n            recent = 0\n            for r in audit:\n                ts = r.get(\"ts\")\n                if not isinstance(ts, str):\n                    continue\n                try:\n                    rdt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if rdt >= cutoff:\n                    recent += 1\n            if recent >= limit:\n                # log the denied request\n                latency_ms = int((time.time() - started) * 1000)\n                audit.append({\"ts\": now_ts, \"endpoint\": endpoint, \"status\": \"RATE_LIMIT\", \"latency_ms\": latency_ms})\n                _save(audit_file, audit)\n                return _err(\"RATE_LIMIT\", \"Too many requests. Please retry later.\", limit_per_minute=limit)\n        except Exception:\n            # If audit parsing fails, still proceed but do not block the call.\n            pass\n        return None\n\n    started = time.time()\n    endpoint = \"cancel_pending_order\"\n\n    # validate inputs\n    if not isinstance(order_id, str) or not order_id or not order_id.startswith(\"#\"):\n        rl = _ensure_audit_and_rate(endpoint, started)\n        if rl:\n            return rl\n        # log validation error\n        audit = _load(\"audit_log.json\")\n        if not isinstance(audit, list):\n            audit = []\n        audit.append({\"ts\": _now(), \"endpoint\": endpoint, \"status\": \"VALIDATION_ERROR\", \"latency_ms\": int((time.time() - started) * 1000)})\n        _save(\"audit_log.json\", audit)\n        return _err(\"VALIDATION_ERROR\", \"order_id must be a non-empty string starting with '#'.\")\n    if not isinstance(reason, str) or reason not in (\"no longer needed\", \"ordered by mistake\"):\n        rl = _ensure_audit_and_rate(endpoint, started)\n        if rl:\n            return rl\n        audit = _load(\"audit_log.json\")\n        if not isinstance(audit, list):\n            audit = []\n        audit.append({\"ts\": _now(), \"endpoint\": endpoint, \"status\": \"VALIDATION_ERROR\", \"latency_ms\": int((time.time() - started) * 1000)})\n        _save(\"audit_log.json\", audit)\n        return _err(\"VALIDATION_ERROR\", \"reason must be one of: 'no longer needed', 'ordered by mistake'.\")\n\n    rl = _ensure_audit_and_rate(endpoint, started)\n    if rl:\n        return rl\n\n    orders = _load(\"orders.json\")\n    users = _load(\"users.json\")\n\n    if not isinstance(orders, list):\n        orders = []\n    if not isinstance(users, list):\n        users = []\n\n    order = None\n    order_idx = None\n    for i, o in enumerate(orders):\n        if isinstance(o, dict) and o.get(\"order_id\") == order_id:\n            order = o\n            order_idx = i\n            break\n\n    if order is None:\n        audit = _load(\"audit_log.json\")\n        if not isinstance(audit, list):\n            audit = []\n        audit.append({\"ts\": _now(), \"endpoint\": endpoint, \"status\": \"NOT_FOUND\", \"latency_ms\": int((time.time() - started) * 1000)})\n        _save(\"audit_log.json\", audit)\n        return _err(\"NOT_FOUND\", \"Order not found.\", order_id=order_id)\n\n    if order.get(\"status\") != \"pending\":\n        audit = _load(\"audit_log.json\")\n        if not isinstance(audit, list):\n            audit = []\n        audit.append({\"ts\": _now(), \"endpoint\": endpoint, \"status\": \"INVALID_TRANSITION\", \"latency_ms\": int((time.time() - started) * 1000)})\n        _save(\"audit_log.json\", audit)\n        return _err(\"INVALID_TRANSITION\", \"Only pending orders can be cancelled.\", current_status=order.get(\"status\"))\n\n    # perform cancellation + refunds in payment_history (ledger). Also adjust gift card balance if applicable.\n    payment_history = order.get(\"payment_history\")\n    if payment_history is None:\n        payment_history = []\n        order[\"payment_history\"] = payment_history\n    if not isinstance(payment_history, list):\n        audit = _load(\"audit_log.json\")\n        if not isinstance(audit, list):\n            audit = []\n        audit.append({\"ts\": _now(), \"endpoint\": endpoint, \"status\": \"VALIDATION_ERROR\", \"latency_ms\": int((time.time() - started) * 1000)})\n        _save(\"audit_log.json\", audit)\n        return _err(\"VALIDATION_ERROR\", \"Order payment_history is invalid.\")\n\n    user_id = order.get(\"user_id\")\n    user = None\n    user_idx = None\n    if isinstance(user_id, str):\n        for i, u in enumerate(users):\n            if isinstance(u, dict) and u.get(\"user_id\") == user_id:\n                user = u\n                user_idx = i\n                break\n\n    # Sum payments already made to refund them; ignore prior refunds.\n    refunds_to_add = []\n    for tx in payment_history:\n        if not isinstance(tx, dict):\n            continue\n        if tx.get(\"transaction_type\") != \"payment\":\n            continue\n        amt = tx.get(\"amount\")\n        pmid = tx.get(\"payment_method_id\")\n        if not isinstance(amt, (int, float)) or not isinstance(pmid, str) or amt <= 0:\n            continue\n        refunds_to_add.append({\"transaction_type\": \"refund\", \"amount\": float(amt), \"payment_method_id\": pmid})\n\n        # If it was a gift card payment, credit it back immediately if we can locate it\n        if user is not None:\n            pms = user.get(\"payment_methods\")\n            if isinstance(pms, list):\n                for pm in pms:\n                    if isinstance(pm, dict) and pm.get(\"id\") == pmid and pm.get(\"source\") == \"gift_card\":\n                        bal = pm.get(\"balance\", 0.0)\n                        if isinstance(bal, (int, float)):\n                            pm[\"balance\"] = round(float(bal) + float(amt), 2)\n                        break\n\n    order[\"status\"] = \"cancelled\"\n    order[\"cancel_reason\"] = reason\n    order[\"cancelled_at\"] = _now()\n    if refunds_to_add:\n        order[\"payment_history\"] = payment_history + refunds_to_add\n\n    # persist order (and user if modified)\n    orders[order_idx] = order\n    _save(\"orders.json\", orders)\n    if user is not None and user_idx is not None:\n        users[user_idx] = user\n        _save(\"users.json\", users)\n\n    audit = _load(\"audit_log.json\")\n    if not isinstance(audit, list):\n        audit = []\n    audit.append({\"ts\": _now(), \"endpoint\": endpoint, \"status\": \"OK\", \"latency_ms\": int((time.time() - started) * 1000)})\n    _save(\"audit_log.json\", audit)\n\n    return {\"order\": order}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "exchange_delivered_order_items",
+          "description": "Exchanges specified items from a delivered order for replacement items of the same product type and returns the updated order reflecting the exchange and any price-difference charge or refund applied to the provided payment method. It requires order_id, item_ids, new_item_ids, and payment_method_id, and it validates that item_ids and new_item_ids are the same length and that each replacement corresponds positionally to an item of the same product type. It refuses requests if the order is not found, not delivered, has already had a post-delivery return/exchange performed, any listed item is not in the order (or quantity is inconsistent with duplicates), any replacement item is incompatible, or the payment method cannot be used for the adjustment.",
+          "parameters": {
+            "properties": {
+              "order_id": {
+                "description": "The order id, such as '#W0000000'. Be careful there is a '#' symbol at the beginning of the order id.",
+                "title": "Order Id",
+                "type": "string"
+              },
+              "item_ids": {
+                "description": "The item ids to be exchanged, each such as '1008292230'. There could be duplicate items in the list.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Item Ids",
+                "type": "array"
+              },
+              "new_item_ids": {
+                "description": "The item ids to be exchanged for, each such as '1008292230'.\nThere could be duplicate items in the list. Each new item id should match the item id\nin the same position and be of the same product.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "New Item Ids",
+                "type": "array"
+              },
+              "payment_method_id": {
+                "description": "The payment method id to pay or receive refund for the item price difference,\nsuch as 'gift_card_0000000' or 'credit_card_0000000'. These can be looked up\nfrom the user or order details.",
+                "title": "Payment Method Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "order_id",
+              "item_ids",
+              "new_item_ids",
+              "payment_method_id"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0041000\" if __import__(\"os\").path.isdir(\"./environment_mix/0041000\") else \"/app/database\")\ndef exchange_delivered_order_items(order_id, item_ids, new_item_ids, payment_method_id):\n    import json, os\n    data = {'products': json.load(open(os.path.join(_DB, 'products.json'), encoding='utf-8')), 'orders': json.load(open(os.path.join(_DB, 'orders.json'), encoding='utf-8')), 'users': json.load(open(os.path.join(_DB, 'users.json'), encoding='utf-8'))}\n    products, orders, users = data[\"products\"], data[\"orders\"], data[\"users\"]\n\n    # check order exists and is delivered\n    if order_id not in orders:\n        return \"Error: order not found\"\n    order = orders[order_id]\n    if order[\"status\"] != \"delivered\":\n        return \"Error: non-delivered order cannot be exchanged\"\n\n    # check the items to be exchanged exist\n    all_item_ids = [item[\"item_id\"] for item in order[\"items\"]]\n    for item_id in item_ids:\n        if item_ids.count(item_id) > all_item_ids.count(item_id):\n            return f\"Error: {item_id} not found\"\n\n    # check new items exist and match old items and are available\n    if len(item_ids) != len(new_item_ids):\n        return \"Error: the number of items to be exchanged should match\"\n\n    diff_price = 0\n    for item_id, new_item_id in zip(item_ids, new_item_ids):\n        item = [item for item in order[\"items\"] if item[\"item_id\"] == item_id][0]\n        product_id = item[\"product_id\"]\n        if not (\n            new_item_id in products[product_id][\"variants\"]\n            and products[product_id][\"variants\"][new_item_id][\"available\"]\n        ):\n            return f\"Error: new item {new_item_id} not found or available\"\n\n        old_price = item[\"price\"]\n        new_price = products[product_id][\"variants\"][new_item_id][\"price\"]\n        diff_price += new_price - old_price\n\n    diff_price = round(diff_price, 2)\n\n    # check payment method exists and can cover the price difference if gift card\n    if payment_method_id not in users[order[\"user_id\"]][\"payment_methods\"]:\n        return \"Error: payment method not found\"\n\n    payment_method = users[order[\"user_id\"]][\"payment_methods\"][payment_method_id]\n    if (\n        payment_method[\"source\"] == \"gift_card\"\n        and payment_method[\"balance\"] < diff_price\n    ):\n        return (\n            \"Error: insufficient gift card balance to pay for the price difference\"\n        )\n\n    # modify the order\n    order[\"status\"] = \"exchange requested\"\n    order[\"exchange_items\"] = sorted(item_ids)\n    order[\"exchange_new_items\"] = sorted(new_item_ids)\n    order[\"exchange_payment_method_id\"] = payment_method_id\n    order[\"exchange_price_difference\"] = diff_price\n\n    return json.dumps(order)\n",
+          "description_restored": true
+        },
+        {
+          "name": "find_user_id_by_name_zip",
+          "description": "Find user id by first name, last name, and zip code. If the user is not found, the function\n\nwill return an error message. By default, find user id by email, and only call this function\nif the user is not found by email or cannot remember email.",
+          "parameters": {
+            "properties": {
+              "first_name": {
+                "description": "The first name of the customer, such as 'John'.",
+                "title": "First Name",
+                "type": "string"
+              },
+              "last_name": {
+                "description": "The last name of the customer, such as 'Doe'.",
+                "title": "Last Name",
+                "type": "string"
+              },
+              "zip": {
+                "description": "The zip code of the customer, such as '12345'.",
+                "title": "Zip",
+                "type": "string"
+              }
+            },
+            "required": [
+              "first_name",
+              "last_name",
+              "zip"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "def find_user_id_by_name_zip(first_name, last_name, zip, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0041000\" if __import__(\"os\").path.isdir(\"./environment_mix/0041000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _rate_and_log(endpoint, started, status):\n        audit_file = \"audit_log.json\"\n        audit = _load(audit_file)\n        if not isinstance(audit, list):\n            audit = []\n        # rate limit: 120/min\n        try:\n            now_dt = datetime.datetime.utcnow()\n            cutoff = now_dt - datetime.timedelta(seconds=60)\n            recent = 0\n            for r in audit:\n                ts = r.get(\"ts\")\n                if not isinstance(ts, str):\n                    continue\n                try:\n                    rdt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if rdt >= cutoff:\n                    recent += 1\n            if recent >= 120:\n                audit.append({\"ts\": _now(), \"endpoint\": endpoint, \"status\": \"RATE_LIMIT\", \"latency_ms\": int((time.time() - started) * 1000)})\n                _save(audit_file, audit)\n                return _err(\"RATE_LIMIT\", \"Too many requests. Please retry later.\", limit_per_minute=120)\n        except Exception:\n            pass\n        audit.append({\"ts\": _now(), \"endpoint\": endpoint, \"status\": status, \"latency_ms\": int((time.time() - started) * 1000)})\n        _save(audit_file, audit)\n        return None\n\n    started = time.time()\n    endpoint = \"find_user_id_by_name_zip\"\n\n    if not isinstance(first_name, str) or not first_name.strip():\n        rl = _rate_and_log(endpoint, started, \"VALIDATION_ERROR\")\n        if rl:\n            return rl\n        return _err(\"VALIDATION_ERROR\", \"first_name is required.\")\n    if not isinstance(last_name, str) or not last_name.strip():\n        rl = _rate_and_log(endpoint, started, \"VALIDATION_ERROR\")\n        if rl:\n            return rl\n        return _err(\"VALIDATION_ERROR\", \"last_name is required.\")\n    if not isinstance(zip, str) or not zip.strip():\n        rl = _rate_and_log(endpoint, started, \"VALIDATION_ERROR\")\n        if rl:\n            return rl\n        return _err(\"VALIDATION_ERROR\", \"zip is required.\")\n\n    users = _load(\"users.json\")\n    if not isinstance(users, list):\n        users = []\n\n    fn = first_name.strip().lower()\n    ln = last_name.strip().lower()\n    z = zip.strip()\n\n    matches = []\n    for u in users:\n        if not isinstance(u, dict):\n            continue\n        name = u.get(\"name\") if isinstance(u.get(\"name\"), dict) else {}\n        addr = u.get(\"address\") if isinstance(u.get(\"address\"), dict) else {}\n        if (\n            isinstance(name.get(\"first_name\"), str)\n            and isinstance(name.get(\"last_name\"), str)\n            and isinstance(addr.get(\"zip\"), str)\n            and name.get(\"first_name\").strip().lower() == fn\n            and name.get(\"last_name\").strip().lower() == ln\n            and addr.get(\"zip\").strip() == z\n        ):\n            matches.append({\"user_id\": u.get(\"user_id\")})\n\n    rl = _rate_and_log(endpoint, started, \"OK\")\n    if rl:\n        return rl\n\n    # Per tool description: return error if not found\n    if not matches:\n        return _err(\"NOT_FOUND\", \"User not found with provided name and zip.\")\n\n    return {\"matches\": matches, \"total\": len(matches)}\n",
+          "implementation_repaired": true
+        },
+        {
+          "name": "find_user_id_by_email",
+          "description": "Find user id by email. If the user is not found, the function will return an error message.",
+          "parameters": {
+            "properties": {
+              "email": {
+                "description": "The email of the user, such as 'something@example.com'.",
+                "title": "Email",
+                "type": "string"
+              }
+            },
+            "required": [
+              "email"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "def find_user_id_by_email(email, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0041000\" if __import__(\"os\").path.isdir(\"./environment_mix/0041000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _rate_and_log(endpoint, started, status):\n        audit_file = \"audit_log.json\"\n        audit = _load(audit_file)\n        if not isinstance(audit, list):\n            audit = []\n        try:\n            now_dt = datetime.datetime.utcnow()\n            cutoff = now_dt - datetime.timedelta(seconds=60)\n            recent = 0\n            for r in audit:\n                ts = r.get(\"ts\")\n                if not isinstance(ts, str):\n                    continue\n                try:\n                    rdt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if rdt >= cutoff:\n                    recent += 1\n            if recent >= 120:\n                audit.append({\"ts\": _now(), \"endpoint\": endpoint, \"status\": \"RATE_LIMIT\", \"latency_ms\": int((time.time() - started) * 1000)})\n                _save(audit_file, audit)\n                return _err(\"RATE_LIMIT\", \"Too many requests. Please retry later.\", limit_per_minute=120)\n        except Exception:\n            pass\n        audit.append({\"ts\": _now(), \"endpoint\": endpoint, \"status\": status, \"latency_ms\": int((time.time() - started) * 1000)})\n        _save(audit_file, audit)\n        return None\n\n    started = time.time()\n    endpoint = \"find_user_id_by_email\"\n\n    if not isinstance(email, str) or not email.strip():\n        rl = _rate_and_log(endpoint, started, \"VALIDATION_ERROR\")\n        if rl:\n            return rl\n        return _err(\"VALIDATION_ERROR\", \"email is required.\")\n\n    users = _load(\"users.json\")\n    if not isinstance(users, list):\n        users = []\n\n    needle = email.strip().lower()\n    matches = []\n    for u in users:\n        if not isinstance(u, dict):\n            continue\n        em = u.get(\"email\")\n        if isinstance(em, str) and em.strip().lower() == needle:\n            matches.append({\"user_id\": u.get(\"user_id\")})\n\n    rl = _rate_and_log(endpoint, started, \"OK\")\n    if rl:\n        return rl\n\n    if not matches:\n        return _err(\"NOT_FOUND\", \"User not found with provided email.\")\n\n    return {\"matches\": matches, \"total\": len(matches)}\n",
+          "implementation_repaired": true
+        },
+        {
+          "name": "get_order_details",
+          "description": "Retrieves an order’s current status and full details and returns the order record for the supplied order_id. It validates that order_id is provided and formatted as expected (including the leading '#'). It refuses requests when the order_id is missing/invalid or when no order exists for that identifier.",
+          "parameters": {
+            "properties": {
+              "order_id": {
+                "description": "The order id, such as '#W0000000'. Be careful there is a '#' symbol at the beginning of the order id.",
+                "title": "Order Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "order_id"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0041000\" if __import__(\"os\").path.isdir(\"./environment_mix/0041000\") else \"/app/database\")\ndef get_order_details(order_id):\n    import json, os\n    data = {'products': json.load(open(os.path.join(_DB, 'products.json'), encoding='utf-8')), 'orders': json.load(open(os.path.join(_DB, 'orders.json'), encoding='utf-8')), 'users': json.load(open(os.path.join(_DB, 'users.json'), encoding='utf-8'))}\n    orders = data[\"orders\"]\n    if order_id in orders:\n        return json.dumps(orders[order_id])\n    return \"Error: order not found\"\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_product_details",
+          "description": "Returns catalog and inventory information for a product type identified by product_id (not an item id). It validates that product_id is provided and refers to a product type in the catalog. It refuses requests when product_id is missing/invalid or when the product does not exist.",
+          "parameters": {
+            "properties": {
+              "product_id": {
+                "description": "The product id, such as '6086499569'. Be careful the product id is different from the item id.",
+                "title": "Product Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "product_id"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0041000\" if __import__(\"os\").path.isdir(\"./environment_mix/0041000\") else \"/app/database\")\ndef get_product_details(product_id):\n    import json, os\n    data = {'products': json.load(open(os.path.join(_DB, 'products.json'), encoding='utf-8')), 'orders': json.load(open(os.path.join(_DB, 'orders.json'), encoding='utf-8')), 'users': json.load(open(os.path.join(_DB, 'users.json'), encoding='utf-8'))}\n    products = data[\"products\"]\n    if product_id in products:\n        return json.dumps(products[product_id])\n    return \"Error: product not found\"\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_item_details",
+          "description": "Returns catalog and inventory information for a specific purchasable item identified by item_id (not a product id). It validates that item_id is provided and refers to a known item. It refuses requests when item_id is missing/invalid or when the item does not exist.",
+          "parameters": {
+            "properties": {
+              "item_id": {
+                "description": "The item id, such as '6086499569'. Be careful the item id is different from the product id.",
+                "title": "Item Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "item_id"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0041000\" if __import__(\"os\").path.isdir(\"./environment_mix/0041000\") else \"/app/database\")\ndef get_item_details(item_id):\n    import json, os\n    products = json.load(open(os.path.join(_DB, \"products.json\"), encoding=\"utf-8\"))\n    for product in products.values():\n        variants = product.get(\"variants\", {})\n        if item_id in variants:\n            return variants[item_id]\n    return \"Error: item not found\"\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_user_details",
+          "description": "Returns a user profile along with their associated orders for the supplied user_id. It validates that user_id is provided and matches an existing user. It refuses requests when user_id is missing/invalid or when the user cannot be found.",
+          "parameters": {
+            "properties": {
+              "user_id": {
+                "description": "The user id, such as 'sara_doe_496'.",
+                "title": "User Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "user_id"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0041000\" if __import__(\"os\").path.isdir(\"./environment_mix/0041000\") else \"/app/database\")\ndef get_user_details(user_id):\n    import json, os\n    data = {'products': json.load(open(os.path.join(_DB, 'products.json'), encoding='utf-8')), 'orders': json.load(open(os.path.join(_DB, 'orders.json'), encoding='utf-8')), 'users': json.load(open(os.path.join(_DB, 'users.json'), encoding='utf-8'))}\n    users = data[\"users\"]\n    if user_id in users:\n        return json.dumps(users[user_id])\n    return \"Error: user not found\"\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_all_product_types",
+          "description": "Lists all product types in the store and returns their display names and product_ids (up to the full catalog of 50 product types). It does not require any parameters. It refuses requests that include unsupported parameters or otherwise fail basic request validation.",
+          "parameters": {
+            "properties": {},
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0041000\" if __import__(\"os\").path.isdir(\"./environment_mix/0041000\") else \"/app/database\")\ndef list_all_product_types():\n    import json, os\n    data = {'products': json.load(open(os.path.join(_DB, 'products.json'), encoding='utf-8')), 'orders': json.load(open(os.path.join(_DB, 'orders.json'), encoding='utf-8')), 'users': json.load(open(os.path.join(_DB, 'users.json'), encoding='utf-8'))}\n    products = data[\"products\"]\n    product_dict = {\n        product[\"name\"]: product[\"product_id\"] for product in products.values()\n    }\n    product_dict = dict(sorted(product_dict.items()))\n    return json.dumps(product_dict)\n",
+          "description_restored": true
+        },
+        {
+          "name": "modify_pending_order_address",
+          "description": "Updates the shipping address on a pending order and returns the updated order details with the new address applied. It requires order_id plus address1, address2, city, state, country, and zip, and validates that all fields are present and non-empty where applicable. It refuses requests when the order is not found, is not pending (for example already processed or delivered), or when any required address field is missing or invalid.",
+          "parameters": {
+            "properties": {
+              "order_id": {
+                "description": "The order id, such as '#W0000000'. Be careful there is a '#' symbol at the beginning of the order id.",
+                "title": "Order Id",
+                "type": "string"
+              },
+              "address1": {
+                "description": "The first line of the address, such as '123 Main St'.",
+                "title": "Address1",
+                "type": "string"
+              },
+              "address2": {
+                "description": "The second line of the address, such as 'Apt 1' or ''.",
+                "title": "Address2",
+                "type": "string"
+              },
+              "city": {
+                "description": "The city, such as 'San Francisco'.",
+                "title": "City",
+                "type": "string"
+              },
+              "state": {
+                "description": "The state, such as 'CA'.",
+                "title": "State",
+                "type": "string"
+              },
+              "country": {
+                "description": "The country, such as 'USA'.",
+                "title": "Country",
+                "type": "string"
+              },
+              "zip": {
+                "description": "The zip code, such as '12345'.",
+                "title": "Zip",
+                "type": "string"
+              }
+            },
+            "required": [
+              "order_id",
+              "address1",
+              "address2",
+              "city",
+              "state",
+              "country",
+              "zip"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "def modify_pending_order_address(order_id, address1, address2, city, state, country, zip, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0041000\" if __import__(\"os\").path.isdir(\"./environment_mix/0041000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, started, status):\n        audit = _load(\"audit_log.json\")\n        if not isinstance(audit, list):\n            audit = []\n        audit.append({\"ts\": _now(), \"endpoint\": endpoint, \"status\": status, \"latency_ms\": int((time.time() - started) * 1000)})\n        _save(\"audit_log.json\", audit)\n\n    def _rate_limit(endpoint, started):\n        audit = _load(\"audit_log.json\")\n        if not isinstance(audit, list):\n            audit = []\n        try:\n            now_dt = datetime.datetime.utcnow()\n            cutoff = now_dt - datetime.timedelta(seconds=60)\n            recent = 0\n            for r in audit:\n                ts = r.get(\"ts\")\n                if not isinstance(ts, str):\n                    continue\n                try:\n                    rdt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if rdt >= cutoff:\n                    recent += 1\n            if recent >= 120:\n                _log(endpoint, started, \"RATE_LIMIT\")\n                return _err(\"RATE_LIMIT\", \"Too many requests. Please retry later.\", limit_per_minute=120)\n        except Exception:\n            pass\n        return None\n\n    started = time.time()\n    endpoint = \"modify_pending_order_address\"\n\n    if not isinstance(order_id, str) or not order_id or not order_id.startswith(\"#\"):\n        rl = _rate_limit(endpoint, started)\n        if rl:\n            return rl\n        _log(endpoint, started, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"order_id must be a non-empty string starting with '#'.\")\n    for k, v in [(\"address1\", address1), (\"address2\", address2), (\"city\", city), (\"state\", state), (\"country\", country), (\"zip\", zip)]:\n        if not isinstance(v, str):\n            rl = _rate_limit(endpoint, started)\n            if rl:\n                return rl\n            _log(endpoint, started, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", f\"{k} must be a string.\")\n        if k != \"address2\" and not v.strip():\n            rl = _rate_limit(endpoint, started)\n            if rl:\n                return rl\n            _log(endpoint, started, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", f\"{k} cannot be empty.\")\n\n    rl = _rate_limit(endpoint, started)\n    if rl:\n        return rl\n\n    orders = _load(\"orders.json\")\n    if not isinstance(orders, list):\n        orders = []\n\n    order = None\n    idx = None\n    for i, o in enumerate(orders):\n        if isinstance(o, dict) and o.get(\"order_id\") == order_id:\n            order = o\n            idx = i\n            break\n    if order is None:\n        _log(endpoint, started, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Order not found.\", order_id=order_id)\n\n    if order.get(\"status\") != \"pending\":\n        _log(endpoint, started, \"INVALID_TRANSITION\")\n        return _err(\"INVALID_TRANSITION\", \"Only pending orders can be modified.\", current_status=order.get(\"status\"))\n\n    order[\"address\"] = {\n        \"address1\": address1.strip(),\n        \"address2\": address2 if isinstance(address2, str) else \"\",\n        \"city\": city.strip(),\n        \"state\": state.strip(),\n        \"country\": country.strip(),\n        \"zip\": zip.strip(),\n    }\n    order[\"updated_at\"] = _now()\n\n    orders[idx] = order\n    _save(\"orders.json\", orders)\n\n    _log(endpoint, started, \"OK\")\n    return {\"order\": order}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "modify_pending_order_items",
+          "description": "Replaces specified items in a pending order with other items of the same product type and returns the updated order reflecting the changes and any price-difference charge or refund applied to the provided payment method. It requires order_id, item_ids, new_item_ids, and payment_method_id, and validates that item_ids and new_item_ids are the same length and that each replacement corresponds positionally to an item of the same product type. It refuses requests if the order is not found, not pending, has already had its items modified once, any listed item is not in the order (or quantity is inconsistent with duplicates), any replacement item is incompatible, or the payment method cannot be used for the adjustment.",
+          "parameters": {
+            "properties": {
+              "order_id": {
+                "description": "The order id, such as '#W0000000'. Be careful there is a '#' symbol at the beginning of the order id.",
+                "title": "Order Id",
+                "type": "string"
+              },
+              "item_ids": {
+                "description": "The item ids to be modified, each such as '1008292230'. There could be duplicate items in the list.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Item Ids",
+                "type": "array"
+              },
+              "new_item_ids": {
+                "description": "The item ids to be modified for, each such as '1008292230'. There could be duplicate items in the list. Each new item id should match the item id in the same position and be of the same product.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "New Item Ids",
+                "type": "array"
+              },
+              "payment_method_id": {
+                "description": "The payment method id to pay or receive refund for the item price difference, such as 'gift_card_0000000' or 'credit_card_0000000'. These can be looked up from the user or order details.",
+                "title": "Payment Method Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "order_id",
+              "item_ids",
+              "new_item_ids",
+              "payment_method_id"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "def modify_pending_order_items(order_id, item_ids, new_item_ids, payment_method_id, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0041000\" if __import__(\"os\").path.isdir(\"./environment_mix/0041000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, started, status):\n        audit = _load(\"audit_log.json\")\n        if not isinstance(audit, list):\n            audit = []\n        audit.append({\"ts\": _now(), \"endpoint\": endpoint, \"status\": status, \"latency_ms\": int((time.time() - started) * 1000)})\n        _save(\"audit_log.json\", audit)\n\n    def _rate_limit(endpoint, started):\n        audit = _load(\"audit_log.json\")\n        if not isinstance(audit, list):\n            audit = []\n        try:\n            now_dt = datetime.datetime.utcnow()\n            cutoff = now_dt - datetime.timedelta(seconds=60)\n            recent = 0\n            for r in audit:\n                ts = r.get(\"ts\")\n                if not isinstance(ts, str):\n                    continue\n                try:\n                    rdt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if rdt >= cutoff:\n                    recent += 1\n            if recent >= 120:\n                _log(endpoint, started, \"RATE_LIMIT\")\n                return _err(\"RATE_LIMIT\", \"Too many requests. Please retry later.\", limit_per_minute=120)\n        except Exception:\n            pass\n        return None\n\n    started = time.time()\n    endpoint = \"modify_pending_order_items\"\n\n    if not isinstance(order_id, str) or not order_id or not order_id.startswith(\"#\"):\n        rl = _rate_limit(endpoint, started)\n        if rl:\n            return rl\n        _log(endpoint, started, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"order_id must be a non-empty string starting with '#'.\")\n    if not isinstance(item_ids, list) or not all(isinstance(x, str) and x for x in item_ids):\n        rl = _rate_limit(endpoint, started)\n        if rl:\n            return rl\n        _log(endpoint, started, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"item_ids must be an array of strings.\")\n    if not isinstance(new_item_ids, list) or not all(isinstance(x, str) and x for x in new_item_ids):\n        rl = _rate_limit(endpoint, started)\n        if rl:\n            return rl\n        _log(endpoint, started, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"new_item_ids must be an array of strings.\")\n    if len(item_ids) != len(new_item_ids):\n        rl = _rate_limit(endpoint, started)\n        if rl:\n            return rl\n        _log(endpoint, started, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"item_ids and new_item_ids must have the same length.\")\n    if not isinstance(payment_method_id, str) or not payment_method_id.strip():\n        rl = _rate_limit(endpoint, started)\n        if rl:\n            return rl\n        _log(endpoint, started, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"payment_method_id is required.\")\n\n    rl = _rate_limit(endpoint, started)\n    if rl:\n        return rl\n\n    orders = _load(\"orders.json\")\n    users = _load(\"users.json\")\n    products = _load(\"products.json\")\n    if not isinstance(orders, list):\n        orders = []\n    if not isinstance(users, list):\n        users = []\n    if not isinstance(products, list):\n        products = []\n\n    # build product lookup product_id -> product row\n    prod_by_id = {}\n    for p in products:\n        if isinstance(p, dict) and isinstance(p.get(\"product_id\"), str):\n            prod_by_id[p[\"product_id\"]] = p\n\n    order = None\n    oidx = None\n    for i, o in enumerate(orders):\n        if isinstance(o, dict) and o.get(\"order_id\") == order_id:\n            order = o\n            oidx = i\n            break\n    if order is None:\n        _log(endpoint, started, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Order not found.\", order_id=order_id)\n    if order.get(\"status\") != \"pending\":\n        _log(endpoint, started, \"INVALID_TRANSITION\")\n        return _err(\"INVALID_TRANSITION\", \"Only pending orders can be modified.\", current_status=order.get(\"status\"))\n\n    user_id = order.get(\"user_id\")\n    user = None\n    for u in users:\n        if isinstance(u, dict) and u.get(\"user_id\") == user_id:\n            user = u\n            break\n    if user is None:\n        _log(endpoint, started, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"User for order not found.\", user_id=user_id)\n\n    # payment method availability check\n    pm = None\n    pms = user.get(\"payment_methods\")\n    if isinstance(pms, list):\n        for m in pms:\n            if isinstance(m, dict) and m.get(\"id\") == payment_method_id:\n                pm = m\n                break\n    if pm is None:\n        _log(endpoint, started, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Payment method not found for user.\", payment_method_id=payment_method_id)\n\n    items = order.get(\"items\")\n    if not isinstance(items, list):\n        _log(endpoint, started, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Order items are invalid.\")\n\n    # verify we can replace each requested item occurrence and compute diff\n    # We'll replace by first unmatched occurrence for each old item_id.\n    indices_by_item_id = {}\n    for idx, it in enumerate(items):\n        if isinstance(it, dict) and isinstance(it.get(\"item_id\"), str):\n            indices_by_item_id.setdefault(it[\"item_id\"], []).append(idx)\n\n    used_index = set()\n    replacements = []  # tuples (old_index, new_item_row)\n    diff = 0.0\n\n    # helper: find variant row in product variants (variants may be list or dict-ish)\n    def _find_variant(product_row, item_id_value):\n        vars_ = product_row.get(\"variants\")\n        if isinstance(vars_, list):\n            for v in vars_:\n                if isinstance(v, dict) and v.get(\"item_id\") == item_id_value:\n                    return v\n        elif isinstance(vars_, dict):\n            # tolerate dict keyed by item_id\n            v = vars_.get(item_id_value)\n            if isinstance(v, dict):\n                if \"item_id\" not in v:\n                    v = dict(v)\n                    v[\"item_id\"] = item_id_value\n                return v\n        return None\n\n    for old_id, new_id in zip(item_ids, new_item_ids):\n        cand = indices_by_item_id.get(old_id, [])\n        chosen = None\n        for j in cand:\n            if j not in used_index:\n                chosen = j\n                break\n        if chosen is None:\n            _log(endpoint, started, \"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"One or more item_ids were not found on the order.\", item_id=old_id)\n\n        old_item = items[chosen]\n        if not isinstance(old_item, dict) or old_item.get(\"item_id\") != old_id:\n            _log(endpoint, started, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Order item data is malformed.\")\n\n        prod_id = old_item.get(\"product_id\")\n        if not isinstance(prod_id, str) or prod_id not in prod_by_id:\n            _log(endpoint, started, \"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Product for order item not found.\", product_id=prod_id)\n\n        product_row = prod_by_id[prod_id]\n        new_variant = _find_variant(product_row, new_id)\n        if new_variant is None:\n            _log(endpoint, started, \"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Replacement item_id not found for that product.\", new_item_id=new_id, product_id=prod_id)\n\n        if new_variant.get(\"available\") is not True:\n            _log(endpoint, started, \"CONFLICT\")\n            return _err(\"CONFLICT\", \"Replacement item is not available.\", new_item_id=new_id)\n\n        old_price = old_item.get(\"price\")\n        new_price = new_variant.get(\"price\")\n        if not isinstance(old_price, (int, float)) or not isinstance(new_price, (int, float)):\n            _log(endpoint, started, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Item price data is invalid.\")\n\n        diff += float(new_price) - float(old_price)\n\n        # Build new order item, keeping name/product_id/options from variant if present, else from old_item\n        new_item = dict(old_item)\n        new_item[\"item_id\"] = new_id\n        new_item[\"price\"] = float(new_price)\n        # options may be stored under variant[\"options\"]\n        if isinstance(new_variant.get(\"options\"), dict):\n            new_item[\"options\"] = new_variant[\"options\"]\n        used_index.add(chosen)\n        replacements.append((chosen, new_item))\n\n    # handle charge/refund against payment method (gift card balance enforced)\n    diff = round(diff, 2)\n    if diff != 0:\n        if pm.get(\"source\") == \"gift_card\":\n            bal = pm.get(\"balance\", 0.0)\n            if not isinstance(bal, (int, float)):\n                _log(endpoint, started, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"Gift card balance is invalid.\")\n            if diff > 0 and float(bal) < diff:\n                _log(endpoint, started, \"CONFLICT\")\n                return _err(\"CONFLICT\", \"Insufficient gift card balance to cover price difference.\", required=diff, balance=float(bal))\n            # apply balance change\n            if diff > 0:\n                pm[\"balance\"] = round(float(bal) - diff, 2)\n            else:\n                pm[\"balance\"] = round(float(bal) + abs(diff), 2)\n\n        ph = order.get(\"payment_history\")\n        if ph is None:\n            ph = []\n            order[\"payment_history\"] = ph\n        if not isinstance(ph, list):\n            _log(endpoint, started, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Order payment_history is invalid.\")\n        order[\"payment_history\"].append(\n            {\n                \"transaction_type\": \"payment\" if diff > 0 else \"refund\",\n                \"amount\": abs(diff),\n                \"payment_method_id\": payment_method_id,\n            }\n        )\n\n    # apply replacements\n    for idx, new_item in replacements:\n        items[idx] = new_item\n    order[\"items\"] = items\n    order[\"updated_at\"] = _now()\n\n    orders[oidx] = order\n    _save(\"orders.json\", orders)\n    _save(\"users.json\", users)  # persist possible gift card balance change\n\n    _log(endpoint, started, \"OK\")\n    return {\"order\": order, \"price_difference\": diff, \"payment_method_id\": payment_method_id}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "modify_pending_order_payment",
+          "description": "Updates the payment method on an existing order that is still pending and returns the updated order/payment details. Refuses requests when the order_id is missing/invalid, the order cannot be found, the order is not in a pending state, or the payment_method_id is missing/invalid or not available for that order/user. Refuses the change if the order is already processed/shipped/canceled or the payment method cannot be used (for example, not owned by the user or otherwise ineligible).",
+          "parameters": {
+            "properties": {
+              "order_id": {
+                "description": "The order id, such as '#W0000000'. Be careful there is a '#' symbol at the beginning of the order id.",
+                "title": "Order Id",
+                "type": "string"
+              },
+              "payment_method_id": {
+                "description": "The payment method id to pay or receive refund for the item price difference, such as 'gift_card_0000000' or 'credit_card_0000000'. These can be looked up from the user or order details.",
+                "title": "Payment Method Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "order_id",
+              "payment_method_id"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "def modify_pending_order_payment(order_id, payment_method_id, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0041000\" if __import__(\"os\").path.isdir(\"./environment_mix/0041000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, started, status):\n        audit = _load(\"audit_log.json\")\n        if not isinstance(audit, list):\n            audit = []\n        audit.append({\"ts\": _now(), \"endpoint\": endpoint, \"status\": status, \"latency_ms\": int((time.time() - started) * 1000)})\n        _save(\"audit_log.json\", audit)\n\n    def _rate_limit(endpoint, started):\n        audit = _load(\"audit_log.json\")\n        if not isinstance(audit, list):\n            audit = []\n        try:\n            now_dt = datetime.datetime.utcnow()\n            cutoff = now_dt - datetime.timedelta(seconds=60)\n            recent = 0\n            for r in audit:\n                ts = r.get(\"ts\")\n                if not isinstance(ts, str):\n                    continue\n                try:\n                    rdt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if rdt >= cutoff:\n                    recent += 1\n            if recent >= 120:\n                _log(endpoint, started, \"RATE_LIMIT\")\n                return _err(\"RATE_LIMIT\", \"Too many requests. Please retry later.\", limit_per_minute=120)\n        except Exception:\n            pass\n        return None\n\n    started = time.time()\n    endpoint = \"modify_pending_order_payment\"\n\n    if not isinstance(order_id, str) or not order_id or not order_id.startswith(\"#\"):\n        rl = _rate_limit(endpoint, started)\n        if rl:\n            return rl\n        _log(endpoint, started, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"order_id must be a non-empty string starting with '#'.\")\n    if not isinstance(payment_method_id, str) or not payment_method_id.strip():\n        rl = _rate_limit(endpoint, started)\n        if rl:\n            return rl\n        _log(endpoint, started, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"payment_method_id is required.\")\n\n    rl = _rate_limit(endpoint, started)\n    if rl:\n        return rl\n\n    orders = _load(\"orders.json\")\n    users = _load(\"users.json\")\n    if not isinstance(orders, list):\n        orders = []\n    if not isinstance(users, list):\n        users = []\n\n    order = None\n    oidx = None\n    for i, o in enumerate(orders):\n        if isinstance(o, dict) and o.get(\"order_id\") == order_id:\n            order = o\n            oidx = i\n            break\n    if order is None:\n        _log(endpoint, started, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Order not found.\", order_id=order_id)\n    if order.get(\"status\") != \"pending\":\n        _log(endpoint, started, \"INVALID_TRANSITION\")\n        return _err(\"INVALID_TRANSITION\", \"Only pending orders can be modified.\", current_status=order.get(\"status\"))\n\n    user_id = order.get(\"user_id\")\n    user = None\n    for u in users:\n        if isinstance(u, dict) and u.get(\"user_id\") == user_id:\n            user = u\n            break\n    if user is None:\n        _log(endpoint, started, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"User for order not found.\", user_id=user_id)\n\n    # payment method must exist\n    new_pm = None\n    pms = user.get(\"payment_methods\")\n    if isinstance(pms, list):\n        for pm in pms:\n            if isinstance(pm, dict) and pm.get(\"id\") == payment_method_id:\n                new_pm = pm\n                break\n    if new_pm is None:\n        _log(endpoint, started, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Payment method not found for user.\", payment_method_id=payment_method_id)\n\n    ph = order.get(\"payment_history\")\n    if not isinstance(ph, list) or not ph:\n        _log(endpoint, started, \"CONFLICT\")\n        return _err(\"CONFLICT\", \"Order has no payment history to update.\")\n\n    # Determine current paid amount as net payments-refunds, but for pending assume initial payment exists.\n    net = 0.0\n    for tx in ph:\n        if not isinstance(tx, dict):\n            continue\n        amt = tx.get(\"amount\")\n        ttype = tx.get(\"transaction_type\")\n        if not isinstance(amt, (int, float)) or ttype not in (\"payment\", \"refund\"):\n            continue\n        net += float(amt) if ttype == \"payment\" else -float(amt)\n    net = round(net, 2)\n    if net <= 0:\n        _log(endpoint, started, \"CONFLICT\")\n        return _err(\"CONFLICT\", \"No outstanding paid amount found to migrate.\", net_paid=net)\n\n    # Identify \"current payment method\" as the most recent payment's payment_method_id\n    current_pmid = None\n    for tx in reversed(ph):\n        if isinstance(tx, dict) and tx.get(\"transaction_type\") == \"payment\" and isinstance(tx.get(\"payment_method_id\"), str):\n            current_pmid = tx[\"payment_method_id\"]\n            break\n    if current_pmid is None:\n        _log(endpoint, started, \"CONFLICT\")\n        return _err(\"CONFLICT\", \"Cannot determine current payment method.\")\n    if current_pmid == payment_method_id:\n        _log(endpoint, started, \"CONFLICT\")\n        return _err(\"CONFLICT\", \"New payment method must be different from current payment method.\", payment_method_id=payment_method_id)\n\n    # If new method is gift card, must have enough balance to cover net\n    if new_pm.get(\"source\") == \"gift_card\":\n        bal = new_pm.get(\"balance\", 0.0)\n        if not isinstance(bal, (int, float)):\n            _log(endpoint, started, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Gift card balance is invalid.\")\n        if float(bal) < net:\n            _log(endpoint, started, \"CONFLICT\")\n            return _err(\"CONFLICT\", \"Insufficient gift card balance to pay for the order.\", required=net, balance=float(bal))\n        new_pm[\"balance\"] = round(float(bal) - net, 2)\n\n    # If current method was a gift card, refund it (credit balance)\n    if isinstance(pms, list) and isinstance(current_pmid, str):\n        for pm in pms:\n            if isinstance(pm, dict) and pm.get(\"id\") == current_pmid and pm.get(\"source\") == \"gift_card\":\n                bal = pm.get(\"balance\", 0.0)\n                if isinstance(bal, (int, float)):\n                    pm[\"balance\"] = round(float(bal) + net, 2)\n                break\n\n    # Append ledger entries\n    ph.append({\"transaction_type\": \"refund\", \"amount\": net, \"payment_method_id\": current_pmid})\n    ph.append({\"transaction_type\": \"payment\", \"amount\": net, \"payment_method_id\": payment_method_id})\n    order[\"payment_history\"] = ph\n    order[\"updated_at\"] = _now()\n\n    orders[oidx] = order\n    _save(\"orders.json\", orders)\n    _save(\"users.json\", users)\n\n    _log(endpoint, started, \"OK\")\n    return {\"order\": order, \"migrated_amount\": net, \"from_payment_method_id\": current_pmid, \"to_payment_method_id\": payment_method_id}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "modify_user_address",
+          "description": "Replaces a user’s default shipping address with the provided address fields and returns the updated user/address details. Refuses requests when the user_id is missing/unknown, any required address field is missing, or the address fails basic validation (for example, empty lines where required). Refuses updates when the caller is not allowed to change that user’s address or the address cannot be set as a default for the account.",
+          "parameters": {
+            "properties": {
+              "user_id": {
+                "description": "The user id, such as 'sara_doe_496'.",
+                "title": "User Id",
+                "type": "string"
+              },
+              "address1": {
+                "description": "The first line of the address, such as '123 Main St'.",
+                "title": "Address1",
+                "type": "string"
+              },
+              "address2": {
+                "description": "The second line of the address, such as 'Apt 1' or ''.",
+                "title": "Address2",
+                "type": "string"
+              },
+              "city": {
+                "description": "The city, such as 'San Francisco'.",
+                "title": "City",
+                "type": "string"
+              },
+              "state": {
+                "description": "The state, such as 'CA'.",
+                "title": "State",
+                "type": "string"
+              },
+              "country": {
+                "description": "The country, such as 'USA'.",
+                "title": "Country",
+                "type": "string"
+              },
+              "zip": {
+                "description": "The zip code, such as '12345'.",
+                "title": "Zip",
+                "type": "string"
+              }
+            },
+            "required": [
+              "user_id",
+              "address1",
+              "address2",
+              "city",
+              "state",
+              "country",
+              "zip"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "def modify_user_address(user_id, address1, address2, city, state, country, zip, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0041000\" if __import__(\"os\").path.isdir(\"./environment_mix/0041000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, started, status):\n        audit = _load(\"audit_log.json\")\n        if not isinstance(audit, list):\n            audit = []\n        audit.append({\"ts\": _now(), \"endpoint\": endpoint, \"status\": status, \"latency_ms\": int((time.time() - started) * 1000)})\n        _save(\"audit_log.json\", audit)\n\n    def _rate_limit(endpoint, started):\n        audit = _load(\"audit_log.json\")\n        if not isinstance(audit, list):\n            audit = []\n        try:\n            now_dt = datetime.datetime.utcnow()\n            cutoff = now_dt - datetime.timedelta(seconds=60)\n            recent = 0\n            for r in audit:\n                ts = r.get(\"ts\")\n                if not isinstance(ts, str):\n                    continue\n                try:\n                    rdt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if rdt >= cutoff:\n                    recent += 1\n            if recent >= 120:\n                _log(endpoint, started, \"RATE_LIMIT\")\n                return _err(\"RATE_LIMIT\", \"Too many requests. Please retry later.\", limit_per_minute=120)\n        except Exception:\n            pass\n        return None\n\n    started = time.time()\n    endpoint = \"modify_user_address\"\n\n    if not isinstance(user_id, str) or not user_id.strip():\n        rl = _rate_limit(endpoint, started)\n        if rl:\n            return rl\n        _log(endpoint, started, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"user_id is required.\")\n    for k, v in [(\"address1\", address1), (\"address2\", address2), (\"city\", city), (\"state\", state), (\"country\", country), (\"zip\", zip)]:\n        if not isinstance(v, str):\n            rl = _rate_limit(endpoint, started)\n            if rl:\n                return rl\n            _log(endpoint, started, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", f\"{k} must be a string.\")\n        if k != \"address2\" and not v.strip():\n            rl = _rate_limit(endpoint, started)\n            if rl:\n                return rl\n            _log(endpoint, started, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", f\"{k} cannot be empty.\")\n\n    rl = _rate_limit(endpoint, started)\n    if rl:\n        return rl\n\n    users = _load(\"users.json\")\n    if not isinstance(users, list):\n        users = []\n\n    user = None\n    uidx = None\n    for i, u in enumerate(users):\n        if isinstance(u, dict) and u.get(\"user_id\") == user_id:\n            user = u\n            uidx = i\n            break\n    if user is None:\n        _log(endpoint, started, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"User not found.\", user_id=user_id)\n\n    user[\"address\"] = {\n        \"address1\": address1.strip(),\n        \"address2\": address2 if isinstance(address2, str) else \"\",\n        \"city\": city.strip(),\n        \"state\": state.strip(),\n        \"country\": country.strip(),\n        \"zip\": zip.strip(),\n    }\n    user[\"updated_at\"] = _now()\n\n    users[uidx] = user\n    _save(\"users.json\", users)\n\n    _log(endpoint, started, \"OK\")\n    return {\"user\": user}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "return_delivered_order_items",
+          "description": "Creates a return request for specific item instances from a delivered order, changes the order status to “return requested,” and returns the updated order/return details (with follow-up instructions sent separately). Refuses requests when the order_id is missing/invalid, the order cannot be found, the order is not delivered, the item_ids list is missing/empty, or any listed item does not belong to the order or is not return-eligible. Refuses the request when the payment_method_id is missing/invalid or cannot be used for the refund/adjustment, or when the requested return conflicts with the order’s current state (for example, already in a return flow).",
+          "parameters": {
+            "properties": {
+              "order_id": {
+                "description": "The order id, such as '#W0000000'. Be careful there is a '#' symbol at the beginning of the order id.",
+                "title": "Order Id",
+                "type": "string"
+              },
+              "item_ids": {
+                "description": "The item ids to be returned, each such as '1008292230'. There could be duplicate items in the list.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Item Ids",
+                "type": "array"
+              },
+              "payment_method_id": {
+                "description": "The payment method id to pay or receive refund for the item price difference, such as 'gift_card_0000000' or 'credit_card_0000000'.\nThese can be looked up from the user or order details.",
+                "title": "Payment Method Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "order_id",
+              "item_ids",
+              "payment_method_id"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0041000\" if __import__(\"os\").path.isdir(\"./environment_mix/0041000\") else \"/app/database\")\ndef return_delivered_order_items(order_id, item_ids, payment_method_id):\n    import json, os\n    data = {'products': json.load(open(os.path.join(_DB, 'products.json'), encoding='utf-8')), 'orders': json.load(open(os.path.join(_DB, 'orders.json'), encoding='utf-8')), 'users': json.load(open(os.path.join(_DB, 'users.json'), encoding='utf-8'))}\n    orders = data[\"orders\"]\n\n    # Check if the order exists and is delivered\n    if order_id not in orders:\n        return \"Error: order not found\"\n    order = orders[order_id]\n    if order[\"status\"] != \"delivered\":\n        return \"Error: non-delivered order cannot be returned\"\n\n    # Check if the payment method exists and is either the original payment method or a gift card\n    if payment_method_id not in data[\"users\"][order[\"user_id\"]][\"payment_methods\"]:\n        return \"Error: payment method not found\"\n    if (\n        \"gift_card\" not in payment_method_id\n        and payment_method_id != order[\"payment_history\"][0][\"payment_method_id\"]\n    ):\n        return \"Error: payment method should be either the original payment method or a gift card\"\n\n    # Check if the items to be returned exist (there could be duplicate items in either list)\n    all_item_ids = [item[\"item_id\"] for item in order[\"items\"]]\n    for item_id in item_ids:\n        if item_ids.count(item_id) > all_item_ids.count(item_id):\n            return \"Error: some item not found\"\n\n    # Update the order status\n    order[\"status\"] = \"return requested\"\n    order[\"return_items\"] = sorted(item_ids)\n    order[\"return_payment_method_id\"] = payment_method_id\n\n    return json.dumps(order)\n",
+          "description_restored": true
+        },
+        {
+          "name": "transfer_to_human_agents",
+          "description": "Escalates the conversation to a human agent and passes along the provided summary, returning an acknowledgement of the handoff. Refuses requests when the summary is missing/empty or the handoff cannot be initiated from the current session/context. Refuses escalation when routing is unavailable or the caller is not permitted to create a human-agent transfer for the conversation.",
+          "parameters": {
+            "properties": {
+              "summary": {
+                "description": "A summary of the user's issue.",
+                "title": "Summary",
+                "type": "string"
+              }
+            },
+            "required": [
+              "summary"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "def transfer_to_human_agents(summary, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0041000\" if __import__(\"os\").path.isdir(\"./environment_mix/0041000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    started = time.time()\n    endpoint = \"transfer_to_human_agents\"\n\n    # basic validation\n    if not isinstance(summary, str) or not summary.strip():\n        audit = _load(\"audit_log.json\")\n        if not isinstance(audit, list):\n            audit = []\n        audit.append({\"ts\": _now(), \"endpoint\": endpoint, \"status\": \"VALIDATION_ERROR\", \"latency_ms\": int((time.time() - started) * 1000)})\n        _save(\"audit_log.json\", audit)\n        return _err(\"VALIDATION_ERROR\", \"summary is required.\")\n\n    # rate limit (120/min)\n    audit = _load(\"audit_log.json\")\n    if not isinstance(audit, list):\n        audit = []\n    try:\n        now_dt = datetime.datetime.utcnow()\n        cutoff = now_dt - datetime.timedelta(seconds=60)\n        recent = 0\n        for r in audit:\n            ts = r.get(\"ts\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                rdt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                continue\n            if rdt >= cutoff:\n                recent += 1\n        if recent >= 120:\n            audit.append({\"ts\": _now(), \"endpoint\": endpoint, \"status\": \"RATE_LIMIT\", \"latency_ms\": int((time.time() - started) * 1000)})\n            _save(\"audit_log.json\", audit)\n            return _err(\"RATE_LIMIT\", \"Too many requests. Please retry later.\", limit_per_minute=120)\n    except Exception:\n        pass\n\n    # persist a handoff record (observable effect)\n    handoffs = _load(\"human_handoffs.json\")\n    if not isinstance(handoffs, list):\n        handoffs = []\n    handoff_id = \"hh_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S\") + \"_\" + str(len(handoffs) + 1)\n    row = {\n        \"handoff_id\": handoff_id,\n        \"ts\": _now(),\n        \"status\": \"queued\",\n        \"summary\": summary.strip(),\n    }\n    handoffs.append(row)\n    _save(\"human_handoffs.json\", handoffs)\n\n    audit.append({\"ts\": _now(), \"endpoint\": endpoint, \"status\": \"OK\", \"latency_ms\": int((time.time() - started) * 1000), \"handoff_id\": handoff_id})\n    _save(\"audit_log.json\", audit)\n\n    return {\"handoff\": row, \"message\": \"Conversation escalated to a human agent.\"}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0041000",
+    "index": 41,
+    "name": "MercantileCare Operations Hub",
+    "description": "A retail commerce support service that powers product and item lookups, customer identity retrieval, and post‑purchase order actions like cancellations, exchanges, returns, payment/address updates, and human agent escalation.",
+    "taxonomy": {
+      "L1_id": "L1-20",
+      "L1_name": "Communication & General Utilities",
+      "L1_name_zh": "通信与通用工具",
+      "L2_id": "L2-50",
+      "L2_name": "Education, Reference & Lifestyle",
+      "L2_name_zh": "教育、参考与生活",
+      "L3_name": "Retail Orders & Customer Care Operations",
+      "L3_name_zh": "零售订单与客服运营"
+    },
+    "database_dir": "./environment_mix/0041000",
+    "mount_path": "/app/database",
+    "n_tools": 16,
+    "n_collections": 3,
+    "n_records": 1550,
+    "n_questions": 2,
+    "execution_audit": {
+      "tools": 16,
+      "loaded": 16,
+      "reads_returning_data": 8,
+      "read_operations": 10,
+      "mutations_persisted": 1,
+      "mutations_attempted": 6
+    },
+    "tools_loadable_from_database_dir": 16,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "find_user_id_by_name_zip",
+      "returned_chars": 89
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

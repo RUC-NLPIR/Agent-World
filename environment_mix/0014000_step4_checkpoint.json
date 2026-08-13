@@ -1,0 +1,443 @@
+{
+  "index": 14,
+  "local_files_dir": "./environment_mix/0014000",
+  "file_list": [
+    "./environment_mix/0014000/README.md",
+    "./environment_mix/0014000/api_keys.json",
+    "./environment_mix/0014000/provider_configs.json",
+    "./environment_mix/0014000/weather_requests.json",
+    "./environment_mix/0014000/weather_responses.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "api_keys.json": "34 rows",
+        "weather_requests.json": "34 rows",
+        "weather_responses.json": "34 rows",
+        "provider_configs.json": "12 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "weather",
+          "description": "Fetches current weather conditions for the specified location (by name and/or latitude/longitude) using the selected provider and returns the resolved weather payload, optionally including the provider raw_payload when include_raw_payload is true; repeated calls with the same idempotency_key are de-duplicated and return the original result. Raises VALIDATION_ERROR when api_key is missing/doesn’t match the required pattern, when latitude/longitude are out of range, when provider/units/request_source are not one of the allowed values, or when unknown parameters are provided. Raises UNAUTHORIZED when the api_key is not recognized, RATE_LIMITED when the client exceeds request rate limits, QUOTA_EXCEEDED when the client exceeds its usage quota for weather calls, and PROVIDER_ERROR when the upstream provider cannot fulfill the request (including invalid/unsupported location inputs).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^wthr_key_[0-9A-Z]{3,}$",
+                "description": "API key id used to identify the client and enforce quotas (api_keys.id)."
+              },
+              "location_name": {
+                "type": "string",
+                "description": "Human-readable location name (e.g., city) to resolve weather for."
+              },
+              "latitude": {
+                "type": "number",
+                "minimum": -90,
+                "maximum": 90,
+                "description": "Latitude in decimal degrees for the weather lookup."
+              },
+              "longitude": {
+                "type": "number",
+                "minimum": -180,
+                "maximum": 180,
+                "description": "Longitude in decimal degrees for the weather lookup."
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "open_meteo",
+                  "openweathermap",
+                  "weatherapi",
+                  "mock"
+                ],
+                "description": "Preferred weather data provider to use when fetching conditions."
+              },
+              "timezone": {
+                "type": "string",
+                "description": "IANA timezone name to use for interpreting timestamps (e.g., 'America/Los_Angeles')."
+              },
+              "request_source": {
+                "type": "string",
+                "enum": [
+                  "mcp",
+                  "http",
+                  "internal"
+                ],
+                "description": "Source channel for the request for logging/analytics."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Optional idempotency key to de-duplicate repeated identical requests."
+              },
+              "units": {
+                "type": "string",
+                "enum": [
+                  "metric",
+                  "imperial"
+                ],
+                "description": "Unit system preference for returned values."
+              },
+              "include_raw_payload": {
+                "type": "boolean",
+                "description": "Whether to include the provider raw_payload in the response."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def weather(api_key, location_name=None, latitude=None, longitude=None, provider=None, timezone=None, request_source=None, idempotency_key=None, units=None, include_raw_payload=None, **_extra):\n    import json, os, datetime, time, re, uuid, copy\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0014000\" if __import__(\"os\").path.isdir(\"./environment_mix/0014000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n        return None\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s if s.tzinfo else s.replace(tzinfo=datetime.timezone.utc)\n        if not isinstance(s, str):\n            return None\n        st = s.strip()\n        try:\n            if st.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(st[:-1]).replace(tzinfo=datetime.timezone.utc)\n            dt = datetime.datetime.fromisoformat(st)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _minute_bucket(dt):\n        return dt.replace(second=0, microsecond=0)\n\n    def _day_bucket(dt):\n        return dt.replace(hour=0, minute=0, second=0, microsecond=0)\n\n    def _new_id(prefix):\n        # Examples are ULID-like; use time+uuid for stable uniqueness offline.\n        return f\"{prefix}{now.strftime('%y%m%d%H%M%S')}_{uuid.uuid4().hex.upper()}\"\n\n    def _safe_jsonable(x, _seen=None):\n        # Prevent \"ValueError: Circular reference detected\" by copying only jsonable parts.\n        if _seen is None:\n            _seen = set()\n        oid = id(x)\n        if oid in _seen:\n            return \"<circular>\"\n        if x is None or isinstance(x, (str, int, float, bool)):\n            return x\n        if isinstance(x, datetime.datetime):\n            return _iso(x)\n        if isinstance(x, list):\n            _seen.add(oid)\n            return [_safe_jsonable(v, _seen) for v in x]\n        if isinstance(x, tuple):\n            _seen.add(oid)\n            return [_safe_jsonable(v, _seen) for v in x]\n        if isinstance(x, dict):\n            _seen.add(oid)\n            out = {}\n            for k, v in x.items():\n                if isinstance(k, (str, int, float, bool)) or k is None:\n                    kk = str(k) if not isinstance(k, str) else k\n                else:\n                    kk = str(k)\n                out[kk] = _safe_jsonable(v, _seen)\n            return out\n        # fallback\n        return str(x)\n\n    # ---------- validate inputs ----------\n    if not isinstance(api_key, str) or not re.match(r\"^wthr_key_[0-9A-Z]{3,}$\", api_key):\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a string matching ^wthr_key_[0-9A-Z]{3,}$.\")\n    if location_name is not None and not isinstance(location_name, str):\n        return _err(\"VALIDATION_ERROR\", \"location_name must be a string when provided.\")\n    if timezone is not None and not isinstance(timezone, str):\n        return _err(\"VALIDATION_ERROR\", \"timezone must be a string when provided.\")\n    if request_source is not None and request_source not in (\"mcp\", \"http\", \"internal\"):\n        return _err(\"VALIDATION_ERROR\", \"request_source must be one of: mcp, http, internal.\")\n    if idempotency_key is not None and not isinstance(idempotency_key, str):\n        return _err(\"VALIDATION_ERROR\", \"idempotency_key must be a string when provided.\")\n    if units is not None and units not in (\"metric\", \"imperial\"):\n        return _err(\"VALIDATION_ERROR\", \"units must be one of: metric, imperial.\")\n    if include_raw_payload is not None and not isinstance(include_raw_payload, bool):\n        return _err(\"VALIDATION_ERROR\", \"include_raw_payload must be a boolean when provided.\")\n    if provider is not None and provider not in (\"open_meteo\", \"openweathermap\", \"weatherapi\", \"mock\"):\n        return _err(\"VALIDATION_ERROR\", \"provider must be one of: open_meteo, openweathermap, weatherapi, mock.\")\n    if latitude is not None:\n        if not isinstance(latitude, (int, float)):\n            return _err(\"VALIDATION_ERROR\", \"latitude must be a number when provided.\")\n        if latitude < -90 or latitude > 90:\n            return _err(\"VALIDATION_ERROR\", \"latitude must be between -90 and 90.\")\n    if longitude is not None:\n        if not isinstance(longitude, (int, float)):\n            return _err(\"VALIDATION_ERROR\", \"longitude must be a number when provided.\")\n        if longitude < -180 or longitude > 180:\n            return _err(\"VALIDATION_ERROR\", \"longitude must be between -180 and 180.\")\n    if not location_name and (latitude is None or longitude is None):\n        return _err(\"VALIDATION_ERROR\", \"Provide either location_name or both latitude and longitude.\")\n\n    # defaults\n    request_source_val = request_source or \"mcp\"\n    include_raw = True if include_raw_payload is True else False\n\n    api_keys = _load(\"api_keys.json\")\n    weather_requests = _load(\"weather_requests.json\")\n    weather_responses = _load(\"weather_responses.json\")\n    provider_configs = _load(\"provider_configs.json\")\n\n    # ---------- authenticate api_key id (explicit credential param) ----------\n    key_row = None\n    for r in api_keys:\n        if isinstance(r, dict) and r.get(\"id\") == api_key:\n            key_row = r\n            break\n    if not key_row or key_row.get(\"status\") != \"active\":\n        # still log the attempt (requests collection is the audit log)\n        req_id = _new_id(\"wthr_req_\")\n        created = _iso(now)\n        finished = _iso(datetime.datetime.now(datetime.timezone.utc))\n        weather_requests.append({\n            \"id\": req_id,\n            \"api_key_id\": api_key if key_row else None,\n            \"tool_name\": \"weather\",\n            \"status\": \"failed\",\n            \"request_source\": request_source_val,\n            \"caller_ip\": None,\n            \"user_agent\": None,\n            \"idempotency_key\": idempotency_key,\n            \"started_at\": created,\n            \"finished_at\": finished,\n            \"duration_ms\": int(max(0, (time.time() - t0) * 1000)),\n            \"error_code\": \"UNAUTHORIZED\",\n            \"error_message\": \"API key is invalid or not active.\",\n            \"created_at\": created,\n            \"updated_at\": finished\n        })\n        _save(\"weather_requests.json\", weather_requests)\n        return _err(\"UNAUTHORIZED\", \"API key is invalid, disabled, or revoked.\")\n\n    api_key_id = key_row[\"id\"]\n\n    # ---------- idempotency: return existing response without creating new request ----------\n    if idempotency_key:\n        for req in weather_requests:\n            if not isinstance(req, dict):\n                continue\n            if req.get(\"api_key_id\") == api_key_id and req.get(\"idempotency_key\") == idempotency_key:\n                # must return previously stored response (if succeeded)\n                rsp = None\n                for rr in weather_responses:\n                    if isinstance(rr, dict) and rr.get(\"weather_request_id\") == req.get(\"id\"):\n                        rsp = rr\n                        break\n                # If the previous attempt wasn't succeeded or has no response, return a stable replay of status.\n                body = {\n                    \"request\": req,\n                    \"response\": rsp if (include_raw and rsp is not None) else (None if rsp is None else {k: v for k, v in rsp.items() if k != \"raw_payload\"}),\n                }\n                # Ensure json-serializable (and no circular refs)\n                return _safe_jsonable(body)\n\n    # ---------- create request row with status='received' BEFORE any provider selection ----------\n    req_id = _new_id(\"wthr_req_\")\n    created = _iso(now)\n    req_row = {\n        \"id\": req_id,\n        \"api_key_id\": api_key_id,\n        \"tool_name\": \"weather\",\n        \"status\": \"received\",\n        \"request_source\": request_source_val,\n        \"caller_ip\": None,\n        \"user_agent\": None,\n        \"idempotency_key\": idempotency_key,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"duration_ms\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"created_at\": created,\n        \"updated_at\": created,\n    }\n    weather_requests.append(req_row)\n    _save(\"weather_requests.json\", weather_requests)\n\n    def _transition(req, to_status, error_code=None, error_message=None):\n        allowed = {\n            \"received\": {\"running\", \"throttled\", \"failed\"},\n            \"running\": {\"succeeded\", \"failed\"},\n            \"succeeded\": set(),\n            \"failed\": set(),\n            \"throttled\": set(),\n        }\n        frm = req.get(\"status\")\n        if to_status not in allowed.get(frm, set()):\n            return False, _err(\"INVALID_TRANSITION\", f\"Invalid status transition {frm} -> {to_status}.\")\n        req[\"status\"] = to_status\n        ts = datetime.datetime.now(datetime.timezone.utc)\n        if to_status == \"running\":\n            req[\"started_at\"] = _iso(ts)\n        if to_status in (\"succeeded\", \"failed\", \"throttled\"):\n            req[\"finished_at\"] = _iso(ts)\n            req[\"duration_ms\"] = int(max(0, (time.time() - t0) * 1000))\n        if error_code is not None:\n            req[\"error_code\"] = error_code\n        if error_message is not None:\n            req[\"error_message\"] = error_message\n        req[\"updated_at\"] = _iso(ts)\n        return True, None\n\n    def _persist_req(req):\n        for i, r in enumerate(weather_requests):\n            if isinstance(r, dict) and r.get(\"id\") == req.get(\"id\"):\n                weather_requests[i] = req\n                _save(\"weather_requests.json\", weather_requests)\n                return True\n        return False\n\n    # ---------- rate limit / quota enforcement ----------\n    # Enforce only when api_key_id present (it is)\n    minute_limit = key_row.get(\"requests_per_minute_limit\")\n    day_limit = key_row.get(\"requests_per_day_limit\")\n    if not isinstance(minute_limit, int) or not isinstance(day_limit, int) or minute_limit < 0 or day_limit < 0:\n        ok, er = _transition(req_row, \"failed\", \"VALIDATION_ERROR\", \"API key limits are misconfigured.\")\n        _persist_req(req_row)\n        return er if er else _err(\"VALIDATION_ERROR\", \"API key limits are misconfigured.\")\n\n    # Compute buckets, reset counters if boundary changed\n    now_min = _minute_bucket(now)\n    now_day = _day_bucket(now)\n    prev_min = _parse_dt(key_row.get(\"usage_minute\"))\n    prev_day = _parse_dt(key_row.get(\"usage_day\"))\n\n    if prev_min is None or _minute_bucket(prev_min) != now_min:\n        key_row[\"usage_minute\"] = _iso(now_min)\n        key_row[\"usage_minute_count\"] = 0\n    if prev_day is None or _day_bucket(prev_day) != now_day:\n        key_row[\"usage_day\"] = _iso(now_day)\n        key_row[\"usage_day_count\"] = 0\n\n    if key_row.get(\"usage_minute_count\", 0) >= minute_limit or key_row.get(\"usage_day_count\", 0) >= day_limit:\n        ok, er = _transition(req_row, \"throttled\", \"RATE_LIMIT\", \"Rate limit or daily quota exceeded.\")\n        _persist_req(req_row)\n        # persist key boundary resets even on throttling\n        key_row[\"updated_at\"] = _iso(datetime.datetime.now(datetime.timezone.utc))\n        for i, r in enumerate(api_keys):\n            if isinstance(r, dict) and r.get(\"id\") == api_key_id:\n                api_keys[i] = key_row\n                _save(\"api_keys.json\", api_keys)\n                break\n        return _err(\"RATE_LIMIT\", \"Rate limit or daily quota exceeded.\")\n\n    # increment usage (this request counts even if it later fails)\n    key_row[\"usage_minute_count\"] = int(key_row.get(\"usage_minute_count\", 0)) + 1\n    key_row[\"usage_day_count\"] = int(key_row.get(\"usage_day_count\", 0)) + 1\n    key_row[\"last_used_at\"] = _iso(datetime.datetime.now(datetime.timezone.utc))\n    key_row[\"updated_at\"] = _iso(datetime.datetime.now(datetime.timezone.utc))\n    for i, r in enumerate(api_keys):\n        if isinstance(r, dict) and r.get(\"id\") == api_key_id:\n            api_keys[i] = key_row\n            _save(\"api_keys.json\", api_keys)\n            break\n\n    # ---------- provider selection ----------\n    active_cfgs = [c for c in provider_configs if isinstance(c, dict) and c.get(\"status\") == \"active\"]\n    if provider:\n        active_cfgs = [c for c in active_cfgs if c.get(\"provider\") == provider]\n    # lowest priority integer wins\n    def _prio(c):\n        p = c.get(\"priority\")\n        return p if isinstance(p, int) else 10**9\n    active_cfgs.sort(key=_prio)\n    cfg = active_cfgs[0] if active_cfgs else None\n\n    if not cfg:\n        ok, er = _transition(req_row, \"failed\", \"NO_PROVIDER_AVAILABLE\", \"No active provider configuration available.\")\n        _persist_req(req_row)\n        return _err(\"CONFLICT\", \"No active provider configuration available.\", rule=\"Provider selection requires an active provider_configs row.\", error_code=\"NO_PROVIDER_AVAILABLE\")\n\n    # transition to running\n    ok, er = _transition(req_row, \"running\")\n    if not ok:\n        _persist_req(req_row)\n        return er\n    _persist_req(req_row)\n\n    # ---------- fulfill (offline): choose from existing stored response patterns or synthesize deterministic payload ----------\n    # Real backend would call upstream; here we produce a payload and persist it as returned to client.\n    # To avoid fabricating rows not in store? Business rules require creating a response row for succeeded.\n    # We'll create exactly one response row for this new request, derived deterministically from input.\n    resolved_lat = latitude\n    resolved_lon = longitude\n    if resolved_lat is None or resolved_lon is None:\n        # minimal deterministic \"geocode\"\n        h = abs(hash((location_name or \"\").strip().lower())) % 1000000\n        resolved_lat = (h % 18000) / 100.0 - 90.0\n        resolved_lon = ((h // 18000) % 36000) / 100.0 - 180.0\n\n    provider_name = cfg.get(\"provider\") if cfg.get(\"provider\") in (\"open_meteo\", \"openweathermap\", \"weatherapi\", \"mock\") else \"unknown\"\n    obs_time = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n\n    # deterministic values\n    base = (abs(hash((resolved_lat, resolved_lon, obs_time.isoformat()[:13]))) % 2500) / 100.0  # 0..25\n    temp_c = (base * 1.2) + 5.0\n    humidity = int(abs(hash((\"h\", resolved_lat, resolved_lon))) % 101)\n    wind = (abs(hash((\"w\", resolved_lat, resolved_lon))) % 1500) / 100.0\n\n    if units == \"imperial\":\n        temperature = temp_c * 9.0 / 5.0 + 32.0\n        wind_speed = wind * 2.2369362920544  # m/s to mph\n        temp_field = {\"temperature_f\": round(temperature, 2)}\n        wind_field = {\"wind_speed_mph\": round(wind_speed, 2)}\n    else:\n        temp_field = {\"temperature_c\": round(temp_c, 2)}\n        wind_field = {\"wind_speed_mps\": round(wind, 2)}\n\n    payload = {\n        \"provider\": provider_name,\n        \"location\": {\n            \"name\": location_name,\n            \"latitude\": resolved_lat,\n            \"longitude\": resolved_lon,\n            \"timezone\": timezone\n        },\n        \"observed_at\": _iso(obs_time),\n        \"current\": {\n            **temp_field,\n            \"humidity_pct\": humidity,\n            **wind_field,\n            \"condition\": {\"code\": \"unknown\", \"text\": \"Unknown\"}\n        }\n    }\n\n    # Persist response row\n    rsp_id = _new_id(\"wthr_rsp_\")\n    rsp_row = {\n        \"id\": rsp_id,\n        \"weather_request_id\": req_id,\n        \"provider\": provider_name if provider_name in (\"open_meteo\", \"openweathermap\", \"weatherapi\", \"mock\") else \"unknown\",\n        \"provider_request_id\": None,\n        \"location_name\": location_name,\n        \"latitude\": float(resolved_lat) if resolved_lat is not None else None,\n        \"longitude\": float(resolved_lon) if resolved_lon is not None else None,\n        \"timezone\": timezone,\n        \"observed_at\": _iso(obs_time),\n        \"temperature_c\": round(temp_c, 2) if units != \"imperial\" else None,\n        \"humidity_pct\": humidity,\n        \"wind_speed_mps\": round(wind, 2) if units != \"imperial\" else None,\n        \"condition_code\": \"unknown\",\n        \"condition_text\": \"Unknown\",\n        \"raw_payload\": _safe_jsonable(payload),\n        \"created_at\": _iso(datetime.datetime.now(datetime.timezone.utc)),\n        \"updated_at\": _iso(datetime.datetime.now(datetime.timezone.utc)),\n    }\n\n    # enforce unique(weather_request_id)\n    for existing in weather_responses:\n        if isinstance(existing, dict) and existing.get(\"weather_request_id\") == req_id:\n            ok, er = _transition(req_row, \"failed\", \"CONFLICT\", \"A response already exists for this request.\")\n            _persist_req(req_row)\n            return _err(\"CONFLICT\", \"A response already exists for this request.\")\n\n    weather_responses.append(rsp_row)\n    _save(\"weather_responses.json\", weather_responses)\n\n    ok, er = _transition(req_row, \"succeeded\")\n    _persist_req(req_row)\n\n    result_response = rsp_row if include_raw else {k: v for k, v in rsp_row.items() if k != \"raw_payload\"}\n    return _safe_jsonable({\n        \"request\": req_row,\n        \"response\": result_response\n    })\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "me",
+          "description": "Returns the calling identity for the provided api_key, including its current status, effective rate-limit/quota settings, and the current minute/day usage counters. Refuses with AUTH_ERROR when the api_key is missing, invalid, disabled, or revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^wthr_key_[0-9A-Z]{3,}$",
+                "description": "API key id used to identify the client and enforce quotas (api_keys.id)."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def me(api_key, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0014000\" if __import__(\"os\").path.isdir(\"./environment_mix/0014000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    def _now_utc():\n        return datetime.datetime.now(datetime.timezone.utc)\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    # Validate api_key format\n    if not isinstance(api_key, str) or not re.match(r\"^wthr_key_[0-9A-Z]{3,}$\", api_key):\n        return _err(\"VALIDATION_ERROR\", \"Invalid api_key format.\")\n\n    api_keys = _load(\"api_keys.json\")\n    weather_requests = _load(\"weather_requests.json\")\n\n    key_row = None\n    for k in api_keys:\n        if k.get(\"id\") == api_key:\n            key_row = k\n            break\n\n    # Log call as a weather_requests row? tool_name enum only 'weather', so cannot. No other log collection exists.\n    # We still update usage counters only on successful authenticated use for this identity endpoint? Spec doesn't say.\n    # We'll avoid mutating quotas here, but we will update last_used_at on success as \"authenticated use\".\n    if key_row is None:\n        return _err(\"UNAUTHORIZED\", \"API key not found.\")\n\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", f\"API key is {key_row.get('status')}.\")\n\n    now = _now_utc()\n    key_row[\"last_used_at\"] = _iso(now)\n    key_row[\"updated_at\"] = _iso(now)\n    _save(\"api_keys.json\", api_keys)\n\n    return {\n        \"id\": key_row.get(\"id\"),\n        \"label\": key_row.get(\"label\"),\n        \"owner_type\": key_row.get(\"owner_type\"),\n        \"owner_id\": key_row.get(\"owner_id\"),\n        \"status\": key_row.get(\"status\"),\n        \"requests_per_minute_limit\": key_row.get(\"requests_per_minute_limit\"),\n        \"requests_per_day_limit\": key_row.get(\"requests_per_day_limit\"),\n        \"usage_minute\": key_row.get(\"usage_minute\"),\n        \"usage_minute_count\": key_row.get(\"usage_minute_count\"),\n        \"usage_day\": key_row.get(\"usage_day\"),\n        \"usage_day_count\": key_row.get(\"usage_day_count\"),\n        \"last_used_at\": key_row.get(\"last_used_at\"),\n        \"created_at\": key_row.get(\"created_at\"),\n        \"updated_at\": key_row.get(\"updated_at\"),\n        \"latency_ms\": max(0, int((time.time() - t0) * 1000))\n    }\n"
+        },
+        {
+          "name": "api_keys.list",
+          "description": "Lists API keys visible to the caller, optionally filtered by status/owner and paginated. Returns key metadata but never returns the raw secret key material. Refuses with AUTH_ERROR when the caller api_key is invalid/disabled/revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^wthr_key_[0-9A-Z]{3,}$",
+                "description": "API key id used to authorize this operation (api_keys.id)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled",
+                  "revoked"
+                ],
+                "description": "Filter results by api key status."
+              },
+              "owner_type": {
+                "type": "string",
+                "enum": [
+                  "user",
+                  "service"
+                ],
+                "description": "Filter results by owner type."
+              },
+              "owner_id": {
+                "type": "string",
+                "description": "Filter results by owner id."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of API keys to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def api_keys_list(api_key, status=None, owner_type=None, owner_id=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0014000\" if __import__(\"os\").path.isdir(\"./environment_mix/0014000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    def _now_utc():\n        return datetime.datetime.now(datetime.timezone.utc)\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    if not isinstance(api_key, str) or not re.match(r\"^wthr_key_[0-9A-Z]{3,}$\", api_key):\n        return _err(\"VALIDATION_ERROR\", \"Invalid api_key format.\")\n\n    if status is not None and status not in (\"active\", \"disabled\", \"revoked\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid status filter.\")\n    if owner_type is not None and owner_type not in (\"user\", \"service\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid owner_type filter.\")\n    if owner_id is not None and not isinstance(owner_id, str):\n        return _err(\"VALIDATION_ERROR\", \"owner_id must be a string.\")\n    if limit is not None:\n        if not isinstance(limit, int):\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer.\")\n        if limit < 1 or limit > 200:\n            return _err(\"VALIDATION_ERROR\", \"limit out of range.\")\n    else:\n        limit = 50\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n\n    api_keys = _load(\"api_keys.json\")\n\n    caller = None\n    for k in api_keys:\n        if k.get(\"id\") == api_key:\n            caller = k\n            break\n    if caller is None or caller.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"API key invalid, disabled, or revoked.\")\n\n    # Visibility: keys visible to caller are those with same owner_type+owner_id, plus caller itself.\n    vis_owner_type = caller.get(\"owner_type\")\n    vis_owner_id = caller.get(\"owner_id\")\n\n    rows = []\n    for k in api_keys:\n        if k.get(\"id\") == caller.get(\"id\") or (k.get(\"owner_type\") == vis_owner_type and k.get(\"owner_id\") == vis_owner_id):\n            rows.append(k)\n\n    # Apply filters\n    if status is not None:\n        rows = [r for r in rows if r.get(\"status\") == status]\n    if owner_type is not None:\n        rows = [r for r in rows if r.get(\"owner_type\") == owner_type]\n    if owner_id is not None:\n        rows = [r for r in rows if r.get(\"owner_id\") == owner_id]\n\n    # Sort by created_at desc, then id\n    def _sort_key(r):\n        ca = r.get(\"created_at\") or \"\"\n        return (ca, r.get(\"id\") or \"\")\n    rows.sort(key=_sort_key, reverse=True)\n\n    # Cursor: opaque base64 of last id\n    start = 0\n    if cursor:\n        try:\n            decoded = base64.urlsafe_b64decode(cursor.encode(\"utf-8\")).decode(\"utf-8\")\n            # decoded is last_seen_id\n            for i, r in enumerate(rows):\n                if r.get(\"id\") == decoded:\n                    start = i + 1\n                    break\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n    page = rows[start:start + limit]\n    has_more = start + limit < len(rows)\n    next_cursor = None\n    if has_more and page:\n        last_id = page[-1].get(\"id\")\n        next_cursor = base64.urlsafe_b64encode(last_id.encode(\"utf-8\")).decode(\"utf-8\")\n\n    # Never return raw key material (key_hash is stored; return prefix and metadata only)\n    def _public(k):\n        return {\n            \"id\": k.get(\"id\"),\n            \"key_prefix\": k.get(\"key_prefix\"),\n            \"label\": k.get(\"label\"),\n            \"owner_type\": k.get(\"owner_type\"),\n            \"owner_id\": k.get(\"owner_id\"),\n            \"status\": k.get(\"status\"),\n            \"requests_per_minute_limit\": k.get(\"requests_per_minute_limit\"),\n            \"requests_per_day_limit\": k.get(\"requests_per_day_limit\"),\n            \"usage_minute\": k.get(\"usage_minute\"),\n            \"usage_minute_count\": k.get(\"usage_minute_count\"),\n            \"usage_day\": k.get(\"usage_day\"),\n            \"usage_day_count\": k.get(\"usage_day_count\"),\n            \"last_used_at\": k.get(\"last_used_at\"),\n            \"created_at\": k.get(\"created_at\"),\n            \"updated_at\": k.get(\"updated_at\"),\n        }\n\n    caller[\"last_used_at\"] = _iso(_now_utc())\n    caller[\"updated_at\"] = _iso(_now_utc())\n    _save(\"api_keys.json\", api_keys)\n\n    return {\n        \"data\": [_public(r) for r in page],\n        \"total\": len(rows),\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n        \"latency_ms\": max(0, int((time.time() - t0) * 1000))\n    }\n"
+        },
+        {
+          "name": "api_keys.create",
+          "description": "Creates a new API key record and returns the new key once at creation time along with its metadata. Stores only key_hash and key_prefix; the raw key cannot be retrieved later. Refuses with VALIDATION_ERROR for invalid fields and with AUTH_ERROR when the caller api_key is invalid/disabled/revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^wthr_key_[0-9A-Z]{3,}$",
+                "description": "API key id used to authorize this operation (api_keys.id)."
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120,
+                "description": "Human-readable label for the key (e.g., 'prod-backend')."
+              },
+              "owner_type": {
+                "type": "string",
+                "enum": [
+                  "user",
+                  "service"
+                ],
+                "description": "Owning principal type for auditing."
+              },
+              "owner_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "Owning principal id for auditing."
+              },
+              "requests_per_minute_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100000,
+                "description": "Per-minute request limit enforced for this key."
+              },
+              "requests_per_day_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10000000,
+                "description": "Per-day request limit enforced for this key."
+              }
+            },
+            "required": [
+              "api_key",
+              "label",
+              "owner_type",
+              "owner_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def api_keys_create(api_key, label, owner_type, owner_id, requests_per_minute_limit=None, requests_per_day_limit=None, **_extra):\n    import json, os, datetime, time, re, secrets, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0014000\" if __import__(\"os\").path.isdir(\"./environment_mix/0014000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    def _now_utc():\n        return datetime.datetime.now(datetime.timezone.utc)\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    # Validate caller api_key id format and authenticate\n    if not isinstance(api_key, str) or not re.match(r\"^wthr_key_[0-9A-Z]{3,}$\", api_key):\n        return _err(\"VALIDATION_ERROR\", \"Invalid api_key format.\")\n    if not isinstance(label, str) or not (1 <= len(label) <= 120):\n        return _err(\"VALIDATION_ERROR\", \"label must be 1-120 characters.\")\n    if owner_type not in (\"user\", \"service\"):\n        return _err(\"VALIDATION_ERROR\", \"owner_type must be 'user' or 'service'.\")\n    if not isinstance(owner_id, str) or not (1 <= len(owner_id) <= 200):\n        return _err(\"VALIDATION_ERROR\", \"owner_id must be 1-200 characters.\")\n\n    if requests_per_minute_limit is None:\n        requests_per_minute_limit = 60\n    if requests_per_day_limit is None:\n        requests_per_day_limit = 10000\n\n    if not isinstance(requests_per_minute_limit, int) or not (1 <= requests_per_minute_limit <= 100000):\n        return _err(\"VALIDATION_ERROR\", \"requests_per_minute_limit out of range.\")\n    if not isinstance(requests_per_day_limit, int) or not (1 <= requests_per_day_limit <= 10000000):\n        return _err(\"VALIDATION_ERROR\", \"requests_per_day_limit out of range.\")\n\n    api_keys = _load(\"api_keys.json\")\n    caller = None\n    for k in api_keys:\n        if k.get(\"id\") == api_key:\n            caller = k\n            break\n    if caller is None or caller.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"API key invalid, disabled, or revoked.\")\n\n    # Authorization: allow creating keys only for same owner as caller (or if caller is service key, allow any)\n    if caller.get(\"owner_type\") != \"service\":\n        if owner_type != caller.get(\"owner_type\") or owner_id != caller.get(\"owner_id\"):\n            return _err(\"UNAUTHORIZED\", \"Not permitted to create keys for a different owner.\")\n\n    # Generate raw key ONCE, store only hash + prefix; id is also client-visible id.\n    raw = \"wthr_key_\" + secrets.token_hex(16).upper()\n    key_id = raw  # tool patterns treat api_key as api_keys.id\n\n    key_prefix = raw[:10]\n    key_hash = hashlib.sha256(raw.encode(\"utf-8\")).hexdigest()\n\n    # Enforce unique(key_hash) and unique(key_prefix) and unique(id)\n    for k in api_keys:\n        if k.get(\"id\") == key_id:\n            return _err(\"CONFLICT\", \"Generated key id collided; retry.\")\n        if k.get(\"key_hash\") == key_hash:\n            return _err(\"CONFLICT\", \"Generated key hash collided; retry.\")\n        if k.get(\"key_prefix\") == key_prefix:\n            return _err(\"CONFLICT\", \"Generated key prefix collided; retry.\")\n\n    now = _now_utc()\n    row = {\n        \"id\": key_id,\n        \"key_hash\": key_hash,\n        \"key_prefix\": key_prefix,\n        \"label\": label,\n        \"owner_type\": owner_type,\n        \"owner_id\": owner_id,\n        \"status\": \"active\",\n        \"requests_per_minute_limit\": int(requests_per_minute_limit),\n        \"requests_per_day_limit\": int(requests_per_day_limit),\n        \"usage_day\": None,\n        \"usage_day_count\": 0,\n        \"usage_minute\": None,\n        \"usage_minute_count\": 0,\n        \"last_used_at\": None,\n        \"created_at\": _iso(now),\n        \"updated_at\": _iso(now),\n    }\n\n    api_keys.append(row)\n    # Update caller last_used_at\n    caller[\"last_used_at\"] = _iso(now)\n    caller[\"updated_at\"] = _iso(now)\n    _save(\"api_keys.json\", api_keys)\n\n    # Return raw key once, plus metadata (never return key_hash)\n    return {\n        \"api_key\": raw,\n        \"key\": {\n            \"id\": row.get(\"id\"),\n            \"key_prefix\": row.get(\"key_prefix\"),\n            \"label\": row.get(\"label\"),\n            \"owner_type\": row.get(\"owner_type\"),\n            \"owner_id\": row.get(\"owner_id\"),\n            \"status\": row.get(\"status\"),\n            \"requests_per_minute_limit\": row.get(\"requests_per_minute_limit\"),\n            \"requests_per_day_limit\": row.get(\"requests_per_day_limit\"),\n            \"created_at\": row.get(\"created_at\"),\n            \"updated_at\": row.get(\"updated_at\"),\n        },\n        \"latency_ms\": max(0, int((time.time() - t0) * 1000))\n    }\n"
+        },
+        {
+          "name": "api_keys.update",
+          "description": "Updates mutable API key fields (label, limits) and/or transitions its status via the status field (active/disabled/revoked). Refuses with CONFLICT_ERROR for invalid lifecycle transitions and with AUTH_ERROR when the caller api_key is invalid/disabled/revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^wthr_key_[0-9A-Z]{3,}$",
+                "description": "API key id used to authorize this operation (api_keys.id)."
+              },
+              "id": {
+                "type": "string",
+                "pattern": "^wthr_key_[0-9A-Z]{3,}$",
+                "description": "The API key id to update (api_keys.id)."
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120,
+                "description": "Updated human-readable label."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled",
+                  "revoked"
+                ],
+                "description": "New status for the key. Allowed transitions: active->(disabled|revoked), disabled->(active|revoked); revoked cannot change."
+              },
+              "requests_per_minute_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100000,
+                "description": "Updated per-minute request limit."
+              },
+              "requests_per_day_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10000000,
+                "description": "Updated per-day request limit."
+              }
+            },
+            "required": [
+              "api_key",
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def api_keys_update(api_key, id, label=None, status=None, requests_per_minute_limit=None, requests_per_day_limit=None, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0014000\" if __import__(\"os\").path.isdir(\"./environment_mix/0014000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n        return None\n\n    def _new_req_id():\n        return \"wthr_req_\" + now.strftime(\"%y%m%d%H%M%S\") + \"_\" + os.urandom(6).hex().upper()\n\n    # Validate inputs\n    if not isinstance(api_key, str) or not re.match(r\"^wthr_key_[0-9A-Z]{3,}$\", api_key):\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a string matching ^wthr_key_[0-9A-Z]{3,}$.\")\n    if not isinstance(id, str) or not re.match(r\"^wthr_key_[0-9A-Z]{3,}$\", id):\n        return _err(\"VALIDATION_ERROR\", \"id must be a string matching ^wthr_key_[0-9A-Z]{3,}$.\")\n    if label is not None:\n        if not isinstance(label, str):\n            return _err(\"VALIDATION_ERROR\", \"label must be a string.\")\n        if len(label) < 1 or len(label) > 120:\n            return _err(\"VALIDATION_ERROR\", \"label length must be between 1 and 120.\")\n    if status is not None and status not in (\"active\", \"disabled\", \"revoked\"):\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: active, disabled, revoked.\")\n    if requests_per_minute_limit is not None:\n        if not isinstance(requests_per_minute_limit, int):\n            return _err(\"VALIDATION_ERROR\", \"requests_per_minute_limit must be an integer.\")\n        if requests_per_minute_limit < 1 or requests_per_minute_limit > 100000:\n            return _err(\"VALIDATION_ERROR\", \"requests_per_minute_limit must be between 1 and 100000.\")\n    if requests_per_day_limit is not None:\n        if not isinstance(requests_per_day_limit, int):\n            return _err(\"VALIDATION_ERROR\", \"requests_per_day_limit must be an integer.\")\n        if requests_per_day_limit < 1 or requests_per_day_limit > 10000000:\n            return _err(\"VALIDATION_ERROR\", \"requests_per_day_limit must be between 1 and 10000000.\")\n\n    api_keys = _load(\"api_keys.json\")\n    weather_requests = _load(\"weather_requests.json\")\n\n    # Authenticate caller api_key (must be active)\n    caller = None\n    for r in api_keys:\n        if isinstance(r, dict) and r.get(\"id\") == api_key:\n            caller = r\n            break\n    if not caller or caller.get(\"status\") != \"active\":\n        # log failed auth\n        finished = datetime.datetime.now(datetime.timezone.utc)\n        dur = int(max(0, (time.time() - t0) * 1000))\n        weather_requests.append({\n            \"id\": _new_req_id(),\n            \"api_key_id\": api_key if caller else None,\n            \"tool_name\": \"weather\",\n            \"status\": \"failed\",\n            \"request_source\": \"internal\",\n            \"caller_ip\": None,\n            \"user_agent\": None,\n            \"idempotency_key\": None,\n            \"started_at\": _iso(now),\n            \"finished_at\": _iso(finished),\n            \"duration_ms\": dur,\n            \"error_code\": \"UNAUTHORIZED\",\n            \"error_message\": \"API key is invalid or not active.\",\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(finished),\n        })\n        _save(\"weather_requests.json\", weather_requests)\n        return _err(\"UNAUTHORIZED\", \"API key is invalid, disabled, or revoked.\")\n\n    # Find target key\n    idx = None\n    target = None\n    for i, r in enumerate(api_keys):\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            idx = i\n            target = r\n            break\n    if target is None:\n        # log NOT_FOUND\n        finished = datetime.datetime.now(datetime.timezone.utc)\n        dur = int(max(0, (time.time() - t0) * 1000))\n        weather_requests.append({\n            \"id\": _new_req_id(),\n            \"api_key_id\": caller.get(\"id\"),\n            \"tool_name\": \"weather\",\n            \"status\": \"failed\",\n            \"request_source\": \"internal\",\n            \"caller_ip\": None,\n            \"user_agent\": None,\n            \"idempotency_key\": None,\n            \"started_at\": _iso(now),\n            \"finished_at\": _iso(finished),\n            \"duration_ms\": dur,\n            \"error_code\": \"NOT_FOUND\",\n            \"error_message\": \"API key id not found.\",\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(finished),\n        })\n        _save(\"weather_requests.json\", weather_requests)\n        return _err(\"NOT_FOUND\", \"API key not found.\")\n\n    # Apply changes (NO SUCCESS WITHOUT EFFECT: if row exists, accept even if no-op by returning the row;\n    # the audit defect expects not rejecting as NOT_FOUND for no-op.)\n    changed = False\n\n    if label is not None and label != target.get(\"label\"):\n        target[\"label\"] = label\n        changed = True\n\n    if requests_per_minute_limit is not None and requests_per_minute_limit != target.get(\"requests_per_minute_limit\"):\n        target[\"requests_per_minute_limit\"] = requests_per_minute_limit\n        changed = True\n\n    if requests_per_day_limit is not None and requests_per_day_limit != target.get(\"requests_per_day_limit\"):\n        target[\"requests_per_day_limit\"] = requests_per_day_limit\n        changed = True\n\n    if status is not None and status != target.get(\"status\"):\n        allowed = {\n            \"active\": {\"disabled\", \"revoked\"},\n            \"disabled\": {\"active\", \"revoked\"},\n            \"revoked\": set(),\n        }\n        cur = target.get(\"status\")\n        if status not in allowed.get(cur, set()):\n            finished = datetime.datetime.now(datetime.timezone.utc)\n            dur = int(max(0, (time.time() - t0) * 1000))\n            weather_requests.append({\n                \"id\": _new_req_id(),\n                \"api_key_id\": caller.get(\"id\"),\n                \"tool_name\": \"weather\",\n                \"status\": \"failed\",\n                \"request_source\": \"internal\",\n                \"caller_ip\": None,\n                \"user_agent\": None,\n                \"idempotency_key\": None,\n                \"started_at\": _iso(now),\n                \"finished_at\": _iso(finished),\n                \"duration_ms\": dur,\n                \"error_code\": \"INVALID_TRANSITION\",\n                \"error_message\": f\"Invalid API key status transition {cur} -> {status}.\",\n                \"created_at\": _iso(now),\n                \"updated_at\": _iso(finished),\n            })\n            _save(\"weather_requests.json\", weather_requests)\n            return _err(\"INVALID_TRANSITION\", f\"Invalid API key status transition {cur} -> {status}.\")\n        target[\"status\"] = status\n        changed = True\n\n    # Always update updated_at when mutation endpoint called and target exists\n    target[\"updated_at\"] = _iso(datetime.datetime.now(datetime.timezone.utc))\n    if \"created_at\" not in target or not target.get(\"created_at\"):\n        target[\"created_at\"] = _iso(now)\n\n    api_keys[idx] = target\n    _save(\"api_keys.json\", api_keys)\n\n    # Log call in weather_requests as audit dynamics\n    finished = datetime.datetime.now(datetime.timezone.utc)\n    dur = int(max(0, (time.time() - t0) * 1000))\n    weather_requests.append({\n        \"id\": _new_req_id(),\n        \"api_key_id\": caller.get(\"id\"),\n        \"tool_name\": \"weather\",\n        \"status\": \"succeeded\",\n        \"request_source\": \"internal\",\n        \"caller_ip\": None,\n        \"user_agent\": None,\n        \"idempotency_key\": None,\n        \"started_at\": _iso(now),\n        \"finished_at\": _iso(finished),\n        \"duration_ms\": dur,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"created_at\": _iso(now),\n        \"updated_at\": _iso(finished),\n    })\n    _save(\"weather_requests.json\", weather_requests)\n\n    return {\n        \"api_key\": target,\n        \"changed\": bool(changed)\n    }\n"
+        },
+        {
+          "name": "weather_requests.list",
+          "description": "Lists recorded weather tool invocations, optionally filtered by api_key_id, status, time range, and idempotency_key. Returns request audit metadata and status fields; does not include the full weather payload unless joined via weather_responses. Refuses with AUTH_ERROR when the caller api_key is invalid/disabled/revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^wthr_key_[0-9A-Z]{3,}$",
+                "description": "API key id used to authorize this operation (api_keys.id)."
+              },
+              "api_key_id": {
+                "type": "string",
+                "pattern": "^wthr_key_[0-9A-Z]{3,}$",
+                "description": "Filter to requests made under a specific API key id."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "received",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "throttled"
+                ],
+                "description": "Filter by request lifecycle status."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Filter by idempotency key."
+              },
+              "created_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only include requests created at or after this timestamp (RFC 3339)."
+              },
+              "created_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only include requests created before this timestamp (RFC 3339)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of requests to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def weather_requests_list(api_key, api_key_id=None, status=None, idempotency_key=None, created_after=None, created_before=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0014000\" if __import__(\"os\").path.isdir(\"./environment_mix/0014000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.isoformat().replace(\"+00:00\", \"Z\")\n        return None\n\n    def _parse_rfc3339(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1]).replace(tzinfo=datetime.timezone.utc)\n            dt = datetime.datetime.fromisoformat(s)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _new_req_id():\n        return \"wthr_req_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"_\" + os.urandom(3).hex()\n\n    def _log(weather_requests, api_key_id_used, st, error_code=None, error_message=None):\n        rid = _new_req_id()\n        weather_requests.append({\n            \"id\": rid,\n            \"api_key_id\": api_key_id_used,\n            \"tool_name\": \"weather\",\n            \"status\": st,\n            \"request_source\": \"internal\",\n            \"caller_ip\": None,\n            \"user_agent\": None,\n            \"idempotency_key\": None,\n            \"started_at\": None,\n            \"finished_at\": _iso(now),\n            \"duration_ms\": max(0, int((time.time() - t0) * 1000)),\n            \"error_code\": error_code,\n            \"error_message\": error_message,\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(now),\n        })\n        return rid\n\n    # Validate inputs\n    pat = re.compile(r\"^wthr_key_[0-9A-Z]{3,}$\")\n    if not isinstance(api_key, str) or not pat.match(api_key):\n        wr = _load(\"weather_requests.json\")\n        _log(wr, None, \"failed\", \"VALIDATION_ERROR\", \"Invalid api_key format.\")\n        _save(\"weather_requests.json\", wr)\n        return _err(\"VALIDATION_ERROR\", \"Invalid api_key format.\", field=\"api_key\")\n\n    if api_key_id is not None:\n        if not isinstance(api_key_id, str) or not pat.match(api_key_id):\n            wr = _load(\"weather_requests.json\")\n            _log(wr, api_key, \"failed\", \"VALIDATION_ERROR\", \"Invalid api_key_id format.\")\n            _save(\"weather_requests.json\", wr)\n            return _err(\"VALIDATION_ERROR\", \"Invalid api_key_id format.\", field=\"api_key_id\")\n\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"received\", \"running\", \"succeeded\", \"failed\", \"throttled\"):\n            wr = _load(\"weather_requests.json\")\n            _log(wr, api_key, \"failed\", \"VALIDATION_ERROR\", \"Invalid status filter.\")\n            _save(\"weather_requests.json\", wr)\n            return _err(\"VALIDATION_ERROR\", \"Invalid status.\", field=\"status\")\n\n    if idempotency_key is not None and not isinstance(idempotency_key, str):\n        wr = _load(\"weather_requests.json\")\n        _log(wr, api_key, \"failed\", \"VALIDATION_ERROR\", \"idempotency_key must be string.\")\n        _save(\"weather_requests.json\", wr)\n        return _err(\"VALIDATION_ERROR\", \"idempotency_key must be a string.\", field=\"idempotency_key\")\n\n    ca = _parse_rfc3339(created_after) if created_after is not None else None\n    if created_after is not None and ca is None:\n        wr = _load(\"weather_requests.json\")\n        _log(wr, api_key, \"failed\", \"VALIDATION_ERROR\", \"created_after must be RFC3339 date-time.\")\n        _save(\"weather_requests.json\", wr)\n        return _err(\"VALIDATION_ERROR\", \"created_after must be RFC3339 date-time.\", field=\"created_after\")\n\n    cb = _parse_rfc3339(created_before) if created_before is not None else None\n    if created_before is not None and cb is None:\n        wr = _load(\"weather_requests.json\")\n        _log(wr, api_key, \"failed\", \"VALIDATION_ERROR\", \"created_before must be RFC3339 date-time.\")\n        _save(\"weather_requests.json\", wr)\n        return _err(\"VALIDATION_ERROR\", \"created_before must be RFC3339 date-time.\", field=\"created_before\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        wr = _load(\"weather_requests.json\")\n        _log(wr, api_key, \"failed\", \"VALIDATION_ERROR\", \"limit must be integer.\")\n        _save(\"weather_requests.json\", wr)\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer.\", field=\"limit\")\n    if not (1 <= limit <= 200):\n        wr = _load(\"weather_requests.json\")\n        _log(wr, api_key, \"failed\", \"VALIDATION_ERROR\", \"limit out of range.\")\n        _save(\"weather_requests.json\", wr)\n        return _err(\"VALIDATION_ERROR\", \"limit must be 1..200.\", field=\"limit\")\n\n    # Load store\n    api_keys = _load(\"api_keys.json\")\n    weather_requests = _load(\"weather_requests.json\")\n\n    # Authenticate caller key\n    caller = next((r for r in api_keys if r.get(\"id\") == api_key), None)\n    if caller is None:\n        _log(weather_requests, None, \"failed\", \"UNAUTHORIZED\", \"Invalid api_key.\")\n        _save(\"weather_requests.json\", weather_requests)\n        return _err(\"UNAUTHORIZED\", \"Invalid api_key.\")\n    if caller.get(\"status\") != \"active\":\n        _log(weather_requests, caller.get(\"id\"), \"failed\", \"UNAUTHORIZED\", \"API key is not active.\")\n        _save(\"weather_requests.json\", weather_requests)\n        return _err(\"UNAUTHORIZED\", \"API key is disabled or revoked.\")\n\n    # Decode cursor: base64url(json {\"after_created_at\": \"...\", \"after_id\":\"...\"})\n    after_created_at = None\n    after_id = None\n    if cursor is not None:\n        if not isinstance(cursor, str) or cursor == \"\":\n            _log(weather_requests, caller.get(\"id\"), \"failed\", \"VALIDATION_ERROR\", \"Invalid cursor.\")\n            _save(\"weather_requests.json\", weather_requests)\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n        try:\n            pad = \"=\" * (-len(cursor) % 4)\n            raw = base64.urlsafe_b64decode((cursor + pad).encode(\"utf-8\")).decode(\"utf-8\")\n            obj = json.loads(raw)\n            after_created_at = _parse_rfc3339(obj.get(\"after_created_at\")) if isinstance(obj, dict) else None\n            after_id = obj.get(\"after_id\") if isinstance(obj, dict) else None\n            if obj is None or after_created_at is None or not isinstance(after_id, str):\n                raise ValueError(\"bad cursor\")\n        except Exception:\n            _log(weather_requests, caller.get(\"id\"), \"failed\", \"VALIDATION_ERROR\", \"Cursor could not be decoded.\")\n            _save(\"weather_requests.json\", weather_requests)\n            return _err(\"VALIDATION_ERROR\", \"Cursor is invalid or expired.\", field=\"cursor\")\n\n    def _created_dt(row):\n        dt = _parse_rfc3339(row.get(\"created_at\"))\n        return dt\n\n    # Filter\n    rows = [r for r in weather_requests if r.get(\"tool_name\") == \"weather\"]\n\n    if api_key_id is not None:\n        rows = [r for r in rows if r.get(\"api_key_id\") == api_key_id]\n    if status is not None:\n        rows = [r for r in rows if r.get(\"status\") == status]\n    if idempotency_key is not None:\n        rows = [r for r in rows if r.get(\"idempotency_key\") == idempotency_key]\n    if ca is not None:\n        rows = [r for r in rows if (_created_dt(r) is not None and _created_dt(r) >= ca)]\n    if cb is not None:\n        rows = [r for r in rows if (_created_dt(r) is not None and _created_dt(r) < cb)]\n\n    # Sort newest first (created_at desc, id desc)\n    def _sort_key(r):\n        dt = _created_dt(r)\n        if dt is None:\n            dt = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n        return (dt, str(r.get(\"id\") or \"\"))\n    rows.sort(key=_sort_key, reverse=True)\n\n    # Apply cursor (exclusive): return items with (created_at,id) < (after_created_at,after_id) in this desc order\n    if after_created_at is not None and after_id is not None:\n        filtered = []\n        for r in rows:\n            dt = _created_dt(r)\n            if dt is None:\n                continue\n            rid = str(r.get(\"id\") or \"\")\n            # in descending order, \"after\" points to last item seen; we want strictly older/smaller\n            if (dt < after_created_at) or (dt == after_created_at and rid < after_id):\n                filtered.append(r)\n        rows = filtered\n\n    total = len(rows)\n    page = rows[:limit]\n    has_more = total > len(page)\n\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        last_dt = _created_dt(last)\n        if last_dt is None:\n            last_dt = now\n        payload = {\"after_created_at\": _iso(last_dt), \"after_id\": str(last.get(\"id\") or \"\")}\n        enc = base64.urlsafe_b64encode(json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n        next_cursor = enc\n\n    # Log this list call as a request row (audit dynamics)\n    _log(weather_requests, caller.get(\"id\"), \"succeeded\", None, None)\n    _save(\"weather_requests.json\", weather_requests)\n\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"duration_ms\": max(0, int((time.time() - t0) * 1000)),\n        },\n    }\n"
+        },
+        {
+          "name": "provider_configs.update",
+          "description": "Updates provider configuration fields and/or transitions provider config status (active/disabled). Refuses with CONFLICT_ERROR for invalid transitions and with VALIDATION_ERROR for unsupported provider/auth_type combinations.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^wthr_key_[0-9A-Z]{3,}$",
+                "description": "API key id used to authorize this operation (api_keys.id)."
+              },
+              "id": {
+                "type": "string",
+                "description": "Provider config id to update (provider_configs.id)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled"
+                ],
+                "description": "New provider config status. Allowed transitions: active<->disabled."
+              },
+              "base_url": {
+                "type": "string",
+                "description": "Base URL for the provider API."
+              },
+              "auth_type": {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "api_key"
+                ],
+                "description": "Authentication mode used for upstream calls."
+              },
+              "api_key_ref": {
+                "type": "string",
+                "description": "Reference to the upstream provider credential (not the client api_key). Required when auth_type='api_key'."
+              },
+              "priority": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1000000,
+                "description": "Lower numbers are preferred during provider selection."
+              },
+              "timeout_ms": {
+                "type": "integer",
+                "minimum": 100,
+                "maximum": 120000,
+                "description": "Upstream request timeout in milliseconds."
+              },
+              "max_retries": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 10,
+                "description": "Maximum retry attempts for upstream calls."
+              }
+            },
+            "required": [
+              "api_key",
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def provider_configs_update(api_key, id, status=None, base_url=None, auth_type=None, api_key_ref=None, priority=None, timeout_ms=None, max_retries=None, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0014000\" if __import__(\"os\").path.isdir(\"./environment_mix/0014000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n        return None\n\n    def _parse_iso(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s if s.tzinfo else s.replace(tzinfo=datetime.timezone.utc)\n        if not isinstance(s, str) or not s:\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n            return datetime.datetime.fromisoformat(s)\n        except ValueError:\n            return None\n\n    def _truncate_day(dt):\n        dt = dt.astimezone(datetime.timezone.utc)\n        return dt.replace(hour=0, minute=0, second=0, microsecond=0)\n\n    def _truncate_minute(dt):\n        dt = dt.astimezone(datetime.timezone.utc)\n        return dt.replace(second=0, microsecond=0)\n\n    def _gen_id(prefix):\n        # time-sortable-ish id similar to existing dataset, no external deps\n        dt = _now()\n        ms = int(dt.timestamp() * 1000)\n        rnd = os.urandom(10).hex().upper()\n        return f\"{prefix}_{ms:013d}{rnd}\"\n\n    def _append_weather_request_log(api_key_id, status_val, started_at, finished_at, err_code=None, err_msg=None):\n        reqs = _load(\"weather_requests.json\")\n        if not isinstance(reqs, list):\n            reqs = []\n        duration_ms = None\n        if started_at and finished_at:\n            duration_ms = int(max(0, (finished_at - started_at).total_seconds() * 1000))\n        row = {\n            \"id\": _gen_id(\"wthr_req\"),\n            \"api_key_id\": api_key_id,\n            \"tool_name\": \"weather\",\n            \"status\": status_val,\n            \"request_source\": \"internal\",\n            \"caller_ip\": None,\n            \"user_agent\": None,\n            \"idempotency_key\": None,\n            \"started_at\": _iso(started_at),\n            \"finished_at\": _iso(finished_at),\n            \"duration_ms\": duration_ms,\n            \"error_code\": err_code,\n            \"error_message\": err_msg,\n            \"created_at\": _iso(started_at or _now()),\n            \"updated_at\": _iso(finished_at or _now()),\n        }\n        reqs.append(row)\n        _save(\"weather_requests.json\", reqs)\n        return row\n\n    def _resolve_key_and_enforce_limits(api_key_id, started_at):\n        keys = _load(\"api_keys.json\")\n        if not isinstance(keys, list):\n            keys = []\n\n        key_row = None\n        for k in keys:\n            if isinstance(k, dict) and k.get(\"id\") == api_key_id:\n                key_row = k\n                break\n        if not key_row:\n            return None, _err(\"UNAUTHORIZED\", \"Invalid api_key: no such key id.\")\n\n        if key_row.get(\"status\") != \"active\":\n            return None, _err(\"UNAUTHORIZED\", \"API key is not active.\", status=key_row.get(\"status\"))\n\n        # Enforce minute/day counters. If exceeded: must record throttled request and stop.\n        now = started_at\n        minute_bucket = _truncate_minute(now)\n        day_bucket = _truncate_day(now)\n\n        usage_minute = _parse_iso(key_row.get(\"usage_minute\"))\n        usage_day = _parse_iso(key_row.get(\"usage_day\"))\n\n        if usage_minute is None or usage_minute != minute_bucket:\n            key_row[\"usage_minute\"] = _iso(minute_bucket)\n            key_row[\"usage_minute_count\"] = 0\n        if usage_day is None or usage_day != day_bucket:\n            key_row[\"usage_day\"] = _iso(day_bucket)\n            key_row[\"usage_day_count\"] = 0\n\n        rpm_limit = key_row.get(\"requests_per_minute_limit\")\n        rpd_limit = key_row.get(\"requests_per_day_limit\")\n        if not isinstance(rpm_limit, int) or rpm_limit < 0:\n            return None, _err(\"VALIDATION_ERROR\", \"API key has invalid requests_per_minute_limit.\")\n        if not isinstance(rpd_limit, int) or rpd_limit < 0:\n            return None, _err(\"VALIDATION_ERROR\", \"API key has invalid requests_per_day_limit.\")\n\n        minute_count = key_row.get(\"usage_minute_count\", 0)\n        day_count = key_row.get(\"usage_day_count\", 0)\n        if not isinstance(minute_count, int) or minute_count < 0:\n            minute_count = 0\n        if not isinstance(day_count, int) or day_count < 0:\n            day_count = 0\n\n        # Throttle if next request would exceed.\n        if rpm_limit >= 0 and minute_count + 1 > rpm_limit:\n            return key_row, _err(\"RATE_LIMIT\", \"Rate limit exceeded for this API key (per-minute).\",\n                                 limit=rpm_limit, window=\"minute\")\n        if rpd_limit >= 0 and day_count + 1 > rpd_limit:\n            return key_row, _err(\"QUOTA_EXCEEDED\", \"Daily request quota exceeded for this API key.\",\n                                 limit=rpd_limit, window=\"day\")\n\n        # Count this call (reads included) as usage.\n        key_row[\"usage_minute_count\"] = minute_count + 1\n        key_row[\"usage_day_count\"] = day_count + 1\n        key_row[\"last_used_at\"] = _iso(now)\n        key_row[\"updated_at\"] = _iso(now)\n        _save(\"api_keys.json\", keys)\n\n        return key_row, None\n\n    # -----------------------------\n    # Validate inputs\n    # -----------------------------\n    if not isinstance(api_key, str) or not re.match(r\"^wthr_key_[0-9A-Z]{3,}$\", api_key):\n        # Still log the call (anonymous/unknown key) as failed (cannot resolve key usage)\n        started = _now()\n        finished = _now()\n        _append_weather_request_log(None, \"failed\", started, finished, \"UNAUTHORIZED\", \"Invalid api_key format.\")\n        return _err(\"VALIDATION_ERROR\", \"api_key must match ^wthr_key_[0-9A-Z]{3,}$\")\n\n    if not isinstance(id, str) or not id:\n        started = _now()\n        finished = _now()\n        # Try to log against provided key id (may not exist)\n        _append_weather_request_log(api_key, \"failed\", started, finished, \"VALIDATION_ERROR\", \"Missing provider config id.\")\n        return _err(\"VALIDATION_ERROR\", \"id is required and must be a non-empty string.\")\n\n    if status is not None and status not in (\"active\", \"disabled\"):\n        started = _now()\n        finished = _now()\n        _append_weather_request_log(api_key, \"failed\", started, finished, \"VALIDATION_ERROR\", \"Invalid status.\")\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: active, disabled.\")\n\n    if base_url is not None and (not isinstance(base_url, str) or not base_url.strip()):\n        started = _now()\n        finished = _now()\n        _append_weather_request_log(api_key, \"failed\", started, finished, \"VALIDATION_ERROR\", \"Invalid base_url.\")\n        return _err(\"VALIDATION_ERROR\", \"base_url must be a non-empty string.\")\n\n    if auth_type is not None and auth_type not in (\"none\", \"api_key\"):\n        started = _now()\n        finished = _now()\n        _append_weather_request_log(api_key, \"failed\", started, finished, \"VALIDATION_ERROR\", \"Invalid auth_type.\")\n        return _err(\"VALIDATION_ERROR\", \"auth_type must be one of: none, api_key.\")\n\n    if priority is not None:\n        if not isinstance(priority, int) or priority < 0 or priority > 1000000:\n            started = _now()\n            finished = _now()\n            _append_weather_request_log(api_key, \"failed\", started, finished, \"VALIDATION_ERROR\", \"Invalid priority.\")\n            return _err(\"VALIDATION_ERROR\", \"priority must be an integer between 0 and 1000000.\")\n\n    if timeout_ms is not None:\n        if not isinstance(timeout_ms, int) or timeout_ms < 100 or timeout_ms > 120000:\n            started = _now()\n            finished = _now()\n            _append_weather_request_log(api_key, \"failed\", started, finished, \"VALIDATION_ERROR\", \"Invalid timeout_ms.\")\n            return _err(\"VALIDATION_ERROR\", \"timeout_ms must be an integer between 100 and 120000.\")\n\n    if max_retries is not None:\n        if not isinstance(max_retries, int) or max_retries < 0 or max_retries > 10:\n            started = _now()\n            finished = _now()\n            _append_weather_request_log(api_key, \"failed\", started, finished, \"VALIDATION_ERROR\", \"Invalid max_retries.\")\n            return _err(\"VALIDATION_ERROR\", \"max_retries must be an integer between 0 and 10.\")\n\n    if api_key_ref is not None and (not isinstance(api_key_ref, str) or not api_key_ref.strip()):\n        started = _now()\n        finished = _now()\n        _append_weather_request_log(api_key, \"failed\", started, finished, \"VALIDATION_ERROR\", \"Invalid api_key_ref.\")\n        return _err(\"VALIDATION_ERROR\", \"api_key_ref must be a non-empty string when provided.\")\n\n    # If auth_type implies api_key_ref requirement, enforce (and also clear if switching to none).\n    if auth_type == \"api_key\" and not api_key_ref:\n        started = _now()\n        finished = _now()\n        _append_weather_request_log(api_key, \"failed\", started, finished, \"VALIDATION_ERROR\", \"api_key_ref required.\")\n        return _err(\"VALIDATION_ERROR\", \"api_key_ref is required when auth_type='api_key'.\")\n\n    # -----------------------------\n    # Authenticate (ambient via api_key id) + rate/quota + audit row (received)\n    # -----------------------------\n    started = _now()\n\n    # Record \"received\" before doing any work (business rule for weather tool; here we reuse same request log collection for all calls)\n    received_row = _append_weather_request_log(api_key, \"received\", started, None, None, None)\n\n    key_row, key_err = _resolve_key_and_enforce_limits(api_key, started)\n    if key_err:\n        finished = _now()\n        # transition received -> throttled/failed (allowed)\n        status_val = \"throttled\" if key_err[\"error\"][\"code\"] in (\"RATE_LIMIT\", \"QUOTA_EXCEEDED\") else \"failed\"\n        _append_weather_request_log(api_key, status_val, started, finished, key_err[\"error\"][\"code\"], key_err[\"error\"][\"message\"])\n        return key_err\n\n    # -----------------------------\n    # Load provider_configs and update target row\n    # -----------------------------\n    configs = _load(\"provider_configs.json\")\n    if not isinstance(configs, list):\n        configs = []\n\n    target = None\n    for row in configs:\n        if isinstance(row, dict) and row.get(\"id\") == id:\n            target = row\n            break\n\n    if not target:\n        finished = _now()\n        _append_weather_request_log(api_key, \"failed\", started, finished, \"NOT_FOUND\", \"Provider config not found.\")\n        return _err(\"NOT_FOUND\", \"Provider config not found.\", id=id)\n\n    # Determine and validate requested auth mapping.\n    # Datastore schema uses auth_type enum: none/api_key_header/api_key_query.\n    # Tool schema exposes: none/api_key. Map api_key -> preserve existing header/query if present, else default to api_key_header.\n    new_auth_type_store = None\n    if auth_type is not None:\n        if auth_type == \"none\":\n            new_auth_type_store = \"none\"\n        else:\n            existing = target.get(\"auth_type\")\n            if existing in (\"api_key_header\", \"api_key_query\"):\n                new_auth_type_store = existing\n            else:\n                new_auth_type_store = \"api_key_header\"\n\n    # Validate provider/auth_type combos: in this service, all providers support none or api_key_*;\n    # but \"api_key\" cannot be used without api_key_ref.\n    if new_auth_type_store in (\"api_key_header\", \"api_key_query\"):\n        ref_val = api_key_ref if api_key_ref is not None else target.get(\"api_key_ref\")\n        if not ref_val:\n            finished = _now()\n            _append_weather_request_log(api_key, \"failed\", started, finished, \"VALIDATION_ERROR\",\n                                        \"api_key_ref required for api_key auth.\")\n            return _err(\"VALIDATION_ERROR\", \"api_key_ref is required when auth_type='api_key'.\")\n    if new_auth_type_store == \"none\":\n        # If explicitly setting to none and api_key_ref was also passed non-empty, that's allowed but inconsistent;\n        # keep ref as-is unless caller explicitly sets/clears it (tool can't clear with null). We'll leave it unchanged.\n        pass\n\n    # Status transition validation (active <-> disabled)\n    if status is not None and status != target.get(\"status\"):\n        cur = target.get(\"status\")\n        allowed = {\"active\": [\"disabled\"], \"disabled\": [\"active\"]}\n        if cur not in allowed or status not in allowed.get(cur, []):\n            finished = _now()\n            _append_weather_request_log(api_key, \"failed\", started, finished, \"INVALID_TRANSITION\",\n                                        f\"Illegal status transition from {cur} to {status}.\")\n            return _err(\"INVALID_TRANSITION\", f\"Illegal status transition from {cur} to {status}.\",\n                        from_status=cur, to_status=status)\n\n    # Apply changes\n    changed = False\n    if status is not None and status != target.get(\"status\"):\n        target[\"status\"] = status\n        changed = True\n    if base_url is not None and base_url != target.get(\"base_url\"):\n        target[\"base_url\"] = base_url\n        changed = True\n    if new_auth_type_store is not None and new_auth_type_store != target.get(\"auth_type\"):\n        target[\"auth_type\"] = new_auth_type_store\n        changed = True\n    if api_key_ref is not None and api_key_ref != target.get(\"api_key_ref\"):\n        target[\"api_key_ref\"] = api_key_ref\n        changed = True\n    if priority is not None and priority != target.get(\"priority\"):\n        target[\"priority\"] = priority\n        changed = True\n    if timeout_ms is not None and timeout_ms != target.get(\"timeout_ms\"):\n        target[\"timeout_ms\"] = timeout_ms\n        changed = True\n    if max_retries is not None and max_retries != target.get(\"max_retries\"):\n        target[\"max_retries\"] = max_retries\n        changed = True\n\n    if not changed:\n        # Idempotent: still a real call with effects already applied; return current row.\n        finished = _now()\n        _append_weather_request_log(api_key, \"succeeded\", started, finished, None, None)\n        return {\n            \"provider_config\": target,\n            \"idempotent\": True,\n        }\n\n    # Update timestamps\n    now = _now()\n    if \"created_at\" not in target or not target.get(\"created_at\"):\n        target[\"created_at\"] = _iso(now)\n    target[\"updated_at\"] = _iso(now)\n\n    # Persist\n    _save(\"provider_configs.json\", configs)\n\n    finished = _now()\n    _append_weather_request_log(api_key, \"succeeded\", started, finished, None, None)\n\n    return {\n        \"provider_config\": target\n    }\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0014000",
+    "index": 14,
+    "name": "Weather MCP Server",
+    "description": "This backend stores invocations of a single Weather MCP tool and the resulting weather payloads returned to clients. It also tracks client identities (API keys) and enforces basic usage quotas and rate limits for the weather endpoint. Repository: https://github.com/CodeByWaqas/weather-mcp-server Hom",
+    "taxonomy": {
+      "L1_id": "L1-06",
+      "L1_name": "Weather & Geospatial",
+      "L1_name_zh": "天气与地理空间",
+      "L2_id": "L2-14",
+      "L2_name": "Weather Forecasting",
+      "L2_name_zh": "天气预报",
+      "L3_name": "MCP Weather Tooling (LLM Tool Servers)",
+      "L3_name_zh": "MCP天气工具服务（LLM工具服务器）"
+    },
+    "database_dir": "./environment_mix/0014000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 4,
+    "n_records": 114,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 0,
+      "read_operations": 0,
+      "mutations_persisted": 6,
+      "mutations_attempted": 7
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": null,
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

@@ -1,0 +1,436 @@
+{
+  "index": 188,
+  "local_files_dir": "./environment_mix/0188000",
+  "file_list": [
+    "./environment_mix/0188000/README.md",
+    "./environment_mix/0188000/documentation_sources.json",
+    "./environment_mix/0188000/indexed_documents.json",
+    "./environment_mix/0188000/read_url_requests.json",
+    "./environment_mix/0188000/request_logs.json",
+    "./environment_mix/0188000/url_content_cache.json",
+    "./environment_mix/0188000/workspaces.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "workspaces.json": "12 rows",
+        "documentation_sources.json": "12 rows",
+        "indexed_documents.json": "19 rows",
+        "read_url_requests.json": "18 rows",
+        "url_content_cache.json": "19 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "ref_search_documentation",
+          "description": "Searches indexed documentation within the given workspace for the provided free‑text query and returns a paged list of matching documents/snippets, optionally filtered by source_id, language, and document status and ordered by the requested sort; pagination is controlled by limit and an opaque cursor returned with each page. Raises VALIDATION_ERROR if workspace_id/source_id formats are invalid, query is empty, limit/cursor/sort/status are invalid, or other parameters violate the schema. Raises UNAUTHORIZED/FORBIDDEN if you don’t have access to the workspace, and NOT_FOUND if the workspace (or specified source_id within it) does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^ref_wsp_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Workspace ULID (ref_wsp_...) to scope the documentation search."
+              },
+              "query": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Free-text query to search across indexed documentation content."
+              },
+              "source_id": {
+                "type": "string",
+                "pattern": "^ref_src_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Optional documentation source ULID (ref_src_...) to restrict results to a single source."
+              },
+              "language": {
+                "type": "string",
+                "description": "Optional language code to filter documents (e.g., en, en-US)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "superseded",
+                  "deleted"
+                ],
+                "description": "Filter documents by indexed_documents.status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Maximum number of results to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor to fetch the next page of results."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "relevance",
+                  "indexed_at_desc",
+                  "indexed_at_asc"
+                ],
+                "description": "Sort order for search results."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "query"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def ref_search_documentation(workspace_id, query, source_id=None, language=None, status=None, limit=None, cursor=None, sort=None, **_extra):\n    import json, os, datetime, re, time, base64, hashlib\n    from urllib.parse import urlparse\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0188000\" if __import__(\"os\").path.isdir(\"./environment_mix/0188000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code, credential_id=None, workspace_id_used=None):\n        latency_ms = int((time.time() - start) * 1000)\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"ref_req_\" + hashlib.sha256(f\"{time.time()}:{os.getpid()}:{len(logs)}\".encode(\"utf-8\")).hexdigest()[:16],\n            \"tool\": \"ref_search_documentation\",\n            \"workspace_id\": workspace_id_used,\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": now\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _valid_id(pat, val):\n        return isinstance(val, str) and re.match(pat, val) is not None\n\n    try:\n        if not _valid_id(r\"^ref_wsp_[0-9A-HJKMNP-TV-Z]{10,}$\", workspace_id):\n            _log(\"VALIDATION_ERROR\", None, workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id format.\")\n        if not isinstance(query, str) or len(query.strip()) < 1:\n            _log(\"VALIDATION_ERROR\", None, workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"query must be a non-empty string.\")\n        if source_id is not None and not _valid_id(r\"^ref_src_[0-9A-HJKMNP-TV-Z]{10,}$\", source_id):\n            _log(\"VALIDATION_ERROR\", None, workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"Invalid source_id format.\")\n        if status is not None and status not in (\"active\", \"superseded\", \"deleted\"):\n            _log(\"VALIDATION_ERROR\", None, workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"Invalid status filter.\")\n        if limit is None:\n            limit = 20\n        if not isinstance(limit, int) or limit < 1 or limit > 50:\n            _log(\"VALIDATION_ERROR\", None, workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 50.\")\n        if sort is None:\n            sort = \"relevance\"\n        if sort not in (\"relevance\", \"indexed_at_desc\", \"indexed_at_asc\"):\n            _log(\"VALIDATION_ERROR\", None, workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"Invalid sort value.\")\n        if cursor is not None and not isinstance(cursor, str):\n            _log(\"VALIDATION_ERROR\", None, workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n\n        workspaces = _load(\"workspaces.json\")\n        if not any(isinstance(w, dict) and w.get(\"id\") == workspace_id and w.get(\"status\") != \"deleted\" for w in workspaces):\n            _log(\"NOT_FOUND\", None, workspace_id)\n            return _err(\"NOT_FOUND\", \"Workspace not found.\")\n\n        sources = _load(\"documentation_sources.json\")\n        if not isinstance(sources, list):\n            sources = []\n        active_sources = {}\n        for s in sources:\n            if not isinstance(s, dict):\n                continue\n            if s.get(\"workspace_id\") != workspace_id:\n                continue\n            if s.get(\"status\") != \"active\":\n                continue\n            active_sources[s.get(\"id\")] = s\n\n        # If no documentation sources exist for a workspace, return empty result set.\n        if len([s for s in sources if isinstance(s, dict) and s.get(\"workspace_id\") == workspace_id]) == 0:\n            _log(\"OK\", None, workspace_id)\n            return {\n                \"object\": \"list\",\n                \"data\": [],\n                \"meta\": {\"total\": 0, \"has_more\": False, \"next_cursor\": None}\n            }\n\n        # If a source_id is given, it must belong to workspace and exist; but results may still be empty.\n        if source_id is not None:\n            src_row = next((s for s in sources if isinstance(s, dict) and s.get(\"id\") == source_id), None)\n            if src_row is None or src_row.get(\"workspace_id\") != workspace_id:\n                _log(\"NOT_FOUND\", None, workspace_id)\n                return _err(\"NOT_FOUND\", \"Source not found in workspace.\")\n            # If source isn't active, business rule says search must use active parent sources; results empty.\n            if src_row.get(\"status\") != \"active\":\n                _log(\"OK\", None, workspace_id)\n                return {\"object\": \"list\", \"data\": [], \"meta\": {\"total\": 0, \"has_more\": False, \"next_cursor\": None}}\n\n        docs = _load(\"indexed_documents.json\")\n        if not isinstance(docs, list):\n            docs = []\n\n        q = query.strip().lower()\n        q_terms = [t for t in re.split(r\"\\s+\", q) if t]\n\n        def _score(doc):\n            title = (doc.get(\"title\") or \"\").lower()\n            text = (doc.get(\"content_text\") or \"\").lower()\n            sc = 0\n            for t in q_terms:\n                if not t:\n                    continue\n                if t in title:\n                    sc += 10\n                # crude count occurrences capped for stability\n                sc += min(text.count(t), 20)\n            return sc\n\n        # Cursor format: base64url(json({\"i\": offset}))\n        offset = 0\n        if cursor:\n            try:\n                pad = \"=\" * ((4 - (len(cursor) % 4)) % 4)\n                raw = base64.urlsafe_b64decode((cursor + pad).encode(\"utf-8\")).decode(\"utf-8\")\n                obj = json.loads(raw)\n                if not isinstance(obj, dict) or \"i\" not in obj or not isinstance(obj[\"i\"], int) or obj[\"i\"] < 0:\n                    raise ValueError(\"bad cursor\")\n                offset = obj[\"i\"]\n            except Exception:\n                _log(\"VALIDATION_ERROR\", None, workspace_id)\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n        rows = []\n        for d in docs:\n            if not isinstance(d, dict):\n                continue\n            if d.get(\"workspace_id\") != workspace_id:\n                continue\n            # Business rule: must query only active documents and active sources\n            if d.get(\"status\") != \"active\":\n                continue\n            sid = d.get(\"source_id\")\n            if sid not in active_sources:\n                continue\n            if source_id is not None and sid != source_id:\n                continue\n            if language is not None:\n                if not isinstance(language, str) or len(language.strip()) == 0:\n                    _log(\"VALIDATION_ERROR\", None, workspace_id)\n                    return _err(\"VALIDATION_ERROR\", \"language must be a non-empty string when provided.\")\n                if (d.get(\"language\") or \"\").lower() != language.strip().lower():\n                    continue\n            # status filter parameter is accepted by schema, but business rule fixes to active; treat non-active as empty\n            if status is not None and status != \"active\":\n                continue\n\n            text = (d.get(\"content_text\") or \"\")\n            title = (d.get(\"title\") or \"\")\n            if q not in (title.lower() + \"\\n\" + text.lower()):\n                # allow term-based match if query split\n                if q_terms:\n                    ok = True\n                    combined = (title + \"\\n\" + text).lower()\n                    for t in q_terms:\n                        if t not in combined:\n                            ok = False\n                            break\n                    if not ok:\n                        continue\n                else:\n                    continue\n\n            sc = _score(d)\n            rows.append((sc, d))\n\n        if sort == \"relevance\":\n            rows.sort(key=lambda x: (x[0], x[1].get(\"indexed_at\") or \"\", x[1].get(\"id\") or \"\"), reverse=True)\n        elif sort == \"indexed_at_desc\":\n            rows.sort(key=lambda x: (x[1].get(\"indexed_at\") or \"\", x[1].get(\"id\") or \"\"), reverse=True)\n        else:\n            rows.sort(key=lambda x: (x[1].get(\"indexed_at\") or \"\", x[1].get(\"id\") or \"\"))\n\n        total = len(rows)\n        page = rows[offset: offset + limit]\n        next_offset = offset + len(page)\n        has_more = next_offset < total\n        next_cursor = None\n        if has_more:\n            payload = json.dumps({\"i\": next_offset}, separators=(\",\", \":\")).encode(\"utf-8\")\n            next_cursor = base64.urlsafe_b64encode(payload).decode(\"utf-8\").rstrip(\"=\")\n\n        out = []\n        for sc, d in page:\n            # must include canonical_url\n            out.append({\n                \"id\": d.get(\"id\"),\n                \"workspace_id\": d.get(\"workspace_id\"),\n                \"source_id\": d.get(\"source_id\"),\n                \"canonical_url\": d.get(\"canonical_url\"),\n                \"title\": d.get(\"title\"),\n                \"language\": d.get(\"language\"),\n                \"indexed_at\": d.get(\"indexed_at\"),\n                \"status\": d.get(\"status\"),\n                \"score\": sc\n            })\n\n        _log(\"OK\", None, workspace_id)\n        return {\"object\": \"list\", \"data\": out, \"meta\": {\"total\": total, \"has_more\": has_more, \"next_cursor\": next_cursor}}\n    except Exception as e:\n        _log(\"FAILED\", None, workspace_id if isinstance(workspace_id, str) else None)\n        return _err(\"CONFLICT\", \"Unexpected server error.\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "ref_read_url",
+          "description": "Fetches the given URL, converts the response content to markdown, and returns the markdown along with read metadata; when use_cache is true it may return a previously cached conversion for the same workspace+URL, and when force_refresh is true it will re-fetch/re-convert even if a cached entry exists. Raises VALIDATION_ERROR for an invalid workspace_id, non-URI/empty url, invalid timeout_ms, or conflicting cache options (e.g., force_refresh=true while use_cache=false if not supported). Raises UNAUTHORIZED/FORBIDDEN if you don’t have access to the workspace, NOT_FOUND when the URL cannot be fetched (e.g., DNS/connection/HTTP 404) or the workspace does not exist, REQUEST_TIMEOUT when timeout_ms is exceeded, and TOO_MANY_REQUESTS when rate limits are hit.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^ref_wsp_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Workspace ULID (ref_wsp_...) to scope caching and auditing of reads."
+              },
+              "url": {
+                "type": "string",
+                "format": "uri",
+                "minLength": 1,
+                "description": "The URL to fetch and convert to markdown."
+              },
+              "use_cache": {
+                "type": "boolean",
+                "description": "Whether to allow serving a cached conversion when available."
+              },
+              "force_refresh": {
+                "type": "boolean",
+                "description": "Whether to bypass cache and fetch/convert again even if a cached entry exists."
+              },
+              "timeout_ms": {
+                "type": "integer",
+                "minimum": 1000,
+                "maximum": 120000,
+                "description": "Maximum time in milliseconds to allow for fetch+conversion."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "url"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def ref_read_url(workspace_id, url, use_cache=None, force_refresh=None, timeout_ms=None, **_extra):\n    import json, os, datetime, re, time, hashlib, ipaddress\n    from urllib.parse import urlsplit, urlunsplit\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0188000\" if __import__(\"os\").path.isdir(\"./environment_mix/0188000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now = now_dt.isoformat() + \"Z\"\n\n    def _new_id(prefix):\n        return prefix + hashlib.sha256(f\"{time.time()}:{os.getpid()}:{os.urandom(8).hex()}\".encode(\"utf-8\")).hexdigest()[:16]\n\n    def _log(status_code, credential_id=None, workspace_id_used=None):\n        latency_ms = int((time.time() - start) * 1000)\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": _new_id(\"ref_req_\"),\n            \"tool\": \"ref_read_url\",\n            \"workspace_id\": workspace_id_used,\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": now\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _valid_id(pat, val):\n        return isinstance(val, str) and re.match(pat, val) is not None\n\n    def _canonicalize(u):\n        sp = urlsplit(u)\n        scheme = (sp.scheme or \"\").lower()\n        netloc = sp.netloc\n        path = sp.path or \"\"\n        query = sp.query or \"\"\n        # strip fragment\n        fragment = \"\"\n        # normalize host casing, remove default ports\n        if \"@\" in netloc:\n            userinfo, hostport = netloc.rsplit(\"@\", 1)\n        else:\n            userinfo, hostport = None, netloc\n        host = hostport\n        port = None\n        if hostport.startswith(\"[\"):\n            # IPv6 literal\n            if \"]\" in hostport:\n                h = hostport[1:hostport.index(\"]\")]\n                rest = hostport[hostport.index(\"]\") + 1:]\n                host = \"[\" + h.lower() + \"]\"\n                if rest.startswith(\":\"):\n                    try:\n                        port = int(rest[1:])\n                    except Exception:\n                        port = None\n            else:\n                host = hostport.lower()\n        else:\n            if \":\" in hostport:\n                h, p = hostport.rsplit(\":\", 1)\n                host = h.lower()\n                try:\n                    port = int(p)\n                except Exception:\n                    port = None\n            else:\n                host = hostport.lower()\n        # resolve default ports\n        default_port = 80 if scheme == \"http\" else 443 if scheme == \"https\" else None\n        use_port = port\n        if default_port is not None and port == default_port:\n            use_port = None\n        net = host\n        if use_port is not None:\n            net = f\"{host}:{use_port}\"\n        if userinfo:\n            net = f\"{userinfo}@{net}\"\n        return urlunsplit((scheme, net, path, query, fragment))\n\n    def _host_is_private(host):\n        h = host\n        if h.startswith(\"[\") and h.endswith(\"]\"):\n            h = h[1:-1]\n        # strip possible port already removed by parsing, but be safe\n        if \":\" in h and not re.match(r\"^[0-9a-fA-F:]+$\", h):\n            h = h.split(\":\")[0]\n        # block localhost by name too\n        if h.lower() in (\"localhost\",):\n            return True\n        try:\n            ip = ipaddress.ip_address(h)\n            # include RFC1918/loopback/link-local/ULA\n            if ip.is_loopback or ip.is_private or ip.is_link_local:\n                return True\n            # ip.is_reserved covers some special ranges; be conservative\n            if getattr(ip, \"is_reserved\", False):\n                return True\n        except Exception:\n            # Not an IP literal; cannot DNS resolve offline. Only block obvious localhost-like.\n            if h.lower().endswith(\".localhost\") or h.lower().endswith(\".local\"):\n                return True\n        # Explicit blocks requested\n        try:\n            ip = ipaddress.ip_address(h)\n            if ip.version == 6:\n                if ip == ipaddress.ip_address(\"::1\"):\n                    return True\n                if ip in ipaddress.ip_network(\"fc00::/7\"):\n                    return True\n        except Exception:\n            pass\n        return False\n\n    def _rate_limited(workspace_id_):\n        # max 60 per minute per workspace, counting attempts\n        reqs = _load(\"read_url_requests.json\")\n        if not isinstance(reqs, list):\n            reqs = []\n        cutoff = now_dt - datetime.timedelta(seconds=60)\n        cnt = 0\n        for r in reqs:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"workspace_id\") != workspace_id_:\n                continue\n            ts = r.get(\"requested_at\")\n            if not isinstance(ts, str) or not ts.endswith(\"Z\"):\n                continue\n            try:\n                t = datetime.datetime.fromisoformat(ts[:-1])\n            except Exception:\n                continue\n            if t >= cutoff:\n                cnt += 1\n        return cnt >= 60\n\n    def _cache_is_nonexpired(entry):\n        if not isinstance(entry, dict):\n            return False\n        if entry.get(\"status\") != \"fresh\":\n            return False\n        if not entry.get(\"markdown\"):\n            return False\n        fetched_at = entry.get(\"fetched_at\")\n        if not isinstance(fetched_at, str) or not fetched_at.endswith(\"Z\"):\n            return False\n        expires_at = entry.get(\"expires_at\")\n        if expires_at is None:\n            return True\n        if not isinstance(expires_at, str) or not expires_at.endswith(\"Z\"):\n            return False\n        try:\n            exp = datetime.datetime.fromisoformat(expires_at[:-1])\n        except Exception:\n            return False\n        return exp >= now_dt\n\n    try:\n        if not _valid_id(r\"^ref_wsp_[0-9A-HJKMNP-TV-Z]{10,}$\", workspace_id):\n            _log(\"VALIDATION_ERROR\", None, workspace_id if isinstance(workspace_id, str) else None)\n            return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id format.\")\n        if not isinstance(url, str) or len(url.strip()) < 1:\n            _log(\"VALIDATION_ERROR\", None, workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"url must be a non-empty string.\")\n        u = url.strip()\n        sp = urlsplit(u)\n        if sp.scheme.lower() not in (\"http\", \"https\") or not sp.netloc:\n            _log(\"VALIDATION_ERROR\", None, workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"url must be an http(s) URL with host.\")\n        if timeout_ms is None:\n            timeout_ms = 30000\n        if not isinstance(timeout_ms, int) or timeout_ms < 1000 or timeout_ms > 120000:\n            _log(\"VALIDATION_ERROR\", None, workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"timeout_ms must be between 1000 and 120000.\")\n        if use_cache is None:\n            use_cache = True\n        if force_refresh is None:\n            force_refresh = False\n        if not isinstance(use_cache, bool) or not isinstance(force_refresh, bool):\n            _log(\"VALIDATION_ERROR\", None, workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"use_cache and force_refresh must be boolean when provided.\")\n\n        workspaces = _load(\"workspaces.json\")\n        if not any(isinstance(w, dict) and w.get(\"id\") == workspace_id and w.get(\"status\") != \"deleted\" for w in workspaces):\n            _log(\"NOT_FOUND\", None, workspace_id)\n            return _err(\"NOT_FOUND\", \"Workspace not found.\")\n\n        normalized_url = _canonicalize(u)\n        nsp = urlsplit(normalized_url)\n        host = nsp.hostname or \"\"\n        if _host_is_private(host):\n            # must record request with blocked\n            reqs = _load(\"read_url_requests.json\")\n            if not isinstance(reqs, list):\n                reqs = []\n            rid = _new_id(\"ref_rur_\")\n            req_row = {\n                \"id\": rid,\n                \"workspace_id\": workspace_id,\n                \"url\": u,\n                \"normalized_url\": normalized_url,\n                \"status\": \"blocked\",\n                \"http_status\": None,\n                \"error_code\": \"ssrf_blocked\",\n                \"error_message\": \"URL blocked by SSRF protection policy.\",\n                \"served_from_cache\": False,\n                \"cache_entry_id\": None,\n                \"requested_at\": now,\n                \"completed_at\": now,\n                \"created_at\": now,\n                \"updated_at\": now\n            }\n            reqs.append(req_row)\n            _save(\"read_url_requests.json\", reqs)\n            _log(\"OK\", None, workspace_id)\n            return {\n                \"request\": req_row,\n                \"result\": None\n            }\n\n        # Create request row (always)\n        reqs = _load(\"read_url_requests.json\")\n        if not isinstance(reqs, list):\n            reqs = []\n        rid = _new_id(\"ref_rur_\")\n        req_row = {\n            \"id\": rid,\n            \"workspace_id\": workspace_id,\n            \"url\": u,\n            \"normalized_url\": normalized_url,\n            \"status\": \"queued\",\n            \"http_status\": None,\n            \"error_code\": None,\n            \"error_message\": None,\n            \"served_from_cache\": False,\n            \"cache_entry_id\": None,\n            \"requested_at\": now,\n            \"completed_at\": None,\n            \"created_at\": now,\n            \"updated_at\": now\n        }\n\n        # Rate limit: refuse additional calls but still record attempt as failed+rate_limited\n        if _rate_limited(workspace_id):\n            req_row[\"status\"] = \"failed\"\n            req_row[\"error_code\"] = \"rate_limited\"\n            req_row[\"error_message\"] = \"Rate limit exceeded (60 requests/minute).\"\n            req_row[\"completed_at\"] = now\n            req_row[\"updated_at\"] = now\n            reqs.append(req_row)\n            _save(\"read_url_requests.json\", reqs)\n            _log(\"RATE_LIMIT\", None, workspace_id)\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", request=req_row)\n\n        # attempt cache reuse\n        cache = _load(\"url_content_cache.json\")\n        if not isinstance(cache, list):\n            cache = []\n        used_entry = None\n        if use_cache and not force_refresh:\n            for e in cache:\n                if not isinstance(e, dict):\n                    continue\n                if e.get(\"workspace_id\") != workspace_id:\n                    continue\n                if e.get(\"normalized_url\") != normalized_url:\n                    continue\n                if _cache_is_nonexpired(e):\n                    used_entry = e\n                    break\n\n        if used_entry is not None:\n            req_row[\"status\"] = \"succeeded\"\n            req_row[\"served_from_cache\"] = True\n            req_row[\"cache_entry_id\"] = used_entry.get(\"id\")\n            req_row[\"completed_at\"] = now\n            req_row[\"updated_at\"] = now\n            reqs.append(req_row)\n            _save(\"read_url_requests.json\", reqs)\n            _log(\"OK\", None, workspace_id)\n            return {\n                \"request\": req_row,\n                \"cache_entry\": used_entry,\n                \"markdown\": used_entry.get(\"markdown\"),\n                \"normalized_url\": normalized_url,\n                \"final_url\": used_entry.get(\"final_url\") or used_entry.get(\"normalized_url\")\n            }\n\n        # Offline environment: no network IO; treat as fetch failure.\n        req_row[\"status\"] = \"fetching\"\n        req_row[\"updated_at\"] = now\n        reqs.append(req_row)\n        _save(\"read_url_requests.json\", reqs)\n\n        # mark failed (no cache served; no fresh cache created)\n        req_row[\"status\"] = \"failed\"\n        req_row[\"error_code\"] = \"fetch_failed\"\n        req_row[\"error_message\"] = \"Upstream fetch not available in offline datastore environment.\"\n        req_row[\"completed_at\"] = now\n        req_row[\"updated_at\"] = now\n\n        # Persist update (mutation must have effect)\n        reqs2 = _load(\"read_url_requests.json\")\n        if not isinstance(reqs2, list):\n            reqs2 = []\n        updated = False\n        for i, r in enumerate(reqs2):\n            if isinstance(r, dict) and r.get(\"id\") == rid:\n                reqs2[i] = req_row\n                updated = True\n                break\n        if not updated:\n            _log(\"CONFLICT\", None, workspace_id)\n            return _err(\"CONFLICT\", \"Failed to persist request status update.\")\n        _save(\"read_url_requests.json\", reqs2)\n\n        _log(\"OK\", None, workspace_id)\n        return {\"request\": req_row, \"result\": None}\n    except Exception as e:\n        _log(\"FAILED\", None, workspace_id if isinstance(workspace_id, str) else None)\n        return _err(\"CONFLICT\", \"Unexpected server error.\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "ref_get_current_actor",
+          "description": "Returns the authenticated caller identity for this request, including actor/workspace context, granted scopes, and current rate-limit/quota consumption; refuses with UNAUTHORIZED if the credential is missing/invalid.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^ref_wsp_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Optional workspace ULID (ref_wsp_...) to return workspace-scoped quota and effective permissions; when omitted, returns the actor's default workspace if any."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def ref_get_current_actor(workspace_id=None, **_extra):\n    import json, os, datetime, time, hashlib, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0188000\" if __import__(\"os\").path.isdir(\"./environment_mix/0188000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now = now_dt.isoformat() + \"Z\"\n\n    def _new_id(prefix):\n        return prefix + hashlib.sha256(f\"{time.time()}:{os.getpid()}:{os.urandom(8).hex()}\".encode(\"utf-8\")).hexdigest()[:16]\n\n    def _log(status_code, credential_id=None, workspace_id_used=None):\n        latency_ms = int((time.time() - start) * 1000)\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": _new_id(\"ref_req_\"),\n            \"tool\": \"ref_get_current_actor\",\n            \"workspace_id\": workspace_id_used,\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": now\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _valid_wsp(val):\n        return isinstance(val, str) and re.match(r\"^ref_wsp_[0-9A-HJKMNP-TV-Z]{10,}$\", val) is not None\n\n    try:\n        if workspace_id is not None and not _valid_wsp(workspace_id):\n            _log(\"VALIDATION_ERROR\", None, workspace_id if isinstance(workspace_id, str) else None)\n            return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id format.\")\n\n        # No explicit credential parameter exists; authentication is ambient.\n        # Resolve a usable workspace context from datastore.\n        wss = _load(\"workspaces.json\")\n        if not isinstance(wss, list):\n            wss = []\n        target = None\n        if workspace_id is not None:\n            for w in wss:\n                if isinstance(w, dict) and w.get(\"id\") == workspace_id and w.get(\"status\") == \"active\":\n                    target = w\n                    break\n            if target is None:\n                _log(\"UNAUTHORIZED\", None, workspace_id)\n                return _err(\"UNAUTHORIZED\", \"No authorized active workspace context available for this request.\")\n        else:\n            for w in wss:\n                if isinstance(w, dict) and w.get(\"status\") == \"active\":\n                    target = w\n                    break\n            if target is None:\n                _log(\"UNAUTHORIZED\", None, None)\n                return _err(\"UNAUTHORIZED\", \"No authorized workspace context available for this request.\")\n\n        # Compute current read_url rate usage (last 60s) for the workspace.\n        reqs = _load(\"read_url_requests.json\")\n        if not isinstance(reqs, list):\n            reqs = []\n        cutoff = now_dt - datetime.timedelta(seconds=60)\n        cnt = 0\n        for r in reqs:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"workspace_id\") != target.get(\"id\"):\n                continue\n            ts = r.get(\"requested_at\")\n            if not isinstance(ts, str) or not ts.endswith(\"Z\"):\n                continue\n            try:\n                t = datetime.datetime.fromisoformat(ts[:-1])\n            except Exception:\n                continue\n            if t >= cutoff:\n                cnt += 1\n\n        remaining = max(0, 60 - cnt)\n\n        actor = {\n            \"object\": \"actor\",\n            \"actor_type\": \"workspace_member\",\n            \"actor_id\": None,\n            \"workspace\": {\n                \"id\": target.get(\"id\"),\n                \"slug\": target.get(\"slug\"),\n                \"name\": target.get(\"name\"),\n                \"status\": target.get(\"status\"),\n                \"default_locale\": target.get(\"default_locale\"),\n                \"created_at\": target.get(\"created_at\"),\n                \"updated_at\": target.get(\"updated_at\")\n            },\n            \"scopes\": [\"ref:read\"],\n            \"rate_limit\": {\n                \"limit_per_minute\": 60,\n                \"used_last_minute\": cnt,\n                \"remaining\": remaining,\n                \"window_seconds\": 60\n            }\n        }\n        _log(\"OK\", None, target.get(\"id\"))\n        return actor\n    except Exception as e:\n        _log(\"FAILED\", None, workspace_id if isinstance(workspace_id, str) else None)\n        return _err(\"CONFLICT\", \"Unexpected server error.\", detail=str(e))\n"
+        },
+        {
+          "name": "ref_list_documentation_sources",
+          "description": "Lists documentation sources for the given workspace with optional filtering by status and source_type and returns a paged result set; refuses with VALIDATION_ERROR for invalid ids/filters or UNAUTHORIZED/FORBIDDEN when the caller cannot access the workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^ref_wsp_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Workspace ULID (ref_wsp_...) to list sources for."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "paused",
+                  "deleted"
+                ],
+                "description": "Optional filter by documentation_sources.status."
+              },
+              "source_type": {
+                "type": "string",
+                "enum": [
+                  "website",
+                  "sitemap",
+                  "git_repo",
+                  "openapi",
+                  "markdown_files"
+                ],
+                "description": "Optional filter by documentation_sources.source_type."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of sources to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor to fetch the next page."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def ref_list_documentation_sources(workspace_id, status=None, source_type=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, re, time, base64, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0188000\" if __import__(\"os\").path.isdir(\"./environment_mix/0188000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _new_id(prefix):\n        return prefix + hashlib.sha256(f\"{time.time()}:{os.getpid()}:{os.urandom(8).hex()}\".encode(\"utf-8\")).hexdigest()[:16]\n\n    def _log(status_code, credential_id=None, workspace_id_used=None):\n        latency_ms = int((time.time() - start) * 1000)\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": _new_id(\"ref_req_\"),\n            \"tool\": \"ref_list_documentation_sources\",\n            \"workspace_id\": workspace_id_used,\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": now\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _valid_id(pat, val):\n        return isinstance(val, str) and re.match(pat, val) is not None\n\n    try:\n        if not _valid_id(r\"^ref_wsp_[0-9A-HJKMNP-TV-Z]{10,}$\", workspace_id):\n            _log(\"VALIDATION_ERROR\", None, workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id format.\")\n        if status is not None and status not in (\"active\", \"paused\", \"deleted\"):\n            _log(\"VALIDATION_ERROR\", None, workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"Invalid status filter.\")\n        # Tool enum differs from schema enum; validate tool values; map to schema where possible.\n        if source_type is not None and source_type not in (\"website\", \"sitemap\", \"git_repo\", \"openapi\", \"markdown_files\"):\n            _log(\"VALIDATION_ERROR\", None, workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"Invalid source_type filter.\")\n        if limit is None:\n            limit = 50\n        if not isinstance(limit, int) or limit < 1 or limit > 100:\n            _log(\"VALIDATION_ERROR\", None, workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 100.\")\n        if cursor is not None and not isinstance(cursor, str):\n            _log(\"VALIDATION_ERROR\", None, workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n\n        wss = _load(\"workspaces.json\")\n        if not any(isinstance(w, dict) and w.get(\"id\") == workspace_id and w.get(\"status\") != \"deleted\" for w in wss):\n            _log(\"NOT_FOUND\", None, workspace_id)\n            return _err(\"NOT_FOUND\", \"Workspace not found.\")\n\n        # Ambient auth; if workspace exists, allow.\n        # (If a real auth model existed, we'd enforce access here.)\n        sources = _load(\"documentation_sources.json\")\n        if not isinstance(sources, list):\n            sources = []\n\n        # Cursor: base64url(json({\"i\": offset}))\n        offset = 0\n        if cursor:\n            try:\n                pad = \"=\" * ((4 - (len(cursor) % 4)) % 4)\n                raw = base64.urlsafe_b64decode((cursor + pad).encode(\"utf-8\")).decode(\"utf-8\")\n                obj = json.loads(raw)\n                if not isinstance(obj, dict) or \"i\" not in obj or not isinstance(obj[\"i\"], int) or obj[\"i\"] < 0:\n                    raise ValueError(\"bad cursor\")\n                offset = obj[\"i\"]\n            except Exception:\n                _log(\"VALIDATION_ERROR\", None, workspace_id)\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n        # Map tool source_type values to schema values where applicable.\n        # schema supports: web_docs, git_repo, uploaded_bundle\n        mapped_source_type = None\n        if source_type is not None:\n            m = {\n                \"website\": \"web_docs\",\n                \"sitemap\": \"web_docs\",\n                \"git_repo\": \"git_repo\",\n                \"openapi\": \"uploaded_bundle\",\n                \"markdown_files\": \"uploaded_bundle\"\n            }\n            mapped_source_type = m.get(source_type)\n\n        rows = []\n        for s in sources:\n            if not isinstance(s, dict):\n                continue\n            if s.get(\"workspace_id\") != workspace_id:\n                continue\n            if status is not None and s.get(\"status\") != status:\n                continue\n            if mapped_source_type is not None and s.get(\"source_type\") != mapped_source_type:\n                continue\n            rows.append(s)\n\n        # Stable sort by created_at then id\n        rows.sort(key=lambda r: (r.get(\"created_at\") or \"\", r.get(\"id\") or \"\"))\n\n        total = len(rows)\n        page = rows[offset: offset + limit]\n        next_offset = offset + len(page)\n        has_more = next_offset < total\n        next_cursor = None\n        if has_more:\n            payload = json.dumps({\"i\": next_offset}, separators=(\",\", \":\")).encode(\"utf-8\")\n            next_cursor = base64.urlsafe_b64encode(payload).decode(\"utf-8\").rstrip(\"=\")\n\n        _log(\"OK\", None, workspace_id)\n        return {\"object\": \"list\", \"data\": page, \"meta\": {\"total\": total, \"has_more\": has_more, \"next_cursor\": next_cursor}}\n    except Exception as e:\n        _log(\"FAILED\", None, workspace_id if isinstance(workspace_id, str) else None)\n        return _err(\"CONFLICT\", \"Unexpected server error.\", detail=str(e))\n"
+        },
+        {
+          "name": "ref_create_documentation_source",
+          "description": "Creates a new documentation source in the given workspace for indexing; returns the created source record and refuses with VALIDATION_ERROR for invalid fields, CONFLICT if a source with the same name/base_url already exists in the workspace, or FORBIDDEN if the caller cannot write to the workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^ref_wsp_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Workspace ULID (ref_wsp_...) that will own the source."
+              },
+              "source_type": {
+                "type": "string",
+                "enum": [
+                  "website",
+                  "sitemap",
+                  "git_repo",
+                  "openapi",
+                  "markdown_files"
+                ],
+                "description": "Type of source to index."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "Human-readable name for the source."
+              },
+              "base_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "Base URL for website/sitemap/openapi sources; required for source_type=website|sitemap|openapi."
+              },
+              "repo_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "Repository URL for git_repo sources; required for source_type=git_repo."
+              },
+              "default_locale": {
+                "type": "string",
+                "description": "Optional locale/language hint for this source (e.g., en, en-US)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "paused"
+                ],
+                "description": "Initial status for the source; defaults to active when omitted."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "source_type",
+              "name"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def ref_create_documentation_source(workspace_id, source_type, name, base_url=None, repo_url=None, default_locale=None, status=None, **_extra):\n    import json, os, datetime, re, time\n    from urllib.parse import urlparse\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0188000\" if __import__(\"os\").path.isdir(\"./environment_mix/0188000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"ref_create_documentation_source\"\n\n    # No request log/audit collection declared in schema; nothing to persist per-call.\n\n    try:\n        if not isinstance(workspace_id, str) or not re.match(r\"^ref_wsp_[0-9A-HJKMNP-TV-Z]{10,}$\", workspace_id):\n            return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n        if not isinstance(source_type, str) or source_type not in (\"website\", \"sitemap\", \"git_repo\", \"openapi\", \"markdown_files\"):\n            return _err(\"VALIDATION_ERROR\", \"Invalid source_type.\")\n        if not isinstance(name, str) or not (1 <= len(name) <= 200):\n            return _err(\"VALIDATION_ERROR\", \"Invalid name.\")\n        if status is None:\n            status = \"active\"\n        if not isinstance(status, str) or status not in (\"active\", \"paused\"):\n            return _err(\"VALIDATION_ERROR\", \"Invalid status.\")\n\n        if default_locale is not None and not isinstance(default_locale, str):\n            return _err(\"VALIDATION_ERROR\", \"default_locale must be a string when provided.\")\n\n        def _is_uri(u):\n            if not isinstance(u, str) or len(u) == 0:\n                return False\n            p = urlparse(u)\n            return p.scheme in (\"http\", \"https\") and bool(p.netloc)\n\n        if source_type in (\"website\", \"sitemap\", \"openapi\"):\n            if base_url is None:\n                return _err(\"VALIDATION_ERROR\", \"base_url is required for source_type=website|sitemap|openapi.\")\n            if not _is_uri(base_url):\n                return _err(\"VALIDATION_ERROR\", \"Invalid base_url (must be a http(s) URI).\")\n        elif base_url is not None:\n            if not _is_uri(base_url):\n                return _err(\"VALIDATION_ERROR\", \"Invalid base_url (must be a http(s) URI).\")\n\n        if source_type == \"git_repo\":\n            if repo_url is None:\n                return _err(\"VALIDATION_ERROR\", \"repo_url is required for source_type=git_repo.\")\n            if not _is_uri(repo_url):\n                return _err(\"VALIDATION_ERROR\", \"Invalid repo_url (must be a http(s) URI).\")\n        elif repo_url is not None:\n            if not _is_uri(repo_url):\n                return _err(\"VALIDATION_ERROR\", \"Invalid repo_url (must be a http(s) URI).\")\n\n        # Map vendor tool types to datastore schema types.\n        if source_type in (\"website\", \"sitemap\", \"openapi\"):\n            ds_source_type = \"web_docs\"\n        elif source_type == \"git_repo\":\n            ds_source_type = \"git_repo\"\n        elif source_type == \"markdown_files\":\n            ds_source_type = \"uploaded_bundle\"\n        else:\n            return _err(\"VALIDATION_ERROR\", \"Unsupported source_type.\")\n\n        workspaces = _load(\"workspaces.json\")\n        wsp = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n        if not wsp:\n            return _err(\"NOT_FOUND\", \"Workspace not found.\")\n        if wsp.get(\"status\") != \"active\":\n            return _err(\"UNAUTHORIZED\", \"Workspace is not active.\")\n\n        sources = _load(\"documentation_sources.json\")\n\n        # Constraint: unique(workspace_id, name)\n        for s in sources:\n            if s.get(\"workspace_id\") == workspace_id and s.get(\"status\") != \"deleted\" and s.get(\"name\") == name:\n                return _err(\"CONFLICT\", \"A documentation source with the same name already exists in this workspace.\")\n\n        # Tool description mentions \"same name/base_url\"; enforce additional conflict when base_url matches.\n        if base_url is not None:\n            for s in sources:\n                if s.get(\"workspace_id\") == workspace_id and s.get(\"status\") != \"deleted\" and s.get(\"base_url\") == base_url:\n                    return _err(\"CONFLICT\", \"A documentation source with the same base_url already exists in this workspace.\")\n\n        # Schema constraints for documentation_sources:\n        if ds_source_type == \"web_docs\" and base_url is None:\n            return _err(\"VALIDATION_ERROR\", \"base_url is required for web_docs sources.\")\n        if ds_source_type == \"git_repo\" and repo_url is None:\n            return _err(\"VALIDATION_ERROR\", \"repo_url is required for git_repo sources.\")\n\n        def _ulid_like(prefix):\n            alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n            # Not a real ULID implementation; deterministic-ish uniqueness using time and a counter.\n            now = int(datetime.datetime.utcnow().timestamp() * 1000)\n            x = now\n            out = []\n            for _ in range(12):\n                out.append(alphabet[x % 32])\n                x //= 32\n            return prefix + \"\".join(reversed(out))\n\n        now_iso = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n        new_id = _ulid_like(\"ref_src_\")\n        existing_ids = {s.get(\"id\") for s in sources if isinstance(s, dict)}\n        # Ensure uniqueness if collision.\n        bump = 0\n        while new_id in existing_ids:\n            bump += 1\n            new_id = _ulid_like(\"ref_src_\") + str(bump)\n\n        row = {\n            \"id\": new_id,\n            \"workspace_id\": workspace_id,\n            \"source_type\": ds_source_type,\n            \"name\": name,\n            \"base_url\": base_url,\n            \"repo_url\": repo_url,\n            \"status\": status,\n            \"last_indexed_at\": None,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n        }\n        sources.append(row)\n        _save(\"documentation_sources.json\", sources)\n\n        # Return created record (include tool-level fields as given by backend schema; pass-through).\n        return {\n            \"documentation_source\": row,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n    except (TypeError, ValueError) as e:\n        return _err(\"VALIDATION_ERROR\", \"Invalid input.\", detail=str(e))\n    except Exception as e:\n        return _err(\"CONFLICT\", \"Unexpected server error.\", detail=str(e))\n"
+        },
+        {
+          "name": "ref_update_documentation_source",
+          "description": "Updates mutable fields of an existing documentation source (including lifecycle transitions active/paused/deleted) and returns the updated record; refuses with VALIDATION_ERROR for invalid updates, NOT_FOUND if the source does not exist in the workspace, or CONFLICT if attempting an illegal status transition.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^ref_wsp_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Workspace ULID (ref_wsp_...) that owns the source."
+              },
+              "source_id": {
+                "type": "string",
+                "pattern": "^ref_src_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Documentation source ULID (ref_src_...) to update."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "New name for the source."
+              },
+              "base_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "New base URL (for website/sitemap/openapi sources)."
+              },
+              "repo_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "New repo URL (for git_repo sources)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "paused",
+                  "deleted"
+                ],
+                "description": "New lifecycle status; allowed transitions: active→paused|deleted, paused→active|deleted."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "source_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def ref_update_documentation_source(workspace_id, source_id, name=None, base_url=None, repo_url=None, status=None, **_extra):\n    import json, os, datetime, re, time\n    from urllib.parse import urlparse\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0188000\" if __import__(\"os\").path.isdir(\"./environment_mix/0188000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    try:\n        if not isinstance(workspace_id, str) or not re.match(r\"^ref_wsp_[0-9A-HJKMNP-TV-Z]{10,}$\", workspace_id):\n            return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n        if not isinstance(source_id, str) or not re.match(r\"^ref_src_[0-9A-HJKMNP-TV-Z]{10,}$\", source_id):\n            return _err(\"VALIDATION_ERROR\", \"Invalid source_id.\")\n\n        if name is not None:\n            if not isinstance(name, str) or not (1 <= len(name) <= 200):\n                return _err(\"VALIDATION_ERROR\", \"Invalid name.\")\n        if status is not None:\n            if not isinstance(status, str) or status not in (\"active\", \"paused\", \"deleted\"):\n                return _err(\"VALIDATION_ERROR\", \"Invalid status.\")\n\n        def _is_uri(u):\n            if not isinstance(u, str) or len(u) == 0:\n                return False\n            p = urlparse(u)\n            return p.scheme in (\"http\", \"https\") and bool(p.netloc)\n\n        if base_url is not None and not _is_uri(base_url):\n            return _err(\"VALIDATION_ERROR\", \"Invalid base_url (must be a http(s) URI).\")\n        if repo_url is not None and not _is_uri(repo_url):\n            return _err(\"VALIDATION_ERROR\", \"Invalid repo_url (must be a http(s) URI).\")\n\n        workspaces = _load(\"workspaces.json\")\n        wsp = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n        if not wsp:\n            return _err(\"NOT_FOUND\", \"Workspace not found.\")\n        if wsp.get(\"status\") != \"active\":\n            return _err(\"UNAUTHORIZED\", \"Workspace is not active.\")\n\n        sources = _load(\"documentation_sources.json\")\n        idx = None\n        for i, s in enumerate(sources):\n            if s.get(\"id\") == source_id and s.get(\"workspace_id\") == workspace_id:\n                idx = i\n                break\n        if idx is None:\n            return _err(\"NOT_FOUND\", \"Documentation source not found in this workspace.\")\n\n        s = sources[idx]\n        old_status = s.get(\"status\")\n\n        # Lifecycle transitions per schema:\n        allowed = {\n            \"active\": {\"paused\", \"deleted\"},\n            \"paused\": {\"active\", \"deleted\"},\n            \"deleted\": set(),\n        }\n        if status is not None:\n            if old_status not in allowed:\n                return _err(\"CONFLICT\", \"Illegal current status.\", current_status=old_status)\n            if status != old_status and status not in allowed.get(old_status, set()):\n                return _err(\"INVALID_TRANSITION\", \"Illegal status transition.\", from_status=old_status, to_status=status)\n\n        # Enforce type-dependent required fields based on stored source_type.\n        src_type = s.get(\"source_type\")  # web_docs/git_repo/uploaded_bundle\n        new_name = name if name is not None else s.get(\"name\")\n        new_base_url = base_url if base_url is not None else s.get(\"base_url\")\n        new_repo_url = repo_url if repo_url is not None else s.get(\"repo_url\")\n        new_status = status if status is not None else old_status\n\n        if src_type == \"web_docs\" and (new_base_url is None):\n            return _err(\"VALIDATION_ERROR\", \"base_url is required for this source.\")\n        if src_type == \"git_repo\" and (new_repo_url is None):\n            return _err(\"VALIDATION_ERROR\", \"repo_url is required for this source.\")\n\n        # Uniqueness: unique(workspace_id, name) (exclude self)\n        for other in sources:\n            if other.get(\"id\") != source_id and other.get(\"workspace_id\") == workspace_id and other.get(\"status\") != \"deleted\":\n                if other.get(\"name\") == new_name:\n                    return _err(\"CONFLICT\", \"A documentation source with the same name already exists in this workspace.\")\n\n        # Apply updates\n        changed = False\n        if name is not None and new_name != s.get(\"name\"):\n            s[\"name\"] = new_name\n            changed = True\n        if base_url is not None and new_base_url != s.get(\"base_url\"):\n            s[\"base_url\"] = new_base_url\n            changed = True\n        if repo_url is not None and new_repo_url != s.get(\"repo_url\"):\n            s[\"repo_url\"] = new_repo_url\n            changed = True\n        if status is not None and new_status != old_status:\n            s[\"status\"] = new_status\n            changed = True\n\n        if not changed:\n            # No success without effect for mutation.\n            return _err(\"VALIDATION_ERROR\", \"No updates provided.\")\n\n        now_iso = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n        s[\"updated_at\"] = now_iso\n        sources[idx] = s\n        _save(\"documentation_sources.json\", sources)\n\n        return {\n            \"documentation_source\": s,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n    except (TypeError, ValueError) as e:\n        return _err(\"VALIDATION_ERROR\", \"Invalid input.\", detail=str(e))\n    except Exception as e:\n        return _err(\"CONFLICT\", \"Unexpected server error.\", detail=str(e))\n"
+        },
+        {
+          "name": "ref_list_read_url_requests",
+          "description": "Lists URL read/audit requests for the given workspace ordered by most recent first, with optional filtering by status and normalized_url/url; returns a paged result set and refuses with VALIDATION_ERROR for invalid filters or FORBIDDEN if the caller cannot access the workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^ref_wsp_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Workspace ULID (ref_wsp_...) to list requests for."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "fetching",
+                  "converting",
+                  "succeeded",
+                  "failed",
+                  "blocked"
+                ],
+                "description": "Optional filter by read_url_requests.status."
+              },
+              "url": {
+                "type": "string",
+                "format": "uri",
+                "description": "Optional filter to requests whose original url matches exactly."
+              },
+              "normalized_url": {
+                "type": "string",
+                "description": "Optional filter to requests whose normalized_url matches exactly (canonicalized URL used for caching)."
+              },
+              "since": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return requests created at or after this timestamp."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of requests to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor to fetch the next page."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def ref_list_read_url_requests(workspace_id, status=None, url=None, normalized_url=None, since=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, re, time\n    from urllib.parse import urlparse\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0188000\" if __import__(\"os\").path.isdir(\"./environment_mix/0188000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    try:\n        if not isinstance(workspace_id, str) or not re.match(r\"^ref_wsp_[0-9A-HJKMNP-TV-Z]{10,}$\", workspace_id):\n            return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n        if status is not None:\n            if not isinstance(status, str) or status not in (\"queued\", \"fetching\", \"converting\", \"succeeded\", \"failed\", \"blocked\"):\n                return _err(\"VALIDATION_ERROR\", \"Invalid status filter.\")\n        if limit is None:\n            limit = 50\n        if not isinstance(limit, int) or not (1 <= limit <= 100):\n            return _err(\"VALIDATION_ERROR\", \"Invalid limit.\")\n\n        def _is_uri(u):\n            if not isinstance(u, str) or len(u) == 0:\n                return False\n            p = urlparse(u)\n            return p.scheme in (\"http\", \"https\") and bool(p.netloc)\n\n        if url is not None and not _is_uri(url):\n            return _err(\"VALIDATION_ERROR\", \"Invalid url filter (must be a http(s) URI).\")\n        if normalized_url is not None:\n            if not isinstance(normalized_url, str) or not re.match(r\"^https?://\", normalized_url):\n                return _err(\"VALIDATION_ERROR\", \"Invalid normalized_url filter.\")\n\n        since_dt = None\n        if since is not None:\n            if not isinstance(since, str):\n                return _err(\"VALIDATION_ERROR\", \"since must be an ISO date-time string.\")\n            s = since\n            try:\n                if s.endswith(\"Z\"):\n                    s = s[:-1] + \"+00:00\"\n                since_dt = datetime.datetime.fromisoformat(s)\n            except ValueError:\n                return _err(\"VALIDATION_ERROR\", \"Invalid since timestamp format.\")\n\n        workspaces = _load(\"workspaces.json\")\n        wsp = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n        if not wsp:\n            return _err(\"NOT_FOUND\", \"Workspace not found.\")\n        if wsp.get(\"status\") == \"deleted\":\n            return _err(\"UNAUTHORIZED\", \"Workspace is deleted.\")\n\n        reqs = _load(\"read_url_requests.json\")\n        rows = [r for r in reqs if r.get(\"workspace_id\") == workspace_id]\n\n        if status is not None:\n            rows = [r for r in rows if r.get(\"status\") == status]\n        if url is not None:\n            rows = [r for r in rows if r.get(\"url\") == url]\n        if normalized_url is not None:\n            rows = [r for r in rows if r.get(\"normalized_url\") == normalized_url]\n        if since_dt is not None:\n            def _parse_dt(x):\n                if not isinstance(x, str):\n                    return None\n                xx = x\n                try:\n                    if xx.endswith(\"Z\"):\n                        xx = xx[:-1] + \"+00:00\"\n                    return datetime.datetime.fromisoformat(xx)\n                except ValueError:\n                    return None\n            rows = [r for r in rows if (_parse_dt(r.get(\"created_at\")) is not None and _parse_dt(r.get(\"created_at\")) >= since_dt)]\n\n        # Order most recent first (created_at desc, fallback updated_at)\n        def _dtkey(r):\n            val = r.get(\"created_at\") or r.get(\"updated_at\") or \"\"\n            try:\n                x = val[:-1] + \"+00:00\" if isinstance(val, str) and val.endswith(\"Z\") else val\n                return datetime.datetime.fromisoformat(x)\n            except Exception:\n                return datetime.datetime.min\n\n        rows.sort(key=_dtkey, reverse=True)\n        total = len(rows)\n\n        # Cursor: base is integer offset encoded as \"o:<int>\"\n        offset = 0\n        if cursor is not None:\n            if not isinstance(cursor, str) or not cursor.startswith(\"o:\"):\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n            try:\n                offset = int(cursor.split(\":\", 1)[1])\n                if offset < 0:\n                    raise ValueError\n            except ValueError:\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor offset.\")\n\n        page = rows[offset:offset + limit]\n        next_offset = offset + len(page)\n        has_more = next_offset < total\n        next_cursor = f\"o:{next_offset}\" if has_more else None\n\n        return {\n            \"data\": page,\n            \"pagination\": {\n                \"total\": total,\n                \"limit\": limit,\n                \"has_more\": has_more,\n                \"next_cursor\": next_cursor,\n            },\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n    except (TypeError, ValueError) as e:\n        return _err(\"VALIDATION_ERROR\", \"Invalid input.\", detail=str(e))\n    except Exception as e:\n        return _err(\"CONFLICT\", \"Unexpected server error.\", detail=str(e))\n"
+        },
+        {
+          "name": "ref_get_url_content_cache_entry",
+          "description": "Fetches a single URL content cache entry by id for the given workspace and returns its stored markdown/text and fetch metadata; refuses with NOT_FOUND if the entry does not exist in the workspace or FORBIDDEN if the caller cannot access the workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^ref_wsp_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Workspace ULID (ref_wsp_...) that owns the cache entry."
+              },
+              "cache_entry_id": {
+                "type": "string",
+                "pattern": "^ref_cache_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "URL content cache ULID (ref_cache_...) to fetch."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "cache_entry_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def ref_get_url_content_cache_entry(workspace_id, cache_entry_id, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0188000\" if __import__(\"os\").path.isdir(\"./environment_mix/0188000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _record_attempt(status, workspace_id_used=None, cache_entry_id_used=None, extra=None):\n        # If a request/audit log exists, record. Otherwise, no-op (schema doesn't declare one here).\n        # We intentionally do not fail the call if logging is unavailable.\n        possible_files = [\"request_log.json\", \"requests.json\", \"audit_log.json\", \"usage_logs.json\", \"api_requests.json\"]\n        for fn in possible_files:\n            path = os.path.join(_DB, fn)\n            if os.path.exists(path):\n                logs = _load(fn)\n                if not isinstance(logs, list):\n                    logs = []\n                row = {\n                    \"id\": None,\n                    \"endpoint\": endpoint,\n                    \"status\": status,\n                    \"workspace_id\": workspace_id_used,\n                    \"cache_entry_id\": cache_entry_id_used,\n                    \"timestamp\": _now_iso(),\n                    \"latency_ms\": int(max(0, (time.time() - t0) * 1000)),\n                }\n                if isinstance(extra, dict):\n                    row.update(extra)\n                logs.append(row)\n                _save(fn, logs)\n                break\n\n    t0 = time.time()\n    endpoint = \"ref_get_url_content_cache_entry\"\n\n    # ---- Validate inputs ----\n    if not isinstance(workspace_id, str) or not re.match(r\"^ref_wsp_[0-9A-HJKMNP-TV-Z]{10,}$\", workspace_id):\n        _record_attempt(\"VALIDATION_ERROR\", workspace_id_used=workspace_id, cache_entry_id_used=cache_entry_id)\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n\n    if not isinstance(cache_entry_id, str) or not cache_entry_id:\n        _record_attempt(\"VALIDATION_ERROR\", workspace_id_used=workspace_id, cache_entry_id_used=cache_entry_id)\n        return _err(\"VALIDATION_ERROR\", \"Invalid cache_entry_id.\")\n\n    # Vendor schema pattern says ref_cache_..., but real datastore uses ref_ucc_...\n    # Accept both to match real service tolerance / migration.\n    if not (\n        re.match(r\"^ref_cache_[0-9A-HJKMNP-TV-Z]{10,}$\", cache_entry_id)\n        or re.match(r\"^ref_ucc_[0-9A-HJKMNP-TV-Z]{10,}$\", cache_entry_id)\n    ):\n        _record_attempt(\"VALIDATION_ERROR\", workspace_id_used=workspace_id, cache_entry_id_used=cache_entry_id)\n        return _err(\"VALIDATION_ERROR\", \"Invalid cache_entry_id format.\")\n\n    # ---- Resolve workspace (ambient auth: if it exists, it's accessible) ----\n    workspaces = _load(\"workspaces.json\")\n    if not isinstance(workspaces, list):\n        _record_attempt(\"CONFLICT\", workspace_id_used=workspace_id, cache_entry_id_used=cache_entry_id)\n        return _err(\"CONFLICT\", \"Datastore corrupted: workspaces.json is not a list.\")\n\n    wsp = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if not wsp:\n        _record_attempt(\"NOT_FOUND\", workspace_id_used=workspace_id, cache_entry_id_used=cache_entry_id)\n        return _err(\"NOT_FOUND\", \"Workspace not found.\")\n\n    # ---- Fetch cache entry ----\n    cache_rows = _load(\"url_content_cache.json\")\n    if not isinstance(cache_rows, list):\n        _record_attempt(\"CONFLICT\", workspace_id_used=workspace_id, cache_entry_id_used=cache_entry_id)\n        return _err(\"CONFLICT\", \"Datastore corrupted: url_content_cache.json is not a list.\")\n\n    # Primary lookup: must be in the given workspace.\n    entry = next(\n        (r for r in cache_rows if isinstance(r, dict) and r.get(\"id\") == cache_entry_id and r.get(\"workspace_id\") == workspace_id),\n        None,\n    )\n\n    if not entry:\n        # Important: do NOT \"resolve a different context\" or switch workspaces; this endpoint is scoped.\n        # Return NOT_FOUND, but be tolerant about vendor-id prefix drift by checking if same id exists elsewhere\n        # and still refusing (prevents confusing \"works in some other workspace\" leaks).\n        _record_attempt(\"NOT_FOUND\", workspace_id_used=workspace_id, cache_entry_id_used=cache_entry_id)\n        return _err(\"NOT_FOUND\", \"Cache entry not found in this workspace.\")\n\n    # ---- Return stored content and metadata (do not fabricate fields) ----\n    # The real API returns markdown/text plus fetch metadata.\n    resp = {\n        \"cache_entry\": entry,\n    }\n\n    _record_attempt(\"OK\", workspace_id_used=workspace_id, cache_entry_id_used=cache_entry_id)\n    return resp\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0188000",
+    "index": 188,
+    "name": "Ref",
+    "description": "This backend stores documentation/search artifacts and URL fetch-to-markdown read results used by the Ref MCP tools. The main workflows are (1) indexing documentation sources into searchable documents and (2) fetching arbitrary URLs, converting them to markdown, and caching the result for subsequent",
+    "taxonomy": {
+      "L1_id": "L1-01",
+      "L1_name": "Search & Information Retrieval",
+      "L1_name_zh": "搜索与信息获取",
+      "L2_id": "L2-01",
+      "L2_name": "General Web Search",
+      "L2_name_zh": "通用网页搜索",
+      "L3_name": "Web Crawling, Scraping & Extraction",
+      "L3_name_zh": "网页爬取、抓取与内容抽取"
+    },
+    "database_dir": "./environment_mix/0188000",
+    "mount_path": "/app/database",
+    "n_tools": 8,
+    "n_collections": 5,
+    "n_records": 80,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 8,
+      "loaded": 8,
+      "reads_returning_data": 5,
+      "read_operations": 6,
+      "mutations_persisted": 2,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 8,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "ref_search_documentation",
+      "returned_chars": 440
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

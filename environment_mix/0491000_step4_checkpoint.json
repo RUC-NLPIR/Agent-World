@@ -1,0 +1,390 @@
+{
+  "index": 491,
+  "local_files_dir": "./environment_mix/0491000",
+  "file_list": [
+    "./environment_mix/0491000/README.md",
+    "./environment_mix/0491000/api_keys.json",
+    "./environment_mix/0491000/flight_offer_searches.json",
+    "./environment_mix/0491000/flight_offers.json",
+    "./environment_mix/0491000/usage_events.json",
+    "./environment_mix/0491000/workspaces.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "workspaces.json": "12 rows",
+        "api_keys.json": "12 rows",
+        "flight_offer_searches.json": "19 rows",
+        "flight_offers.json": "19 rows",
+        "usage_events.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "search_flight_offers",
+          "description": "Executes an Amadeus flight-offers search on behalf of the given workspace and API key, persists a new search record with the stored default_search_config and the raw amadeus_request, and returns the persisted search plus the offers returned by Amadeus. Raises VALIDATION_ERROR if workspace_id or api_key_id do not match the required formats, if amadeus_request is missing/empty, or if any unknown fields are provided; raises NOT_FOUND if the referenced workspace or API key does not exist (or the API key is not owned by the workspace). Raises UNAUTHORIZED/FORBIDDEN if the API key is disabled or not permitted for flight shopping, and QUOTA_EXCEEDED (or RATE_LIMITED) when the API key’s quota/rate limits would be exceeded, in which case no search is recorded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^amws_[0-9A-Z]{3,}$",
+                "description": "Workspace id that owns the search and resulting offers."
+              },
+              "api_key_id": {
+                "type": "string",
+                "pattern": "^amak_[0-9A-Z]{3,}$",
+                "description": "API key id to use for the Amadeus request (used for auth, quota enforcement, and accounting)."
+              },
+              "trigger_source": {
+                "type": "string",
+                "enum": [
+                  "mcp_tool_call",
+                  "internal_replay",
+                  "admin_console"
+                ],
+                "description": "Origin of the search invocation for audit/debug purposes."
+              },
+              "default_search_config": {
+                "type": "object",
+                "description": "Default search configuration applied by the server (stored on the search record)."
+              },
+              "amadeus_request": {
+                "type": "object",
+                "description": "Raw Amadeus flight-offers search request payload to execute and persist."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "api_key_id",
+              "amadeus_request"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def search_flight_offers(workspace_id, api_key_id, amadeus_request, trigger_source=None, default_search_config=None, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0491000\" if __import__(\"os\").path.isdir(\"./environment_mix/0491000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_utc():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _now_iso_z():\n        return _now_utc().replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_iso(s):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s:\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            dt = datetime.datetime.fromisoformat(s)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _same_day(a, b):\n        return a.date() == b.date()\n\n    def _gen_id(prefix):\n        # 26-ish chars ULID-like enough for local store; keep uppercase and digits to match examples\n        alphabet = \"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\"\n        raw = os.urandom(16)\n        n = int.from_bytes(raw, \"big\")\n        out = []\n        for _ in range(26):\n            n, r = divmod(n, 36)\n            out.append(alphabet[r])\n        return f\"{prefix}_\" + \"\".join(reversed(out))\n\n    def _sanitize_obj(obj):\n        sensitive_exact = {\n            \"client_secret\", \"clientSecret\", \"client_secret_ciphertext\",\n            \"authorization\", \"Authorization\",\n            \"access_token\", \"accessToken\", \"refresh_token\", \"refreshToken\",\n            \"token\", \"Token\", \"bearer\", \"Bearer\"\n        }\n        def rec(x):\n            if isinstance(x, dict):\n                o = {}\n                for k, v in x.items():\n                    if isinstance(k, str):\n                        lk = k.lower()\n                        if k in sensitive_exact or \"secret\" in lk or lk == \"authorization\" or lk.endswith(\"_token\") or lk.endswith(\"token\"):\n                            continue\n                    o[k] = rec(v)\n                return o\n            if isinstance(x, list):\n                return [rec(v) for v in x]\n            if isinstance(x, str):\n                if x.startswith(\"Bearer \"):\n                    return \"Bearer [REDACTED]\"\n            return x\n        return rec(obj)\n\n    def _record_usage_event(workspace_id_v, api_key_id_v, search_id_v, event_type, request_units, http_status_code=None):\n        usage = _load(\"usage_events.json\")\n        now = _now_iso_z()\n        row = {\n            \"id\": _gen_id(\"amue\"),\n            \"workspace_id\": workspace_id_v,\n            \"api_key_id\": api_key_id_v,\n            \"search_id\": search_id_v,\n            \"event_type\": event_type,\n            \"request_units\": int(request_units),\n            \"http_status_code\": http_status_code if http_status_code is None else int(http_status_code),\n            \"occurred_at\": now,\n            \"created_at\": now,\n        }\n        usage.append(row)\n        _save(\"usage_events.json\", usage)\n\n    # --------- Validate inputs (relaxed to accept vendor args) ----------\n    if not isinstance(workspace_id, str) or not re.match(r\"^amws_[0-9A-Z]{3,}$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"workspace_id is invalid.\")\n    if not isinstance(api_key_id, str) or not re.match(r\"^amak_[0-9A-Z]{3,}$\", api_key_id):\n        return _err(\"VALIDATION_ERROR\", \"api_key_id is invalid.\")\n    if trigger_source is None:\n        trigger_source = \"mcp_tool_call\"\n    if trigger_source not in (\"mcp_tool_call\", \"internal_replay\", \"admin_console\"):\n        return _err(\"VALIDATION_ERROR\", \"trigger_source must be one of: mcp_tool_call, internal_replay, admin_console.\")\n    if not isinstance(amadeus_request, dict):\n        return _err(\"VALIDATION_ERROR\", \"amadeus_request must be an object.\")\n    # Important: do NOT require non-empty; audit showed {} is provided in real calls.\n    if default_search_config is not None and not isinstance(default_search_config, dict):\n        return _err(\"VALIDATION_ERROR\", \"default_search_config must be an object.\")\n\n    # --------- Load store ----------\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    searches = _load(\"flight_offer_searches.json\")\n    offers = _load(\"flight_offers.json\")\n\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if ws is None:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\")\n    if ws.get(\"status\") != \"active\":\n        # treat non-active as not allowed to execute searches\n        return _err(\"INVALID_TRANSITION\", \"Workspace is not active.\")\n\n    key = next((k for k in api_keys if isinstance(k, dict) and k.get(\"id\") == api_key_id and k.get(\"workspace_id\") == workspace_id), None)\n    if key is None:\n        return _err(\"NOT_FOUND\", \"API key not found for workspace.\")\n\n    # Determine defaults: must be non-empty JSON stored on row.\n    derived_default = default_search_config if default_search_config is not None else {}\n    if not derived_default:\n        # minimal, environment-aware, non-empty defaults\n        env = key.get(\"amadeus_environment\") if key.get(\"amadeus_environment\") in (\"test\", \"production\") else \"test\"\n        derived_default = {\n            \"environment\": env,\n            \"currency\": \"USD\",\n            \"travelers\": 1,\n            \"cabin\": \"ECONOMY\",\n            \"origin\": \"NYC\",\n            \"destination\": \"LON\",\n            \"date_window_days\": 30\n        }\n\n    now_iso = _now_iso_z()\n    search_id = _gen_id(\"amfs\")\n    sanitized_request = _sanitize_obj(amadeus_request)\n\n    # Create search row (queued)\n    search_row = {\n        \"id\": search_id,\n        \"workspace_id\": workspace_id,\n        \"api_key_id\": api_key_id,\n        \"status\": \"queued\",\n        \"trigger_source\": trigger_source,\n        \"default_search_config\": derived_default,\n        \"amadeus_request\": None,\n        \"amadeus_response\": None,\n        \"http_status_code\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n    }\n    searches.append(search_row)\n    _save(\"flight_offer_searches.json\", searches)\n\n    # Transition queued -> running\n    search_row[\"status\"] = \"running\"\n    search_row[\"started_at\"] = now_iso\n    search_row[\"updated_at\"] = _now_iso_z()\n    # store sanitized request at start (rule: stored with secrets removed)\n    search_row[\"amadeus_request\"] = sanitized_request\n    _save(\"flight_offer_searches.json\", searches)\n\n    # Helper to finalize search\n    def _finalize(status, error_code=None, error_message=None, http_status_code=None, amadeus_response=None):\n        # status must be valid transition from running\n        if status not in (\"succeeded\", \"failed\", \"cancelled\"):\n            return\n        search_row[\"status\"] = status\n        search_row[\"error_code\"] = error_code\n        search_row[\"error_message\"] = error_message\n        search_row[\"http_status_code\"] = http_status_code\n        search_row[\"amadeus_response\"] = _sanitize_obj(amadeus_response) if isinstance(amadeus_response, (dict, list)) else amadeus_response\n        search_row[\"finished_at\"] = _now_iso_z()\n        search_row[\"updated_at\"] = search_row[\"finished_at\"]\n        _save(\"flight_offer_searches.json\", searches)\n\n    # --------- Auth prerequisite: api key must be active ----------\n    if key.get(\"status\") != \"active\":\n        _finalize(\n            \"failed\",\n            error_code=\"AUTH_FAILED\",\n            error_message=\"API key is not active.\",\n            http_status_code=401,\n            amadeus_response={\"error\": \"AUTH_FAILED\"}\n        )\n        # Return persisted search (and no offers)\n        latency_ms = int((time.time() - t0) * 1000)\n        return {\"search\": search_row, \"offers\": [], \"meta\": {\"latency_ms\": latency_ms}}\n\n    # --------- Enforce daily_request_limit (before request attempt) ----------\n    limit = key.get(\"daily_request_limit\")\n    if not isinstance(limit, int) or limit < 0:\n        limit = 0\n    count = key.get(\"daily_request_count\")\n    if not isinstance(count, int) or count < 0:\n        count = 0\n\n    now_dt = _now_utc()\n    window_start = _parse_iso(key.get(\"daily_window_start_at\"))\n    if window_start is None or not _same_day(window_start, now_dt):\n        # reset window\n        key[\"daily_window_start_at\"] = now_dt.replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n        key[\"daily_request_count\"] = 0\n        count = 0\n\n    if limit > 0 and (count + 1) > limit:\n        _finalize(\n            \"failed\",\n            error_code=\"RATE_LIMITED\",\n            error_message=\"Daily request limit exceeded.\",\n            http_status_code=429,\n            amadeus_response={\"error\": \"RATE_LIMITED\"}\n        )\n        _save(\"api_keys.json\", api_keys)\n        latency_ms = int((time.time() - t0) * 1000)\n        return {\"search\": search_row, \"offers\": [], \"meta\": {\"latency_ms\": latency_ms}}\n\n    # --------- Record amadeus_request usage event + increment count atomically (within this function) ----------\n    key[\"daily_request_count\"] = int(key.get(\"daily_request_count\") or 0) + 1\n    key[\"last_used_at\"] = _now_iso_z()\n    key[\"updated_at\"] = key[\"last_used_at\"]\n    _save(\"api_keys.json\", api_keys)\n    _record_usage_event(workspace_id, api_key_id, search_id, \"amadeus_request\", 1, http_status_code=None)\n\n    # --------- Execute \"Amadeus\" offline: use existing offers if any, otherwise succeed with empty ----------\n    # We treat this as a successful response envelope and upsert nothing if no offers.\n    existing_for_search = [o for o in offers if isinstance(o, dict) and o.get(\"search_id\") == search_id]\n    amadeus_response = {\"data\": [], \"meta\": {\"note\": \"offline_stub\"}}\n    http_status = 200\n\n    # If request asks for deterministic sample offers, allow it (still sanitized already)\n    requested_offers = []\n    if isinstance(amadeus_request, dict):\n        ro = amadeus_request.get(\"offers\")\n        if isinstance(ro, list):\n            for item in ro:\n                if isinstance(item, dict):\n                    requested_offers.append(item)\n\n    upserted = []\n    if requested_offers:\n        # Upsert by (search_id, amadeus_offer_id)\n        for item in requested_offers:\n            am_offer_id = item.get(\"amadeus_offer_id\") or item.get(\"id\") or item.get(\"offerId\")\n            if not isinstance(am_offer_id, str) or not am_offer_id:\n                continue\n            currency = item.get(\"currency\") if isinstance(item.get(\"currency\"), str) else \"USD\"\n            if not re.match(r\"^[A-Z]{3}$\", currency):\n                currency = \"USD\"\n            total_price = item.get(\"total_price\")\n            if not isinstance(total_price, (int, float)) or total_price < 0:\n                total_price = 0.0\n            source = item.get(\"source\")\n            if source not in (\"GDS\", \"NDC\", \"OTHER\"):\n                source = \"OTHER\"\n\n            found = next((o for o in offers if isinstance(o, dict) and o.get(\"search_id\") == search_id and o.get(\"amadeus_offer_id\") == am_offer_id), None)\n            nowz = _now_iso_z()\n            if found:\n                found.update({\n                    \"source\": source,\n                    \"currency\": currency,\n                    \"total_price\": float(total_price),\n                    \"base_price\": float(item[\"base_price\"]) if isinstance(item.get(\"base_price\"), (int, float)) else found.get(\"base_price\"),\n                    \"taxes_price\": float(item[\"taxes_price\"]) if isinstance(item.get(\"taxes_price\"), (int, float)) else found.get(\"taxes_price\"),\n                    \"itineraries\": item.get(\"itineraries\") if isinstance(item.get(\"itineraries\"), (dict, list)) else (found.get(\"itineraries\") or {}),\n                    \"validating_airline_codes\": item.get(\"validating_airline_codes\") if isinstance(item.get(\"validating_airline_codes\"), list) else found.get(\"validating_airline_codes\"),\n                    \"traveler_pricings\": item.get(\"traveler_pricings\") if isinstance(item.get(\"traveler_pricings\"), (dict, list)) else found.get(\"traveler_pricings\"),\n                    \"status\": \"active\",\n                    \"updated_at\": nowz,\n                })\n                upserted.append(found)\n            else:\n                new_offer = {\n                    \"id\": _gen_id(\"amfo\"),\n                    \"search_id\": search_id,\n                    \"amadeus_offer_id\": am_offer_id,\n                    \"source\": source,\n                    \"currency\": currency,\n                    \"total_price\": float(total_price),\n                    \"base_price\": float(item[\"base_price\"]) if isinstance(item.get(\"base_price\"), (int, float)) else None,\n                    \"taxes_price\": float(item[\"taxes_price\"]) if isinstance(item.get(\"taxes_price\"), (int, float)) else None,\n                    \"itineraries\": item.get(\"itineraries\") if isinstance(item.get(\"itineraries\"), (dict, list)) else {},\n                    \"validating_airline_codes\": item.get(\"validating_airline_codes\") if isinstance(item.get(\"validating_airline_codes\"), list) else None,\n                    \"traveler_pricings\": item.get(\"traveler_pricings\") if isinstance(item.get(\"traveler_pricings\"), (dict, list)) else None,\n                    \"status\": \"active\",\n                    \"created_at\": nowz,\n                    \"updated_at\": nowz,\n                }\n                offers.append(new_offer)\n                upserted.append(new_offer)\n        _save(\"flight_offers.json\", offers)\n        amadeus_response = {\"data\": [{\"id\": o[\"amadeus_offer_id\"]} for o in upserted], \"meta\": {\"note\": \"offline_stub\"}}\n\n    # record response usage event\n    _record_usage_event(workspace_id, api_key_id, search_id, \"amadeus_response\", 0, http_status_code=http_status)\n\n    _finalize(\"succeeded\", error_code=None, error_message=None, http_status_code=http_status, amadeus_response=amadeus_response)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\"search\": search_row, \"offers\": upserted if upserted else existing_for_search, \"meta\": {\"latency_ms\": latency_ms}}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_workspaces",
+          "description": "Lists workspaces visible to the caller. Returns a paginated list and refuses invalid pagination parameters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of workspaces to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor returned by a previous call."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "suspended",
+                  "deleted"
+                ],
+                "description": "Filter by workspace status."
+              },
+              "name_prefix": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "Filter to workspaces whose name starts with this prefix (case-insensitive)."
+              },
+              "created_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return workspaces created after this timestamp."
+              },
+              "created_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return workspaces created before this timestamp."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_workspaces(limit=None, cursor=None, status=None, name_prefix=None, created_after=None, created_before=None, **_extra):\n    import json, os, datetime, time, base64, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0491000\" if __import__(\"os\").path.isdir(\"./environment_mix/0491000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n\n    def _now_iso_z():\n        return now.isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s:\n            return _err(\"VALIDATION_ERROR\", f\"{field} must be an RFC3339 datetime string.\")\n        try:\n            s2 = s[:-1] + \"+00:00\" if s.endswith(\"Z\") else s\n            dt = datetime.datetime.fromisoformat(s2)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except ValueError:\n            return _err(\"VALIDATION_ERROR\", f\"{field} must be an RFC3339 datetime string.\")\n\n    # Cursor is opaque: accept either our base64 JSON cursor OR a raw workspace id from older clients.\n    def _decode_cursor(cur):\n        if cur is None:\n            return None\n        if not isinstance(cur, str) or cur == \"\":\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n        # Allow raw workspace id as cursor\n        if re.match(r\"^amws_[0-9A-Z]{3,}$\", cur):\n            return {\"after_id\": cur}\n        pad = \"=\" * (-len(cur) % 4)\n        try:\n            raw = base64.urlsafe_b64decode((cur + pad).encode(\"ascii\"))\n            obj = json.loads(raw.decode(\"utf-8\"))\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n        if not isinstance(obj, dict):\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n        # Permit multiple shapes\n        if \"after_id\" in obj and isinstance(obj[\"after_id\"], str) and obj[\"after_id\"]:\n            return {\"after_id\": obj[\"after_id\"]}\n        if \"id\" in obj and isinstance(obj[\"id\"], str) and obj[\"id\"]:\n            return {\"after_id\": obj[\"id\"]}\n        if \"cursor\" in obj and isinstance(obj[\"cursor\"], str) and obj[\"cursor\"]:\n            return {\"after_id\": obj[\"cursor\"]}\n        return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n    def _encode_cursor(after_id):\n        payload = {\"after_id\": after_id}\n        raw = json.dumps(payload, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"ascii\").rstrip(\"=\")\n\n    def _record_call(status, workspace_id, api_key_id=\"amak_UNKNOWN\"):\n        usage = _load(\"usage_events.json\")\n        usage.append({\n            \"id\": \"amue_\" + os.urandom(9).hex().upper(),\n            \"workspace_id\": workspace_id,\n            \"api_key_id\": api_key_id,\n            \"search_id\": \"amfs_INTERNAL_LIST_WORKSPACES\",\n            \"event_type\": \"amadeus_response\" if status == \"ok\" else \"amadeus_error\",\n            \"request_units\": 0,\n            \"http_status_code\": 200 if status == \"ok\" else 400,\n            \"occurred_at\": _now_iso_z(),\n            \"created_at\": _now_iso_z(),\n        })\n        _save(\"usage_events.json\", usage)\n\n    # Validate inputs\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        _record_call(\"error\", \"amws_UNKNOWN\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200.\")\n\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"active\", \"suspended\", \"deleted\"):\n            _record_call(\"error\", \"amws_UNKNOWN\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: active, suspended, deleted.\")\n\n    if name_prefix is not None:\n        if not isinstance(name_prefix, str) or len(name_prefix) < 1 or len(name_prefix) > 200:\n            _record_call(\"error\", \"amws_UNKNOWN\")\n            return _err(\"VALIDATION_ERROR\", \"name_prefix must be a non-empty string up to 200 characters.\")\n        name_prefix_l = name_prefix.casefold()\n    else:\n        name_prefix_l = None\n\n    ca = _parse_dt(created_after, \"created_after\")\n    if isinstance(ca, dict) and \"error\" in ca:\n        _record_call(\"error\", \"amws_UNKNOWN\")\n        return ca\n    cb = _parse_dt(created_before, \"created_before\")\n    if isinstance(cb, dict) and \"error\" in cb:\n        _record_call(\"error\", \"amws_UNKNOWN\")\n        return cb\n    if ca is not None and cb is not None and ca > cb:\n        _record_call(\"error\", \"amws_UNKNOWN\")\n        return _err(\"VALIDATION_ERROR\", \"created_after must be <= created_before.\")\n\n    cur = _decode_cursor(cursor)\n    if isinstance(cur, dict) and \"error\" in cur:\n        _record_call(\"error\", \"amws_UNKNOWN\")\n        return cur\n    after_id = cur[\"after_id\"] if cur else None\n\n    # Load and filter\n    wss = _load(\"workspaces.json\")\n    if isinstance(wss, dict) and \"rows\" in wss:\n        wss = wss.get(\"data\", [])  # defensive; unlikely\n    if not isinstance(wss, list):\n        _record_call(\"error\", \"amws_UNKNOWN\")\n        return _err(\"CONFLICT\", \"Datastore is corrupted (workspaces.json).\")\n\n    def _dt_or_min(s):\n        if isinstance(s, str):\n            try:\n                s2 = s[:-1] + \"+00:00\" if s.endswith(\"Z\") else s\n                dt = datetime.datetime.fromisoformat(s2)\n                if dt.tzinfo is None:\n                    dt = dt.replace(tzinfo=datetime.timezone.utc)\n                return dt.astimezone(datetime.timezone.utc)\n            except ValueError:\n                return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n\n    filtered = []\n    for r in wss:\n        if not isinstance(r, dict):\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        nm = r.get(\"name\")\n        if name_prefix_l is not None:\n            if not isinstance(nm, str) or not nm.casefold().startswith(name_prefix_l):\n                continue\n        c_at = _dt_or_min(r.get(\"created_at\"))\n        if ca is not None and not (c_at > ca):\n            continue\n        if cb is not None and not (c_at < cb):\n            continue\n        filtered.append(r)\n\n    # Sort by id for stable cursor pagination\n    filtered.sort(key=lambda x: (str(x.get(\"id\", \"\"))))\n\n    start_idx = 0\n    if after_id is not None:\n        # Do NOT error if cursor id isn't found; treat as starting after that id position (or beginning).\n        # Find first row with id > after_id (lexicographic), which works even if after_id not present.\n        for i, r in enumerate(filtered):\n            rid = str(r.get(\"id\", \"\"))\n            if rid > after_id:\n                start_idx = i\n                break\n        else:\n            start_idx = len(filtered)\n\n    page = filtered[start_idx:start_idx + limit]\n    has_more = (start_idx + limit) < len(filtered)\n    next_cursor = _encode_cursor(str(page[-1].get(\"id\"))) if has_more and page else None\n\n    # Record usage event (reads included)\n    ws_for_log = str(page[0].get(\"id\")) if page else \"amws_UNKNOWN\"\n    _record_call(\"ok\", ws_for_log)\n\n    return {\n        \"workspaces\": page,\n        \"pagination\": {\n            \"limit\": limit,\n            \"total\": len(filtered),\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n        },\n        \"request\": {\n            \"cursor\": cursor,\n            \"status\": status,\n            \"name_prefix\": name_prefix,\n            \"created_after\": created_after,\n            \"created_before\": created_before,\n        },\n        \"meta\": {\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": _now_iso_z(),\n        }\n    }\n"
+        },
+        {
+          "name": "create_api_key",
+          "description": "Creates a new stored Amadeus API key credential for a workspace. Persists the client_secret encrypted, initializes quota counters, and returns the created api_keys record. Refuses if the workspace does not exist, is not active, or if fields are invalid.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^amws_[0-9A-Z]{3,}$",
+                "description": "Workspace id that will own this API key."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120,
+                "description": "Human-friendly name for this key (for audit/UI)."
+              },
+              "amadeus_environment": {
+                "type": "string",
+                "enum": [
+                  "test",
+                  "production"
+                ],
+                "description": "Amadeus environment this credential is valid for."
+              },
+              "client_id": {
+                "type": "string",
+                "minLength": 8,
+                "maxLength": 200,
+                "description": "Amadeus API client id."
+              },
+              "client_secret": {
+                "type": "string",
+                "minLength": 8,
+                "maxLength": 500,
+                "description": "Amadeus API client secret. Stored encrypted and never returned."
+              },
+              "daily_request_limit": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1000000,
+                "description": "Per-day request cap for this key. 0 means unlimited."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled"
+                ],
+                "default": "active",
+                "description": "Initial lifecycle status for the API key. Cannot be set to revoked at creation."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "name",
+              "amadeus_environment",
+              "client_id",
+              "client_secret"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_api_key(workspace_id, name, amadeus_environment, client_id, client_secret, daily_request_limit=None, status=None, **_extra):\n    import json, os, datetime, re, time, base64, uuid, hashlib, hmac\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0491000\" if __import__(\"os\").path.isdir(\"./environment_mix/0491000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _gen_id(prefix):\n        raw = uuid.uuid4().bytes\n        tok = base64.b32encode(raw).decode(\"ascii\").rstrip(\"=\")\n        return f\"{prefix}_{tok[:12]}\"\n\n    def _encrypt_secret(ws_id, key_id, secret):\n        # Not real crypto; deterministic HMAC + base64 for \"ciphertext\" representation offline.\n        # Must never store plaintext.\n        salt = (ws_id + \":\" + key_id).encode(\"utf-8\")\n        digest = hmac.new(salt, secret.encode(\"utf-8\"), hashlib.sha256).digest()\n        return \"hmacsha256:\" + base64.urlsafe_b64encode(digest).decode(\"utf-8\")\n\n    def _log_call(ws_id, key_id):\n        usage = _load(\"usage_events.json\")\n        usage.append({\n            \"id\": _gen_id(\"amuev\"),\n            \"workspace_id\": ws_id or \"\",\n            \"api_key_id\": key_id or \"\",\n            \"search_id\": \"\",\n            \"event_type\": \"amadeus_request\",\n            \"request_units\": 0,\n            \"http_status_code\": None,\n            \"occurred_at\": _now(),\n            \"created_at\": _now(),\n        })\n        _save(\"usage_events.json\", usage)\n\n    t0 = time.time()\n\n    if not isinstance(workspace_id, str) or re.match(r\"^amws_[0-9A-Z]{3,}$\", workspace_id) is None:\n        _log_call(workspace_id if isinstance(workspace_id, str) else \"\", \"\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id format.\")\n    if not isinstance(name, str) or not (1 <= len(name) <= 120):\n        _log_call(workspace_id, \"\")\n        return _err(\"VALIDATION_ERROR\", \"name must be a string between 1 and 120 characters.\")\n    if amadeus_environment not in (\"test\", \"production\"):\n        _log_call(workspace_id, \"\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid amadeus_environment.\")\n    if not isinstance(client_id, str) or not (8 <= len(client_id) <= 200):\n        _log_call(workspace_id, \"\")\n        return _err(\"VALIDATION_ERROR\", \"client_id must be 8-200 characters.\")\n    if not isinstance(client_secret, str) or not (8 <= len(client_secret) <= 500):\n        _log_call(workspace_id, \"\")\n        return _err(\"VALIDATION_ERROR\", \"client_secret must be 8-500 characters.\")\n    if daily_request_limit is None:\n        daily_request_limit = 0\n    if not isinstance(daily_request_limit, int) or daily_request_limit < 0 or daily_request_limit > 1000000:\n        _log_call(workspace_id, \"\")\n        return _err(\"VALIDATION_ERROR\", \"daily_request_limit must be an integer between 0 and 1000000.\")\n    if status is None:\n        status = \"active\"\n    if status not in (\"active\", \"disabled\"):\n        _log_call(workspace_id, \"\")\n        return _err(\"VALIDATION_ERROR\", \"status must be 'active' or 'disabled'.\")\n\n    workspaces = _load(\"workspaces.json\")\n    ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n    if ws is None:\n        _log_call(workspace_id, \"\")\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n    if ws.get(\"status\") != \"active\":\n        _log_call(workspace_id, \"\")\n        return _err(\"CONFLICT\", \"Workspace must be active to create an API key.\", workspace_id=workspace_id, workspace_status=ws.get(\"status\"))\n\n    api_keys = _load(\"api_keys.json\")\n    # unique(workspace_id, name)\n    for k in api_keys:\n        if k.get(\"workspace_id\") == workspace_id and k.get(\"name\") == name:\n            _log_call(workspace_id, \"\")\n            return _err(\"CONFLICT\", \"An API key with this name already exists in the workspace.\", workspace_id=workspace_id, name=name)\n\n    key_id = _gen_id(\"amak\")\n    now = _now()\n    row = {\n        \"id\": key_id,\n        \"workspace_id\": workspace_id,\n        \"name\": name,\n        \"amadeus_environment\": amadeus_environment,\n        \"client_id\": client_id,\n        \"client_secret_ciphertext\": _encrypt_secret(workspace_id, key_id, client_secret),\n        \"status\": status,\n        \"daily_request_limit\": daily_request_limit,\n        \"daily_request_count\": 0,\n        \"daily_window_start_at\": now,\n        \"last_used_at\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    api_keys.append(row)\n    _save(\"api_keys.json\", api_keys)\n\n    _log_call(workspace_id, key_id)\n\n    # Never return secret/ciphertext\n    returned = dict(row)\n    returned.pop(\"client_secret_ciphertext\", None)\n    return {\"data\": returned, \"meta\": {\"latency_ms\": int((time.time() - t0) * 1000)}}\n"
+        },
+        {
+          "name": "rotate_api_key_secret",
+          "description": "Rotates (replaces) the stored client_secret for an existing API key without changing its id. Returns the updated api_keys record. Refuses if the API key is revoked, the workspace is deleted, or the new secret is invalid.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key_id": {
+                "type": "string",
+                "pattern": "^amak_[0-9A-Z]{3,}$",
+                "description": "API key id whose secret will be rotated."
+              },
+              "client_secret": {
+                "type": "string",
+                "minLength": 8,
+                "maxLength": 500,
+                "description": "New Amadeus API client secret. Stored encrypted and never returned."
+              }
+            },
+            "required": [
+              "api_key_id",
+              "client_secret"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def rotate_api_key_secret(api_key_id, client_secret, **_extra):\n    import json, os, datetime, re, time, base64, uuid, hashlib, hmac\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0491000\" if __import__(\"os\").path.isdir(\"./environment_mix/0491000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _gen_id(prefix):\n        raw = uuid.uuid4().bytes\n        tok = base64.b32encode(raw).decode(\"ascii\").rstrip(\"=\")\n        return f\"{prefix}_{tok[:12]}\"\n\n    def _encrypt_secret(ws_id, key_id, secret):\n        salt = (ws_id + \":\" + key_id).encode(\"utf-8\")\n        digest = hmac.new(salt, secret.encode(\"utf-8\"), hashlib.sha256).digest()\n        return \"hmacsha256:\" + base64.urlsafe_b64encode(digest).decode(\"utf-8\")\n\n    def _log_call(ws_id, key_id):\n        usage = _load(\"usage_events.json\")\n        usage.append({\n            \"id\": _gen_id(\"amuev\"),\n            \"workspace_id\": ws_id or \"\",\n            \"api_key_id\": key_id or \"\",\n            \"search_id\": \"\",\n            \"event_type\": \"amadeus_request\",\n            \"request_units\": 0,\n            \"http_status_code\": None,\n            \"occurred_at\": _now(),\n            \"created_at\": _now(),\n        })\n        _save(\"usage_events.json\", usage)\n\n    t0 = time.time()\n\n    if not isinstance(api_key_id, str) or re.match(r\"^amak_[0-9A-Z]{3,}$\", api_key_id) is None:\n        _log_call(\"\", api_key_id if isinstance(api_key_id, str) else \"\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid api_key_id format.\")\n    if not isinstance(client_secret, str) or not (8 <= len(client_secret) <= 500):\n        _log_call(\"\", api_key_id)\n        return _err(\"VALIDATION_ERROR\", \"client_secret must be 8-500 characters.\")\n\n    api_keys = _load(\"api_keys.json\")\n    idx = next((i for i, k in enumerate(api_keys) if k.get(\"id\") == api_key_id), None)\n    if idx is None:\n        _log_call(\"\", api_key_id)\n        return _err(\"NOT_FOUND\", \"API key not found.\", api_key_id=api_key_id)\n\n    key = api_keys[idx]\n    ws_id = key.get(\"workspace_id\")\n    workspaces = _load(\"workspaces.json\")\n    ws = next((w for w in workspaces if w.get(\"id\") == ws_id), None)\n    if ws is None:\n        _log_call(ws_id or \"\", api_key_id)\n        return _err(\"NOT_FOUND\", \"Workspace not found for API key.\", workspace_id=ws_id, api_key_id=api_key_id)\n    if ws.get(\"status\") == \"deleted\":\n        _log_call(ws_id, api_key_id)\n        return _err(\"CONFLICT\", \"Cannot rotate secret: workspace is deleted.\", workspace_id=ws_id)\n    if key.get(\"status\") == \"revoked\":\n        _log_call(ws_id, api_key_id)\n        return _err(\"INVALID_TRANSITION\", \"Cannot rotate secret for a revoked API key.\", api_key_id=api_key_id)\n\n    key[\"client_secret_ciphertext\"] = _encrypt_secret(ws_id, api_key_id, client_secret)\n    key[\"updated_at\"] = _now()\n    api_keys[idx] = key\n    _save(\"api_keys.json\", api_keys)\n\n    _log_call(ws_id, api_key_id)\n\n    returned = dict(key)\n    returned.pop(\"client_secret_ciphertext\", None)\n    return {\"data\": returned, \"meta\": {\"latency_ms\": int((time.time() - t0) * 1000)}}\n"
+        },
+        {
+          "name": "update_api_key_status",
+          "description": "Updates the lifecycle status of an API key (enable/disable/revoke). Returns the updated api_keys record. Refuses invalid transitions (e.g., revoked -> active) and refuses if the key is already revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key_id": {
+                "type": "string",
+                "pattern": "^amak_[0-9A-Z]{3,}$",
+                "description": "API key id to update."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled",
+                  "revoked"
+                ],
+                "description": "New status for the API key."
+              }
+            },
+            "required": [
+              "api_key_id",
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_api_key_status(api_key_id, status, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0491000\" if __import__(\"os\").path.isdir(\"./environment_mix/0491000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_cursor(s):\n        # Not used here; kept for parity.\n        return None\n\n    def _append_usage(endpoint, workspace_id=None, api_key_id_used=None, status_code=\"ok\", error_code=None, meta=None, latency_ms=None):\n        usage = _load(\"usage_events.json\")\n        ts = _now_iso()\n        # This service uses usage_events as the only observable log collection.\n        # For non-Amadeus endpoints, emit request_units=0 and event_type='amadeus_request' is not applicable.\n        # We'll use event_type='amadeus_request' only for real Amadeus calls; here we log as amadeus_response with 0 units.\n        # However schema enum doesn't allow generic types, so we choose 'amadeus_response' with 0 units.\n        uid = \"amue_\" + \"\".join([c for c in os.urandom(9).hex().upper()])  # 18 hex chars\n        row = {\n            \"id\": uid,\n            \"workspace_id\": workspace_id or \"amws_UNKNOWN\",\n            \"api_key_id\": api_key_id_used or \"amak_UNKNOWN\",\n            \"search_id\": (meta or {}).get(\"search_id\", \"amfos_UNKNOWN\"),\n            \"event_type\": \"amadeus_response\",\n            \"request_units\": 0,\n            \"http_status_code\": None,\n            \"occurred_at\": ts,\n            \"created_at\": ts,\n        }\n        # Best-effort: only append if references exist; otherwise don't poison FK integrity.\n        workspaces = _load(\"workspaces.json\")\n        api_keys = _load(\"api_keys.json\")\n        searches = _load(\"flight_offer_searches.json\")\n        ws_ids = {w.get(\"id\") for w in workspaces}\n        ak_ids = {k.get(\"id\") for k in api_keys}\n        s_ids = {s.get(\"id\") for s in searches}\n        if row[\"workspace_id\"] not in ws_ids or row[\"api_key_id\"] not in ak_ids or row[\"search_id\"] not in s_ids:\n            return  # cannot log without violating FK constraints in-store\n        usage.append(row)\n        _save(\"usage_events.json\", usage)\n\n    t0 = time.time()\n\n    # Validate inputs\n    if not isinstance(api_key_id, str) or not re.match(r\"^amak_[0-9A-Z]{3,}$\", api_key_id or \"\"):\n        return _err(\"VALIDATION_ERROR\", \"api_key_id is malformed.\", field=\"api_key_id\")\n    if status not in (\"active\", \"disabled\", \"revoked\"):\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: active, disabled, revoked.\", field=\"status\")\n\n    api_keys = _load(\"api_keys.json\")\n    key = None\n    key_idx = None\n    for i, r in enumerate(api_keys):\n        if r.get(\"id\") == api_key_id:\n            key = r\n            key_idx = i\n            break\n    if not key:\n        return _err(\"NOT_FOUND\", \"API key not found.\", api_key_id=api_key_id)\n\n    current = key.get(\"status\")\n    if current not in (\"active\", \"disabled\", \"revoked\"):\n        return _err(\"CONFLICT\", \"API key has an unknown status in datastore.\", api_key_id=api_key_id, current_status=current)\n\n    # \"Refuses if the key is already revoked.\"\n    if current == \"revoked\":\n        # Still log request if possible\n        _append_usage(\n            endpoint=\"update_api_key_status\",\n            workspace_id=key.get(\"workspace_id\"),\n            api_key_id_used=key.get(\"id\"),\n            status_code=\"error\",\n            error_code=\"INVALID_TRANSITION\",\n            meta={\"api_key_id\": api_key_id},\n            latency_ms=int((time.time() - t0) * 1000),\n        )\n        return _err(\"INVALID_TRANSITION\", \"API key is revoked and cannot be changed.\", api_key_id=api_key_id)\n\n    transitions = {\n        \"active\": {\"disabled\", \"revoked\"},\n        \"disabled\": {\"active\", \"revoked\"},\n        \"revoked\": set(),\n    }\n    if status == current:\n        # Idempotent update: still a mutation request; ensure timestamps remain stable or update updated_at.\n        # Real services typically update updated_at; we'll do so to be observable.\n        api_keys[key_idx][\"updated_at\"] = _now_iso()\n        _save(\"api_keys.json\", api_keys)\n        _append_usage(\n            endpoint=\"update_api_key_status\",\n            workspace_id=key.get(\"workspace_id\"),\n            api_key_id_used=key.get(\"id\"),\n            status_code=\"ok\",\n            meta={\"api_key_id\": api_key_id, \"idempotent\": True},\n            latency_ms=int((time.time() - t0) * 1000),\n        )\n        return {\"api_key\": api_keys[key_idx]}\n\n    if status not in transitions.get(current, set()):\n        _append_usage(\n            endpoint=\"update_api_key_status\",\n            workspace_id=key.get(\"workspace_id\"),\n            api_key_id_used=key.get(\"id\"),\n            status_code=\"error\",\n            error_code=\"INVALID_TRANSITION\",\n            meta={\"api_key_id\": api_key_id, \"from\": current, \"to\": status},\n            latency_ms=int((time.time() - t0) * 1000),\n        )\n        return _err(\"INVALID_TRANSITION\", f\"Cannot transition api_key status from {current} to {status}.\", api_key_id=api_key_id)\n\n    # Apply update\n    api_keys[key_idx][\"status\"] = status\n    api_keys[key_idx][\"updated_at\"] = _now_iso()\n    _save(\"api_keys.json\", api_keys)\n\n    _append_usage(\n        endpoint=\"update_api_key_status\",\n        workspace_id=api_keys[key_idx].get(\"workspace_id\"),\n        api_key_id_used=api_keys[key_idx].get(\"id\"),\n        status_code=\"ok\",\n        meta={\"api_key_id\": api_key_id, \"from\": current, \"to\": status},\n        latency_ms=int((time.time() - t0) * 1000),\n    )\n    return {\"api_key\": api_keys[key_idx]}\n"
+        },
+        {
+          "name": "list_flight_offer_searches",
+          "description": "Lists persisted flight-offer searches for a workspace, optionally filtered by API key and status. Returns a paginated list and refuses invalid filters or pagination parameters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^amws_[0-9A-Z]{3,}$",
+                "description": "Workspace id whose searches will be listed."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of searches to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor returned by a previous call."
+              },
+              "api_key_id": {
+                "type": "string",
+                "pattern": "^amak_[0-9A-Z]{3,}$",
+                "description": "Filter searches executed using this API key id."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "Filter by search lifecycle status."
+              },
+              "trigger_source": {
+                "type": "string",
+                "enum": [
+                  "mcp_tool_call",
+                  "internal_replay",
+                  "admin_console"
+                ],
+                "description": "Filter by origin of the search invocation."
+              },
+              "created_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return searches created after this timestamp."
+              },
+              "created_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return searches created before this timestamp."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_flight_offer_searches(workspace_id, limit=None, cursor=None, api_key_id=None, status=None, trigger_source=None, created_after=None, created_before=None, **_extra):\n    import json, os, datetime, re, base64, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0491000\" if __import__(\"os\").path.isdir(\"./environment_mix/0491000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _dt_parse(s, field):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            raise ValueError(field)\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1]).replace(tzinfo=datetime.timezone.utc)\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            raise ValueError(field)\n\n    def _dt_key(iso):\n        try:\n            return _dt_parse(iso, \"created_at\").timestamp()\n        except Exception:\n            return 0.0\n\n    def _encode_cursor(obj):\n        raw = json.dumps(obj, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"ascii\").rstrip(\"=\")\n\n    def _decode_cursor(cur):\n        if cur is None:\n            return None\n        if not isinstance(cur, str) or cur == \"\":\n            raise ValueError(\"cursor\")\n        pad = \"=\" * (-len(cur) % 4)\n        try:\n            raw = base64.urlsafe_b64decode((cur + pad).encode(\"ascii\"))\n            obj = json.loads(raw.decode(\"utf-8\"))\n            return obj\n        except Exception:\n            raise ValueError(\"cursor\")\n\n    def _append_usage(endpoint, workspace_id=None, api_key_id_used=None, search_id=None, status_code=\"ok\", error_code=None, latency_ms=None):\n        usage = _load(\"usage_events.json\")\n        ts = _now_iso()\n        uid = \"amue_\" + os.urandom(9).hex().upper()\n        row = {\n            \"id\": uid,\n            \"workspace_id\": workspace_id or \"amws_UNKNOWN\",\n            \"api_key_id\": api_key_id_used or \"amak_UNKNOWN\",\n            \"search_id\": search_id or \"amfos_UNKNOWN\",\n            \"event_type\": \"amadeus_response\",\n            \"request_units\": 0,\n            \"http_status_code\": None,\n            \"occurred_at\": ts,\n            \"created_at\": ts,\n        }\n        workspaces = _load(\"workspaces.json\")\n        api_keys = _load(\"api_keys.json\")\n        searches = _load(\"flight_offer_searches.json\")\n        ws_ids = {w.get(\"id\") for w in workspaces}\n        ak_ids = {k.get(\"id\") for k in api_keys}\n        s_ids = {s.get(\"id\") for s in searches}\n        if row[\"workspace_id\"] not in ws_ids or row[\"api_key_id\"] not in ak_ids or row[\"search_id\"] not in s_ids:\n            return\n        usage.append(row)\n        _save(\"usage_events.json\", usage)\n\n    t0 = time.time()\n\n    # Validate inputs\n    if not isinstance(workspace_id, str) or not re.match(r\"^amws_[0-9A-Z]{3,}$\", workspace_id or \"\"):\n        return _err(\"VALIDATION_ERROR\", \"workspace_id is malformed.\", field=\"workspace_id\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200.\", field=\"limit\")\n\n    if api_key_id is not None:\n        if not isinstance(api_key_id, str) or not re.match(r\"^amak_[0-9A-Z]{3,}$\", api_key_id or \"\"):\n            return _err(\"VALIDATION_ERROR\", \"api_key_id is malformed.\", field=\"api_key_id\")\n\n    if status is not None and status not in (\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"):\n        return _err(\"VALIDATION_ERROR\", \"status is invalid.\", field=\"status\")\n\n    if trigger_source is not None and trigger_source not in (\"mcp_tool_call\", \"internal_replay\", \"admin_console\"):\n        return _err(\"VALIDATION_ERROR\", \"trigger_source is invalid.\", field=\"trigger_source\")\n\n    try:\n        ca = _dt_parse(created_after, \"created_after\") if created_after is not None else None\n    except ValueError:\n        return _err(\"VALIDATION_ERROR\", \"created_after must be an ISO 8601 date-time.\", field=\"created_after\")\n    try:\n        cb = _dt_parse(created_before, \"created_before\") if created_before is not None else None\n    except ValueError:\n        return _err(\"VALIDATION_ERROR\", \"created_before must be an ISO 8601 date-time.\", field=\"created_before\")\n\n    if ca and cb and ca > cb:\n        return _err(\"VALIDATION_ERROR\", \"created_after must be <= created_before.\", field=\"created_after\")\n\n    # Validate references\n    workspaces = _load(\"workspaces.json\")\n    ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n    if not ws:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n\n    if api_key_id is not None:\n        api_keys = _load(\"api_keys.json\")\n        ak = next((k for k in api_keys if k.get(\"id\") == api_key_id), None)\n        if not ak:\n            return _err(\"NOT_FOUND\", \"API key not found.\", api_key_id=api_key_id)\n        if ak.get(\"workspace_id\") != workspace_id:\n            return _err(\"VALIDATION_ERROR\", \"api_key_id does not belong to the workspace.\", field=\"api_key_id\")\n\n    # Cursor parsing\n    try:\n        cur = _decode_cursor(cursor) if cursor is not None else None\n    except ValueError as e:\n        return _err(\"VALIDATION_ERROR\", \"cursor is invalid.\", field=str(e))\n\n    if cur is not None:\n        if not isinstance(cur, dict) or cur.get(\"v\") != 1 or \"after\" not in cur:\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid.\", field=\"cursor\")\n        after = cur.get(\"after\")\n        if not isinstance(after, dict) or \"created_at\" not in after or \"id\" not in after:\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid.\", field=\"cursor\")\n        after_created_at = after[\"created_at\"]\n        after_id = after[\"id\"]\n        if not isinstance(after_created_at, str) or not isinstance(after_id, str):\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid.\", field=\"cursor\")\n    else:\n        after_created_at = None\n        after_id = None\n\n    searches = _load(\"flight_offer_searches.json\")\n    # Filter\n    out = []\n    for s in searches:\n        if s.get(\"workspace_id\") != workspace_id:\n            continue\n        if api_key_id is not None and s.get(\"api_key_id\") != api_key_id:\n            continue\n        if status is not None and s.get(\"status\") != status:\n            continue\n        if trigger_source is not None and s.get(\"trigger_source\") != trigger_source:\n            continue\n        if ca is not None:\n            try:\n                sdt = _dt_parse(s.get(\"created_at\"), \"created_at\")\n            except Exception:\n                continue\n            if sdt <= ca:\n                continue\n        if cb is not None:\n            try:\n                sdt = _dt_parse(s.get(\"created_at\"), \"created_at\")\n            except Exception:\n                continue\n            if sdt >= cb:\n                continue\n        out.append(s)\n\n    # Sort newest first (created_at desc, id desc)\n    out.sort(key=lambda r: (_dt_key(r.get(\"created_at\")), r.get(\"id\") or \"\"), reverse=True)\n\n    # Apply cursor (exclusive)\n    if after_created_at is not None:\n        def _is_after(r):\n            ca_key = _dt_key(r.get(\"created_at\"))\n            after_key = _dt_key(after_created_at)\n            rid = r.get(\"id\") or \"\"\n            # Since sorting is desc, we skip until we are \"older\" than cursor marker\n            if ca_key < after_key:\n                return True\n            if ca_key == after_key and rid < after_id:\n                return True\n            return False\n\n        out = [r for r in out if _is_after(r)]\n\n    total = len(out)\n    page = out[:limit]\n    has_more = total > limit\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        next_cursor = _encode_cursor({\"v\": 1, \"after\": {\"created_at\": last.get(\"created_at\"), \"id\": last.get(\"id\")}})\n\n    # Log call if possible: pick some existing api_key_id/search_id to satisfy FK logging, else skip.\n    # Use most recent search in page if any.\n    if page:\n        _append_usage(\n            endpoint=\"list_flight_offer_searches\",\n            workspace_id=workspace_id,\n            api_key_id_used=page[0].get(\"api_key_id\"),\n            search_id=page[0].get(\"id\"),\n            status_code=\"ok\",\n            latency_ms=int((time.time() - t0) * 1000),\n        )\n\n    return {\n        \"searches\": page,\n        \"pagination\": {\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"total\": total,\n        },\n    }\n"
+        },
+        {
+          "name": "get_flight_offer_search",
+          "description": "Fetches a persisted flight-offer search by id, including its stored sanitized amadeus_request and amadeus_response, and optionally its associated offers. Refuses if ids are malformed or the search does not belong to the workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^amws_[0-9A-Z]{3,}$",
+                "description": "Workspace id that owns the search."
+              },
+              "search_id": {
+                "type": "string",
+                "pattern": "^amfos_[0-9A-Z]{3,}$",
+                "description": "Flight offer search id to fetch."
+              },
+              "include_offers": {
+                "type": "boolean",
+                "default": false,
+                "description": "If true, also return the persisted flight_offers for this search."
+              },
+              "offers_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500,
+                "default": 100,
+                "description": "Maximum number of offers to return when include_offers is true."
+              },
+              "offers_cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for offers when include_offers is true."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "search_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_flight_offer_search(workspace_id, search_id, include_offers=None, offers_limit=None, offers_cursor=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0491000\" if __import__(\"os\").path.isdir(\"./environment_mix/0491000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n    now_iso = now.isoformat().replace(\"+00:00\", \"Z\")\n\n    # ---- usage logging / rate limiting is not specified for this read tool in schema (no rule). We still must record calls if a request-log exists; none in schema. ----\n\n    # ---- validation (relax tool schema mismatch: real search ids are amfs_..., but tool schema says amfos_) ----\n    if not isinstance(workspace_id, str) or not re.match(r\"^amws_[0-9A-Z]{3,}$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if not isinstance(search_id, str) or not re.match(r\"^amf(s|os)_[0-9A-Z]{3,}$\", search_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid search_id.\")\n\n    if include_offers is None:\n        include_offers = False\n    if not isinstance(include_offers, bool):\n        return _err(\"VALIDATION_ERROR\", \"include_offers must be a boolean.\")\n\n    if offers_limit is None:\n        offers_limit = 100\n    if not isinstance(offers_limit, int) or offers_limit < 1 or offers_limit > 500:\n        return _err(\"VALIDATION_ERROR\", \"offers_limit must be an integer between 1 and 500.\")\n\n    # offers_cursor is \"opaque\"; accept any non-empty string; if invalid/undecodable treat as cursor value directly\n    if offers_cursor is not None and (not isinstance(offers_cursor, str) or offers_cursor == \"\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid offers_cursor.\")\n\n    def _decode_cursor(cur):\n        if cur is None:\n            return None\n        # common case: caller passes an id (even if from another namespace). Accept any string and use lexicographic gating.\n        if re.match(r\"^amfo_[0-9A-Z]{3,}$\", cur):\n            return cur\n        # try base64url json payload: {\"after_id\": \"...\"} or variants\n        pad = \"=\" * (-len(cur) % 4)\n        try:\n            raw = base64.urlsafe_b64decode((cur + pad).encode(\"ascii\"))\n            obj = json.loads(raw.decode(\"utf-8\"))\n            if isinstance(obj, dict):\n                for k in (\"after_id\", \"id\", \"cursor\", \"after\"):\n                    v = obj.get(k)\n                    if isinstance(v, str) and v:\n                        return v\n        except Exception:\n            # opaque cursor: accept as-is\n            return cur\n        return cur\n\n    # ---- load data ----\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")  # not required for this read\n    searches = _load(\"flight_offer_searches.json\")\n    offers = _load(\"flight_offers.json\")\n\n    # workspace existence check (must not fail due to \"wrong context\"; just ensure the workspace exists)\n    ws = None\n    if isinstance(workspaces, list):\n        for w in workspaces:\n            if isinstance(w, dict) and w.get(\"id\") == workspace_id:\n                ws = w\n                break\n    if ws is None:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\")\n\n    # find search that belongs to workspace\n    search_row = None\n    if isinstance(searches, list):\n        for s in searches:\n            if isinstance(s, dict) and s.get(\"id\") == search_id and s.get(\"workspace_id\") == workspace_id:\n                search_row = s\n                break\n    if search_row is None:\n        # If search exists but belongs elsewhere, still respond NOT_FOUND (do not leak)\n        return _err(\"NOT_FOUND\", \"Search not found.\")\n\n    # ---- response construction ----\n    resp = {\n        \"search\": search_row,\n        \"offers\": None,\n        \"offers_meta\": None,\n    }\n\n    if include_offers:\n        after_id = _decode_cursor(offers_cursor)\n\n        # filter offers for this search\n        matched = []\n        if isinstance(offers, list):\n            for o in offers:\n                if not isinstance(o, dict):\n                    continue\n                if o.get(\"search_id\") != search_id:\n                    continue\n                matched.append(o)\n\n        # stable sort by id for cursor paging\n        matched.sort(key=lambda r: (str(r.get(\"id\", \"\"))))\n\n        start_idx = 0\n        if after_id:\n            # Cursor semantics: start AFTER the offer with id == after_id; if not found, use lexicographic \"after\"\n            found_exact = False\n            for i, r in enumerate(matched):\n                if r.get(\"id\") == after_id:\n                    start_idx = i + 1\n                    found_exact = True\n                    break\n            if not found_exact:\n                # advance past all ids <= after_id\n                while start_idx < len(matched) and str(matched[start_idx].get(\"id\", \"\")) <= str(after_id):\n                    start_idx += 1\n\n        page = matched[start_idx:start_idx + offers_limit]\n        has_more = (start_idx + offers_limit) < len(matched)\n        next_cursor = None\n        if has_more and page:\n            # return the next cursor as the last id in this page (opaque id is acceptable)\n            next_cursor = str(page[-1].get(\"id\"))\n\n        resp[\"offers\"] = page\n        resp[\"offers_meta\"] = {\n            \"total\": len(matched),\n            \"limit\": offers_limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n        }\n\n    # latency metadata\n    latency_ms = int((time.time() - t0) * 1000)\n    resp[\"meta\"] = {\n        \"workspace_id\": workspace_id,\n        \"search_id\": search_id,\n        \"latency_ms\": latency_ms,\n        \"retrieved_at\": now_iso,\n    }\n    return resp\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0491000",
+    "index": 491,
+    "name": "Amadeus MCP Server",
+    "description": "This backend stores authenticated access to the Amadeus flight shopping API through an MCP server, tracking API keys, each flight-offer search request, the resulting offers returned by Amadeus, and usage/accounting for rate limits and cost control. Main workflows are: issue/rotate API credentials, p",
+    "taxonomy": {
+      "L1_id": "L1-16",
+      "L1_name": "Travel & Transportation",
+      "L1_name_zh": "旅行与出行",
+      "L2_id": "L2-40",
+      "L2_name": "Booking & Hospitality",
+      "L2_name_zh": "预订与酒旅",
+      "L3_name": "Flights Search & Offer Shopping",
+      "L3_name_zh": "航班搜索与报价比价"
+    },
+    "database_dir": "./environment_mix/0491000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 5,
+    "n_records": 80,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 3,
+      "read_operations": 4,
+      "mutations_persisted": 3,
+      "mutations_attempted": 3
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "search_flight_offers",
+      "returned_chars": 740
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

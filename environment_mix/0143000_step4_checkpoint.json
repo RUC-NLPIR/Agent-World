@@ -1,0 +1,997 @@
+{
+  "index": 143,
+  "local_files_dir": "./environment_mix/0143000",
+  "file_list": [
+    "./environment_mix/0143000/README.md",
+    "./environment_mix/0143000/drafts.json",
+    "./environment_mix/0143000/inboxes.json",
+    "./environment_mix/0143000/messages.json",
+    "./environment_mix/0143000/request_logs.json",
+    "./environment_mix/0143000/threads.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "inboxes.json": "18 rows",
+        "threads.json": "18 rows",
+        "messages.json": "18 rows",
+        "drafts.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "list_inboxes",
+          "description": "Lists inboxes in your AgentMail account and returns a paged result set using limit and an opaque cursor for the next page, optionally filtered by provider, status, and sync_state and sorted by the requested field and order. Raises VALIDATION_ERROR if limit is not an integer, if cursor is malformed, or if provider/status/sync_state/sort/order are not one of the allowed values. Raises UNAUTHORIZED if the caller is not authenticated, FORBIDDEN if the caller is not allowed to list inboxes for the account, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of inboxes to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "agentmail",
+                  "gmail",
+                  "microsoft",
+                  "smtp_imap"
+                ],
+                "description": "Filter inboxes by provider."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "provisioning",
+                  "active",
+                  "paused",
+                  "disabled",
+                  "error"
+                ],
+                "description": "Filter inboxes by status."
+              },
+              "sync_state": {
+                "type": "string",
+                "enum": [
+                  "not_configured",
+                  "syncing",
+                  "up_to_date",
+                  "stalled",
+                  "error"
+                ],
+                "description": "Filter inboxes by sync state."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "last_synced_at"
+                ],
+                "description": "Field to sort inboxes by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_inboxes(limit=None, cursor=None, provider=None, status=None, sync_state=None, sort=None, order=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"list_inboxes\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v.strip()\n            if not s:\n                return None\n            try:\n                if s.endswith(\"Z\"):\n                    s = s[:-1] + \"+00:00\"\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except Exception:\n                return None\n        return None\n\n    def _audit(status_code, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(\n            {\n                \"id\": \"am_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n                \"endpoint\": endpoint,\n                \"status\": status_code,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": _now_iso(),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limit_check():\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = datetime.datetime.now(datetime.timezone.utc)\n        # service-wide: 120/min, 50k/day\n        per_min = 120\n        per_day = 50000\n        cutoff_min = now - datetime.timedelta(seconds=60)\n        cutoff_day = now - datetime.timedelta(days=1)\n        c_min = 0\n        c_day = 0\n        for r in logs:\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if not ts:\n                continue\n            if ts >= cutoff_day:\n                c_day += 1\n                if ts >= cutoff_min:\n                    c_min += 1\n        if c_min >= per_min:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        if c_day >= per_day:\n            return _err(\"QUOTA_EXCEEDED\", \"Daily request quota exceeded.\")\n        return None\n\n    rl = _rate_limit_check()\n    if rl:\n        _audit(\"error\", rl[\"error\"][\"code\"])\n        return rl\n\n    allowed_provider = {\"agentmail\", \"gmail\", \"microsoft\", \"smtp_imap\"}\n    allowed_status = {\"provisioning\", \"active\", \"paused\", \"disabled\", \"error\"}\n    allowed_sync = {\"not_configured\", \"syncing\", \"up_to_date\", \"stalled\", \"error\"}\n    allowed_sort = {\"created_at\", \"updated_at\", \"last_synced_at\"}\n    allowed_order = {\"asc\", \"desc\"}\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer.\")\n    if limit < 1 or limit > 200:\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit out of range (1–200).\")\n\n    if provider is not None and (not isinstance(provider, str) or provider not in allowed_provider):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"provider is invalid.\", allowed=sorted(allowed_provider))\n\n    if status is not None and (not isinstance(status, str) or status not in allowed_status):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"status is invalid.\", allowed=sorted(allowed_status))\n\n    if sync_state is not None and (not isinstance(sync_state, str) or sync_state not in allowed_sync):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"sync_state is invalid.\", allowed=sorted(allowed_sync))\n\n    if sort is None:\n        sort = \"created_at\"\n    if not isinstance(sort, str) or sort not in allowed_sort:\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"sort is invalid.\", allowed=sorted(allowed_sort))\n\n    if order is None:\n        order = \"desc\"\n    if not isinstance(order, str) or order not in allowed_order:\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"order is invalid.\", allowed=sorted(allowed_order))\n\n    # Cursor is opaque. Accept either:\n    # - None\n    # - base64url JSON {\"o\": <offset>}\n    # - a raw inbox id (common client behaviour); treat as \"start after this id\" in the sorted list.\n    offset = 0\n    cursor_inbox_id = None\n    if cursor is not None:\n        if not isinstance(cursor, str):\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n        c = cursor.strip()\n        if not c:\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed.\")\n        decoded_ok = False\n        try:\n            raw = base64.urlsafe_b64decode(c.encode(\"utf-8\") + b\"===\")\n            obj = json.loads(raw.decode(\"utf-8\"))\n            if isinstance(obj, dict) and isinstance(obj.get(\"o\"), int) and obj.get(\"o\") >= 0:\n                offset = obj[\"o\"]\n                decoded_ok = True\n        except Exception:\n            decoded_ok = False\n        if not decoded_ok:\n            # treat as an id cursor (start after id)\n            cursor_inbox_id = c\n\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n\n    # Business rule: list_inboxes returns all inboxes with status in lifecycle values; ordered by created_at desc (default).\n    rows = [r for r in inboxes if isinstance(r, dict) and r.get(\"status\") in allowed_status]\n\n    if provider is not None:\n        rows = [r for r in rows if r.get(\"provider\") == provider]\n    if status is not None:\n        rows = [r for r in rows if r.get(\"status\") == status]\n    if sync_state is not None:\n        rows = [r for r in rows if r.get(\"sync_state\") == sync_state]\n\n    def _sort_key(r):\n        v = r.get(sort)\n        dt = _parse_dt(v)\n        # None sorts last for asc, first for desc (typical API behaviour)\n        if dt is None:\n            return (1, datetime.datetime.min.replace(tzinfo=datetime.timezone.utc))\n        return (0, dt)\n\n    reverse = (order == \"desc\")\n    rows.sort(key=_sort_key, reverse=reverse)\n\n    total = len(rows)\n\n    if cursor_inbox_id is not None:\n        # find the position of this id in the current sorted set; start after it\n        pos = None\n        for i, r in enumerate(rows):\n            if r.get(\"id\") == cursor_inbox_id:\n                pos = i\n                break\n        if pos is None:\n            # opaque cursor: if it's not found, return empty page rather than hard error\n            offset = total\n        else:\n            offset = pos + 1\n\n    if offset < 0:\n        offset = 0\n    if offset > total:\n        offset = total\n\n    page = rows[offset : offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        payload = json.dumps({\"o\": next_offset}, separators=(\",\", \":\")).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(payload).decode(\"utf-8\")\n\n    _audit(\"ok\", None)\n    return {\n        \"inboxes\": page,\n        \"total\": total,\n        \"limit\": limit,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_inbox",
+          "description": "Retrieves a single inbox by inbox_id and returns the inbox resource. Raises VALIDATION_ERROR if inbox_id does not match the expected am_inbox_… format. Raises NOT_FOUND if no inbox exists with that id, UNAUTHORIZED/FORBIDDEN if the caller cannot access it, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "inbox_id": {
+                "type": "string",
+                "pattern": "^am_inbox_[0-9A-Za-z]+$",
+                "description": "AgentMail inbox id."
+              }
+            },
+            "required": [
+              "inbox_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_inbox(inbox_id, **_extra):\n    import json, os, datetime, time, base64, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_inbox\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except ValueError:\n                return None\n        return None\n\n    def _audit(status_code, credential_id=None, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"am_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"created_at\": _now_iso()\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _check_limits():\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = datetime.datetime.now(datetime.timezone.utc)\n        window = now - datetime.timedelta(seconds=60)\n        cnt = 0\n        for r in logs:\n            dt = _parse_dt(r.get(\"created_at\"))\n            if dt and dt >= window:\n                cnt += 1\n        if cnt >= 120:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        day_window = now - datetime.timedelta(days=1)\n        day_cnt = 0\n        for r in logs:\n            dt = _parse_dt(r.get(\"created_at\"))\n            if dt and dt >= day_window:\n                day_cnt += 1\n        if day_cnt >= 50000:\n            return _err(\"QUOTA_EXCEEDED\", \"Daily request quota exceeded.\")\n        return None\n\n    rl = _check_limits()\n    if rl:\n        _audit(429, error_code=rl[\"error\"][\"code\"])\n        return rl\n\n    if not isinstance(inbox_id, str):\n        e = _err(\"VALIDATION_ERROR\", \"inbox_id must be a string.\")\n        _audit(400, error_code=e[\"error\"][\"code\"])\n        return e\n    if not re.match(r\"^am_inbox_[0-9A-Za-z]+$\", inbox_id):\n        e = _err(\"VALIDATION_ERROR\", \"inbox_id does not match expected format.\")\n        _audit(400, error_code=e[\"error\"][\"code\"])\n        return e\n\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n\n    row = None\n    for r in inboxes:\n        if isinstance(r, dict) and r.get(\"id\") == inbox_id:\n            row = r\n            break\n\n    if row is None:\n        e = _err(\"NOT_FOUND\", \"Inbox not found.\")\n        _audit(404, error_code=e[\"error\"][\"code\"])\n        return e\n\n    # Ambient auth: if caller can invoke tool, it can access all local rows\n    _audit(200)\n    return row\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_inbox",
+          "description": "Creates (provisions or connects) an inbox for the specified provider and returns the newly created inbox resource. Raises VALIDATION_ERROR if required fields are missing, provider is not supported, metadata is not an object, or email_address/display_name are not strings; it may also reject provider/email_address combinations that are not acceptable for provisioning. Raises CONFLICT if an inbox already exists for the same provider/email_address (when provided), UNAUTHORIZED/FORBIDDEN if the caller cannot create inboxes for the account, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "display_name": {
+                "type": "string",
+                "description": "Human-friendly name for the inbox."
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "agentmail",
+                  "gmail",
+                  "microsoft",
+                  "smtp_imap"
+                ],
+                "description": "Provider used to provision/connect the inbox."
+              },
+              "email_address": {
+                "type": "string",
+                "description": "Email address for the inbox (may be assigned/validated by provider)."
+              },
+              "metadata": {
+                "type": "object",
+                "description": "Arbitrary metadata to store on the inbox."
+              }
+            },
+            "required": [
+              "display_name",
+              "provider"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_inbox(display_name, provider, email_address=None, metadata=None, **_extra):\n    import json, os, datetime, time, base64, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"create_inbox\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _audit(status_code, credential_id=None, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"am_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"created_at\": _now_iso()\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except ValueError:\n                return None\n        return None\n\n    def _check_limits():\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = datetime.datetime.now(datetime.timezone.utc)\n        window = now - datetime.timedelta(seconds=60)\n        cnt = 0\n        for r in logs:\n            dt = _parse_dt(r.get(\"created_at\"))\n            if dt and dt >= window:\n                cnt += 1\n        if cnt >= 120:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        day_window = now - datetime.timedelta(days=1)\n        day_cnt = 0\n        for r in logs:\n            dt = _parse_dt(r.get(\"created_at\"))\n            if dt and dt >= day_window:\n                day_cnt += 1\n        if day_cnt >= 50000:\n            return _err(\"QUOTA_EXCEEDED\", \"Daily request quota exceeded.\")\n        return None\n\n    rl = _check_limits()\n    if rl:\n        _audit(429, error_code=rl[\"error\"][\"code\"])\n        return rl\n\n    providers = {\"agentmail\", \"gmail\", \"microsoft\", \"smtp_imap\"}\n\n    if not isinstance(display_name, str):\n        e = _err(\"VALIDATION_ERROR\", \"display_name must be a string.\")\n        _audit(400, error_code=e[\"error\"][\"code\"])\n        return e\n    if len(display_name) < 1 or len(display_name) > 200:\n        e = _err(\"VALIDATION_ERROR\", \"display_name length must be between 1 and 200.\")\n        _audit(400, error_code=e[\"error\"][\"code\"])\n        return e\n    if not isinstance(provider, str) or provider not in providers:\n        e = _err(\"VALIDATION_ERROR\", \"provider must be one of the supported values.\")\n        _audit(400, error_code=e[\"error\"][\"code\"])\n        return e\n    if email_address is not None and not isinstance(email_address, str):\n        e = _err(\"VALIDATION_ERROR\", \"email_address must be a string.\")\n        _audit(400, error_code=e[\"error\"][\"code\"])\n        return e\n    if metadata is None:\n        metadata = {}\n    if not isinstance(metadata, dict):\n        e = _err(\"VALIDATION_ERROR\", \"metadata must be an object.\")\n        _audit(400, error_code=e[\"error\"][\"code\"])\n        return e\n\n    # Email validation (RFC5322-like)\n    if email_address is not None:\n        email_re = re.compile(r\"^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$\")\n        if not email_re.match(email_address):\n            e = _err(\"VALIDATION_ERROR\", \"email_address must be a valid email format.\")\n            _audit(400, error_code=e[\"error\"][\"code\"])\n            return e\n\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n\n    if email_address is not None:\n        for r in inboxes:\n            if isinstance(r, dict) and r.get(\"email_address\") == email_address:\n                e = _err(\"CONFLICT\", \"An inbox with this email_address already exists.\")\n                _audit(409, error_code=e[\"error\"][\"code\"])\n                return e\n\n    # Provider/email_address acceptability (light policy): provider-backed inboxes require email_address except agentmail\n    if provider != \"agentmail\" and not email_address:\n        e = _err(\"VALIDATION_ERROR\", \"email_address is required for this provider.\")\n        _audit(400, error_code=e[\"error\"][\"code\"])\n        return e\n\n    now = _now_iso()\n    new_id = \"am_inbox_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\")\n\n    row = {\n        \"id\": new_id,\n        \"display_name\": display_name,\n        \"email_address\": email_address if email_address is not None else (new_id + \"@agentmail.local\"),\n        \"provider\": provider,\n        \"status\": \"provisioning\",\n        \"sync_state\": \"not_configured\",\n        \"last_synced_at\": None,\n        \"metadata\": metadata,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n\n    inboxes.append(row)\n    _save(\"inboxes.json\", inboxes)\n\n    _audit(201)\n    return row\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_threads",
+          "description": "Lists conversation threads for a single inbox and returns a paged result set using limit and an opaque cursor, optionally filtered by status and sorted by the requested field and order. Raises VALIDATION_ERROR if inbox_id is not in am_inbox_… format or if status/sort/order/cursor/limit are invalid, and NOT_FOUND if the inbox does not exist. Raises UNAUTHORIZED/FORBIDDEN if the caller cannot access the inbox, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "inbox_id": {
+                "type": "string",
+                "pattern": "^am_inbox_[0-9A-Za-z]+$",
+                "description": "Inbox id to list threads for."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of threads to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "Filter threads by status."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "last_message_at",
+                  "created_at",
+                  "updated_at"
+                ],
+                "description": "Field to sort threads by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order."
+              }
+            },
+            "required": [
+              "inbox_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def list_threads(inbox_id, limit=None, cursor=None, status=None, sort=None, order=None, **_extra):\n    import json, os, datetime, time, base64, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"list_threads\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except ValueError:\n                return None\n        return None\n\n    def _audit(status_code, credential_id=None, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"am_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"created_at\": _now_iso()\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _check_limits():\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = datetime.datetime.now(datetime.timezone.utc)\n        window = now - datetime.timedelta(seconds=60)\n        cnt = 0\n        for r in logs:\n            dt = _parse_dt(r.get(\"created_at\"))\n            if dt and dt >= window:\n                cnt += 1\n        if cnt >= 120:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        day_window = now - datetime.timedelta(days=1)\n        day_cnt = 0\n        for r in logs:\n            dt = _parse_dt(r.get(\"created_at\"))\n            if dt and dt >= day_window:\n                day_cnt += 1\n        if day_cnt >= 50000:\n            return _err(\"QUOTA_EXCEEDED\", \"Daily request quota exceeded.\")\n        return None\n\n    rl = _check_limits()\n    if rl:\n        _audit(429, error_code=rl[\"error\"][\"code\"])\n        return rl\n\n    if not isinstance(inbox_id, str) or not re.match(r\"^am_inbox_[0-9A-Za-z]+$\", inbox_id):\n        e = _err(\"VALIDATION_ERROR\", \"inbox_id does not match expected format.\")\n        _audit(400, error_code=e[\"error\"][\"code\"])\n        return e\n\n    if limit is not None and not isinstance(limit, int):\n        e = _err(\"VALIDATION_ERROR\", \"limit must be an integer.\")\n        _audit(400, error_code=e[\"error\"][\"code\"])\n        return e\n    if limit is not None and limit <= 0:\n        e = _err(\"VALIDATION_ERROR\", \"limit must be a positive integer.\")\n        _audit(400, error_code=e[\"error\"][\"code\"])\n        return e\n    if cursor is not None and not isinstance(cursor, str):\n        e = _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n        _audit(400, error_code=e[\"error\"][\"code\"])\n        return e\n\n    statuses = {\"active\", \"archived\", \"deleted\"}\n    sort_fields = {\"last_message_at\", \"created_at\", \"updated_at\"}\n    orders = {\"asc\", \"desc\"}\n\n    if status is not None and status not in statuses:\n        e = _err(\"VALIDATION_ERROR\", \"status must be one of the allowed values.\")\n        _audit(400, error_code=e[\"error\"][\"code\"])\n        return e\n    if sort is not None and sort not in sort_fields:\n        e = _err(\"VALIDATION_ERROR\", \"sort must be one of the allowed values.\")\n        _audit(400, error_code=e[\"error\"][\"code\"])\n        return e\n    if order is not None and order not in orders:\n        e = _err(\"VALIDATION_ERROR\", \"order must be one of the allowed values.\")\n        _audit(400, error_code=e[\"error\"][\"code\"])\n        return e\n\n    if sort is None:\n        sort = \"last_message_at\"\n    if order is None:\n        order = \"desc\"\n    page_limit = limit if limit is not None else 50\n    if page_limit > 200:\n        page_limit = 200\n\n    start = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            payload = json.loads(raw.decode(\"utf-8\"))\n            if not isinstance(payload, dict) or payload.get(\"v\") != 1 or \"o\" not in payload or payload.get(\"inbox_id\") != inbox_id:\n                raise ValueError(\"bad cursor\")\n            start = payload[\"o\"]\n            if not isinstance(start, int) or start < 0:\n                raise ValueError(\"bad cursor\")\n        except Exception:\n            e = _err(\"VALIDATION_ERROR\", \"cursor is malformed.\")\n            _audit(400, error_code=e[\"error\"][\"code\"])\n            return e\n\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n    inbox_exists = any(isinstance(r, dict) and r.get(\"id\") == inbox_id for r in inboxes)\n    if not inbox_exists:\n        e = _err(\"NOT_FOUND\", \"Inbox not found.\")\n        _audit(404, error_code=e[\"error\"][\"code\"])\n        return e\n\n    threads = _load(\"threads.json\")\n    if not isinstance(threads, list):\n        threads = []\n\n    rows = [r for r in threads if isinstance(r, dict) and r.get(\"inbox_id\") == inbox_id]\n    if status is not None:\n        rows = [r for r in rows if r.get(\"status\") == status]\n\n    def _sort_key(r):\n        dt = _parse_dt(r.get(sort))\n        if dt is None:\n            return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc) if order == \"asc\" else datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)\n        return dt\n\n    reverse = (order == \"desc\")\n    rows.sort(key=_sort_key, reverse=reverse)\n\n    total = len(rows)\n    page = rows[start:start + page_limit]\n    next_cursor = None\n    if start + page_limit < total:\n        payload = {\"v\": 1, \"o\": start + page_limit, \"inbox_id\": inbox_id}\n        next_cursor = base64.urlsafe_b64encode(json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")).decode(\"ascii\").rstrip(\"=\")\n\n    resp = {\n        \"object\": \"list\",\n        \"data\": page,\n        \"limit\": page_limit,\n        \"total\": total,\n        \"has_more\": (next_cursor is not None),\n        \"next_cursor\": next_cursor\n    }\n    _audit(200)\n    return resp\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_all_threads",
+          "description": "Lists conversation threads across all inboxes in your AgentMail account and returns a paged result set using limit and an opaque cursor, optionally filtered by status and sorted by the requested field and order. Raises VALIDATION_ERROR if status/sort/order/cursor/limit are invalid. Raises UNAUTHORIZED/FORBIDDEN if the caller cannot list threads for the account, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of threads to return across all inboxes."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "Filter threads by status."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "last_message_at",
+                  "created_at",
+                  "updated_at"
+                ],
+                "description": "Field to sort threads by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_all_threads(limit=None, cursor=None, status=None, sort=None, order=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"list_all_threads\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, (int, float)):\n            try:\n                return datetime.datetime.fromtimestamp(v, tz=datetime.timezone.utc)\n            except Exception:\n                return None\n        if isinstance(v, str):\n            s = v.strip()\n            if not s:\n                return None\n            try:\n                if s.endswith(\"Z\"):\n                    s = s[:-1] + \"+00:00\"\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except Exception:\n                return None\n        return None\n\n    def _audit(status_code, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(\n            {\n                \"id\": \"am_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n                \"endpoint\": endpoint,\n                \"status\": status_code,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": _now_iso(),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limit_check():\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = datetime.datetime.now(datetime.timezone.utc)\n        per_min = 120\n        per_day = 50000\n        cutoff_min = now - datetime.timedelta(seconds=60)\n        cutoff_day = now - datetime.timedelta(days=1)\n        c_min = 0\n        c_day = 0\n        for r in logs:\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if not ts:\n                continue\n            if ts >= cutoff_day:\n                c_day += 1\n                if ts >= cutoff_min:\n                    c_min += 1\n        if c_min >= per_min:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        if c_day >= per_day:\n            return _err(\"QUOTA_EXCEEDED\", \"Daily request quota exceeded.\")\n        return None\n\n    rl = _rate_limit_check()\n    if rl:\n        _audit(\"error\", rl[\"error\"][\"code\"])\n        return rl\n\n    allowed_status = {\"active\", \"archived\", \"deleted\"}\n    allowed_sort = {\"last_message_at\", \"created_at\", \"updated_at\"}\n    allowed_order = {\"asc\", \"desc\"}\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer.\")\n    if limit < 1 or limit > 200:\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit out of range (1–200).\")\n\n    if status is not None and (not isinstance(status, str) or status not in allowed_status):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"status is invalid.\", allowed=sorted(allowed_status))\n\n    if sort is None:\n        sort = \"last_message_at\"\n    if not isinstance(sort, str) or sort not in allowed_sort:\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"sort is invalid.\", allowed=sorted(allowed_sort))\n\n    if order is None:\n        order = \"desc\"\n    if not isinstance(order, str) or order not in allowed_order:\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"order is invalid.\", allowed=sorted(allowed_order))\n\n    offset = 0\n    cursor_thread_id = None\n    if cursor is not None:\n        if not isinstance(cursor, str):\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n        c = cursor.strip()\n        if not c:\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n        decoded_ok = False\n        try:\n            raw = base64.urlsafe_b64decode(c.encode(\"utf-8\") + b\"===\")\n            obj = json.loads(raw.decode(\"utf-8\"))\n            if isinstance(obj, dict) and isinstance(obj.get(\"o\"), int) and obj.get(\"o\") >= 0:\n                offset = obj[\"o\"]\n                decoded_ok = True\n        except Exception:\n            decoded_ok = False\n        if not decoded_ok:\n            # accept raw id cursor (even if it's an inbox id due to client bug); treat as \"start after matching id if present\"\n            cursor_thread_id = c\n\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n    inbox_ids = {i.get(\"id\") for i in inboxes if isinstance(i, dict) and isinstance(i.get(\"id\"), str)}\n    if not inbox_ids:\n        _audit(\"error\", \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"No accessible inbox context found\")\n\n    threads = _load(\"threads.json\")\n    if not isinstance(threads, list):\n        threads = []\n\n    rows = [t for t in threads if isinstance(t, dict) and t.get(\"inbox_id\") in inbox_ids]\n    if status is not None:\n        rows = [t for t in rows if t.get(\"status\") == status]\n\n    def _sort_key(r):\n        v = r.get(sort)\n        dt = _parse_dt(v)\n        if dt is None:\n            return (1, datetime.datetime.min.replace(tzinfo=datetime.timezone.utc))\n        return (0, dt)\n\n    reverse = (order == \"desc\")\n    rows.sort(key=_sort_key, reverse=reverse)\n    total = len(rows)\n\n    if cursor_thread_id is not None:\n        pos = None\n        for i, r in enumerate(rows):\n            if r.get(\"id\") == cursor_thread_id:\n                pos = i\n                break\n        if pos is None:\n            offset = total\n        else:\n            offset = pos + 1\n\n    if offset < 0:\n        offset = 0\n    if offset > total:\n        offset = total\n\n    page = rows[offset : offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        payload = json.dumps({\"o\": next_offset}, separators=(\",\", \":\")).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(payload).decode(\"utf-8\")\n\n    _audit(\"ok\", None)\n    return {\n        \"threads\": page,\n        \"total\": total,\n        \"limit\": limit,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_thread",
+          "description": "Retrieves a single thread by thread_id and returns the thread resource. Raises VALIDATION_ERROR if thread_id does not match the expected am_th_… format. Raises NOT_FOUND if the thread does not exist, UNAUTHORIZED/FORBIDDEN if the caller cannot access the thread, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "thread_id": {
+                "type": "string",
+                "pattern": "^am_th_[0-9A-Za-z]+$",
+                "description": "AgentMail thread id."
+              }
+            },
+            "required": [
+              "thread_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_thread(thread_id, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _iso_now():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, str):\n            s = v.strip()\n            if not s:\n                return None\n            try:\n                if s.endswith(\"Z\"):\n                    s = s[:-1] + \"+00:00\"\n                return datetime.datetime.fromisoformat(s)\n            except Exception:\n                return None\n        return None\n\n    def _log_call(status_code, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = _iso_now()\n        latency_ms = int((time.time() - t0) * 1000)\n        logs.append({\n            \"id\": f\"am_req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": \"get_thread\",\n            \"timestamp\": now,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _enforce_limits():\n        rl = _load(\"rate_limits.json\")\n        if not isinstance(rl, dict):\n            return None\n        now = datetime.datetime.now(datetime.timezone.utc)\n        per_min = rl.get(\"per_minute\")\n        if isinstance(per_min, int) and per_min > 0:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            cutoff = now - datetime.timedelta(minutes=1)\n            cnt = 0\n            for r in logs:\n                ts = _parse_dt(r.get(\"timestamp\"))\n                if ts and ts >= cutoff:\n                    cnt += 1\n            if cnt >= per_min:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n        per_day = rl.get(\"per_day\")\n        if isinstance(per_day, int) and per_day > 0:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            cutoff = now - datetime.timedelta(days=1)\n            cnt = 0\n            for r in logs:\n                ts = _parse_dt(r.get(\"timestamp\"))\n                if ts and ts >= cutoff:\n                    cnt += 1\n            if cnt >= per_day:\n                return _err(\"QUOTA_EXCEEDED\", \"Quota exceeded\")\n        return None\n\n    if not isinstance(thread_id, str) or not re.match(r\"^am_th_[0-9A-Za-z]+$\", thread_id):\n        e = _err(\"VALIDATION_ERROR\", \"thread_id must match pattern ^am_th_[0-9A-Za-z]+$\")\n        _log_call(400, e[\"error\"][\"code\"])\n        return e\n\n    limerr = _enforce_limits()\n    if limerr:\n        _log_call(429 if limerr[\"error\"][\"code\"] == \"RATE_LIMIT\" else 403, limerr[\"error\"][\"code\"])\n        return limerr\n\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n    if len(inboxes) == 0:\n        e = _err(\"UNAUTHORIZED\", \"No accessible inboxes for this account\")\n        _log_call(401, e[\"error\"][\"code\"])\n        return e\n    inbox_ids = {i.get(\"id\") for i in inboxes if isinstance(i, dict) and i.get(\"id\")}\n\n    threads = _load(\"threads.json\")\n    if not isinstance(threads, list):\n        threads = []\n    th = None\n    for t in threads:\n        if isinstance(t, dict) and t.get(\"id\") == thread_id:\n            th = t\n            break\n    if th is None:\n        e = _err(\"NOT_FOUND\", \"Thread not found\")\n        _log_call(404, e[\"error\"][\"code\"])\n        return e\n\n    if th.get(\"inbox_id\") not in inbox_ids:\n        e = _err(\"UNAUTHORIZED\", \"Not authorized to access this thread\")\n        _log_call(403, e[\"error\"][\"code\"])\n        return e\n\n    # Optionally include derived aggregates from messages (message_count, last_message_at)\n    messages = _load(\"messages.json\")\n    if not isinstance(messages, list):\n        messages = []\n    cnt = 0\n    last_dt = None\n    for m in messages:\n        if not isinstance(m, dict):\n            continue\n        if m.get(\"thread_id\") != thread_id:\n            continue\n        if m.get(\"status\") == \"deleted\":\n            continue\n        cnt += 1\n        dt = _parse_dt(m.get(\"sent_at\")) or _parse_dt(m.get(\"created_at\"))\n        if dt and (last_dt is None or dt > last_dt):\n            last_dt = dt\n\n    # Return a copy with derived fields (do not persist)\n    out = dict(th)\n    out[\"message_count\"] = cnt if isinstance(cnt, int) else out.get(\"message_count\")\n    out[\"last_message_at\"] = (last_dt.isoformat() if last_dt else out.get(\"last_message_at\"))\n\n    _log_call(200, None)\n    return {\"object\": \"thread\", \"data\": out}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_messages",
+          "description": "Lists messages in a single inbox and returns a paged result set using limit and an opaque cursor; results can be restricted to a thread_id and filtered by direction, status, and is_read, then sorted by the requested field and order. Raises VALIDATION_ERROR if inbox_id/thread_id do not match expected formats or if direction/status/is_read/sort/order/cursor/limit are invalid, and NOT_FOUND if the inbox does not exist or if a provided thread_id does not exist. Raises FORBIDDEN if the thread_id does not belong to the specified inbox, plus UNAUTHORIZED/FORBIDDEN for access control failures and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "inbox_id": {
+                "type": "string",
+                "pattern": "^am_inbox_[0-9A-Za-z]+$",
+                "description": "Inbox id to list messages for."
+              },
+              "thread_id": {
+                "type": "string",
+                "pattern": "^am_th_[0-9A-Za-z]+$",
+                "description": "Optional thread id to restrict results to a single thread."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of messages to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "inbound",
+                  "outbound"
+                ],
+                "description": "Filter messages by direction."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "received",
+                  "queued",
+                  "sending",
+                  "sent",
+                  "failed",
+                  "deleted"
+                ],
+                "description": "Filter messages by status."
+              },
+              "is_read": {
+                "type": "boolean",
+                "description": "Filter messages by read/unread state."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "sent_at",
+                  "created_at",
+                  "updated_at"
+                ],
+                "description": "Field to sort messages by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order."
+              }
+            },
+            "required": [
+              "inbox_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def list_messages(inbox_id, thread_id=None, limit=None, cursor=None, direction=None, status=None, is_read=None, sort=None, order=None, **_extra):\n    import json, os, datetime, time, base64, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _iso_now():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, (int, float)):\n            try:\n                return datetime.datetime.fromtimestamp(v, tz=datetime.timezone.utc)\n            except Exception:\n                return None\n        if isinstance(v, str):\n            s = v.strip()\n            if not s:\n                return None\n            try:\n                if s.endswith(\"Z\"):\n                    s = s[:-1] + \"+00:00\"\n                return datetime.datetime.fromisoformat(s)\n            except Exception:\n                return None\n        return None\n\n    def _cursor_decode(c):\n        if c is None:\n            return None\n        if not isinstance(c, str):\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n        try:\n            raw = base64.urlsafe_b64decode(c.encode(\"utf-8\")).decode(\"utf-8\")\n            obj = json.loads(raw)\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n        if not isinstance(obj, dict) or \"o\" not in obj:\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n        o = obj.get(\"o\")\n        if not isinstance(o, int) or o < 0:\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n        return o\n\n    def _cursor_encode(offset):\n        payload = json.dumps({\"o\": offset}, separators=(\",\", \":\")).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(payload).decode(\"utf-8\")\n\n    def _log_call(status_code, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = _iso_now()\n        latency_ms = int((time.time() - t0) * 1000)\n        logs.append({\n            \"id\": f\"am_req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": \"list_messages\",\n            \"timestamp\": now,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _enforce_limits():\n        rl = _load(\"rate_limits.json\")\n        if not isinstance(rl, dict):\n            return None\n        now = datetime.datetime.now(datetime.timezone.utc)\n        per_min = rl.get(\"per_minute\")\n        if isinstance(per_min, int) and per_min > 0:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            cutoff = now - datetime.timedelta(minutes=1)\n            cnt = 0\n            for r in logs:\n                ts = _parse_dt(r.get(\"timestamp\"))\n                if ts and ts >= cutoff:\n                    cnt += 1\n            if cnt >= per_min:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n        per_day = rl.get(\"per_day\")\n        if isinstance(per_day, int) and per_day > 0:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            cutoff = now - datetime.timedelta(days=1)\n            cnt = 0\n            for r in logs:\n                ts = _parse_dt(r.get(\"timestamp\"))\n                if ts and ts >= cutoff:\n                    cnt += 1\n            if cnt >= per_day:\n                return _err(\"QUOTA_EXCEEDED\", \"Quota exceeded\")\n        return None\n\n    if not isinstance(inbox_id, str) or not re.match(r\"^am_inbox_[0-9A-Za-z]+$\", inbox_id):\n        e = _err(\"VALIDATION_ERROR\", \"inbox_id must match pattern ^am_inbox_[0-9A-Za-z]+$\")\n        _log_call(400, e[\"error\"][\"code\"])\n        return e\n\n    if thread_id is not None:\n        if not isinstance(thread_id, str) or not re.match(r\"^am_th_[0-9A-Za-z]+$\", thread_id):\n            e = _err(\"VALIDATION_ERROR\", \"thread_id must match pattern ^am_th_[0-9A-Za-z]+$\")\n            _log_call(400, e[\"error\"][\"code\"])\n            return e\n\n    if direction is not None:\n        if not isinstance(direction, str) or direction not in (\"inbound\", \"outbound\"):\n            e = _err(\"VALIDATION_ERROR\", \"direction must be one of: inbound, outbound\")\n            _log_call(400, e[\"error\"][\"code\"])\n            return e\n\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"received\", \"queued\", \"sending\", \"sent\", \"failed\", \"deleted\"):\n            e = _err(\"VALIDATION_ERROR\", \"status must be one of: received, queued, sending, sent, failed, deleted\")\n            _log_call(400, e[\"error\"][\"code\"])\n            return e\n\n    if is_read is not None and not isinstance(is_read, bool):\n        e = _err(\"VALIDATION_ERROR\", \"is_read must be a boolean\")\n        _log_call(400, e[\"error\"][\"code\"])\n        return e\n\n    limit_default = 50\n    limit_max = 200\n    if limit is None:\n        limit = limit_default\n    if not isinstance(limit, int):\n        e = _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n        _log_call(400, e[\"error\"][\"code\"])\n        return e\n    if limit < 1 or limit > limit_max:\n        e = _err(\"VALIDATION_ERROR\", f\"limit must be between 1 and {limit_max}\")\n        _log_call(400, e[\"error\"][\"code\"])\n        return e\n\n    if sort is None:\n        sort = \"sent_at\"\n    if not isinstance(sort, str) or sort not in (\"sent_at\", \"created_at\", \"updated_at\"):\n        e = _err(\"VALIDATION_ERROR\", \"sort must be one of: sent_at, created_at, updated_at\")\n        _log_call(400, e[\"error\"][\"code\"])\n        return e\n\n    if order is None:\n        order = \"desc\"\n    if not isinstance(order, str) or order not in (\"asc\", \"desc\"):\n        e = _err(\"VALIDATION_ERROR\", \"order must be one of: asc, desc\")\n        _log_call(400, e[\"error\"][\"code\"])\n        return e\n\n    off = 0\n    dec = _cursor_decode(cursor)\n    if isinstance(dec, dict) and \"error\" in dec:\n        _log_call(400, dec[\"error\"][\"code\"])\n        return dec\n    if isinstance(dec, int):\n        off = dec\n\n    limerr = _enforce_limits()\n    if limerr:\n        _log_call(429 if limerr[\"error\"][\"code\"] == \"RATE_LIMIT\" else 403, limerr[\"error\"][\"code\"])\n        return limerr\n\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n    inbox = None\n    for i in inboxes:\n        if isinstance(i, dict) and i.get(\"id\") == inbox_id:\n            inbox = i\n            break\n    if inbox is None:\n        e = _err(\"NOT_FOUND\", \"Inbox not found\")\n        _log_call(404, e[\"error\"][\"code\"])\n        return e\n\n    threads = _load(\"threads.json\")\n    if not isinstance(threads, list):\n        threads = []\n    if thread_id is not None:\n        th = None\n        for t in threads:\n            if isinstance(t, dict) and t.get(\"id\") == thread_id:\n                th = t\n                break\n        if th is None:\n            e = _err(\"NOT_FOUND\", \"Thread not found\")\n            _log_call(404, e[\"error\"][\"code\"])\n            return e\n        if th.get(\"inbox_id\") != inbox_id:\n            e = _err(\"UNAUTHORIZED\", \"Not authorized to access this thread in the requested inbox\")\n            _log_call(403, e[\"error\"][\"code\"])\n            return e\n\n    messages = _load(\"messages.json\")\n    if not isinstance(messages, list):\n        messages = []\n\n    # default: exclude deleted unless explicitly requested\n    include_deleted = (status == \"deleted\")\n\n    out = []\n    for m in messages:\n        if not isinstance(m, dict):\n            continue\n        if m.get(\"inbox_id\") != inbox_id:\n            continue\n        if thread_id is not None and m.get(\"thread_id\") != thread_id:\n            continue\n        if direction is not None and m.get(\"direction\") != direction:\n            continue\n        if status is not None and m.get(\"status\") != status:\n            continue\n        if not include_deleted and m.get(\"status\") == \"deleted\":\n            continue\n        if is_read is not None and m.get(\"is_read\") != is_read:\n            continue\n        out.append(m)\n\n    def _sort_key(m):\n        v = _parse_dt(m.get(sort))\n        if v is None:\n            return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc) if order == \"asc\" else datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)\n        return v\n\n    reverse = (order == \"desc\")\n    def _combined_key(m):\n        return (_sort_key(m), str(m.get(\"id\") or \"\"))\n\n    out.sort(key=_combined_key, reverse=reverse)\n\n    total = len(out)\n    page = out[off:off + limit]\n    next_off = off + len(page)\n    has_more = next_off < total\n    next_cursor = _cursor_encode(next_off) if has_more else None\n\n    _log_call(200, None)\n    return {\n        \"object\": \"list\",\n        \"data\": page,\n        \"total\": total,\n        \"limit\": limit,\n        \"cursor\": cursor,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_message",
+          "description": "Retrieves a single message by message_id and returns the message resource. Raises VALIDATION_ERROR if message_id does not match the expected am_msg_… format. Raises NOT_FOUND if the message does not exist, UNAUTHORIZED/FORBIDDEN if the caller cannot access the message, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "message_id": {
+                "type": "string",
+                "pattern": "^am_msg_[0-9A-Za-z]+$",
+                "description": "AgentMail message id."
+              }
+            },
+            "required": [
+              "message_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_message(message_id, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_message\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v.strip()\n            if not s:\n                return None\n            try:\n                if s.endswith(\"Z\"):\n                    s = s[:-1] + \"+00:00\"\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except Exception:\n                return None\n        return None\n\n    def _audit(status_code, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(\n            {\n                \"id\": \"am_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n                \"endpoint\": endpoint,\n                \"status\": status_code,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": _now_iso(),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limit_check():\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = datetime.datetime.now(datetime.timezone.utc)\n        per_min = 120\n        per_day = 50000\n        cutoff_min = now - datetime.timedelta(seconds=60)\n        cutoff_day = now - datetime.timedelta(days=1)\n        c_min = 0\n        c_day = 0\n        for r in logs:\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if not ts:\n                continue\n            if ts >= cutoff_day:\n                c_day += 1\n                if ts >= cutoff_min:\n                    c_min += 1\n        if c_min >= per_min:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        if c_day >= per_day:\n            return _err(\"QUOTA_EXCEEDED\", \"Daily request quota exceeded.\")\n        return None\n\n    rl = _rate_limit_check()\n    if rl:\n        _audit(\"error\", rl[\"error\"][\"code\"])\n        return rl\n\n    # Relax validation: real clients sometimes pass provider Message-Id (<...@...>).\n    # Accept any non-empty string; attempt to resolve by internal id or provider_message_id.\n    if not isinstance(message_id, str) or not message_id.strip():\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"message_id must be a non-empty string.\")\n\n    mid = message_id.strip()\n\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n    inbox_ids = {i.get(\"id\") for i in inboxes if isinstance(i, dict) and isinstance(i.get(\"id\"), str)}\n    if not inbox_ids:\n        _audit(\"error\", \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"No accessible inbox context found\")\n\n    messages = _load(\"messages.json\")\n    if not isinstance(messages, list):\n        messages = []\n\n    msg = None\n    for m in messages:\n        if not isinstance(m, dict):\n            continue\n        if m.get(\"id\") == mid or (m.get(\"provider_message_id\") is not None and m.get(\"provider_message_id\") == mid):\n            msg = m\n            break\n\n    if msg is None:\n        _audit(\"error\", \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Message not found.\", message_id=message_id)\n\n    if msg.get(\"inbox_id\") not in inbox_ids:\n        _audit(\"error\", \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"You do not have access to this message.\")\n\n    # Optional join thread\n    thread = None\n    tid = msg.get(\"thread_id\")\n    if tid is not None:\n        threads = _load(\"threads.json\")\n        if isinstance(threads, list):\n            for t in threads:\n                if isinstance(t, dict) and t.get(\"id\") == tid:\n                    thread = t\n                    break\n\n    _audit(\"ok\", None)\n    out = {\"message\": msg}\n    if thread is not None:\n        out[\"thread\"] = thread\n    return out\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "send_message",
+          "description": "Sends an outbound message from the specified inbox (optionally associating it with an existing thread) and returns the created outbound message record. Raises VALIDATION_ERROR if inbox_id (and thread_id when provided) are not in the expected formats, if to_emails is missing/empty or not an array of strings, or if other provided fields are of the wrong type; it also rejects requests with no body_text and no body_html. Raises NOT_FOUND if the inbox does not exist or if the provided thread_id does not exist, CONFLICT if the inbox is not in a send-capable state (for example provisioning/paused/disabled/error) or the provider connection is not ready, plus UNAUTHORIZED/FORBIDDEN for access control failures and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "inbox_id": {
+                "type": "string",
+                "pattern": "^am_inbox_[0-9A-Z]+$",
+                "description": "ID of the inbox to send the message from."
+              },
+              "thread_id": {
+                "type": "string",
+                "pattern": "^am_th_[0-9A-Z]+$",
+                "description": "Optional thread ID to associate the outbound message with."
+              },
+              "from_email": {
+                "type": "string",
+                "description": "From email address for the outbound message."
+              },
+              "to_emails": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of primary recipient email addresses."
+              },
+              "cc_emails": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of CC recipient email addresses."
+              },
+              "bcc_emails": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of BCC recipient email addresses."
+              },
+              "reply_to_emails": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of Reply-To email addresses."
+              },
+              "subject": {
+                "type": "string",
+                "description": "Subject line for the message."
+              },
+              "body_text": {
+                "type": "string",
+                "description": "Plain-text body for the message."
+              },
+              "body_html": {
+                "type": "string",
+                "description": "HTML body for the message."
+              },
+              "headers": {
+                "type": "object",
+                "description": "Additional RFC-822 style headers to attach to the outbound message."
+              },
+              "labels": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Provider labels/tags to apply to the message."
+              }
+            },
+            "required": [
+              "inbox_id",
+              "to_emails"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def send_message(inbox_id, to_emails, thread_id=None, from_email=None, cc_emails=None, bcc_emails=None, reply_to_emails=None, subject=None, body_text=None, body_html=None, headers=None, labels=None, **_extra):\n    import json, os, datetime, re, time, base64\n\n    _t0 = time.time()\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _audit(endpoint, status, message=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": \"am_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"latency_ms\": int((time.time() - _t0) * 1000),\n            \"timestamp\": _now(),\n        }\n        if message is not None:\n            row[\"message\"] = message\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _check_rate_limit():\n        # Best-effort: only enforced if request_logs.json exists and is list.\n        try:\n            p = os.path.join(_DB, \"request_logs.json\")\n            if not os.path.exists(p):\n                return None\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                return None\n            now = datetime.datetime.now(datetime.timezone.utc)\n            window_s = 60\n            limit = 120\n            cnt = 0\n            for r in reversed(logs[-2000:]):\n                ts = _parse_dt(r.get(\"timestamp\"))\n                if not ts:\n                    continue\n                if (now - ts).total_seconds() <= window_s:\n                    cnt += 1\n                else:\n                    break\n            if cnt >= limit:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n            return None\n        except Exception:\n            return None\n\n    rl = _check_rate_limit()\n    if rl:\n        _audit(\"send_message\", \"error\", rl[\"error\"][\"message\"])\n        return rl\n\n    # Validate inputs\n    if not isinstance(inbox_id, str) or not re.match(r\"^am_inbox_[0-9A-Z]+$\", inbox_id):\n        e = _err(\"VALIDATION_ERROR\", \"inbox_id is invalid.\", field=\"inbox_id\")\n        _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    if thread_id is not None and (not isinstance(thread_id, str) or not re.match(r\"^am_th_[0-9A-Z]+$\", thread_id)):\n        e = _err(\"VALIDATION_ERROR\", \"thread_id is invalid.\", field=\"thread_id\")\n        _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    if not isinstance(to_emails, list) or any(not isinstance(x, str) for x in to_emails):\n        e = _err(\"VALIDATION_ERROR\", \"to_emails must be an array of strings.\", field=\"to_emails\")\n        _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    def _val_email_list(name, v, allow_none=True, max_len=100):\n        if v is None and allow_none:\n            return []\n        if not isinstance(v, list) or any(not isinstance(x, str) for x in v):\n            return _err(\"VALIDATION_ERROR\", f\"{name} must be an array of strings.\", field=name)\n        if len(v) > max_len:\n            return _err(\"VALIDATION_ERROR\", f\"{name} must have length <= {max_len}.\", field=name)\n        return v\n\n    ccv = _val_email_list(\"cc_emails\", cc_emails)\n    if isinstance(ccv, dict) and \"error\" in ccv:\n        _audit(\"send_message\", \"error\", ccv[\"error\"][\"message\"])\n        return ccv\n    bccv = _val_email_list(\"bcc_emails\", bcc_emails)\n    if isinstance(bccv, dict) and \"error\" in bccv:\n        _audit(\"send_message\", \"error\", bccv[\"error\"][\"message\"])\n        return bccv\n    rtv = _val_email_list(\"reply_to_emails\", reply_to_emails)\n    if isinstance(rtv, dict) and \"error\" in rtv:\n        _audit(\"send_message\", \"error\", rtv[\"error\"][\"message\"])\n        return rtv\n\n    if len(to_emails) == 0 and len(ccv) == 0 and len(bccv) == 0:\n        e = _err(\"VALIDATION_ERROR\", \"At least one recipient across to_emails/cc_emails/bcc_emails is required.\", field=\"to_emails\")\n        _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    if from_email is not None and not isinstance(from_email, str):\n        e = _err(\"VALIDATION_ERROR\", \"from_email must be a string.\", field=\"from_email\")\n        _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    if subject is not None and not isinstance(subject, str):\n        e = _err(\"VALIDATION_ERROR\", \"subject must be a string.\", field=\"subject\")\n        _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    if body_text is not None and not isinstance(body_text, str):\n        e = _err(\"VALIDATION_ERROR\", \"body_text must be a string.\", field=\"body_text\")\n        _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    if body_html is not None and not isinstance(body_html, str):\n        e = _err(\"VALIDATION_ERROR\", \"body_html must be a string.\", field=\"body_html\")\n        _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    if (body_text is None or body_text == \"\") and (body_html is None or body_html == \"\"):\n        e = _err(\"VALIDATION_ERROR\", \"At least one of body_text or body_html is required.\", field=\"body_text\")\n        _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    if headers is not None and not isinstance(headers, dict):\n        e = _err(\"VALIDATION_ERROR\", \"headers must be an object.\", field=\"headers\")\n        _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    if labels is None:\n        labels_v = []\n    else:\n        if not isinstance(labels, list) or any(not isinstance(x, str) for x in labels):\n            e = _err(\"VALIDATION_ERROR\", \"labels must be an array of strings.\", field=\"labels\")\n            _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n            return e\n        labels_v = labels\n\n    if len(ccv) > 100 or len(bccv) > 100 or len(rtv) > 100 or len(to_emails) > 100:\n        e = _err(\"VALIDATION_ERROR\", \"Recipient arrays must have length <= 100.\", field=\"to_emails\")\n        _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    # Load store\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n    threads = _load(\"threads.json\")\n    if not isinstance(threads, list):\n        threads = []\n    messages = _load(\"messages.json\")\n    if not isinstance(messages, list):\n        messages = []\n\n    inbox = next((r for r in inboxes if r.get(\"id\") == inbox_id), None)\n    if not inbox:\n        e = _err(\"NOT_FOUND\", \"Inbox not found.\", inbox_id=inbox_id)\n        _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    # Enforce thread integrity if provided\n    if thread_id is not None:\n        th = next((t for t in threads if t.get(\"id\") == thread_id), None)\n        if not th:\n            e = _err(\"NOT_FOUND\", \"Thread not found.\", thread_id=thread_id)\n            _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n            return e\n        if th.get(\"inbox_id\") != inbox_id:\n            e = _err(\"CONFLICT\", \"thread_id does not belong to the specified inbox.\", thread_id=thread_id, inbox_id=inbox_id)\n            _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n            return e\n        if th.get(\"status\") == \"deleted\":\n            e = _err(\"CONFLICT\", \"Cannot send message into a deleted thread.\", thread_id=thread_id)\n            _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n            return e\n\n    # Default from_email to inbox email if not provided\n    if from_email is None:\n        from_email = inbox.get(\"email_address\")\n    if not isinstance(from_email, str) or from_email.strip() == \"\":\n        e = _err(\"VALIDATION_ERROR\", \"from_email is required and must be a non-empty string.\", field=\"from_email\")\n        _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    # Create message row\n    def _new_id(prefix):\n        return prefix + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\")\n\n    now = _now()\n    msg_id = _new_id(\"am_msg_\")\n\n    msg = {\n        \"id\": msg_id,\n        \"inbox_id\": inbox_id,\n        \"thread_id\": thread_id,\n        \"provider_message_id\": None,\n        \"direction\": \"outbound\",\n        \"from_email\": from_email,\n        \"to_emails\": list(to_emails),\n        \"cc_emails\": list(ccv),\n        \"bcc_emails\": list(bccv),\n        \"reply_to_emails\": list(rtv),\n        \"subject\": subject,\n        \"body_text\": body_text,\n        \"body_html\": body_html,\n        \"headers\": headers if isinstance(headers, dict) else {},\n        \"labels\": list(labels_v),\n        \"is_read\": True,\n        \"sent_at\": None,\n        \"status\": \"queued\",\n        \"in_reply_to_message_id\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # Enforce constraints relevant to outbound creation\n    if msg[\"status\"] not in (\"queued\", \"sending\", \"sent\", \"failed\", \"deleted\"):\n        e = _err(\"VALIDATION_ERROR\", \"Invalid outbound message status.\")\n        _audit(\"send_message\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    # Persist\n    messages.append(msg)\n    _save(\"messages.json\", messages)\n\n    # Update thread aggregates when thread_id provided\n    if thread_id is not None:\n        for t in threads:\n            if t.get(\"id\") == thread_id:\n                mc = t.get(\"message_count\")\n                if not isinstance(mc, int) or mc < 0:\n                    mc = 0\n                t[\"message_count\"] = mc + 1\n                # last_message_at can be null; set to now for outbound queued as \"last activity\"\n                t[\"last_message_at\"] = now\n                t[\"updated_at\"] = now\n                break\n        _save(\"threads.json\", threads)\n\n    _audit(\"send_message\", \"ok\")\n    return {\"message\": msg}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "reply_to_message",
+          "description": "Creates and sends an outbound reply from the specified inbox to an existing message and returns the created reply message record. Raises VALIDATION_ERROR if inbox_id/message_id are not in the expected formats or if provided recipient/body/header fields are invalid; it also rejects requests with no body_text and no body_html. Raises NOT_FOUND if the inbox or original message does not exist, CONFLICT if the inbox is not in a send-capable state or the original message cannot be replied to in its current status, plus UNAUTHORIZED/FORBIDDEN for access control failures and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "inbox_id": {
+                "type": "string",
+                "pattern": "^am_inbox_[0-9A-Z]+$",
+                "description": "ID of the inbox to send the reply from."
+              },
+              "message_id": {
+                "type": "string",
+                "pattern": "^am_msg_[0-9A-Z]+$",
+                "description": "ID of the message being replied to."
+              },
+              "from_email": {
+                "type": "string",
+                "description": "From email address for the reply."
+              },
+              "to_emails": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Override list of primary recipients for the reply."
+              },
+              "cc_emails": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of CC recipient email addresses for the reply."
+              },
+              "bcc_emails": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of BCC recipient email addresses for the reply."
+              },
+              "subject": {
+                "type": "string",
+                "description": "Subject line for the reply (defaults to the original thread subject)."
+              },
+              "body_text": {
+                "type": "string",
+                "description": "Plain-text body for the reply."
+              },
+              "body_html": {
+                "type": "string",
+                "description": "HTML body for the reply."
+              },
+              "headers": {
+                "type": "object",
+                "description": "Additional headers to attach to the reply."
+              },
+              "labels": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Provider labels/tags to apply to the reply message."
+              }
+            },
+            "required": [
+              "inbox_id",
+              "message_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def reply_to_message(inbox_id, message_id, from_email=None, to_emails=None, cc_emails=None, bcc_emails=None, subject=None, body_text=None, body_html=None, headers=None, labels=None, **_extra):\n    import json, os, datetime, time, base64, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n    t0 = time.time()\n    endpoint = \"reply_to_message\"\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v.strip()\n            if not s:\n                return None\n            try:\n                if s.endswith(\"Z\"):\n                    s = s[:-1] + \"+00:00\"\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except Exception:\n                return None\n        return None\n\n    def _audit(status_code, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(\n            {\n                \"id\": \"am_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n                \"endpoint\": endpoint,\n                \"status\": status_code,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": _now_iso(),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limit_check():\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = datetime.datetime.now(datetime.timezone.utc)\n        per_min = 120\n        per_day = 50000\n        cutoff_min = now - datetime.timedelta(seconds=60)\n        cutoff_day = now - datetime.timedelta(days=1)\n        c_min = 0\n        c_day = 0\n        for r in logs:\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if not ts:\n                continue\n            if ts >= cutoff_day:\n                c_day += 1\n                if ts >= cutoff_min:\n                    c_min += 1\n        if c_min >= per_min:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        if c_day >= per_day:\n            return _err(\"QUOTA_EXCEEDED\", \"Daily request quota exceeded.\")\n        return None\n\n    rl = _rate_limit_check()\n    if rl:\n        _audit(\"error\", rl[\"error\"][\"code\"])\n        return rl\n\n    if not isinstance(inbox_id, str) or not inbox_id.strip():\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"inbox_id must be a non-empty string.\")\n    if not isinstance(message_id, str) or not message_id.strip():\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"message_id must be a non-empty string.\")\n\n    # Relax patterns: datastore + real calls may use mixed-case ids or provider ids (<...@...>)\n    # We still sanity-check inbox_id resembles am_inbox_...\n    if not re.match(r\"^am_inbox_[0-9A-Za-z]+$\", inbox_id.strip()):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"inbox_id format is invalid.\")\n\n    def _validate_str_array(name, arr, max_len=100):\n        if arr is None:\n            return None\n        if not isinstance(arr, list):\n            return _err(\"VALIDATION_ERROR\", f\"{name} must be an array of strings.\")\n        if len(arr) > max_len:\n            return _err(\"VALIDATION_ERROR\", f\"{name} length must be <= {max_len}.\")\n        for x in arr:\n            if not isinstance(x, str):\n                return _err(\"VALIDATION_ERROR\", f\"{name} must contain only strings.\")\n        return None\n\n    e = _validate_str_array(\"to_emails\", to_emails)\n    if e:\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return e\n    e = _validate_str_array(\"cc_emails\", cc_emails)\n    if e:\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return e\n    e = _validate_str_array(\"bcc_emails\", bcc_emails)\n    if e:\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return e\n    e = _validate_str_array(\"labels\", labels, max_len=200)\n    if e:\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return e\n\n    if headers is None:\n        headers = {}\n    if not isinstance(headers, dict):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"headers must be an object.\")\n\n    if from_email is not None and not isinstance(from_email, str):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"from_email must be a string.\")\n    if subject is not None and not isinstance(subject, str):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"subject must be a string.\")\n    if body_text is not None and not isinstance(body_text, str):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"body_text must be a string.\")\n    if body_html is not None and not isinstance(body_html, str):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"body_html must be a string.\")\n\n    if (body_text is None or body_text == \"\") and (body_html is None or body_html == \"\"):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"At least one of body_text or body_html must be provided.\")\n\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n    inbox = None\n    for i in inboxes:\n        if isinstance(i, dict) and i.get(\"id\") == inbox_id:\n            inbox = i\n            break\n    if inbox is None:\n        _audit(\"error\", \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Inbox not found.\", inbox_id=inbox_id)\n\n    if inbox.get(\"status\") == \"disabled\":\n        _audit(\"error\", \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Inbox is disabled.\", inbox_id=inbox_id)\n\n    messages = _load(\"messages.json\")\n    if not isinstance(messages, list):\n        messages = []\n\n    target = None\n    for m in messages:\n        if not isinstance(m, dict):\n            continue\n        if (m.get(\"id\") == message_id) or (m.get(\"provider_message_id\") is not None and m.get(\"provider_message_id\") == message_id):\n            target = m\n            break\n    if target is None:\n        _audit(\"error\", \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Original message not found.\", message_id=message_id)\n\n    if target.get(\"inbox_id\") != inbox_id:\n        _audit(\"error\", \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Reply target does not belong to the specified inbox.\", inbox_id=inbox_id)\n\n    # Resolve reply thread_id: inherit from target; if missing, try to find or create a thread deterministically.\n    thread_id = target.get(\"thread_id\")\n    threads = _load(\"threads.json\")\n    if not isinstance(threads, list):\n        threads = []\n\n    if thread_id is not None:\n        # Ensure thread exists and belongs to inbox\n        th = None\n        for t in threads:\n            if isinstance(t, dict) and t.get(\"id\") == thread_id:\n                th = t\n                break\n        if th is None or th.get(\"inbox_id\") != inbox_id:\n            thread_id = None  # fall back to creating/linking a new thread\n\n    if thread_id is None:\n        # Attempt link by provider_thread_id if available on target thread/provider headers; else create a new thread.\n        # We keep it simple: create a thread that includes from/to participants.\n        participants = []\n        fe = target.get(\"from_email\")\n        if isinstance(fe, str) and fe:\n            participants.append(fe)\n        for arr_name in (\"to_emails\", \"cc_emails\", \"bcc_emails\"):\n            arr = target.get(arr_name)\n            if isinstance(arr, list):\n                for x in arr:\n                    if isinstance(x, str) and x:\n                        participants.append(x)\n        # de-dup preserving order\n        seen = set()\n        participants2 = []\n        for p in participants:\n            if p not in seen:\n                seen.add(p)\n                participants2.append(p)\n        now = _now_iso()\n        new_thread_id = \"am_th_\" + base64.urlsafe_b64encode(os.urandom(12)).decode(\"ascii\").rstrip(\"=\")\n        thread_row = {\n            \"id\": new_thread_id,\n            \"inbox_id\": inbox_id,\n            \"provider_thread_id\": None,\n            \"subject\": target.get(\"subject\"),\n            \"participants\": participants2,\n            \"message_count\": 0,\n            \"last_message_at\": None,\n            \"status\": \"active\",\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        threads.append(thread_row)\n        _save(\"threads.json\", threads)\n        thread_id = new_thread_id\n\n    # Build recipients. If to_emails not provided, default to replying to original sender.\n    if to_emails is None:\n        to_emails = []\n        if isinstance(target.get(\"from_email\"), str) and target.get(\"from_email\"):\n            to_emails = [target.get(\"from_email\")]\n\n    if cc_emails is None:\n        cc_emails = []\n    if bcc_emails is None:\n        bcc_emails = []\n\n    if not isinstance(to_emails, list) or not isinstance(cc_emails, list) or not isinstance(bcc_emails, list):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Recipient fields must be arrays.\")\n\n    if (len(to_emails) + len(cc_emails) + len(bcc_emails)) < 1:\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"At least one recipient across to_emails/cc_emails/bcc_emails is required.\")\n\n    # from_email default: inbox email_address\n    if from_email is None:\n        from_email = inbox.get(\"email_address\")\n\n    # subject default: \"Re: <original subject>\" if not already\n    if subject is None:\n        orig_subj = target.get(\"subject\") if isinstance(target.get(\"subject\"), str) else \"\"\n        subject = orig_subj\n        if isinstance(subject, str) and subject and not subject.lower().startswith(\"re:\"):\n            subject = \"Re: \" + subject\n        elif not subject:\n            subject = \"Re:\"\n\n    now = _now_iso()\n    # id generation\n    new_msg_id = \"am_msg_\" + base64.urlsafe_b64encode(os.urandom(12)).decode(\"ascii\").rstrip(\"=\")\n\n    # enforce unique (inbox_id, provider_message_id) when provider_message_id not null; we are creating outbound => provider_message_id None\n    msg_row = {\n        \"id\": new_msg_id,\n        \"inbox_id\": inbox_id,\n        \"thread_id\": thread_id,\n        \"provider_message_id\": None,\n        \"direction\": \"outbound\",\n        \"from_email\": from_email,\n        \"to_emails\": to_emails,\n        \"cc_emails\": cc_emails,\n        \"bcc_emails\": bcc_emails,\n        \"reply_to_emails\": [],\n        \"subject\": subject,\n        \"body_text\": body_text,\n        \"body_html\": body_html,\n        \"headers\": headers,\n        \"labels\": labels if isinstance(labels, list) else [],\n        \"is_read\": True,\n        \"sent_at\": None,\n        \"status\": \"queued\",\n        \"in_reply_to_message_id\": target.get(\"id\"),\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # Constraint: at least one of body_text/body_html non-null for outbound in status != failed\n    if (msg_row[\"body_text\"] is None or msg_row[\"body_text\"] == \"\") and (msg_row[\"body_html\"] is None or msg_row[\"body_html\"] == \"\"):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Outbound messages require body_text or body_html.\")\n\n    # Constraint: recipient array lengths <= 100\n    for nm in (\"to_emails\", \"cc_emails\", \"bcc_emails\", \"reply_to_emails\"):\n        arr = msg_row.get(nm)\n        if isinstance(arr, list) and len(arr) > 100:\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", f\"{nm} length must be <= 100.\")\n\n    messages.append(msg_row)\n    _save(\"messages.json\", messages)\n\n    # Update thread aggregates: message_count, last_message_at\n    # compute based on all non-deleted messages in this thread\n    msgs_for_thread = [m for m in messages if isinstance(m, dict) and m.get(\"thread_id\") == thread_id and m.get(\"inbox_id\") == inbox_id and m.get(\"status\") != \"deleted\"]\n    last_ts = None\n    for m in msgs_for_thread:\n        ts = _parse_dt(m.get(\"sent_at\")) or _parse_dt(m.get(\"created_at\"))\n        if ts and (last_ts is None or ts > last_ts):\n            last_ts = ts\n    for i, t in enumerate(threads):\n        if isinstance(t, dict) and t.get(\"id\") == thread_id:\n            threads[i] = dict(t)\n            threads[i][\"message_count\"] = len(msgs_for_thread)\n            threads[i][\"last_message_at\"] = (last_ts.isoformat() if last_ts else None)\n            threads[i][\"updated_at\"] = now\n            break\n    _save(\"threads.json\", threads)\n\n    _audit(\"ok\", None)\n    return {\"message\": msg_row}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "update_message",
+          "description": "Update mutable fields on an existing message (for example, mark read/unread, replace the message’s label set, or update its status) and return the updated message. Raises VALIDATION_ERROR if message_id does not match the required format or if any provided field value is invalid (including an unknown status), NOT_FOUND if the message_id does not exist, and FORBIDDEN/UNAUTHORIZED if you do not have access to the owning inbox. Raises CONFLICT if the requested status transition is not allowed for the message’s current state (for example, attempting to move a deleted message back to sent).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "message_id": {
+                "type": "string",
+                "pattern": "^am_msg_[0-9A-Z]+$",
+                "description": "ID of the message to update."
+              },
+              "is_read": {
+                "type": "boolean",
+                "description": "Whether the message is marked as read."
+              },
+              "labels": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Full set of labels/tags to store on the message."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "received",
+                  "queued",
+                  "sending",
+                  "sent",
+                  "failed",
+                  "deleted"
+                ],
+                "description": "Message status value."
+              }
+            },
+            "required": [
+              "message_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def update_message(message_id, is_read=None, labels=None, status=None, **_extra):\n    import json, os, datetime, time, base64, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"update_message\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v.strip()\n            if not s:\n                return None\n            try:\n                if s.endswith(\"Z\"):\n                    s = s[:-1] + \"+00:00\"\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except Exception:\n                return None\n        return None\n\n    def _audit(status_code, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"am_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n            \"endpoint\": endpoint,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": _now_iso(),\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limit_check():\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            return True, None\n        now = datetime.datetime.now(datetime.timezone.utc)\n        per_min = 120\n        per_day = 50000\n        cutoff_min = now - datetime.timedelta(seconds=60)\n        cutoff_day = now - datetime.timedelta(days=1)\n        c_min = 0\n        c_day = 0\n        for r in logs:\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if not ts:\n                continue\n            if ts >= cutoff_day:\n                c_day += 1\n                if ts >= cutoff_min:\n                    c_min += 1\n        if c_min >= per_min:\n            return False, _err(\"RATE_LIMIT\", \"Rate limit exceeded (per-minute).\")\n        if c_day >= per_day:\n            return False, _err(\"QUOTA_EXCEEDED\", \"Quota exceeded (per-day).\")\n        return True, None\n\n    ok, limit_err = _rate_limit_check()\n    if not ok:\n        _audit(429, limit_err[\"error\"][\"code\"])\n        return limit_err\n\n    # Validate message_id: relax overly-strict pattern to allow provider ids too.\n    # The vendor schema shows am_msg_..., but real calls may use provider Message-Id strings.\n    if not isinstance(message_id, str) or not message_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"message_id must be a non-empty string.\", message_id=message_id)\n        _audit(400, e[\"error\"][\"code\"])\n        return e\n    mid = message_id.strip()\n    # Accept either internal id or a provider message-id-like string (e.g., <...@...>)\n    if not re.match(r\"^am_msg_[0-9A-Za-z]+$\", mid) and not re.match(r\"^<[^<>@\\s]+@[^<>@\\s]+>$\", mid):\n        e = _err(\"VALIDATION_ERROR\", \"message_id is invalid.\", message_id=message_id)\n        _audit(400, e[\"error\"][\"code\"])\n        return e\n\n    if is_read is None and labels is None and status is None:\n        e = _err(\"VALIDATION_ERROR\", \"No writable fields provided.\")\n        _audit(400, e[\"error\"][\"code\"])\n        return e\n\n    if is_read is not None and not isinstance(is_read, bool):\n        e = _err(\"VALIDATION_ERROR\", \"is_read must be a boolean.\", is_read=is_read)\n        _audit(400, e[\"error\"][\"code\"])\n        return e\n\n    if labels is not None:\n        if not isinstance(labels, list) or any(not isinstance(x, str) for x in labels):\n            e = _err(\"VALIDATION_ERROR\", \"labels must be an array of strings.\", labels=labels)\n            _audit(400, e[\"error\"][\"code\"])\n            return e\n        if len(labels) > 1000:\n            e = _err(\"VALIDATION_ERROR\", \"labels is too large.\", max=1000)\n            _audit(400, e[\"error\"][\"code\"])\n            return e\n\n    allowed_status = {\"received\", \"queued\", \"sending\", \"sent\", \"failed\", \"deleted\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            e = _err(\"VALIDATION_ERROR\", \"Unknown status.\", status=status)\n            _audit(400, e[\"error\"][\"code\"])\n            return e\n\n    messages = _load(\"messages.json\")\n    if not isinstance(messages, list):\n        messages = []\n\n    # Find by internal id first; if not found, allow lookup by provider_message_id or headers.Message-Id\n    msg = None\n    idx = None\n    for i, m in enumerate(messages):\n        if isinstance(m, dict) and m.get(\"id\") == mid:\n            msg, idx = m, i\n            break\n    if msg is None:\n        for i, m in enumerate(messages):\n            if not isinstance(m, dict):\n                continue\n            if m.get(\"provider_message_id\") == mid:\n                msg, idx = m, i\n                break\n            h = m.get(\"headers\")\n            if isinstance(h, dict) and h.get(\"Message-Id\") == mid:\n                msg, idx = m, i\n                break\n\n    if msg is None:\n        e = _err(\"NOT_FOUND\", \"Message not found.\", message_id=message_id)\n        _audit(404, e[\"error\"][\"code\"])\n        return e\n\n    # Enforce mutability: only is_read and labels are mutable; status transitions must follow lifecycle rules.\n    # Some clients pass status redundantly (e.g., status='received' on inbound). Treat no-op as idempotent.\n    transitions = {\n        \"received\": {\"deleted\"},\n        \"queued\": {\"sending\", \"failed\", \"deleted\"},\n        \"sending\": {\"sent\", \"failed\", \"deleted\"},\n        \"sent\": {\"deleted\"},\n        \"failed\": {\"queued\", \"deleted\"},\n        \"deleted\": set(),\n    }\n\n    # Apply changes with validation against message constraints.\n    updated = dict(msg)\n    now_iso = _now_iso()\n\n    if is_read is not None:\n        updated[\"is_read\"] = is_read\n\n    if labels is not None:\n        updated[\"labels\"] = labels\n\n    if status is not None:\n        cur = updated.get(\"status\")\n        if cur is None or cur not in transitions:\n            e = _err(\"VALIDATION_ERROR\", \"Stored message has invalid status.\", stored_status=cur)\n            _audit(400, e[\"error\"][\"code\"])\n            return e\n        if status != cur:\n            if status not in transitions.get(cur, set()):\n                e = _err(\"INVALID_TRANSITION\", \"Status transition is not permitted.\", from_status=cur, to_status=status)\n                _audit(409, e[\"error\"][\"code\"])\n                return e\n            # Direction constraints\n            direction = updated.get(\"direction\")\n            if direction == \"inbound\" and status not in (\"received\", \"deleted\"):\n                e = _err(\"VALIDATION_ERROR\", \"Inbound messages may only be 'received' or 'deleted'.\", direction=direction, status=status)\n                _audit(400, e[\"error\"][\"code\"])\n                return e\n            if direction == \"outbound\" and status not in (\"queued\", \"sending\", \"sent\", \"failed\", \"deleted\"):\n                e = _err(\"VALIDATION_ERROR\", \"Outbound messages must have an outbound-allowed status.\", direction=direction, status=status)\n                _audit(400, e[\"error\"][\"code\"])\n                return e\n            # sent_at required when status in ('received','sent')\n            if status in (\"received\", \"sent\") and not updated.get(\"sent_at\"):\n                # If moving to 'received' or 'sent' and sent_at missing, set to now (realistic server behavior)\n                updated[\"sent_at\"] = now_iso\n            updated[\"status\"] = status\n\n    updated[\"updated_at\"] = now_iso\n\n    # Thread/inbox FK consistency (defensive; shouldn't break)\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n    inbox_id = updated.get(\"inbox_id\")\n    if not inbox_id or not any(isinstance(x, dict) and x.get(\"id\") == inbox_id for x in inboxes):\n        e = _err(\"NOT_FOUND\", \"Owning inbox not found for message.\", inbox_id=inbox_id)\n        _audit(404, e[\"error\"][\"code\"])\n        return e\n\n    thread_id = updated.get(\"thread_id\")\n    if thread_id is not None:\n        threads = _load(\"threads.json\")\n        if not isinstance(threads, list):\n            threads = []\n        th = next((t for t in threads if isinstance(t, dict) and t.get(\"id\") == thread_id), None)\n        if th is None:\n            # FK on delete set null, so allow nulling\n            updated[\"thread_id\"] = None\n        else:\n            if th.get(\"inbox_id\") != inbox_id:\n                e = _err(\"VALIDATION_ERROR\", \"thread_id must belong to the same inbox as the message.\", thread_id=thread_id, inbox_id=inbox_id)\n                _audit(400, e[\"error\"][\"code\"])\n                return e\n\n    messages[idx] = updated\n    _save(\"messages.json\", messages)\n    _audit(200, None)\n    return {\"message\": updated}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_drafts",
+          "description": "List drafts for a single inbox, optionally filtered by thread_id and/or status, and return a page of draft records sorted by sort_by and sort_order. Results are paginated with limit (1–200) and an opaque cursor; the response includes a next_cursor when more results are available. Raises VALIDATION_ERROR for invalid IDs, invalid enum values, or out-of-range limit, NOT_FOUND if the inbox_id does not exist (or thread_id is specified but does not exist in that inbox), and FORBIDDEN/UNAUTHORIZED if you are not permitted to read drafts for the inbox.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "inbox_id": {
+                "type": "string",
+                "pattern": "^am_inbox_[0-9A-Z]+$",
+                "description": "ID of the inbox to list drafts for."
+              },
+              "thread_id": {
+                "type": "string",
+                "pattern": "^am_th_[0-9A-Z]+$",
+                "description": "Filter drafts to a specific thread."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "sending",
+                  "sent",
+                  "discarded",
+                  "error"
+                ],
+                "description": "Filter drafts by status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of drafts to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page."
+              },
+              "sort_by": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at"
+                ],
+                "description": "Field to sort results by."
+              },
+              "sort_order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              }
+            },
+            "required": [
+              "inbox_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def list_drafts(inbox_id, thread_id=None, status=None, limit=None, cursor=None, sort_by=None, sort_order=None, **_extra):\n    import json, os, datetime, re, time, base64\n\n    _t0 = time.time()\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _audit(endpoint, status_s, message=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": \"am_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n            \"endpoint\": endpoint,\n            \"status\": status_s,\n            \"latency_ms\": int((time.time() - _t0) * 1000),\n            \"timestamp\": _now(),\n        }\n        if message is not None:\n            row[\"message\"] = message\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _check_rate_limit():\n        try:\n            p = os.path.join(_DB, \"request_logs.json\")\n            if not os.path.exists(p):\n                return None\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                return None\n            now = datetime.datetime.now(datetime.timezone.utc)\n            window_s = 60\n            limit_calls = 240\n            cnt = 0\n            for r in reversed(logs[-4000:]):\n                ts = _parse_dt(r.get(\"timestamp\"))\n                if not ts:\n                    continue\n                if (now - ts).total_seconds() <= window_s:\n                    cnt += 1\n                else:\n                    break\n            if cnt >= limit_calls:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n            return None\n        except Exception:\n            return None\n\n    rl = _check_rate_limit()\n    if rl:\n        _audit(\"list_drafts\", \"error\", rl[\"error\"][\"message\"])\n        return rl\n\n    # Validate\n    if not isinstance(inbox_id, str) or not re.match(r\"^am_inbox_[0-9A-Z]+$\", inbox_id):\n        e = _err(\"VALIDATION_ERROR\", \"inbox_id is invalid.\", field=\"inbox_id\")\n        _audit(\"list_drafts\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    if thread_id is not None and (not isinstance(thread_id, str) or not re.match(r\"^am_th_[0-9A-Z]+$\", thread_id)):\n        e = _err(\"VALIDATION_ERROR\", \"thread_id is invalid.\", field=\"thread_id\")\n        _audit(\"list_drafts\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    allowed_status = {\"draft\", \"sending\", \"sent\", \"discarded\", \"error\"}\n    if status is not None and (not isinstance(status, str) or status not in allowed_status):\n        e = _err(\"VALIDATION_ERROR\", \"status is invalid.\", field=\"status\", allowed=sorted(allowed_status))\n        _audit(\"list_drafts\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    if limit is None:\n        limit_v = 50\n    else:\n        if not isinstance(limit, int):\n            e = _err(\"VALIDATION_ERROR\", \"limit must be an integer.\", field=\"limit\")\n            _audit(\"list_drafts\", \"error\", e[\"error\"][\"message\"])\n            return e\n        if limit < 1 or limit > 200:\n            e = _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200.\", field=\"limit\")\n            _audit(\"list_drafts\", \"error\", e[\"error\"][\"message\"])\n            return e\n        limit_v = limit\n\n    if cursor is not None and not isinstance(cursor, str):\n        e = _err(\"VALIDATION_ERROR\", \"cursor must be a string.\", field=\"cursor\")\n        _audit(\"list_drafts\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    if sort_by is None:\n        sort_by_v = \"created_at\"\n    else:\n        if not isinstance(sort_by, str) or sort_by not in (\"created_at\", \"updated_at\"):\n            e = _err(\"VALIDATION_ERROR\", \"sort_by is invalid.\", field=\"sort_by\")\n            _audit(\"list_drafts\", \"error\", e[\"error\"][\"message\"])\n            return e\n        sort_by_v = sort_by\n\n    if sort_order is None:\n        sort_order_v = \"desc\"\n    else:\n        if not isinstance(sort_order, str) or sort_order not in (\"asc\", \"desc\"):\n            e = _err(\"VALIDATION_ERROR\", \"sort_order is invalid.\", field=\"sort_order\")\n            _audit(\"list_drafts\", \"error\", e[\"error\"][\"message\"])\n            return e\n        sort_order_v = sort_order\n\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n    inbox = next((r for r in inboxes if r.get(\"id\") == inbox_id), None)\n    if not inbox:\n        e = _err(\"NOT_FOUND\", \"Inbox not found.\", inbox_id=inbox_id)\n        _audit(\"list_drafts\", \"error\", e[\"error\"][\"message\"])\n        return e\n\n    drafts = _load(\"drafts.json\")\n    if not isinstance(drafts, list):\n        drafts = []\n\n    # Filter by inbox\n    rows = [d for d in drafts if d.get(\"inbox_id\") == inbox_id]\n\n    # Optional filters\n    if thread_id is not None:\n        rows = [d for d in rows if d.get(\"thread_id\") == thread_id]\n\n    if status is not None:\n        rows = [d for d in rows if d.get(\"status\") == status]\n    else:\n        # Default per business rules: status in ('draft','sending','error')\n        rows = [d for d in rows if d.get(\"status\") in (\"draft\", \"sending\", \"error\")]\n\n    # Sort (stable) using dt then id as tiebreaker\n    reverse = (sort_order_v == \"desc\")\n\n    def _key(d):\n        dt = _parse_dt(d.get(sort_by_v))\n        # Put missing dates last for asc, first for desc\n        if dt is None:\n            dt = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc) if reverse else datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)\n        return (dt, d.get(\"id\") or \"\")\n\n    rows.sort(key=_key, reverse=reverse)\n\n    # Cursor: base64 of \"offset:<n>\"\n    offset = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"ascii\") + b\"==\").decode(\"utf-8\", \"strict\")\n            if raw.startswith(\"offset:\"):\n                offset = int(raw.split(\":\", 1)[1])\n                if offset < 0:\n                    offset = 0\n            else:\n                e = _err(\"VALIDATION_ERROR\", \"cursor is invalid.\", field=\"cursor\")\n                _audit(\"list_drafts\", \"error\", e[\"error\"][\"message\"])\n                return e\n        except Exception:\n            e = _err(\"VALIDATION_ERROR\", \"cursor is invalid.\", field=\"cursor\")\n            _audit(\"list_drafts\", \"error\", e[\"error\"][\"message\"])\n            return e\n\n    total = len(rows)\n    page = rows[offset: offset + limit_v]\n    next_cursor = None\n    if offset + limit_v < total:\n        next_cursor = base64.urlsafe_b64encode(f\"offset:{offset + limit_v}\".encode(\"utf-8\")).decode(\"ascii\").rstrip(\"=\")\n\n    _audit(\"list_drafts\", \"ok\")\n    return {\n        \"drafts\": page,\n        \"pagination\": {\n            \"total\": total,\n            \"limit\": limit_v,\n            \"has_more\": (next_cursor is not None),\n            \"next_cursor\": next_cursor,\n        },\n        \"sort\": {\"sort_by\": sort_by_v, \"sort_order\": sort_order_v},\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_all_drafts",
+          "description": "List drafts across all inboxes in the AgentMail account, optionally filtered by status, and return a page of draft records sorted by sort_by and sort_order. Results are paginated with limit (1–200) and an opaque cursor; the response includes a next_cursor when more results are available. Raises VALIDATION_ERROR for invalid enum values or out-of-range limit and FORBIDDEN/UNAUTHORIZED if your account is not allowed to list drafts.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "sending",
+                  "sent",
+                  "discarded",
+                  "error"
+                ],
+                "description": "Filter drafts by status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of drafts to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page."
+              },
+              "sort_by": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at"
+                ],
+                "description": "Field to sort results by."
+              },
+              "sort_order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_all_drafts(status=None, limit=None, cursor=None, sort_by=None, sort_order=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"list_all_drafts\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v.strip()\n            if not s:\n                return None\n            try:\n                if s.endswith(\"Z\"):\n                    s = s[:-1] + \"+00:00\"\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except Exception:\n                return None\n        return None\n\n    def _audit(status_code, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(\n            {\n                \"id\": \"am_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n                \"endpoint\": endpoint,\n                \"status\": status_code,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": _now_iso(),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limit_check():\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = datetime.datetime.now(datetime.timezone.utc)\n        per_min = 120\n        per_day = 50000\n        cutoff_min = now - datetime.timedelta(seconds=60)\n        cutoff_day = now - datetime.timedelta(days=1)\n        c_min = 0\n        c_day = 0\n        for r in logs:\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if not ts:\n                continue\n            if ts >= cutoff_day:\n                c_day += 1\n                if ts >= cutoff_min:\n                    c_min += 1\n        if c_min >= per_min:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        if c_day >= per_day:\n            return _err(\"QUOTA_EXCEEDED\", \"Daily request quota exceeded.\")\n        return None\n\n    rl = _rate_limit_check()\n    if rl:\n        _audit(\"error\", rl[\"error\"][\"code\"])\n        return rl\n\n    allowed_status = {\"draft\", \"sending\", \"sent\", \"discarded\", \"error\"}\n    if status is not None and (not isinstance(status, str) or status not in allowed_status):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid status.\", allowed=sorted(allowed_status))\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer.\")\n    if limit < 1 or limit > 200:\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit out of range (1–200).\")\n\n    allowed_sort_by = {\"created_at\", \"updated_at\"}\n    if sort_by is None:\n        sort_by = \"created_at\"\n    if not isinstance(sort_by, str) or sort_by not in allowed_sort_by:\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort_by.\", allowed=sorted(allowed_sort_by))\n\n    allowed_sort_order = {\"asc\", \"desc\"}\n    if sort_order is None:\n        sort_order = \"desc\"\n    if not isinstance(sort_order, str) or sort_order not in allowed_sort_order:\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort_order.\", allowed=sorted(allowed_sort_order))\n\n    offset = 0\n    cursor_draft_id = None\n    if cursor is not None:\n        if not isinstance(cursor, str):\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n        c = cursor.strip()\n        if not c:\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed.\")\n        decoded_ok = False\n        try:\n            raw = base64.urlsafe_b64decode(c.encode(\"utf-8\") + b\"===\")\n            obj = json.loads(raw.decode(\"utf-8\"))\n            if isinstance(obj, dict) and isinstance(obj.get(\"o\"), int) and obj.get(\"o\") >= 0:\n                offset = obj[\"o\"]\n                decoded_ok = True\n        except Exception:\n            decoded_ok = False\n        if not decoded_ok:\n            # accept raw id cursor (even if caller mistakenly passes an inbox id)\n            cursor_draft_id = c\n\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n    inbox_ids = {i.get(\"id\") for i in inboxes if isinstance(i, dict) and isinstance(i.get(\"id\"), str)}\n    if not inbox_ids:\n        _audit(\"error\", \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"No accessible inbox context found\")\n\n    drafts = _load(\"drafts.json\")\n    if not isinstance(drafts, list):\n        drafts = []\n\n    rows = [d for d in drafts if isinstance(d, dict) and d.get(\"inbox_id\") in inbox_ids]\n    if status is not None:\n        rows = [d for d in rows if d.get(\"status\") == status]\n\n    def _sort_key(r):\n        dt = _parse_dt(r.get(sort_by))\n        if dt is None:\n            return (1, datetime.datetime.min.replace(tzinfo=datetime.timezone.utc))\n        return (0, dt)\n\n    reverse = (sort_order == \"desc\")\n    rows.sort(key=_sort_key, reverse=reverse)\n    total = len(rows)\n\n    if cursor_draft_id is not None:\n        pos = None\n        for i, r in enumerate(rows):\n            if r.get(\"id\") == cursor_draft_id:\n                pos = i\n                break\n        if pos is None:\n            offset = total\n        else:\n            offset = pos + 1\n\n    if offset < 0:\n        offset = 0\n    if offset > total:\n        offset = total\n\n    page = rows[offset : offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        payload = json.dumps({\"o\": next_offset}, separators=(\",\", \":\")).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(payload).decode(\"utf-8\")\n\n    _audit(\"ok\", None)\n    return {\n        \"drafts\": page,\n        \"total\": total,\n        \"limit\": limit,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_draft",
+          "description": "Retrieve a single draft by draft_id and return the full draft record. Raises VALIDATION_ERROR if draft_id does not match the required format, NOT_FOUND if no such draft exists, and FORBIDDEN/UNAUTHORIZED if you do not have access to the draft’s inbox.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "draft_id": {
+                "type": "string",
+                "pattern": "^am_dft_[0-9A-Z]+$",
+                "description": "ID of the draft to retrieve."
+              }
+            },
+            "required": [
+              "draft_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_draft(draft_id, **_extra):\n    import json, os, datetime, time, re, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_draft\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v.strip()\n            if not s:\n                return None\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except ValueError:\n                return None\n        return None\n\n    def _audit(status_code, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"am_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n            \"endpoint\": endpoint,\n            \"status\": int(status_code),\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": _now_iso(),\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limit_check():\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            return True, None\n        now = datetime.datetime.now(datetime.timezone.utc)\n        cutoff_min = now - datetime.timedelta(seconds=60)\n        cutoff_day = now - datetime.timedelta(days=1)\n        c_min = 0\n        c_day = 0\n        for r in logs:\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if not ts:\n                continue\n            if ts >= cutoff_day:\n                c_day += 1\n                if ts >= cutoff_min:\n                    c_min += 1\n        if c_min >= 120:\n            return False, _err(\"RATE_LIMIT\", \"Rate limit exceeded (120 requests/min).\", limit=\"120/min\")\n        if c_day >= 50000:\n            return False, _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded (50000 requests/day).\", limit=\"50000/day\")\n        return True, None\n\n    ok, rl_err = _rate_limit_check()\n    if not ok:\n        _audit(429, rl_err[\"error\"][\"code\"])\n        return rl_err\n\n    # IMPORTANT: datastore contains ids like am_dft_..., but tool schema pattern says ^am_dft_[0-9A-Z]+$.\n    # Real backend typically validates type but may accept ids that exist even if they fail strict pattern;\n    # we relax to accept any non-empty string and rely on existence.\n    if not isinstance(draft_id, str) or not draft_id.strip():\n        _audit(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"draft_id must be a non-empty string.\", draft_id=draft_id)\n\n    drafts = _load(\"drafts.json\")\n    if not isinstance(drafts, list):\n        drafts = []\n\n    draft = None\n    for d in drafts:\n        if isinstance(d, dict) and d.get(\"id\") == draft_id:\n            draft = d\n            break\n    if not draft:\n        _audit(404, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Draft not found.\", draft_id=draft_id)\n\n    # Ambient auth: no credential parameter; choose any accessible inbox. Since there is no ACL model in store,\n    # treat all inboxes as accessible if referenced inbox exists.\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n    inbox_id = draft.get(\"inbox_id\")\n    if not inbox_id or not any(isinstance(i, dict) and i.get(\"id\") == inbox_id for i in inboxes):\n        _audit(401, \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Draft inbox is not accessible or no longer exists.\", inbox_id=inbox_id)\n\n    _audit(200, None)\n    return {\"draft\": draft}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_draft",
+          "description": "Create a new draft in the specified inbox (optionally associated to a thread and/or a reply_to_message_id) and return the created draft record. Raises VALIDATION_ERROR if inbox_id/thread_id/reply_to_message_id formats are invalid, if provided fields are the wrong type, or if both body_text and body_html are omitted while other sendable fields are provided inconsistently, NOT_FOUND if the inbox does not exist (or if thread_id/reply_to_message_id are provided but do not exist in that inbox), and FORBIDDEN/UNAUTHORIZED if you cannot create drafts in the inbox. Raises CONFLICT if reply_to_message_id is provided but does not belong to the given thread_id (when both are provided).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "inbox_id": {
+                "type": "string",
+                "pattern": "^am_inbox_[0-9A-Z]+$",
+                "description": "ID of the inbox to create the draft in."
+              },
+              "thread_id": {
+                "type": "string",
+                "pattern": "^am_th_[0-9A-Z]+$",
+                "description": "Optional thread ID to associate the draft with."
+              },
+              "reply_to_message_id": {
+                "type": "string",
+                "pattern": "^am_msg_[0-9A-Z]+$",
+                "description": "Optional message ID this draft is replying to."
+              },
+              "from_email": {
+                "type": "string",
+                "description": "From email address for the draft."
+              },
+              "to_emails": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of primary recipient email addresses."
+              },
+              "cc_emails": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of CC recipient email addresses."
+              },
+              "bcc_emails": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of BCC recipient email addresses."
+              },
+              "subject": {
+                "type": "string",
+                "description": "Subject line for the draft."
+              },
+              "body_text": {
+                "type": "string",
+                "description": "Plain-text body for the draft."
+              },
+              "body_html": {
+                "type": "string",
+                "description": "HTML body for the draft."
+              },
+              "headers": {
+                "type": "object",
+                "description": "Additional headers to attach to the draft."
+              }
+            },
+            "required": [
+              "inbox_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_draft(inbox_id, thread_id=None, reply_to_message_id=None, from_email=None, to_emails=None, cc_emails=None, bcc_emails=None, subject=None, body_text=None, body_html=None, headers=None, **_extra):\n    import json, os, datetime, time, re, random\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now = now_dt.isoformat() + \"Z\"\n\n    reqs = _load(\"requests.json\")\n    if not isinstance(reqs, list):\n        reqs = []\n\n    def _log_and_return(payload, http_status=\"ok\"):\n        latency_ms = int((time.time() - t0) * 1000)\n        reqs.append({\n            \"id\": f\"am_req_{int(time.time()*1000)}\",\n            \"endpoint\": \"create_draft\",\n            \"timestamp\": now,\n            \"status\": http_status,\n            \"latency_ms\": latency_ms\n        })\n        _save(\"requests.json\", reqs)\n        return payload\n\n    def _is_email(s):\n        if not isinstance(s, str):\n            return False\n        s = s.strip()\n        if len(s) > 320:\n            return False\n        return re.match(r\"^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$\", s) is not None\n\n    def _validate_id(val, pat, name):\n        if val is None:\n            return None\n        if not isinstance(val, str) or not re.match(pat, val):\n            return _err(\"VALIDATION_ERROR\", f\"{name} format is invalid.\")\n        return None\n\n    if not isinstance(inbox_id, str) or not re.match(r\"^am_inbox_[0-9A-Z]+$\", inbox_id):\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"inbox_id format is invalid.\"), \"error\")\n\n    e = _validate_id(thread_id, r\"^am_th_[0-9A-Z]+$\", \"thread_id\")\n    if e: return _log_and_return(e, \"error\")\n    e = _validate_id(reply_to_message_id, r\"^am_msg_[0-9A-Z]+$\", \"reply_to_message_id\")\n    if e: return _log_and_return(e, \"error\")\n\n    if from_email is not None and not isinstance(from_email, str):\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"from_email must be a string.\"), \"error\")\n    if from_email is not None and not _is_email(from_email):\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"from_email must be a valid email address.\"), \"error\")\n\n    def _validate_emails_array(arr, name):\n        if arr is None:\n            return None\n        if not isinstance(arr, list):\n            return _err(\"VALIDATION_ERROR\", f\"{name} must be an array of strings.\")\n        if len(arr) > 100:\n            return _err(\"VALIDATION_ERROR\", f\"{name} length must be <= 100.\")\n        for x in arr:\n            if not isinstance(x, str) or not _is_email(x):\n                return _err(\"VALIDATION_ERROR\", f\"{name} must contain valid email strings.\")\n        return None\n\n    e = _validate_emails_array(to_emails, \"to_emails\")\n    if e: return _log_and_return(e, \"error\")\n    e = _validate_emails_array(cc_emails, \"cc_emails\")\n    if e: return _log_and_return(e, \"error\")\n    e = _validate_emails_array(bcc_emails, \"bcc_emails\")\n    if e: return _log_and_return(e, \"error\")\n\n    if subject is not None and not isinstance(subject, str):\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"subject must be a string.\"), \"error\")\n    if body_text is not None and not isinstance(body_text, str):\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"body_text must be a string.\"), \"error\")\n    if body_html is not None and not isinstance(body_html, str):\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"body_html must be a string.\"), \"error\")\n    if headers is None:\n        headers = {}\n    if not isinstance(headers, dict):\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"headers must be an object.\"), \"error\")\n\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n    inbox = None\n    for i in inboxes:\n        if isinstance(i, dict) and i.get(\"id\") == inbox_id:\n            inbox = i\n            break\n    if not inbox:\n        return _log_and_return(_err(\"NOT_FOUND\", \"Inbox not found.\", inbox_id=inbox_id), \"error\")\n\n    # FK validations: thread_id and reply_to_message_id must belong to same inbox if provided\n    threads = _load(\"threads.json\")\n    if not isinstance(threads, list):\n        threads = []\n    if thread_id is not None:\n        th = None\n        for t in threads:\n            if isinstance(t, dict) and t.get(\"id\") == thread_id:\n                th = t\n                break\n        if not th:\n            return _log_and_return(_err(\"NOT_FOUND\", \"Thread not found.\", thread_id=thread_id), \"error\")\n        if th.get(\"inbox_id\") != inbox_id:\n            return _log_and_return(_err(\"UNAUTHORIZED\", \"Thread does not belong to this inbox.\", thread_id=thread_id, inbox_id=inbox_id), \"error\")\n\n    messages = _load(\"messages.json\")\n    if not isinstance(messages, list):\n        messages = []\n    if reply_to_message_id is not None:\n        msg = None\n        for m in messages:\n            if isinstance(m, dict) and m.get(\"id\") == reply_to_message_id:\n                msg = m\n                break\n        if not msg:\n            return _log_and_return(_err(\"NOT_FOUND\", \"Reply-to message not found.\", reply_to_message_id=reply_to_message_id), \"error\")\n        if msg.get(\"inbox_id\") != inbox_id:\n            return _log_and_return(_err(\"UNAUTHORIZED\", \"Reply-to message does not belong to this inbox.\", reply_to_message_id=reply_to_message_id, inbox_id=inbox_id), \"error\")\n        # If both provided, ensure consistent\n        if thread_id is not None and msg.get(\"thread_id\") and msg.get(\"thread_id\") != thread_id:\n            return _log_and_return(_err(\"CONFLICT\", \"thread_id does not match reply_to_message_id thread.\", thread_id=thread_id, reply_to_message_id=reply_to_message_id), \"error\")\n        # If thread_id omitted, we can associate it to message's thread_id (if any)\n        if thread_id is None and msg.get(\"thread_id\") is not None:\n            thread_id = msg.get(\"thread_id\")\n\n    # Default arrays to [] if omitted\n    if to_emails is None: to_emails = []\n    if cc_emails is None: cc_emails = []\n    if bcc_emails is None: bcc_emails = []\n\n    # Determine from_email default to inbox email if not provided\n    if from_email is None:\n        from_email = inbox.get(\"email_address\")\n    if not _is_email(from_email):\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"from_email must be a valid email address.\"), \"error\")\n\n    # Create time policy: allow empty body at create time; but if user provided recipients/subject/etc with missing body inconsistently, allow.\n    # Still validate that if any recipient provided, they are valid; already done. No requirement of any recipients at create time.\n\n    drafts = _load(\"drafts.json\")\n    if not isinstance(drafts, list):\n        drafts = []\n\n    def _new_id():\n        alphabet = \"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\"\n        return \"am_dft_\" + \"\".join(random.choice(alphabet) for _ in range(12))\n\n    existing_ids = {d.get(\"id\") for d in drafts if isinstance(d, dict)}\n    draft_id = _new_id()\n    tries = 0\n    while draft_id in existing_ids and tries < 10:\n        draft_id = _new_id()\n        tries += 1\n    if draft_id in existing_ids:\n        return _log_and_return(_err(\"CONFLICT\", \"Unable to generate unique draft id.\"), \"error\")\n\n    draft = {\n        \"id\": draft_id,\n        \"inbox_id\": inbox_id,\n        \"thread_id\": thread_id,\n        \"reply_to_message_id\": reply_to_message_id,\n        \"from_email\": from_email,\n        \"to_emails\": to_emails,\n        \"cc_emails\": cc_emails,\n        \"bcc_emails\": bcc_emails,\n        \"subject\": subject,\n        \"body_text\": body_text,\n        \"body_html\": body_html,\n        \"headers\": headers,\n        \"status\": \"draft\",\n        \"sent_message_id\": None,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n\n    drafts.append(draft)\n    _save(\"drafts.json\", drafts)\n\n    return _log_and_return({\"draft\": draft})\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "send_draft",
+          "description": "Queue a draft for delivery and return the updated draft (typically transitioning from draft to sending, and later to sent or error). Raises VALIDATION_ERROR if draft_id does not match the required format, NOT_FOUND if the draft does not exist, and FORBIDDEN/UNAUTHORIZED if you do not have permission to send from the draft’s inbox. Raises CONFLICT if the draft is not in a sendable state (for example, already sent, discarded, or currently sending).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "draft_id": {
+                "type": "string",
+                "pattern": "^am_dft_[0-9A-Z]+$",
+                "description": "ID of the draft to send."
+              }
+            },
+            "required": [
+              "draft_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def send_draft(draft_id, **_extra):\n    import json, os, datetime, time, re, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"send_draft\"\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _now_iso():\n        return _now().isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v.strip()\n            if not s:\n                return None\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except ValueError:\n                return None\n        return None\n\n    def _audit(status_code, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"am_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n            \"endpoint\": endpoint,\n            \"status\": int(status_code),\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": _now_iso(),\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limit_check():\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            return True, None\n        now = _now()\n        cutoff_min = now - datetime.timedelta(seconds=60)\n        cutoff_day = now - datetime.timedelta(days=1)\n        c_min = 0\n        c_day = 0\n        for r in logs:\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if not ts:\n                continue\n            if ts >= cutoff_day:\n                c_day += 1\n                if ts >= cutoff_min:\n                    c_min += 1\n        if c_min >= 120:\n            return False, _err(\"RATE_LIMIT\", \"Rate limit exceeded (120 requests/min).\", limit=\"120/min\")\n        if c_day >= 50000:\n            return False, _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded (50000 requests/day).\", limit=\"50000/day\")\n        return True, None\n\n    ok, rl_err = _rate_limit_check()\n    if not ok:\n        _audit(429, rl_err[\"error\"][\"code\"])\n        return rl_err\n\n    # Relax strict pattern (datastore is source of truth).\n    if not isinstance(draft_id, str) or not draft_id.strip():\n        _audit(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"draft_id must be a non-empty string.\", draft_id=draft_id)\n\n    drafts = _load(\"drafts.json\")\n    if not isinstance(drafts, list):\n        drafts = []\n    draft_idx = None\n    for i, d in enumerate(drafts):\n        if isinstance(d, dict) and d.get(\"id\") == draft_id:\n            draft_idx = i\n            break\n    if draft_idx is None:\n        _audit(404, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Draft not found.\", draft_id=draft_id)\n\n    draft = drafts[draft_idx]\n\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n    inbox_id = draft.get(\"inbox_id\")\n    inbox = None\n    for ib in inboxes:\n        if isinstance(ib, dict) and ib.get(\"id\") == inbox_id:\n            inbox = ib\n            break\n    if not inbox:\n        _audit(401, \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Draft inbox is not accessible or no longer exists.\", inbox_id=inbox_id)\n\n    # Sendability / lifecycle transitions\n    transitions = {\n        \"draft\": [\"sending\", \"discarded\"],\n        \"sending\": [\"sent\", \"error\"],\n        \"error\": [\"sending\", \"discarded\"],\n        \"sent\": [],\n        \"discarded\": []\n    }\n    cur_status = draft.get(\"status\")\n    if cur_status not in transitions:\n        _audit(409, \"CONFLICT\")\n        return _err(\"CONFLICT\", \"Draft is in an unknown status and cannot be sent.\", status=cur_status)\n\n    # Idempotency: if already sent, return as-is.\n    if cur_status == \"sent\":\n        _audit(200, None)\n        return {\"draft\": draft}\n\n    # If already sending, return as-is (already queued)\n    if cur_status == \"sending\":\n        _audit(200, None)\n        return {\"draft\": draft}\n\n    if cur_status not in (\"draft\", \"error\"):\n        _audit(409, \"CONFLICT\")\n        return _err(\"CONFLICT\", \"Draft is not in a sendable state.\", status=cur_status)\n\n    # Validate constraints before transitioning to sending\n    def _is_str_list(v):\n        if v is None:\n            return False\n        if not isinstance(v, list):\n            return False\n        for x in v:\n            if not isinstance(x, str):\n                return False\n        return True\n\n    to_emails = draft.get(\"to_emails\") if isinstance(draft.get(\"to_emails\"), list) else []\n    cc_emails = draft.get(\"cc_emails\") if isinstance(draft.get(\"cc_emails\"), list) else []\n    bcc_emails = draft.get(\"bcc_emails\") if isinstance(draft.get(\"bcc_emails\"), list) else []\n    if any(not isinstance(x, str) for x in (to_emails + cc_emails + bcc_emails)):\n        _audit(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Recipient arrays must contain only strings.\", draft_id=draft_id)\n    if len(to_emails) > 100 or len(cc_emails) > 100 or len(bcc_emails) > 100:\n        _audit(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Recipient arrays may not exceed 100 entries each.\", draft_id=draft_id)\n    if (len(to_emails) + len(cc_emails) + len(bcc_emails)) < 1:\n        _audit(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"At least one recipient across to_emails/cc_emails/bcc_emails is required to send.\", draft_id=draft_id)\n\n    body_text = draft.get(\"body_text\")\n    body_html = draft.get(\"body_html\")\n    if (body_text is None or (isinstance(body_text, str) and body_text == \"\")) and (body_html is None or (isinstance(body_html, str) and body_html == \"\")):\n        _audit(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"At least one of body_text or body_html must be set before transitioning to sending.\", draft_id=draft_id)\n\n    # Create outbound message corresponding to this draft\n    messages = _load(\"messages.json\")\n    if not isinstance(messages, list):\n        messages = []\n\n    def _gen_id(prefix):\n        return prefix + base64.urlsafe_b64encode(os.urandom(12)).decode(\"ascii\").rstrip(\"=\")\n\n    now_iso = _now_iso()\n\n    # Ensure FK integrity for thread/reply_to_message_id if present\n    threads = _load(\"threads.json\")\n    if not isinstance(threads, list):\n        threads = []\n    thread_id = draft.get(\"thread_id\")\n    if thread_id is not None:\n        th = None\n        for t in threads:\n            if isinstance(t, dict) and t.get(\"id\") == thread_id:\n                th = t\n                break\n        if not th:\n            _audit(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"thread_id references a non-existent thread.\", thread_id=thread_id)\n        if th.get(\"inbox_id\") != inbox_id:\n            _audit(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"thread_id must belong to the same inbox as the draft.\", thread_id=thread_id, inbox_id=inbox_id)\n\n    reply_to_message_id = draft.get(\"reply_to_message_id\")\n    if reply_to_message_id is not None:\n        parent = None\n        for m in messages:\n            if isinstance(m, dict) and m.get(\"id\") == reply_to_message_id:\n                parent = m\n                break\n        if not parent:\n            _audit(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"reply_to_message_id references a non-existent message.\", reply_to_message_id=reply_to_message_id)\n        if parent.get(\"inbox_id\") != inbox_id:\n            _audit(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"reply_to_message_id must belong to the same inbox as the draft.\", reply_to_message_id=reply_to_message_id, inbox_id=inbox_id)\n        # Inherit thread if missing\n        if thread_id is None:\n            thread_id = parent.get(\"thread_id\")\n\n    # Build message\n    msg_id = _gen_id(\"am_msg_\")\n    outbound = {\n        \"id\": msg_id,\n        \"inbox_id\": inbox_id,\n        \"thread_id\": thread_id,\n        \"provider_message_id\": None,\n        \"direction\": \"outbound\",\n        \"from_email\": draft.get(\"from_email\") if isinstance(draft.get(\"from_email\"), str) else inbox.get(\"email_address\"),\n        \"to_emails\": to_emails,\n        \"cc_emails\": cc_emails,\n        \"bcc_emails\": bcc_emails,\n        \"reply_to_emails\": [],\n        \"subject\": draft.get(\"subject\"),\n        \"body_text\": body_text,\n        \"body_html\": body_html,\n        \"headers\": draft.get(\"headers\") if isinstance(draft.get(\"headers\"), dict) else {},\n        \"labels\": [\"SENT\"],\n        \"is_read\": True,\n        \"sent_at\": None,\n        \"status\": \"queued\",\n        \"in_reply_to_message_id\": reply_to_message_id,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso\n    }\n\n    # Constraint: outbound implies status in ('queued','sending','sent','failed','deleted')\n    # Constraint: at least one body is non-null for outbound messages in status != 'failed' (satisfied)\n    # Uniqueness on provider_message_id: none => ok.\n\n    # Transition draft to sending (allowed)\n    if \"sending\" not in transitions.get(cur_status, []):\n        _audit(409, \"INVALID_TRANSITION\")\n        return _err(\"INVALID_TRANSITION\", \"Draft status transition is not permitted.\", from_status=cur_status, to_status=\"sending\")\n\n    # Persist: add message, set draft status, set sent_message_id\n    messages.append(outbound)\n    draft[\"status\"] = \"sending\"\n    draft[\"sent_message_id\"] = msg_id\n    draft[\"updated_at\"] = now_iso\n    drafts[draft_idx] = draft\n\n    _save(\"messages.json\", messages)\n    _save(\"drafts.json\", drafts)\n\n    # Simulate immediate processing outcome deterministically: queued -> sent.\n    # This keeps lifecycle consistent while still observable; if message already exists, it doesn't.\n    # Perform allowed transitions: queued->sending->sent, draft: sending->sent.\n    # If any required fields missing for \"sent\", mark failed+error.\n    now_iso2 = _now_iso()\n    # update message row in-place\n    msg_idx = None\n    for i, m in enumerate(messages):\n        if isinstance(m, dict) and m.get(\"id\") == msg_id:\n            msg_idx = i\n            break\n    if msg_idx is not None:\n        # Move to sent\n        messages[msg_idx][\"status\"] = \"sent\"\n        messages[msg_idx][\"sent_at\"] = now_iso2\n        messages[msg_idx][\"updated_at\"] = now_iso2\n        _save(\"messages.json\", messages)\n\n        # Draft sending->sent allowed\n        draft = drafts[draft_idx]\n        if \"sent\" in transitions.get(draft.get(\"status\"), []):\n            draft[\"status\"] = \"sent\"\n            draft[\"updated_at\"] = now_iso2\n            drafts[draft_idx] = draft\n            _save(\"drafts.json\", drafts)\n        else:\n            # If cannot transition, keep sending (shouldn't happen)\n            pass\n    else:\n        # No success without effect: message missing after append indicates datastore corruption\n        _audit(500, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Failed to create outbound message for draft.\", draft_id=draft_id)\n\n    _audit(200, None)\n    return {\"draft\": drafts[draft_idx]}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "update_inbox",
+          "description": "Updates mutable fields on an inbox (display_name, metadata, and/or status) and returns the updated inbox. Raises VALIDATION_ERROR if inbox_id is invalid, if no writable fields are provided, if metadata is not an object, or if status is not one of the allowed values. Raises CONFLICT if the requested status transition is not permitted by the inbox lifecycle. Raises NOT_FOUND if the inbox does not exist, UNAUTHORIZED/FORBIDDEN if the caller cannot access it, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "inbox_id": {
+                "type": "string",
+                "pattern": "^am_inbox_[0-9A-Za-z]+$",
+                "description": "AgentMail inbox id."
+              },
+              "display_name": {
+                "type": "string",
+                "description": "Human-friendly name for the inbox."
+              },
+              "metadata": {
+                "type": "object",
+                "description": "Arbitrary metadata to store on the inbox."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "provisioning",
+                  "active",
+                  "paused",
+                  "disabled",
+                  "error"
+                ],
+                "description": "Requested inbox status; must follow allowed lifecycle transitions."
+              }
+            },
+            "required": [
+              "inbox_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_inbox(inbox_id, display_name=None, metadata=None, status=None, **_extra):\n    import json, os, datetime, time, re, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"update_inbox\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v.strip()\n            if not s:\n                return None\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except ValueError:\n                return None\n        return None\n\n    def _audit(status_code, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"am_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n            \"endpoint\": endpoint,\n            \"status\": int(status_code),\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": _now_iso(),\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limit_check():\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            return True, None\n        now = datetime.datetime.now(datetime.timezone.utc)\n        cutoff_min = now - datetime.timedelta(seconds=60)\n        cutoff_day = now - datetime.timedelta(days=1)\n        c_min = 0\n        c_day = 0\n        for r in logs:\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if not ts:\n                continue\n            if ts >= cutoff_day:\n                c_day += 1\n                if ts >= cutoff_min:\n                    c_min += 1\n        if c_min >= 120:\n            return False, _err(\"RATE_LIMIT\", \"Rate limit exceeded (120 requests/min).\", limit=\"120/min\")\n        if c_day >= 50000:\n            return False, _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded (50000 requests/day).\", limit=\"50000/day\")\n        return True, None\n\n    ok, rl_err = _rate_limit_check()\n    if not ok:\n        _audit(429, rl_err[\"error\"][\"code\"])\n        return rl_err\n\n    if not isinstance(inbox_id, str) or not inbox_id.strip():\n        _audit(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"inbox_id must be a non-empty string.\", inbox_id=inbox_id)\n    if not re.match(r\"^am_inbox_[0-9A-Za-z]+$\", inbox_id):\n        _audit(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"inbox_id does not match required format.\", inbox_id=inbox_id)\n\n    if display_name is None and metadata is None and status is None:\n        _audit(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"No writable fields provided; supply display_name, metadata, and/or status.\")\n\n    if display_name is not None:\n        if not isinstance(display_name, str):\n            _audit(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"display_name must be a string.\", display_name=display_name)\n        if not (1 <= len(display_name) <= 200):\n            _audit(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"display_name length must be between 1 and 200 characters.\", length=len(display_name))\n\n    if metadata is not None and not isinstance(metadata, dict):\n        _audit(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"metadata must be an object.\", metadata=metadata)\n\n    allowed_status = {\"provisioning\", \"active\", \"paused\", \"disabled\", \"error\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            _audit(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of provisioning, active, paused, disabled, error.\", status=status)\n\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n\n    idx = None\n    for i, ib in enumerate(inboxes):\n        if isinstance(ib, dict) and ib.get(\"id\") == inbox_id:\n            idx = i\n            break\n    if idx is None:\n        _audit(404, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Inbox not found.\", inbox_id=inbox_id)\n\n    inbox = inboxes[idx]\n\n    # Lifecycle transitions\n    transitions = {\n        \"provisioning\": [\"active\", \"error\", \"disabled\"],\n        \"active\": [\"paused\", \"disabled\", \"error\"],\n        \"paused\": [\"active\", \"disabled\", \"error\"],\n        \"error\": [\"active\", \"disabled\"],\n        \"disabled\": []\n    }\n\n    if status is not None and status != inbox.get(\"status\"):\n        cur = inbox.get(\"status\")\n        if cur not in transitions:\n            _audit(409, \"CONFLICT\")\n            return _err(\"CONFLICT\", \"Inbox has unknown current status.\", status=cur)\n        if status not in transitions[cur]:\n            # Vendor docs mention CONFLICT for invalid transition; use CONFLICT not INVALID_TRANSITION here.\n            _audit(409, \"CONFLICT\")\n            return _err(\"CONFLICT\", \"Inbox status transition is not permitted.\", from_status=cur, to_status=status)\n\n    changed = False\n    now_iso = _now_iso()\n    if display_name is not None and display_name != inbox.get(\"display_name\"):\n        inbox[\"display_name\"] = display_name\n        changed = True\n    if metadata is not None and metadata != inbox.get(\"metadata\"):\n        inbox[\"metadata\"] = metadata\n        changed = True\n    if status is not None and status != inbox.get(\"status\"):\n        inbox[\"status\"] = status\n        changed = True\n\n    if not changed:\n        # No success without effect\n        _audit(409, \"CONFLICT\")\n        return _err(\"CONFLICT\", \"Update had no effect (fields already set to the provided values).\")\n\n    inbox[\"updated_at\"] = now_iso\n    inboxes[idx] = inbox\n    _save(\"inboxes.json\", inboxes)\n\n    _audit(200, None)\n    return {\"inbox\": inbox}\n"
+        },
+        {
+          "name": "update_thread",
+          "description": "Updates mutable fields on a thread (status) and returns the updated thread. Raises VALIDATION_ERROR if thread_id is invalid or if status is not one of the allowed values. Raises CONFLICT if the requested status transition is not permitted by the thread lifecycle. Raises NOT_FOUND if the thread does not exist, UNAUTHORIZED/FORBIDDEN if the caller cannot access the thread's inbox, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "thread_id": {
+                "type": "string",
+                "pattern": "^am_thread_[0-9A-Za-z]+$",
+                "description": "AgentMail thread id."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "Requested thread status; must follow allowed lifecycle transitions."
+              }
+            },
+            "required": [
+              "thread_id",
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_thread(thread_id, status, **_extra):\n    import json, os, datetime, time, base64, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n    t0 = time.time()\n    endpoint = \"update_thread\"\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v.strip()\n            if not s:\n                return None\n            try:\n                if s.endswith(\"Z\"):\n                    s = s[:-1] + \"+00:00\"\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except Exception:\n                return None\n        return None\n\n    def _audit(status_code, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(\n            {\n                \"id\": \"am_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n                \"endpoint\": endpoint,\n                \"status\": status_code,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": _now_iso(),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limit_check():\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = datetime.datetime.now(datetime.timezone.utc)\n        per_min = 120\n        per_day = 50000\n        cutoff_min = now - datetime.timedelta(seconds=60)\n        cutoff_day = now - datetime.timedelta(days=1)\n        c_min = 0\n        c_day = 0\n        for r in logs:\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if not ts:\n                continue\n            if ts >= cutoff_day:\n                c_day += 1\n                if ts >= cutoff_min:\n                    c_min += 1\n        if c_min >= per_min:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        if c_day >= per_day:\n            return _err(\"QUOTA_EXCEEDED\", \"Daily request quota exceeded.\")\n        return None\n\n    rl = _rate_limit_check()\n    if rl:\n        _audit(\"error\", rl[\"error\"][\"code\"])\n        return rl\n\n    if not isinstance(thread_id, str) or not thread_id.strip():\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"thread_id must be a non-empty string.\")\n    # Relax pattern mismatch in broken code: real ids are am_th_..., not am_thread_...\n    if not (re.match(r\"^am_th_[0-9A-Za-z]+$\", thread_id.strip()) or re.match(r\"^am_thread_[0-9A-Za-z]+$\", thread_id.strip())):\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"thread_id format is invalid.\")\n\n    allowed_status = {\"active\", \"archived\", \"deleted\"}\n    transitions = {\"active\": {\"archived\", \"deleted\"}, \"archived\": {\"active\", \"deleted\"}, \"deleted\": set()}\n\n    if not isinstance(status, str) or status not in allowed_status:\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"status is invalid.\", allowed=sorted(allowed_status))\n\n    inboxes = _load(\"inboxes.json\")\n    if not isinstance(inboxes, list):\n        inboxes = []\n    inbox_ids = {i.get(\"id\") for i in inboxes if isinstance(i, dict) and isinstance(i.get(\"id\"), str)}\n    if not inbox_ids:\n        _audit(\"error\", \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"No accessible inbox context found\")\n\n    threads = _load(\"threads.json\")\n    if not isinstance(threads, list):\n        threads = []\n\n    idx = None\n    thr = None\n    for i, r in enumerate(threads):\n        if isinstance(r, dict) and r.get(\"id\") == thread_id:\n            idx = i\n            thr = r\n            break\n    if thr is None:\n        _audit(\"error\", \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Thread not found.\", thread_id=thread_id)\n\n    if thr.get(\"inbox_id\") not in inbox_ids:\n        _audit(\"error\", \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"You do not have access to this thread.\")\n\n    cur = thr.get(\"status\")\n    if cur not in allowed_status:\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Existing thread has unknown status.\", status=cur)\n\n    if status != cur and status not in transitions.get(cur, set()):\n        _audit(\"error\", \"CONFLICT\")\n        return _err(\"CONFLICT\", \"Requested status transition is not permitted.\", from_status=cur, to_status=status)\n\n    updated = dict(thr)\n    updated[\"status\"] = status\n    updated[\"updated_at\"] = _now_iso()\n    threads[idx] = updated\n    _save(\"threads.json\", threads)\n\n    _audit(\"ok\", None)\n    return {\"thread\": updated}\n"
+        },
+        {
+          "name": "update_draft",
+          "description": "Updates a draft (recipients, subject, body, headers, metadata fields) while it is in a writable state and returns the updated draft. Raises VALIDATION_ERROR if draft_id is invalid, if no writable fields are provided, if recipients arrays contain non-strings, or if headers is not an object. Raises CONFLICT if the draft is not in a writable status (e.g., sent or discarded) or if an attempted status transition is not permitted. Raises NOT_FOUND if the draft does not exist, UNAUTHORIZED/FORBIDDEN if the caller cannot access the draft's inbox, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "draft_id": {
+                "type": "string",
+                "pattern": "^am_draft_[0-9A-Za-z]+$",
+                "description": "AgentMail draft id."
+              },
+              "to_emails": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Primary recipients for the draft."
+              },
+              "cc_emails": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "CC recipients for the draft."
+              },
+              "bcc_emails": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "BCC recipients for the draft."
+              },
+              "subject": {
+                "type": "string",
+                "description": "Email subject."
+              },
+              "body_text": {
+                "type": "string",
+                "description": "Plaintext body."
+              },
+              "body_html": {
+                "type": "string",
+                "description": "HTML body."
+              },
+              "headers": {
+                "type": "object",
+                "description": "Additional RFC822-style headers to include when sending."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "sending",
+                  "sent",
+                  "discarded",
+                  "error"
+                ],
+                "description": "Requested draft status; only lifecycle-allowed transitions are permitted (e.g., draft->discarded)."
+              }
+            },
+            "required": [
+              "draft_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_draft(draft_id, to_emails=None, cc_emails=None, bcc_emails=None, subject=None, body_text=None, body_html=None, headers=None, status=None, **_extra):\n    import json, os, datetime, time, re, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0143000\" if __import__(\"os\").path.isdir(\"./environment_mix/0143000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"update_draft\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v.strip()\n            if not s:\n                return None\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except ValueError:\n                return None\n        return None\n\n    def _audit(status_code, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"am_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n            \"endpoint\": endpoint,\n            \"status\": int(status_code),\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": _now_iso(),\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limit_check():\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            return True, None\n        now = datetime.datetime.now(datetime.timezone.utc)\n        cutoff_min = now - datetime.timedelta(seconds=60)\n        cutoff_day = now - datetime.timedelta(days=1)\n        c_min = 0\n        c_day = 0\n        for r in logs:\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if not ts:\n                continue\n            if ts >= cutoff_day:\n                c_day += 1\n                if ts >= cutoff_min:\n                    c_min += 1\n        if c_min >= 120:\n            return False, _err(\"RATE_LIMIT\", \"Rate limit exceeded (120 requests/min).\", limit=\"120/min\")\n        if c_day >= 50000:\n            return False, _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded (50000 requests/day).\", limit=\"50000/day\")\n        return True, None\n\n    ok, rl_err = _rate_limit_check()\n    if not ok:\n        _audit(429, rl_err[\"error\"][\"code\"])\n        return rl_err\n\n    if not isinstance(draft_id, str) or not draft_id.strip():\n        _audit(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"draft_id must be a non-empty string.\", draft_id=draft_id)\n    # Tool schema says am_draft_..., but datastore uses am_dft_...; relax to accept either.\n    if not (re.match(r\"^am_dft_[0-9A-Za-z]+$\", draft_id) or re.match(r\"^am_draft_[0-9A-Za-z]+$\", draft_id)):\n        _audit(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"draft_id does not match required format.\", draft_id=draft_id)\n\n    provided = any(v is not None for v in (to_emails, cc_emails, bcc_emails, subject, body_text, body_html, headers, status))\n    if not provided:\n        _audit(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"No writable fields provided.\")\n\n    def _validate_email_list(name, v):\n        if v is None:\n            return None\n        if not isinstance(v, list):\n            return _err(\"VALIDATION_ERROR\", f\"{name} must be an array of strings.\", field=name)\n        for x in v:\n            if not isinstance(x, str):\n                return _err(\"VALIDATION_ERROR\", f\"{name} must contain only strings.\", field=name)\n        if len(v) > 100:\n            return _err(\"VALIDATION_ERROR\", f\"{name} may not exceed 100 entries.\", field=name, limit=100)\n        return None\n\n    for nm, vv in ((\"to_emails\", to_emails), (\"cc_emails\", cc_emails), (\"bcc_emails\", bcc_emails)):\n        e = _validate_email_list(nm, vv)\n        if e:\n            _audit(400, e[\"error\"][\"code\"])\n            return e\n\n    if headers is not None and not isinstance(headers, dict):\n        _audit(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"headers must be an object.\", headers=headers)\n\n    allowed_status = {\"draft\", \"sending\", \"sent\", \"discarded\", \"error\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            _audit(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of draft, sending, sent, discarded, error.\", status=status)\n\n    drafts = _load(\"drafts.json\")\n    if not isinstance(drafts, list):\n        drafts = []\n    idx = None\n    for i, d in enumerate(drafts):\n        if isinstance(d, dict) and d.get(\"id\") == draft_id:\n            idx = i\n            break\n    if idx is None:\n        _audit(404, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Draft not found.\", draft_id=draft_id)\n\n    draft = drafts[idx]\n\n    # Enforce writable states: can update while draft or error (and possibly sending in some systems, but rule says writable state)\n    writable_statuses = {\"draft\", \"error\"}\n    if draft.get(\"status\") not in writable_statuses:\n        _audit(409, \"CONFLICT\")\n        return _err(\"CONFLICT\", \"Draft is not in a writable status.\", status=draft.get(\"status\"))\n\n    transitions = {\n        \"draft\": [\"sending\", \"discarded\"],\n        \"sending\": [\"sent\", \"error\"],\n        \"error\": [\"sending\", \"discarded\"],\n        \"sent\": [],\n        \"discarded\": []\n    }\n\n    if status is not None and status != draft.get(\"status\"):\n        cur = draft.get(\"status\")\n        if status not in transitions.get(cur, []):\n            _audit(409, \"CONFLICT\")\n            return _err(\"CONFLICT\", \"Draft status transition is not permitted.\", from_status=cur, to_status=status)\n\n        # If transitioning to sending, enforce body present (business rule)\n        if status == \"sending\":\n            bt = body_text if body_text is not None else draft.get(\"body_text\")\n            bh = body_html if body_html is not None else draft.get(\"body_html\")\n            if (bt is None or (isinstance(bt, str) and bt == \"\")) and (bh is None or (isinstance(bh, str) and bh == \"\")):\n                _audit(400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"At least one of body_text or body_html must be set before transitioning to sending.\")\n\n        # If transitioning to sent, enforce sent_message_id present (business rule)\n        if status == \"sent\" and not draft.get(\"sent_message_id\"):\n            _audit(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Cannot set status='sent' unless sent_message_id is set.\")\n\n    changed = False\n    if to_emails is not None and to_emails != draft.get(\"to_emails\"):\n        draft[\"to_emails\"] = to_emails\n        changed = True\n    if cc_emails is not None and cc_emails != draft.get(\"cc_emails\"):\n        draft[\"cc_emails\"] = cc_emails\n        changed = True\n    if bcc_emails is not None and bcc_emails != draft.get(\"bcc_emails\"):\n        draft[\"bcc_emails\"] = bcc_emails\n        changed = True\n    if subject is not None and subject != draft.get(\"subject\"):\n        if not isinstance(subject, str):\n            _audit(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"subject must be a string.\", subject=subject)\n        draft[\"subject\"] = subject\n        changed = True\n    if body_text is not None and body_text != draft.get(\"body_text\"):\n        if not isinstance(body_text, str):\n            _audit(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"body_text must be a string.\", body_text=body_text)\n        draft[\"body_text\"] = body_text\n        changed = True\n    if body_html is not None and body_html != draft.get(\"body_html\"):\n        if not isinstance(body_html, str):\n            _audit(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"body_html must be a string.\", body_html=body_html)\n        draft[\"body_html\"] = body_html\n        changed = True\n    if headers is not None and headers != draft.get(\"headers\"):\n        draft[\"headers\"] = headers\n        changed = True\n    if status is not None and status != draft.get(\"status\"):\n        draft[\"status\"] = status\n        changed = True\n\n    if not changed:\n        _audit(409, \"CONFLICT\")\n        return _err(\"CONFLICT\", \"Update had no effect (fields already set to the provided values).\")\n\n    draft[\"updated_at\"] = _now_iso()\n    drafts[idx] = draft\n    _save(\"drafts.json\", drafts)\n\n    _audit(200, None)\n    return {\"draft\": draft}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0143000",
+    "index": 143,
+    "name": "AgentMail MCP Server",
+    "description": "This backend stores email inboxes provisioned for an AgentMail account, along with conversation threads, individual messages, and drafts. The main workflows are: create/provision an inbox, receive/sync inbound messages into threads, compose drafts or send/reply to messages (creating outbound message",
+    "taxonomy": {
+      "L1_id": "L1-20",
+      "L1_name": "Communication & General Utilities",
+      "L1_name_zh": "通信与通用工具",
+      "L2_id": "L2-48",
+      "L2_name": "Messaging & Notification",
+      "L2_name_zh": "即时通信与通知",
+      "L3_name": "Email Mailbox & Workspace Connectors",
+      "L3_name_zh": "邮箱与办公套件连接器"
+    },
+    "database_dir": "./environment_mix/0143000",
+    "mount_path": "/app/database",
+    "n_tools": 19,
+    "n_collections": 4,
+    "n_records": 72,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 19,
+      "loaded": 19,
+      "reads_returning_data": 9,
+      "read_operations": 10,
+      "mutations_persisted": 6,
+      "mutations_attempted": 9
+    },
+    "tools_loadable_from_database_dir": 19,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_inboxes",
+      "returned_chars": 79
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

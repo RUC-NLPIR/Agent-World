@@ -1,0 +1,589 @@
+{
+  "index": 148,
+  "local_files_dir": "./environment_mix/0148000",
+  "file_list": [
+    "./environment_mix/0148000/README.md",
+    "./environment_mix/0148000/api_requests.json",
+    "./environment_mix/0148000/issues.json",
+    "./environment_mix/0148000/projects.json",
+    "./environment_mix/0148000/teams.json",
+    "./environment_mix/0148000/workspaces.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "workspaces.json": "12 rows",
+        "teams.json": "12 rows",
+        "projects.json": "20 rows",
+        "issues.json": "35 rows",
+        "api_requests.json": "37 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "create_issue",
+          "description": "Creates a new issue in the specified workspace and team, optionally assigning it to a project, and returns the created issue record. Raises VALIDATION_ERROR if any ID does not match the required lin_* pattern, if priority/status is not one of the allowed values, if due_date is not ISO 8601 date-time, or if unknown fields are provided. Raises NOT_FOUND if the workspace_id, team_id, or provided project_id does not exist or is not accessible; raises FORBIDDEN if you are not allowed to create issues in that workspace/team.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^lin_ws_[0-9A-Z]+$",
+                "description": "ID of the workspace the issue belongs to (lin_ws_...)."
+              },
+              "team_id": {
+                "type": "string",
+                "pattern": "^lin_team_[0-9A-Z]+$",
+                "description": "ID of the team the issue belongs to (lin_team_...)."
+              },
+              "project_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "pattern": "^lin_prj_[0-9A-Z]+$",
+                "description": "Optional ID of the project the issue belongs to (lin_prj_...)."
+              },
+              "title": {
+                "type": "string",
+                "description": "Short title/summary of the issue."
+              },
+              "description": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Long-form description/body of the issue."
+              },
+              "priority": {
+                "type": "integer",
+                "enum": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  4
+                ],
+                "description": "Issue priority (0-4)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "triage",
+                  "backlog",
+                  "started",
+                  "completed",
+                  "canceled"
+                ],
+                "description": "Workflow status of the issue."
+              },
+              "labels": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of label names applied to the issue."
+              },
+              "due_date": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time",
+                "description": "Optional due date/time in ISO 8601 format."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "team_id",
+              "title"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_issue(workspace_id, team_id, project_id=None, title=None, description=None, priority=None, status=None, labels=None, due_date=None, **_extra):\n    import json, os, datetime, re, time, base64, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0148000\" if __import__(\"os\").path.isdir(\"./environment_mix/0148000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n    now_s = now.isoformat()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            ss = s.strip()\n            if ss.endswith(\"Z\"):\n                ss = ss[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(ss)\n        except Exception:\n            return None\n\n    def _new_id(prefix, existing_ids):\n        # Deterministic-ish unique id, offline safe\n        seed = f\"{prefix}:{now.timestamp()}:{os.getpid()}:{len(existing_ids)}\".encode(\"utf-8\")\n        tok = base64.b32encode(hashlib.sha1(seed).digest()).decode(\"utf-8\").rstrip(\"=\")\n        tok = re.sub(r\"[^0-9A-Z]\", \"\", tok)[:16]\n        cand = f\"{prefix}_{tok}\"\n        i = 0\n        while cand in existing_ids:\n            i += 1\n            seed2 = f\"{seed.decode('utf-8')}:{i}\".encode(\"utf-8\")\n            tok = base64.b32encode(hashlib.sha1(seed2).digest()).decode(\"utf-8\").rstrip(\"=\")\n            tok = re.sub(r\"[^0-9A-Z]\", \"\", tok)[:16]\n            cand = f\"{prefix}_{tok}\"\n        return cand\n\n    def _log_request(status, payload, response_summary=None, error_message=None, workspace_for_log=None):\n        api_requests = _load(\"api_requests.json\")\n        existing_ids = {r.get(\"id\") for r in api_requests if isinstance(r, dict)}\n        rid = _new_id(\"lin_req\", existing_ids)\n        row = {\n            \"id\": rid,\n            \"workspace_id\": workspace_for_log,\n            \"tool_name\": \"create_issue\",\n            \"status\": \"received\",\n            \"request_payload\": payload if isinstance(payload, dict) else {},\n            \"response_summary\": None,\n            \"error_message\": None,\n            \"duration_ms\": None,\n            \"created_at\": now_s,\n            \"updated_at\": now_s,\n        }\n        api_requests.append(row)\n        _save(\"api_requests.json\", api_requests)\n\n        end = datetime.datetime.now(datetime.timezone.utc)\n        dur = int(max(0, (time.time() - t0) * 1000))\n        row[\"updated_at\"] = end.isoformat()\n        row[\"duration_ms\"] = dur\n        row[\"status\"] = status\n        row[\"response_summary\"] = response_summary\n        row[\"error_message\"] = error_message\n        _save(\"api_requests.json\", api_requests)\n\n    payload = {\n        \"workspace_id\": workspace_id,\n        \"team_id\": team_id,\n        \"project_id\": project_id,\n        \"title\": title,\n        \"description\": description,\n        \"priority\": priority,\n        \"status\": status,\n        \"labels\": labels,\n        \"due_date\": due_date,\n    }\n\n    # Validate inputs\n    if not isinstance(workspace_id, str) or not re.match(r\"^lin_ws_[0-9A-Z]+$\", workspace_id):\n        _log_request(\"failed\", payload, error_message=\"Invalid workspace_id format\", workspace_for_log=None)\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id format\")\n    if not isinstance(team_id, str) or not re.match(r\"^lin_team_[0-9A-Z]+$\", team_id):\n        _log_request(\"failed\", payload, error_message=\"Invalid team_id format\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"Invalid team_id format\")\n    if project_id is not None:\n        if not isinstance(project_id, str) or not re.match(r\"^lin_prj_[0-9A-Z]+$\", project_id):\n            _log_request(\"failed\", payload, error_message=\"Invalid project_id format\", workspace_for_log=workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"Invalid project_id format\")\n    if not isinstance(title, str) or title.strip() == \"\":\n        _log_request(\"failed\", payload, error_message=\"title must be a non-empty string\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"title must be a non-empty string\")\n    if description is not None and not isinstance(description, str):\n        _log_request(\"failed\", payload, error_message=\"description must be string or null\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"description must be string or null\")\n    if priority is not None and (not isinstance(priority, int) or priority not in [0, 1, 2, 3, 4]):\n        _log_request(\"failed\", payload, error_message=\"Invalid priority\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"Invalid priority\")\n    if status is not None and (not isinstance(status, str) or status not in [\"triage\", \"backlog\", \"started\", \"completed\", \"canceled\"]):\n        _log_request(\"failed\", payload, error_message=\"Invalid status\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"Invalid status\")\n    if labels is not None:\n        if not isinstance(labels, list) or any(not isinstance(x, str) for x in labels):\n            _log_request(\"failed\", payload, error_message=\"labels must be an array of strings\", workspace_for_log=workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"labels must be an array of strings\")\n        if len(labels) > 50:\n            _log_request(\"failed\", payload, error_message=\"Too many labels (max 50)\", workspace_for_log=workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"Too many labels (max 50)\")\n    if due_date is not None:\n        dt = _parse_dt(due_date)\n        if dt is None:\n            _log_request(\"failed\", payload, error_message=\"due_date must be ISO 8601 date-time or null\", workspace_for_log=workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"due_date must be ISO 8601 date-time or null\")\n\n    # Load refs\n    workspaces = _load(\"workspaces.json\")\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if not ws:\n        _log_request(\"failed\", payload, error_message=\"Workspace not found\", workspace_for_log=None)\n        return _err(\"NOT_FOUND\", \"Workspace not found\")\n    if ws.get(\"status\") != \"active\":\n        _log_request(\"failed\", payload, error_message=\"Workspace not active\", workspace_for_log=workspace_id)\n        return _err(\"UNAUTHORIZED\", \"Workspace not active\")\n\n    teams = _load(\"teams.json\")\n    team = next((t for t in teams if isinstance(t, dict) and t.get(\"id\") == team_id), None)\n    if not team:\n        _log_request(\"failed\", payload, error_message=\"Team not found\", workspace_for_log=workspace_id)\n        return _err(\"NOT_FOUND\", \"Team not found\")\n    if team.get(\"workspace_id\") != workspace_id:\n        _log_request(\"failed\", payload, error_message=\"Cross-workspace access forbidden\", workspace_for_log=workspace_id)\n        return _err(\"UNAUTHORIZED\", \"Cross-workspace access forbidden\")\n    if team.get(\"status\") != \"active\":\n        _log_request(\"failed\", payload, error_message=\"Team is not active\", workspace_for_log=workspace_id)\n        return _err(\"CONFLICT\", \"Team is not active\")\n\n    prj = None\n    if project_id is not None:\n        projects = _load(\"projects.json\")\n        prj = next((p for p in projects if isinstance(p, dict) and p.get(\"id\") == project_id), None)\n        if not prj:\n            _log_request(\"failed\", payload, error_message=\"Project not found\", workspace_for_log=workspace_id)\n            return _err(\"NOT_FOUND\", \"Project not found\")\n        if prj.get(\"workspace_id\") != workspace_id:\n            _log_request(\"failed\", payload, error_message=\"Cross-workspace access forbidden\", workspace_for_log=workspace_id)\n            return _err(\"UNAUTHORIZED\", \"Cross-workspace access forbidden\")\n\n    issues = _load(\"issues.json\")\n\n    # Transaction-like: compute next number for team based on current file content.\n    max_num = 0\n    for iss in issues:\n        if isinstance(iss, dict) and iss.get(\"team_id\") == team_id:\n            n = iss.get(\"number\")\n            if isinstance(n, int) and n > max_num:\n                max_num = n\n    next_num = max_num + 1\n    if next_num < 1:\n        next_num = 1\n\n    identifier = f\"{team.get('key')}-{next_num}\"\n    # Uniqueness constraints\n    if any(isinstance(iss, dict) and iss.get(\"team_id\") == team_id and iss.get(\"number\") == next_num for iss in issues):\n        _log_request(\"failed\", payload, error_message=\"Issue number conflict\", workspace_for_log=workspace_id)\n        return _err(\"CONFLICT\", \"Issue number conflict\")\n    if any(isinstance(iss, dict) and iss.get(\"workspace_id\") == workspace_id and iss.get(\"identifier\") == identifier for iss in issues):\n        _log_request(\"failed\", payload, error_message=\"Issue identifier conflict\", workspace_for_log=workspace_id)\n        return _err(\"CONFLICT\", \"Issue identifier conflict\")\n\n    existing_ids = {r.get(\"id\") for r in issues if isinstance(r, dict)}\n    issue_id = _new_id(\"lin_iss\", existing_ids)\n\n    issue_status = status if status is not None else \"triage\"\n    issue_priority = priority if priority is not None else 3\n    issue_labels = labels if labels is not None else []\n\n    completed_at = None\n    if issue_status == \"completed\":\n        completed_at = now_s\n\n    new_issue = {\n        \"id\": issue_id,\n        \"workspace_id\": workspace_id,\n        \"team_id\": team_id,\n        \"project_id\": project_id,\n        \"number\": next_num,\n        \"identifier\": identifier,\n        \"title\": title,\n        \"description\": description,\n        \"priority\": issue_priority,\n        \"status\": issue_status,\n        \"labels\": issue_labels,\n        \"due_date\": due_date,\n        \"created_at\": now_s,\n        \"updated_at\": now_s,\n        \"completed_at\": completed_at,\n    }\n\n    issues.append(new_issue)\n    _save(\"issues.json\", issues)\n\n    _log_request(\"succeeded\", payload, response_summary={\"created_issue_id\": issue_id, \"identifier\": identifier}, workspace_for_log=workspace_id)\n    return {\n        \"issue\": new_issue\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_issues",
+          "description": "Lists issues in a workspace, optionally filtered by team, project, status, priority, label, and created/updated time ranges, and returns a page of results sorted per sort/order. Results are paginated with limit (1–100) and an opaque cursor; omit cursor for the first page and use the returned cursor to fetch the next page until no further cursor is provided. Raises VALIDATION_ERROR for invalid IDs, invalid enum values, malformed timestamps, limit out of range, or unknown fields; raises NOT_FOUND if the workspace_id (or any provided filter IDs) does not exist or is not accessible; raises FORBIDDEN if you are not permitted to list issues in the workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^lin_ws_[0-9A-Z]+$",
+                "description": "Workspace to list issues from (lin_ws_...)."
+              },
+              "team_id": {
+                "type": "string",
+                "pattern": "^lin_team_[0-9A-Z]+$",
+                "description": "Filter issues by team (lin_team_...)."
+              },
+              "project_id": {
+                "type": "string",
+                "pattern": "^lin_prj_[0-9A-Z]+$",
+                "description": "Filter issues by project (lin_prj_...)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "triage",
+                  "backlog",
+                  "started",
+                  "completed",
+                  "canceled"
+                ],
+                "description": "Filter issues by status."
+              },
+              "priority": {
+                "type": "integer",
+                "enum": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  4
+                ],
+                "description": "Filter issues by priority (0-4)."
+              },
+              "label": {
+                "type": "string",
+                "description": "Filter to issues containing this label."
+              },
+              "created_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Filter to issues created after this timestamp (ISO 8601)."
+              },
+              "created_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Filter to issues created before this timestamp (ISO 8601)."
+              },
+              "updated_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Filter to issues updated after this timestamp (ISO 8601)."
+              },
+              "updated_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Filter to issues updated before this timestamp (ISO 8601)."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "priority",
+                  "due_date",
+                  "number"
+                ],
+                "description": "Field to sort results by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order (ascending/descending)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of issues to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def list_issues(workspace_id, team_id=None, project_id=None, status=None, priority=None, label=None, created_after=None, created_before=None, updated_after=None, updated_before=None, sort=None, order=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, re, time, base64, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0148000\" if __import__(\"os\").path.isdir(\"./environment_mix/0148000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n    now_s = now.isoformat()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            ss = s.strip()\n            if ss.endswith(\"Z\"):\n                ss = ss[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(ss)\n        except Exception:\n            return None\n\n    def _new_id(prefix, existing_ids):\n        seed = f\"{prefix}:{now.timestamp()}:{os.getpid()}:{len(existing_ids)}\".encode(\"utf-8\")\n        tok = base64.b32encode(hashlib.sha1(seed).digest()).decode(\"utf-8\").rstrip(\"=\")\n        tok = re.sub(r\"[^0-9A-Z]\", \"\", tok)[:16]\n        cand = f\"{prefix}_{tok}\"\n        i = 0\n        while cand in existing_ids:\n            i += 1\n            seed2 = f\"{seed.decode('utf-8')}:{i}\".encode(\"utf-8\")\n            tok = base64.b32encode(hashlib.sha1(seed2).digest()).decode(\"utf-8\").rstrip(\"=\")\n            tok = re.sub(r\"[^0-9A-Z]\", \"\", tok)[:16]\n            cand = f\"{prefix}_{tok}\"\n        return cand\n\n    def _log_request(status_s, payload, response_summary=None, error_message=None, workspace_for_log=None):\n        api_requests = _load(\"api_requests.json\")\n        existing_ids = {r.get(\"id\") for r in api_requests if isinstance(r, dict)}\n        rid = _new_id(\"lin_req\", existing_ids)\n        row = {\n            \"id\": rid,\n            \"workspace_id\": workspace_for_log,\n            \"tool_name\": \"list_issues\",\n            \"status\": \"received\",\n            \"request_payload\": payload if isinstance(payload, dict) else {},\n            \"response_summary\": None,\n            \"error_message\": None,\n            \"duration_ms\": None,\n            \"created_at\": now_s,\n            \"updated_at\": now_s,\n        }\n        api_requests.append(row)\n        _save(\"api_requests.json\", api_requests)\n\n        end = datetime.datetime.now(datetime.timezone.utc)\n        dur = int(max(0, (time.time() - t0) * 1000))\n        row[\"updated_at\"] = end.isoformat()\n        row[\"duration_ms\"] = dur\n        row[\"status\"] = status_s\n        row[\"response_summary\"] = response_summary\n        row[\"error_message\"] = error_message\n        _save(\"api_requests.json\", api_requests)\n\n    payload = {\n        \"workspace_id\": workspace_id,\n        \"team_id\": team_id,\n        \"project_id\": project_id,\n        \"status\": status,\n        \"priority\": priority,\n        \"label\": label,\n        \"created_after\": created_after,\n        \"created_before\": created_before,\n        \"updated_after\": updated_after,\n        \"updated_before\": updated_before,\n        \"sort\": sort,\n        \"order\": order,\n        \"limit\": limit,\n        \"cursor\": cursor,\n    }\n\n    if not isinstance(workspace_id, str) or not re.match(r\"^lin_ws_[0-9A-Z]+$\", workspace_id):\n        _log_request(\"failed\", payload, error_message=\"Invalid workspace_id format\", workspace_for_log=None)\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id format\")\n    if team_id is not None and (not isinstance(team_id, str) or not re.match(r\"^lin_team_[0-9A-Z]+$\", team_id)):\n        _log_request(\"failed\", payload, error_message=\"Invalid team_id format\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"Invalid team_id format\")\n    if project_id is not None and (not isinstance(project_id, str) or not re.match(r\"^lin_prj_[0-9A-Z]+$\", project_id)):\n        _log_request(\"failed\", payload, error_message=\"Invalid project_id format\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"Invalid project_id format\")\n    if status is not None and (not isinstance(status, str) or status not in [\"triage\", \"backlog\", \"started\", \"completed\", \"canceled\"]):\n        _log_request(\"failed\", payload, error_message=\"Invalid status\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"Invalid status\")\n    if priority is not None and (not isinstance(priority, int) or priority not in [0, 1, 2, 3, 4]):\n        _log_request(\"failed\", payload, error_message=\"Invalid priority\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"Invalid priority\")\n    if label is not None and not isinstance(label, str):\n        _log_request(\"failed\", payload, error_message=\"label must be string\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"label must be string\")\n\n    ca = _parse_dt(created_after) if created_after is not None else None\n    cb = _parse_dt(created_before) if created_before is not None else None\n    ua = _parse_dt(updated_after) if updated_after is not None else None\n    ub = _parse_dt(updated_before) if updated_before is not None else None\n    if created_after is not None and ca is None:\n        _log_request(\"failed\", payload, error_message=\"created_after must be ISO 8601 date-time\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"created_after must be ISO 8601 date-time\")\n    if created_before is not None and cb is None:\n        _log_request(\"failed\", payload, error_message=\"created_before must be ISO 8601 date-time\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"created_before must be ISO 8601 date-time\")\n    if updated_after is not None and ua is None:\n        _log_request(\"failed\", payload, error_message=\"updated_after must be ISO 8601 date-time\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"updated_after must be ISO 8601 date-time\")\n    if updated_before is not None and ub is None:\n        _log_request(\"failed\", payload, error_message=\"updated_before must be ISO 8601 date-time\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"updated_before must be ISO 8601 date-time\")\n\n    if sort is not None and sort not in [\"created_at\", \"updated_at\", \"priority\", \"due_date\", \"number\"]:\n        _log_request(\"failed\", payload, error_message=\"Invalid sort\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort\")\n    if order is not None and order not in [\"asc\", \"desc\"]:\n        _log_request(\"failed\", payload, error_message=\"Invalid order\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"Invalid order\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 100:\n        _log_request(\"failed\", payload, error_message=\"limit out of range\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"limit out of range\")\n\n    # Workspace existence & active check\n    workspaces = _load(\"workspaces.json\")\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if not ws:\n        _log_request(\"failed\", payload, error_message=\"Workspace not found\", workspace_for_log=None)\n        return _err(\"NOT_FOUND\", \"Workspace not found\")\n    if ws.get(\"status\") != \"active\":\n        _log_request(\"failed\", payload, error_message=\"Workspace not active\", workspace_for_log=workspace_id)\n        return _err(\"UNAUTHORIZED\", \"Workspace not active\")\n\n    teams = _load(\"teams.json\")\n    team_by_id = {t.get(\"id\"): t for t in teams if isinstance(t, dict) and t.get(\"workspace_id\") == workspace_id}\n\n    if team_id is not None:\n        t = team_by_id.get(team_id)\n        if not t:\n            _log_request(\"failed\", payload, error_message=\"Team not found\", workspace_for_log=workspace_id)\n            return _err(\"NOT_FOUND\", \"Team not found\")\n\n    if project_id is not None:\n        projects = _load(\"projects.json\")\n        prj = next((p for p in projects if isinstance(p, dict) and p.get(\"id\") == project_id), None)\n        if not prj:\n            _log_request(\"failed\", payload, error_message=\"Project not found\", workspace_for_log=workspace_id)\n            return _err(\"NOT_FOUND\", \"Project not found\")\n        if prj.get(\"workspace_id\") != workspace_id:\n            _log_request(\"failed\", payload, error_message=\"Cross-workspace access forbidden\", workspace_for_log=workspace_id)\n            return _err(\"UNAUTHORIZED\", \"Cross-workspace access forbidden\")\n\n    issues = _load(\"issues.json\")\n    scoped = [i for i in issues if isinstance(i, dict) and i.get(\"workspace_id\") == workspace_id]\n\n    # Filters\n    if team_id is not None:\n        scoped = [i for i in scoped if i.get(\"team_id\") == team_id]\n    if project_id is not None:\n        scoped = [i for i in scoped if i.get(\"project_id\") == project_id]\n    if status is not None:\n        scoped = [i for i in scoped if i.get(\"status\") == status]\n    if priority is not None:\n        scoped = [i for i in scoped if i.get(\"priority\") == priority]\n    if label is not None:\n        scoped = [i for i in scoped if isinstance(i.get(\"labels\"), list) and label in i.get(\"labels\")]\n\n    def _dt_field(row, field):\n        v = row.get(field)\n        if not isinstance(v, str):\n            return None\n        return _parse_dt(v)\n\n    if ca is not None:\n        scoped = [i for i in scoped if (_dt_field(i, \"created_at\") is not None and _dt_field(i, \"created_at\") > ca)]\n    if cb is not None:\n        scoped = [i for i in scoped if (_dt_field(i, \"created_at\") is not None and _dt_field(i, \"created_at\") < cb)]\n    if ua is not None:\n        scoped = [i for i in scoped if (_dt_field(i, \"updated_at\") is not None and _dt_field(i, \"updated_at\") > ua)]\n    if ub is not None:\n        scoped = [i for i in scoped if (_dt_field(i, \"updated_at\") is not None and _dt_field(i, \"updated_at\") < ub)]\n\n    # Sorting\n    sfield = sort or \"updated_at\"\n    sorder = order or \"desc\"\n\n    def _sort_key(row):\n        if sfield in (\"created_at\", \"updated_at\", \"due_date\"):\n            dt = _dt_field(row, sfield)\n            # None sorts last for desc, first for asc; normalize via tuple\n            missing = 1 if dt is None else 0\n            # use timestamp; if None, 0\n            ts = dt.timestamp() if dt is not None else 0.0\n            return (missing, ts, row.get(\"id\") or \"\")\n        elif sfield == \"priority\":\n            v = row.get(\"priority\")\n            v = v if isinstance(v, int) else 999\n            return (v, row.get(\"updated_at\") or \"\", row.get(\"id\") or \"\")\n        elif sfield == \"number\":\n            v = row.get(\"number\")\n            v = v if isinstance(v, int) else 0\n            return (v, row.get(\"updated_at\") or \"\", row.get(\"id\") or \"\")\n        return (row.get(\"updated_at\") or \"\", row.get(\"id\") or \"\")\n\n    reverse = (sorder == \"desc\")\n    scoped.sort(key=_sort_key, reverse=reverse)\n\n    # Cursor pagination: cursor is base64url of integer offset\n    offset = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or cursor.strip() == \"\":\n            _log_request(\"failed\", payload, error_message=\"Invalid cursor\", workspace_for_log=workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n        try:\n            pad = \"=\" * ((4 - len(cursor) % 4) % 4)\n            raw = base64.urlsafe_b64decode((cursor + pad).encode(\"utf-8\")).decode(\"utf-8\")\n            offset = int(raw)\n            if offset < 0:\n                raise ValueError()\n        except Exception:\n            _log_request(\"failed\", payload, error_message=\"Invalid cursor\", workspace_for_log=workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n\n    total = len(scoped)\n    page = scoped[offset:offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(str(next_offset).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    _log_request(\"succeeded\", payload, response_summary={\"returned\": len(page), \"total\": total, \"has_more\": has_more}, workspace_for_log=workspace_id)\n    return {\n        \"issues\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "update_issue",
+          "description": "Updates mutable fields on an existing issue (title, description, priority, status, labels, due_date, project_id, team_id) and returns the updated issue. Raises VALIDATION_ERROR if issue_id/team_id/project_id formats are invalid, if priority/status is not allowed, if due_date is not ISO 8601 date-time, or if unknown fields are provided. Raises NOT_FOUND if the issue_id does not exist or is not accessible, or if the provided team_id/project_id does not exist; raises FORBIDDEN if you are not allowed to modify the issue or move it to the specified team/project.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "issue_id": {
+                "type": "string",
+                "pattern": "^lin_iss_[0-9A-Z]+$",
+                "description": "ID of the issue to update (lin_iss_...)."
+              },
+              "title": {
+                "type": "string",
+                "description": "Updated issue title."
+              },
+              "description": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Updated issue description/body."
+              },
+              "priority": {
+                "type": "integer",
+                "enum": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  4
+                ],
+                "description": "Updated issue priority (0-4)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "triage",
+                  "backlog",
+                  "started",
+                  "completed",
+                  "canceled"
+                ],
+                "description": "Updated workflow status."
+              },
+              "labels": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Replace the issue's labels with this list."
+              },
+              "due_date": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time",
+                "description": "Updated due date/time in ISO 8601 format (or null to clear)."
+              },
+              "project_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "pattern": "^lin_prj_[0-9A-Z]+$",
+                "description": "Updated project assignment (lin_prj_...) or null to clear."
+              },
+              "team_id": {
+                "type": "string",
+                "pattern": "^lin_team_[0-9A-Z]+$",
+                "description": "Move issue to a different team (lin_team_...)."
+              }
+            },
+            "required": [
+              "issue_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def update_issue(issue_id, title=None, description=None, priority=None, status=None, labels=None, due_date=None, project_id=None, team_id=None, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0148000\" if __import__(\"os\").path.isdir(\"./environment_mix/0148000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now_s = now_dt.isoformat() + \"Z\"\n\n    # --- request logging helpers ---\n    def _new_req_id(existing_ids):\n        base = datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\").upper()\n        cand = \"lin_req_\" + base\n        i = 0\n        while cand in existing_ids:\n            i += 1\n            cand = \"lin_req_\" + base + str(i)\n        return cand\n\n    def _append_req_received(payload):\n        api_requests = _load(\"api_requests.json\")\n        if not isinstance(api_requests, list):\n            api_requests = []\n        existing = {r.get(\"id\") for r in api_requests if isinstance(r, dict)}\n        rid = _new_req_id(existing)\n        row = {\n            \"id\": rid,\n            \"workspace_id\": None,\n            \"tool_name\": \"update_issue\",\n            \"status\": \"received\",\n            \"request_payload\": payload if isinstance(payload, dict) else {},\n            \"response_summary\": None,\n            \"error_message\": None,\n            \"duration_ms\": None,\n            \"created_at\": now_s,\n            \"updated_at\": now_s,\n        }\n        api_requests.append(row)\n        _save(\"api_requests.json\", api_requests)\n        return rid\n\n    def _finalize_req(rid, status_s, workspace_id, summary=None, error_message=None):\n        api_requests = _load(\"api_requests.json\")\n        if not isinstance(api_requests, list):\n            api_requests = []\n        for r in reversed(api_requests):\n            if isinstance(r, dict) and r.get(\"id\") == rid:\n                r[\"workspace_id\"] = workspace_id\n                r[\"status\"] = status_s\n                r[\"response_summary\"] = summary\n                r[\"error_message\"] = error_message\n                r[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n                r[\"updated_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n                break\n        _save(\"api_requests.json\", api_requests)\n\n    def _pick_accessible_workspace():\n        # Ambient auth: choose a workspace that can serve the operation.\n        # For update_issue: need an active workspace with at least one issue (so the caller can update something).\n        wss = _load(\"workspaces.json\")\n        issues = _load(\"issues.json\")\n        if not isinstance(wss, list):\n            wss = []\n        if not isinstance(issues, list):\n            issues = []\n        ws_by_id = {w.get(\"id\"): w for w in wss if isinstance(w, dict) and isinstance(w.get(\"id\"), str)}\n        # Prefer workspace owning the issue_id if present (even if suspended; rule doesn't forbid reads/writes by status explicitly,\n        # but keep it realistic: avoid deleted).\n        for iss in issues:\n            if isinstance(iss, dict) and iss.get(\"id\") == issue_id:\n                wid = iss.get(\"workspace_id\")\n                w = ws_by_id.get(wid)\n                if isinstance(w, dict) and w.get(\"status\") != \"deleted\":\n                    return wid\n        # Otherwise pick any non-deleted workspace with issues\n        ws_with_issues = set(\n            iss.get(\"workspace_id\")\n            for iss in issues\n            if isinstance(iss, dict) and isinstance(iss.get(\"workspace_id\"), str)\n        )\n        for wid in ws_with_issues:\n            w = ws_by_id.get(wid)\n            if isinstance(w, dict) and w.get(\"status\") != \"deleted\":\n                return wid\n        # Fallback: any non-deleted workspace\n        for w in wss:\n            if isinstance(w, dict) and w.get(\"status\") != \"deleted\" and isinstance(w.get(\"id\"), str):\n                return w[\"id\"]\n        return None\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return \"type\"\n        # Accept Z; basic ISO8601 validation/parse\n        try:\n            ss = s.strip()\n            if ss.endswith(\"Z\"):\n                ss = ss[:-1] + \"+00:00\"\n            datetime.datetime.fromisoformat(ss)\n            return None\n        except Exception:\n            return \"format\"\n\n    req_payload = {\n        \"issue_id\": issue_id,\n        \"title\": title,\n        \"description\": description,\n        \"priority\": priority,\n        \"status\": status,\n        \"labels\": labels,\n        \"due_date\": due_date,\n        \"project_id\": project_id,\n        \"team_id\": team_id,\n    }\n    rid = _append_req_received(req_payload)\n\n    workspace_id = None\n    try:\n        # --- validate inputs first ---\n        if not isinstance(issue_id, str) or not re.match(r\"^lin_iss_[0-9A-Z]+$\", issue_id):\n            workspace_id = _pick_accessible_workspace()\n            _finalize_req(rid, \"failed\", workspace_id, error_message=\"validation error: issue_id must match ^lin_iss_[0-9A-Z]+$\")\n            return _err(\"VALIDATION_ERROR\", \"validation error: issue_id must match ^lin_iss_[0-9A-Z]+$\")\n\n        if title is not None and not isinstance(title, str):\n            workspace_id = _pick_accessible_workspace()\n            _finalize_req(rid, \"failed\", workspace_id, error_message=\"validation error: title must be a string\")\n            return _err(\"VALIDATION_ERROR\", \"validation error: title must be a string\")\n        if isinstance(title, str) and title == \"\":\n            workspace_id = _pick_accessible_workspace()\n            _finalize_req(rid, \"failed\", workspace_id, error_message=\"validation error: title must not be empty\")\n            return _err(\"VALIDATION_ERROR\", \"validation error: title must not be empty\")\n\n        if description is not None and not isinstance(description, str):\n            # description may be None (clear) or string\n            workspace_id = _pick_accessible_workspace()\n            _finalize_req(rid, \"failed\", workspace_id, error_message=\"validation error: description must be a string or null\")\n            return _err(\"VALIDATION_ERROR\", \"validation error: description must be a string or null\")\n\n        if priority is not None:\n            if not isinstance(priority, int) or priority not in (0, 1, 2, 3, 4):\n                workspace_id = _pick_accessible_workspace()\n                _finalize_req(rid, \"failed\", workspace_id, error_message=\"validation error: priority must be one of 0,1,2,3,4\")\n                return _err(\"VALIDATION_ERROR\", \"validation error: priority must be one of 0,1,2,3,4\")\n\n        if status is not None:\n            if not isinstance(status, str) or status not in (\"triage\", \"backlog\", \"started\", \"completed\", \"canceled\"):\n                workspace_id = _pick_accessible_workspace()\n                _finalize_req(rid, \"failed\", workspace_id, error_message=\"validation error: status must be one of triage, backlog, started, completed, canceled\")\n                return _err(\"VALIDATION_ERROR\", \"validation error: status must be one of triage, backlog, started, completed, canceled\")\n\n        if labels is not None:\n            if not isinstance(labels, list) or any(not isinstance(x, str) for x in labels):\n                workspace_id = _pick_accessible_workspace()\n                _finalize_req(rid, \"failed\", workspace_id, error_message=\"validation error: labels must be an array of strings\")\n                return _err(\"VALIDATION_ERROR\", \"validation error: labels must be an array of strings\")\n            if len(labels) > 50:\n                workspace_id = _pick_accessible_workspace()\n                _finalize_req(rid, \"failed\", workspace_id, error_message=\"validation error: array_length(labels) must be <= 50\")\n                return _err(\"VALIDATION_ERROR\", \"validation error: array_length(labels) must be <= 50\")\n\n        if due_date is not None:\n            if due_date is not None:\n                dt_err = _parse_dt(due_date)\n                if dt_err == \"type\":\n                    workspace_id = _pick_accessible_workspace()\n                    _finalize_req(rid, \"failed\", workspace_id, error_message=\"validation error: due_date must be an ISO 8601 date-time string or null\")\n                    return _err(\"VALIDATION_ERROR\", \"validation error: due_date must be an ISO 8601 date-time string or null\")\n                if dt_err == \"format\":\n                    workspace_id = _pick_accessible_workspace()\n                    _finalize_req(rid, \"failed\", workspace_id, error_message=\"validation error: due_date must be ISO 8601 date-time\")\n                    return _err(\"VALIDATION_ERROR\", \"validation error: due_date must be ISO 8601 date-time\")\n\n        if project_id is not None:\n            if project_id is not None and (not isinstance(project_id, str) or not re.match(r\"^lin_prj_[0-9A-Z]+$\", project_id)):\n                workspace_id = _pick_accessible_workspace()\n                _finalize_req(rid, \"failed\", workspace_id, error_message=\"validation error: project_id must match ^lin_prj_[0-9A-Z]+$ or be null\")\n                return _err(\"VALIDATION_ERROR\", \"validation error: project_id must match ^lin_prj_[0-9A-Z]+$ or be null\")\n\n        if team_id is not None:\n            if not isinstance(team_id, str) or not re.match(r\"^lin_team_[0-9A-Z]+$\", team_id):\n                workspace_id = _pick_accessible_workspace()\n                _finalize_req(rid, \"failed\", workspace_id, error_message=\"validation error: team_id must match ^lin_team_[0-9A-Z]+$\")\n                return _err(\"VALIDATION_ERROR\", \"validation error: team_id must match ^lin_team_[0-9A-Z]+$\")\n\n        # --- load rows ---\n        issues = _load(\"issues.json\")\n        teams = _load(\"teams.json\")\n        projects = _load(\"projects.json\")\n        workspaces = _load(\"workspaces.json\")\n        if not isinstance(issues, list):\n            issues = []\n        if not isinstance(teams, list):\n            teams = []\n        if not isinstance(projects, list):\n            projects = []\n        if not isinstance(workspaces, list):\n            workspaces = []\n\n        teams_by_id = {t.get(\"id\"): t for t in teams if isinstance(t, dict) and isinstance(t.get(\"id\"), str)}\n        projects_by_id = {p.get(\"id\"): p for p in projects if isinstance(p, dict) and isinstance(p.get(\"id\"), str)}\n        ws_by_id = {w.get(\"id\"): w for w in workspaces if isinstance(w, dict) and isinstance(w.get(\"id\"), str)}\n\n        # Locate issue anywhere first, to infer workspace context correctly (ambient auth must pick a combination that exists)\n        issue = None\n        for it in issues:\n            if isinstance(it, dict) and it.get(\"id\") == issue_id:\n                issue = it\n                break\n\n        if not issue:\n            workspace_id = _pick_accessible_workspace()\n            _finalize_req(rid, \"failed\", workspace_id, error_message=\"not found: issue_id does not exist in workspace\")\n            return _err(\"NOT_FOUND\", \"not found: issue_id does not exist in workspace\")\n\n        workspace_id = issue.get(\"workspace_id\")\n        if not isinstance(workspace_id, str) or workspace_id not in ws_by_id or ws_by_id[workspace_id].get(\"status\") == \"deleted\":\n            # treat as unauthorized context rather than leaking cross-workspace\n            _finalize_req(rid, \"failed\", None, error_message=\"unauthorized: no accessible workspace context\")\n            return _err(\"UNAUTHORIZED\", \"unauthorized: no accessible workspace context\")\n\n        # Enforce scoping + FK integrity on existing row\n        cur_team = teams_by_id.get(issue.get(\"team_id\"))\n        if not isinstance(cur_team, dict) or cur_team.get(\"workspace_id\") != workspace_id:\n            _finalize_req(rid, \"failed\", workspace_id, error_message=\"forbidden: issue.team_id does not belong to workspace\")\n            return _err(\"UNAUTHORIZED\", \"forbidden: issue.team_id does not belong to workspace\")\n\n        cur_project_id = issue.get(\"project_id\")\n        if cur_project_id is not None:\n            cur_project = projects_by_id.get(cur_project_id)\n            if not isinstance(cur_project, dict) or cur_project.get(\"workspace_id\") != workspace_id:\n                _finalize_req(rid, \"failed\", workspace_id, error_message=\"forbidden: issue.project_id does not belong to workspace\")\n                return _err(\"UNAUTHORIZED\", \"forbidden: issue.project_id does not belong to workspace\")\n\n        # --- enforce immutables (business rule says reject updates to these fields)\n        # Note: tool schema includes team_id as a parameter, but business rules explicitly say team_id is immutable.\n        # Therefore, if team_id is provided and differs, reject; if it's the same as current, allow (idempotent).\n        if team_id is not None and team_id != issue.get(\"team_id\"):\n            _finalize_req(rid, \"failed\", workspace_id, error_message=\"validation error: team_id is immutable (business rule)\")\n            return _err(\"VALIDATION_ERROR\", \"validation error: team_id is immutable (business rule)\")\n\n        # Validate referenced project if provided\n        if project_id is not None and project_id is not None:\n            pr = projects_by_id.get(project_id)\n            if not isinstance(pr, dict):\n                _finalize_req(rid, \"failed\", workspace_id, error_message=\"not found: project_id does not exist\")\n                return _err(\"NOT_FOUND\", \"not found: project_id does not exist\")\n            if pr.get(\"workspace_id\") != workspace_id:\n                _finalize_req(rid, \"failed\", workspace_id, error_message=\"forbidden: project_id does not belong to workspace\")\n                return _err(\"UNAUTHORIZED\", \"forbidden: project_id does not belong to workspace\")\n\n        # lifecycle transitions for issue status\n        transitions = {\n            \"triage\": {\"backlog\", \"started\", \"canceled\"},\n            \"backlog\": {\"started\", \"canceled\"},\n            \"started\": {\"completed\", \"backlog\", \"canceled\"},\n            \"completed\": {\"started\"},\n            \"canceled\": {\"backlog\"},\n        }\n\n        old_status = issue.get(\"status\")\n        if status is not None:\n            if not isinstance(old_status, str) or old_status not in transitions:\n                _finalize_req(rid, \"failed\", workspace_id, error_message=\"validation error: issue has invalid current status\")\n                return _err(\"VALIDATION_ERROR\", \"validation error: issue has invalid current status\")\n            if status != old_status:\n                if status not in transitions.get(old_status, set()):\n                    _finalize_req(\n                        rid,\n                        \"failed\",\n                        workspace_id,\n                        error_message=f\"invalid transition: cannot change status from {old_status} to {status}\",\n                    )\n                    return _err(\"INVALID_TRANSITION\", f\"invalid transition: cannot change status from {old_status} to {status}\")\n\n        # Apply updates (only mutables)\n        changed = False\n        if title is not None and title != issue.get(\"title\"):\n            issue[\"title\"] = title\n            changed = True\n\n        if description is not None or description is None:\n            # only update if parameter was provided (including explicit None) - we cannot distinguish here,\n            # but function signature default None means caller might omit; so update only if _extra indicates? Not available.\n            # We approximate: update if description is not None OR if \"description\" was explicitly passed as None via tool.\n            # Many MCP callers pass explicit null; we'll accept that by checking _extra for key presence.\n            pass\n        if \"description\" in _extra or description is not None:\n            if description != issue.get(\"description\"):\n                issue[\"description\"] = description\n                changed = True\n\n        if priority is not None and priority != issue.get(\"priority\"):\n            issue[\"priority\"] = priority\n            changed = True\n\n        if labels is not None and labels != issue.get(\"labels\"):\n            issue[\"labels\"] = labels\n            changed = True\n\n        if due_date is not None or \"due_date\" in _extra:\n            if due_date != issue.get(\"due_date\"):\n                issue[\"due_date\"] = due_date\n                changed = True\n\n        if project_id is not None or \"project_id\" in _extra:\n            if project_id != issue.get(\"project_id\"):\n                issue[\"project_id\"] = project_id\n                changed = True\n\n        if status is not None and status != old_status:\n            issue[\"status\"] = status\n            changed = True\n            # completed_at rule\n            if status == \"completed\":\n                issue[\"completed_at\"] = now_s\n            elif old_status == \"completed\" and status != \"completed\":\n                issue[\"completed_at\"] = None\n\n        if not changed:\n            # Idempotent update: still a real success, return current issue\n            _finalize_req(rid, \"succeeded\", workspace_id, summary={\"issue_id\": issue_id, \"updated\": False})\n            return {\"issue\": issue}\n\n        issue[\"updated_at\"] = now_s\n        _save(\"issues.json\", issues)\n\n        _finalize_req(rid, \"succeeded\", workspace_id, summary={\"issue_id\": issue_id, \"updated\": True})\n        return {\"issue\": issue}\n    except Exception as e:\n        # unexpected condition\n        _finalize_req(rid, \"failed\", workspace_id, error_message=str(e))\n        return _err(\"VALIDATION_ERROR\", \"internal error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_teams",
+          "description": "Lists teams in a workspace with optional status filtering and returns a paginated result set sorted per sort/order. Results are paginated with limit (1–100) and an opaque cursor; omit cursor for the first page and pass the returned cursor to retrieve subsequent pages. Raises VALIDATION_ERROR for invalid workspace_id, invalid status/sort/order, limit out of range, or unknown fields; raises NOT_FOUND if the workspace_id does not exist or is not accessible; raises FORBIDDEN if you are not permitted to view teams in the workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^lin_ws_[0-9A-Z]+$",
+                "description": "Workspace to list teams from (lin_ws_...)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived"
+                ],
+                "description": "Filter teams by status."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "name",
+                  "key"
+                ],
+                "description": "Field to sort results by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order (ascending/descending)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of teams to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def list_teams(workspace_id, status=None, sort=None, order=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, re, time, base64, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0148000\" if __import__(\"os\").path.isdir(\"./environment_mix/0148000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n    now_s = now.isoformat()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            ss = s.strip()\n            if ss.endswith(\"Z\"):\n                ss = ss[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(ss)\n        except Exception:\n            return None\n\n    def _new_id(prefix, existing_ids):\n        seed = f\"{prefix}:{now.timestamp()}:{os.getpid()}:{len(existing_ids)}\".encode(\"utf-8\")\n        tok = base64.b32encode(hashlib.sha1(seed).digest()).decode(\"utf-8\").rstrip(\"=\")\n        tok = re.sub(r\"[^0-9A-Z]\", \"\", tok)[:16]\n        cand = f\"{prefix}_{tok}\"\n        i = 0\n        while cand in existing_ids:\n            i += 1\n            seed2 = f\"{seed.decode('utf-8')}:{i}\".encode(\"utf-8\")\n            tok = base64.b32encode(hashlib.sha1(seed2).digest()).decode(\"utf-8\").rstrip(\"=\")\n            tok = re.sub(r\"[^0-9A-Z]\", \"\", tok)[:16]\n            cand = f\"{prefix}_{tok}\"\n        return cand\n\n    def _log_request(status_s, payload, response_summary=None, error_message=None, workspace_for_log=None):\n        api_requests = _load(\"api_requests.json\")\n        existing_ids = {r.get(\"id\") for r in api_requests if isinstance(r, dict)}\n        rid = _new_id(\"lin_req\", existing_ids)\n        row = {\n            \"id\": rid,\n            \"workspace_id\": workspace_for_log,\n            \"tool_name\": \"list_teams\",\n            \"status\": \"received\",\n            \"request_payload\": payload if isinstance(payload, dict) else {},\n            \"response_summary\": None,\n            \"error_message\": None,\n            \"duration_ms\": None,\n            \"created_at\": now_s,\n            \"updated_at\": now_s,\n        }\n        api_requests.append(row)\n        _save(\"api_requests.json\", api_requests)\n\n        end = datetime.datetime.now(datetime.timezone.utc)\n        dur = int(max(0, (time.time() - t0) * 1000))\n        row[\"updated_at\"] = end.isoformat()\n        row[\"duration_ms\"] = dur\n        row[\"status\"] = status_s\n        row[\"response_summary\"] = response_summary\n        row[\"error_message\"] = error_message\n        _save(\"api_requests.json\", api_requests)\n\n    payload = {\n        \"workspace_id\": workspace_id,\n        \"status\": status,\n        \"sort\": sort,\n        \"order\": order,\n        \"limit\": limit,\n        \"cursor\": cursor,\n    }\n\n    if not isinstance(workspace_id, str) or not re.match(r\"^lin_ws_[0-9A-Z]+$\", workspace_id):\n        _log_request(\"failed\", payload, error_message=\"Invalid workspace_id format\", workspace_for_log=None)\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id format\")\n    if status is not None and (not isinstance(status, str) or status not in [\"active\", \"archived\"]):\n        _log_request(\"failed\", payload, error_message=\"Invalid status\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"Invalid status\")\n    if sort is not None and sort not in [\"created_at\", \"updated_at\", \"name\", \"key\"]:\n        _log_request(\"failed\", payload, error_message=\"Invalid sort\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort\")\n    if order is not None and order not in [\"asc\", \"desc\"]:\n        _log_request(\"failed\", payload, error_message=\"Invalid order\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"Invalid order\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 100:\n        _log_request(\"failed\", payload, error_message=\"limit out of range\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"limit out of range\")\n\n    workspaces = _load(\"workspaces.json\")\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if not ws:\n        _log_request(\"failed\", payload, error_message=\"Workspace not found\", workspace_for_log=None)\n        return _err(\"NOT_FOUND\", \"Workspace not found\")\n    if ws.get(\"status\") != \"active\":\n        _log_request(\"failed\", payload, error_message=\"Workspace not active\", workspace_for_log=workspace_id)\n        return _err(\"UNAUTHORIZED\", \"Workspace not active\")\n\n    teams = _load(\"teams.json\")\n    scoped = [t for t in teams if isinstance(t, dict) and t.get(\"workspace_id\") == workspace_id and t.get(\"status\") in (\"active\", \"archived\")]\n    if status is not None:\n        scoped = [t for t in scoped if t.get(\"status\") == status]\n\n    sfield = sort or \"name\"\n    sorder = order or \"asc\"\n    reverse = (sorder == \"desc\")\n\n    def _dt_field(row, field):\n        v = row.get(field)\n        if not isinstance(v, str):\n            return None\n        return _parse_dt(v)\n\n    def _sort_key(row):\n        if sfield in (\"created_at\", \"updated_at\"):\n            dt = _dt_field(row, sfield)\n            missing = 1 if dt is None else 0\n            ts = dt.timestamp() if dt is not None else 0.0\n            return (missing, ts, row.get(\"id\") or \"\")\n        if sfield == \"name\":\n            return ((row.get(\"name\") or \"\").lower(), row.get(\"id\") or \"\")\n        if sfield == \"key\":\n            return ((row.get(\"key\") or \"\"), (row.get(\"name\") or \"\").lower(), row.get(\"id\") or \"\")\n        return ((row.get(\"name\") or \"\").lower(), row.get(\"id\") or \"\")\n\n    scoped.sort(key=_sort_key, reverse=reverse)\n\n    offset = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or cursor.strip() == \"\":\n            _log_request(\"failed\", payload, error_message=\"Invalid cursor\", workspace_for_log=workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n        try:\n            pad = \"=\" * ((4 - len(cursor) % 4) % 4)\n            raw = base64.urlsafe_b64decode((cursor + pad).encode(\"utf-8\")).decode(\"utf-8\")\n            offset = int(raw)\n            if offset < 0:\n                raise ValueError()\n        except Exception:\n            _log_request(\"failed\", payload, error_message=\"Invalid cursor\", workspace_for_log=workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n\n    total = len(scoped)\n    page = scoped[offset:offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(str(next_offset).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    _log_request(\"succeeded\", payload, response_summary={\"returned\": len(page), \"total\": total, \"has_more\": has_more}, workspace_for_log=workspace_id)\n    return {\n        \"teams\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_projects",
+          "description": "Lists projects in a workspace, optionally filtered by project status, and returns a paginated result set sorted per sort/order. Results are paginated with limit (1–100) and an opaque cursor; omit cursor for the first page and use the returned cursor for the next page until exhausted. Raises VALIDATION_ERROR for invalid workspace_id, invalid status/sort/order, limit out of range, or unknown fields; raises NOT_FOUND if the workspace_id does not exist or is not accessible; raises FORBIDDEN if you are not permitted to view projects in the workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^lin_ws_[0-9A-Z]+$",
+                "description": "Workspace to list projects from (lin_ws_...)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "planned",
+                  "started",
+                  "paused",
+                  "completed",
+                  "canceled",
+                  "archived"
+                ],
+                "description": "Filter projects by status."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "name",
+                  "start_date",
+                  "target_date"
+                ],
+                "description": "Field to sort results by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order (ascending/descending)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of projects to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def list_projects(workspace_id, status=None, sort=None, order=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0148000\" if __import__(\"os\").path.isdir(\"./environment_mix/0148000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    api_requests = _load(\"api_requests.json\")\n    workspaces = _load(\"workspaces.json\")\n    projects = _load(\"projects.json\")\n\n    req_id = \"lin_req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\")\n    req_row = {\n        \"id\": req_id,\n        \"workspace_id\": None,\n        \"tool_name\": \"list_projects\",\n        \"status\": \"received\",\n        \"request_payload\": {\n            \"workspace_id\": workspace_id,\n            \"status\": status,\n            \"sort\": sort,\n            \"order\": order,\n            \"limit\": limit,\n            \"cursor\": cursor,\n        },\n        \"response_summary\": None,\n        \"error_message\": None,\n        \"duration_ms\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    api_requests.append(req_row)\n    _save(\"api_requests.json\", api_requests)\n\n    def _finish_ok(workspace_id_val, summary):\n        api_requests2 = _load(\"api_requests.json\")\n        for r in reversed(api_requests2):\n            if r.get(\"id\") == req_id:\n                r[\"workspace_id\"] = workspace_id_val\n                r[\"status\"] = \"succeeded\"\n                r[\"response_summary\"] = summary\n                r[\"error_message\"] = None\n                r[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n                r[\"updated_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n                break\n        _save(\"api_requests.json\", api_requests2)\n\n    def _finish_err(workspace_id_val, code, msg, **x):\n        api_requests2 = _load(\"api_requests.json\")\n        for r in reversed(api_requests2):\n            if r.get(\"id\") == req_id:\n                r[\"workspace_id\"] = workspace_id_val\n                r[\"status\"] = \"failed\"\n                r[\"response_summary\"] = None\n                r[\"error_message\"] = msg\n                r[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n                r[\"updated_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n                break\n        _save(\"api_requests.json\", api_requests2)\n        return _err(code, msg, **x)\n\n    if not isinstance(workspace_id, str) or not re.match(r\"^lin_ws_[0-9A-Z]+$\", workspace_id):\n        return _finish_err(None, \"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n\n    ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n    if not ws:\n        return _finish_err(None, \"NOT_FOUND\", \"Workspace not found.\")\n    if ws.get(\"status\") != \"active\":\n        return _finish_err(workspace_id, \"UNAUTHORIZED\", \"Workspace is not active.\")\n\n    allowed_status = {\"planned\", \"started\", \"paused\", \"completed\", \"canceled\", \"archived\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"Invalid status filter.\")\n\n    allowed_sort = {\"created_at\", \"updated_at\", \"name\", \"start_date\", \"target_date\"}\n    if sort is None:\n        sort = \"updated_at\"\n    if not isinstance(sort, str) or sort not in allowed_sort:\n        return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"Invalid sort field.\")\n\n    allowed_order = {\"asc\", \"desc\"}\n    if order is None:\n        order = \"desc\" if sort in {\"updated_at\", \"created_at\"} else \"asc\"\n    if not isinstance(order, str) or order not in allowed_order:\n        return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"Invalid order.\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 100:\n        return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"limit must be an integer between 1 and 100.\")\n\n    start = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or cursor.strip() == \"\":\n            return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"Invalid cursor.\")\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\").decode(\"utf-8\")\n            if not raw.startswith(\"off:\"):\n                return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"Invalid cursor.\")\n            start = int(raw.split(\":\", 1)[1])\n            if start < 0:\n                return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"Invalid cursor.\")\n        except Exception:\n            return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n    rows = [p for p in projects if p.get(\"workspace_id\") == workspace_id]\n    if status is not None:\n        rows = [p for p in rows if p.get(\"status\") == status]\n\n    def _sort_key(p):\n        v = p.get(sort)\n        if v is None:\n            # Put nulls last for asc, first for desc (stable)\n            return (1, \"\")\n        return (0, v)\n\n    rows.sort(key=_sort_key, reverse=(order == \"desc\"))\n\n    total = len(rows)\n    page = rows[start:start + limit]\n    next_cursor = None\n    has_more = start + limit < total\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode((\"off:%d\" % (start + limit)).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    resp = {\n        \"projects\": page,\n        \"total\": total,\n        \"limit\": limit,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n        \"sort\": sort,\n        \"order\": order,\n    }\n    _finish_ok(workspace_id, {\"returned\": len(page), \"total\": total, \"has_more\": has_more})\n    return resp\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "search_issues",
+          "description": "Performs full-text search over issues in a workspace using the provided query, optionally constrained by team, project, status, and priority, and returns a paginated list of matching issues sorted by relevance or the requested time field. Results are paginated with limit (1–100) and an opaque cursor; omit cursor for the first page and pass the returned cursor to continue. Raises VALIDATION_ERROR for invalid IDs, invalid enum values, empty/invalid query, limit out of range, or unknown fields; raises NOT_FOUND if the workspace_id (or provided team_id/project_id) does not exist or is not accessible; raises FORBIDDEN if you are not permitted to search issues in the workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^lin_ws_[0-9A-Z]+$",
+                "description": "Workspace to search issues within (lin_ws_...)."
+              },
+              "query": {
+                "type": "string",
+                "description": "Full-text query string to search in issues."
+              },
+              "team_id": {
+                "type": "string",
+                "pattern": "^lin_team_[0-9A-Z]+$",
+                "description": "Optional team filter for the search (lin_team_...)."
+              },
+              "project_id": {
+                "type": "string",
+                "pattern": "^lin_prj_[0-9A-Z]+$",
+                "description": "Optional project filter for the search (lin_prj_...)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "triage",
+                  "backlog",
+                  "started",
+                  "completed",
+                  "canceled"
+                ],
+                "description": "Optional status filter for the search."
+              },
+              "priority": {
+                "type": "integer",
+                "enum": [
+                  0,
+                  1,
+                  2,
+                  3,
+                  4
+                ],
+                "description": "Optional priority filter for the search (0-4)."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "relevance",
+                  "created_at",
+                  "updated_at"
+                ],
+                "description": "Sort mode for search results."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order (ascending/descending) when applicable."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of issues to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "query"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def search_issues(workspace_id, query, team_id=None, project_id=None, status=None, priority=None, sort=None, order=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0148000\" if __import__(\"os\").path.isdir(\"./environment_mix/0148000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    api_requests = _load(\"api_requests.json\")\n    workspaces = _load(\"workspaces.json\")\n    teams = _load(\"teams.json\")\n    projects = _load(\"projects.json\")\n    issues = _load(\"issues.json\")\n\n    req_id = \"lin_req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\")\n    req_row = {\n        \"id\": req_id,\n        \"workspace_id\": None,\n        \"tool_name\": \"search_issues\",\n        \"status\": \"received\",\n        \"request_payload\": {\n            \"workspace_id\": workspace_id,\n            \"query\": query,\n            \"team_id\": team_id,\n            \"project_id\": project_id,\n            \"status\": status,\n            \"priority\": priority,\n            \"sort\": sort,\n            \"order\": order,\n            \"limit\": limit,\n            \"cursor\": cursor,\n        },\n        \"response_summary\": None,\n        \"error_message\": None,\n        \"duration_ms\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    api_requests.append(req_row)\n    _save(\"api_requests.json\", api_requests)\n\n    def _finish_ok(workspace_id_val, summary):\n        api_requests2 = _load(\"api_requests.json\")\n        for r in reversed(api_requests2):\n            if r.get(\"id\") == req_id:\n                r[\"workspace_id\"] = workspace_id_val\n                r[\"status\"] = \"succeeded\"\n                r[\"response_summary\"] = summary\n                r[\"error_message\"] = None\n                r[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n                r[\"updated_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n                break\n        _save(\"api_requests.json\", api_requests2)\n\n    def _finish_err(workspace_id_val, code, msg, **x):\n        api_requests2 = _load(\"api_requests.json\")\n        for r in reversed(api_requests2):\n            if r.get(\"id\") == req_id:\n                r[\"workspace_id\"] = workspace_id_val\n                r[\"status\"] = \"failed\"\n                r[\"response_summary\"] = None\n                r[\"error_message\"] = msg\n                r[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n                r[\"updated_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n                break\n        _save(\"api_requests.json\", api_requests2)\n        return _err(code, msg, **x)\n\n    if not isinstance(workspace_id, str) or not re.match(r\"^lin_ws_[0-9A-Z]+$\", workspace_id):\n        return _finish_err(None, \"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if not isinstance(query, str) or query.strip() == \"\":\n        return _finish_err(None, \"VALIDATION_ERROR\", \"query must be a non-empty string.\")\n\n    ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n    if not ws:\n        return _finish_err(None, \"NOT_FOUND\", \"Workspace not found.\")\n    if ws.get(\"status\") != \"active\":\n        return _finish_err(workspace_id, \"UNAUTHORIZED\", \"Workspace is not active.\")\n\n    if team_id is not None:\n        if not isinstance(team_id, str) or not re.match(r\"^lin_team_[0-9A-Z]+$\", team_id):\n            return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"Invalid team_id.\")\n        trow = next((t for t in teams if t.get(\"id\") == team_id and t.get(\"workspace_id\") == workspace_id), None)\n        if not trow:\n            return _finish_err(workspace_id, \"NOT_FOUND\", \"Team not found in workspace.\")\n\n    if project_id is not None:\n        if not isinstance(project_id, str) or not re.match(r\"^lin_prj_[0-9A-Z]+$\", project_id):\n            return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"Invalid project_id.\")\n        prow = next((p for p in projects if p.get(\"id\") == project_id and p.get(\"workspace_id\") == workspace_id), None)\n        if not prow:\n            return _finish_err(workspace_id, \"NOT_FOUND\", \"Project not found in workspace.\")\n\n    allowed_status = {\"triage\", \"backlog\", \"started\", \"completed\", \"canceled\"}\n    if status is not None and (not isinstance(status, str) or status not in allowed_status):\n        return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"Invalid status.\")\n\n    allowed_priority = {0, 1, 2, 3, 4}\n    if priority is not None and (not isinstance(priority, int) or priority not in allowed_priority):\n        return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"Invalid priority.\")\n\n    allowed_sort = {\"relevance\", \"created_at\", \"updated_at\"}\n    if sort is None:\n        sort = \"relevance\"\n    if not isinstance(sort, str) or sort not in allowed_sort:\n        return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"Invalid sort.\")\n\n    allowed_order = {\"asc\", \"desc\"}\n    if order is None:\n        order = \"desc\"\n    if not isinstance(order, str) or order not in allowed_order:\n        return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"Invalid order.\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 100:\n        return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"limit must be an integer between 1 and 100.\")\n\n    start = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or cursor.strip() == \"\":\n            return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"Invalid cursor.\")\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\").decode(\"utf-8\")\n            if not raw.startswith(\"off:\"):\n                return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"Invalid cursor.\")\n            start = int(raw.split(\":\", 1)[1])\n            if start < 0:\n                return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"Invalid cursor.\")\n        except Exception:\n            return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n    # server-side: do not return issues from archived teams\n    team_by_id = {t.get(\"id\"): t for t in teams if t.get(\"workspace_id\") == workspace_id}\n    def _team_allowed(issue_row):\n        t = team_by_id.get(issue_row.get(\"team_id\"))\n        if not t:\n            return False\n        return t.get(\"status\") != \"archived\"\n\n    q = query.strip().lower()\n    terms = [t for t in re.split(r\"\\s+\", q) if t]\n    if not terms:\n        return _finish_err(workspace_id, \"VALIDATION_ERROR\", \"query must contain searchable terms.\")\n\n    def _text(hay):\n        return (hay or \"\").lower()\n\n    def _score(issue_row):\n        title = _text(issue_row.get(\"title\"))\n        desc = _text(issue_row.get(\"description\"))\n        ident = _text(issue_row.get(\"identifier\"))\n        score = 0\n        for term in terms:\n            if term in title:\n                score += 5\n                if title.startswith(term):\n                    score += 2\n            if term in ident:\n                score += 4\n            if term in desc:\n                score += 1\n        return score\n\n    # workspace scope + filters\n    rows = [i for i in issues if i.get(\"workspace_id\") == workspace_id and _team_allowed(i)]\n    if team_id is not None:\n        rows = [i for i in rows if i.get(\"team_id\") == team_id]\n    if project_id is not None:\n        rows = [i for i in rows if i.get(\"project_id\") == project_id]\n    if status is not None:\n        rows = [i for i in rows if i.get(\"status\") == status]\n    if priority is not None:\n        rows = [i for i in rows if i.get(\"priority\") == priority]\n\n    scored = []\n    for i in rows:\n        s = _score(i)\n        if s > 0:\n            scored.append((s, i))\n\n    # Sort\n    if sort == \"relevance\":\n        # Rank by (score desc, updated_at desc)\n        def _upd(x):\n            return x.get(\"updated_at\") or \"\"\n        scored.sort(key=lambda si: (si[0], _upd(si[1])), reverse=True)\n        ordered = [i for _, i in scored]\n    else:\n        ordered = [i for _, i in scored]\n        def _k(i):\n            v = i.get(sort)\n            if v is None:\n                return (1, \"\")\n            return (0, v)\n        ordered.sort(key=_k, reverse=(order == \"desc\"))\n\n    total = len(ordered)\n    page = ordered[start:start + limit]\n    has_more = start + limit < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode((\"off:%d\" % (start + limit)).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    resp = {\n        \"issues\": page,\n        \"total\": total,\n        \"limit\": limit,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n        \"sort\": sort,\n        \"order\": order,\n    }\n    _finish_ok(workspace_id, {\"returned\": len(page), \"total\": total, \"has_more\": has_more})\n    return resp\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_issue",
+          "description": "Retrieves and returns the full issue record for the specified issue_id. Raises VALIDATION_ERROR if issue_id does not match the required lin_iss_* pattern or if unknown fields are provided. Raises NOT_FOUND if the issue_id does not exist or is not accessible; raises FORBIDDEN if you do not have permission to view the issue.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "issue_id": {
+                "type": "string",
+                "pattern": "^lin_iss_[0-9A-Z]+$",
+                "description": "ID of the issue to retrieve (lin_iss_...)."
+              }
+            },
+            "required": [
+              "issue_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_issue(issue_id, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0148000\" if __import__(\"os\").path.isdir(\"./environment_mix/0148000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_s = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _new_req_id(existing_ids):\n        base = datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\").upper()\n        cand = \"lin_req_\" + base\n        i = 0\n        while cand in existing_ids:\n            i += 1\n            cand = \"lin_req_\" + base + str(i)\n        return cand\n\n    def _append_req_received(payload):\n        api_requests = _load(\"api_requests.json\")\n        if not isinstance(api_requests, list):\n            api_requests = []\n        existing = {r.get(\"id\") for r in api_requests if isinstance(r, dict)}\n        rid = _new_req_id(existing)\n        row = {\n            \"id\": rid,\n            \"workspace_id\": None,\n            \"tool_name\": \"get_issue\",\n            \"status\": \"received\",\n            \"request_payload\": payload if isinstance(payload, dict) else {},\n            \"response_summary\": None,\n            \"error_message\": None,\n            \"duration_ms\": None,\n            \"created_at\": now_s,\n            \"updated_at\": now_s,\n        }\n        api_requests.append(row)\n        _save(\"api_requests.json\", api_requests)\n        return rid\n\n    def _finalize_req(rid, status_s, workspace_id, summary=None, error_message=None):\n        api_requests = _load(\"api_requests.json\")\n        if not isinstance(api_requests, list):\n            api_requests = []\n        for r in reversed(api_requests):\n            if isinstance(r, dict) and r.get(\"id\") == rid:\n                r[\"workspace_id\"] = workspace_id\n                r[\"status\"] = status_s\n                r[\"response_summary\"] = summary\n                r[\"error_message\"] = error_message\n                r[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n                r[\"updated_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n                break\n        _save(\"api_requests.json\", api_requests)\n\n    def _pick_accessible_workspace():\n        # Ambient auth resolution: pick a workspace that actually has issues (so get_issue has meaningful scope).\n        workspaces = _load(\"workspaces.json\")\n        issues = _load(\"issues.json\")\n        if not isinstance(workspaces, list):\n            workspaces = []\n        if not isinstance(issues, list):\n            issues = []\n        ws_by_id = {w.get(\"id\"): w for w in workspaces if isinstance(w, dict) and isinstance(w.get(\"id\"), str)}\n        # Prefer workspace owning the issue_id if present\n        for iss in issues:\n            if isinstance(iss, dict) and iss.get(\"id\") == issue_id:\n                wid = iss.get(\"workspace_id\")\n                w = ws_by_id.get(wid)\n                if isinstance(w, dict) and w.get(\"status\") != \"deleted\":\n                    return wid\n        ws_with_issues = set(\n            iss.get(\"workspace_id\")\n            for iss in issues\n            if isinstance(iss, dict) and isinstance(iss.get(\"workspace_id\"), str)\n        )\n        for wid in ws_with_issues:\n            w = ws_by_id.get(wid)\n            if isinstance(w, dict) and w.get(\"status\") != \"deleted\":\n                return wid\n        for w in workspaces:\n            if isinstance(w, dict) and isinstance(w.get(\"id\"), str) and w.get(\"status\") != \"deleted\":\n                return w[\"id\"]\n        return None\n\n    rid = _append_req_received({\"issue_id\": issue_id})\n\n    workspace_id = None\n    try:\n        if not isinstance(issue_id, str) or not re.match(r\"^lin_iss_[0-9A-Z]+$\", issue_id):\n            workspace_id = _pick_accessible_workspace()\n            _finalize_req(rid, \"failed\", workspace_id, error_message=\"validation error: issue_id must match ^lin_iss_[0-9A-Z]+$\")\n            return _err(\"VALIDATION_ERROR\", \"validation error: issue_id must match ^lin_iss_[0-9A-Z]+$\")\n\n        issues = _load(\"issues.json\")\n        teams = _load(\"teams.json\")\n        projects = _load(\"projects.json\")\n        workspaces = _load(\"workspaces.json\")\n        if not isinstance(issues, list):\n            issues = []\n        if not isinstance(teams, list):\n            teams = []\n        if not isinstance(projects, list):\n            projects = []\n        if not isinstance(workspaces, list):\n            workspaces = []\n\n        ws_by_id = {w.get(\"id\"): w for w in workspaces if isinstance(w, dict) and isinstance(w.get(\"id\"), str)}\n        teams_by_id = {t.get(\"id\"): t for t in teams if isinstance(t, dict) and isinstance(t.get(\"id\"), str)}\n        projects_by_id = {p.get(\"id\"): p for p in projects if isinstance(p, dict) and isinstance(p.get(\"id\"), str)}\n\n        issue = None\n        for it in issues:\n            if isinstance(it, dict) and it.get(\"id\") == issue_id:\n                issue = it\n                break\n\n        if not issue:\n            workspace_id = _pick_accessible_workspace()\n            _finalize_req(rid, \"failed\", workspace_id, error_message=\"not found: issue_id does not exist in workspace\")\n            return _err(\"NOT_FOUND\", \"not found: issue_id does not exist in workspace\")\n\n        workspace_id = issue.get(\"workspace_id\")\n        w = ws_by_id.get(workspace_id) if isinstance(workspace_id, str) else None\n        if not isinstance(w, dict) or w.get(\"status\") == \"deleted\":\n            _finalize_req(rid, \"failed\", None, error_message=\"unauthorized: no accessible workspace context\")\n            return _err(\"UNAUTHORIZED\", \"unauthorized: no accessible workspace context\")\n\n        # Enforce cross-workspace access is forbidden via FK integrity check\n        t = teams_by_id.get(issue.get(\"team_id\"))\n        if not isinstance(t, dict) or t.get(\"workspace_id\") != workspace_id:\n            _finalize_req(rid, \"failed\", workspace_id, error_message=\"forbidden: team_id does not belong to workspace\")\n            return _err(\"UNAUTHORIZED\", \"forbidden: team_id does not belong to workspace\")\n\n        prj_id = issue.get(\"project_id\")\n        if prj_id is not None:\n            pr = projects_by_id.get(prj_id)\n            if not isinstance(pr, dict) or pr.get(\"workspace_id\") != workspace_id:\n                _finalize_req(rid, \"failed\", workspace_id, error_message=\"forbidden: project_id does not belong to workspace\")\n                return _err(\"UNAUTHORIZED\", \"forbidden: project_id does not belong to workspace\")\n\n        _finalize_req(rid, \"succeeded\", workspace_id, summary={\"issue_id\": issue_id})\n        return {\"issue\": issue}\n    except Exception as e:\n        _finalize_req(rid, \"failed\", workspace_id, error_message=str(e))\n        return _err(\"VALIDATION_ERROR\", \"internal error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_workspace",
+          "description": "Fetches the caller-accessible workspace by id and returns the workspace record. Raises VALIDATION_ERROR if workspace_id is not a valid lin_ws_... id. Raises NOT_FOUND if the workspace is not accessible to the caller.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^lin_ws_[0-9A-Z]+$",
+                "description": "Workspace id to fetch (lin_ws_...)."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_workspace(workspace_id, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0148000\" if __import__(\"os\").path.isdir(\"./environment_mix/0148000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    api_requests = _load(\"api_requests.json\")\n    workspaces = _load(\"workspaces.json\")\n\n    req_id = \"lin_req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\")\n    req_row = {\n        \"id\": req_id,\n        \"workspace_id\": None,\n        \"tool_name\": \"get_workspace\",\n        \"status\": \"received\",\n        \"request_payload\": {\"workspace_id\": workspace_id},\n        \"response_summary\": None,\n        \"error_message\": None,\n        \"duration_ms\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    api_requests.append(req_row)\n    _save(\"api_requests.json\", api_requests)\n\n    def _finish_ok(workspace_id_val, summary):\n        api_requests2 = _load(\"api_requests.json\")\n        for r in reversed(api_requests2):\n            if r.get(\"id\") == req_id:\n                r[\"workspace_id\"] = workspace_id_val\n                r[\"status\"] = \"succeeded\"\n                r[\"response_summary\"] = summary\n                r[\"error_message\"] = None\n                r[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n                r[\"updated_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n                break\n        _save(\"api_requests.json\", api_requests2)\n\n    def _finish_err(workspace_id_val, code, msg, **x):\n        api_requests2 = _load(\"api_requests.json\")\n        for r in reversed(api_requests2):\n            if r.get(\"id\") == req_id:\n                r[\"workspace_id\"] = workspace_id_val\n                r[\"status\"] = \"failed\"\n                r[\"response_summary\"] = None\n                r[\"error_message\"] = msg\n                r[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n                r[\"updated_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n                break\n        _save(\"api_requests.json\", api_requests2)\n        return _err(code, msg, **x)\n\n    if not isinstance(workspace_id, str) or not re.match(r\"^lin_ws_[0-9A-Z]+$\", workspace_id):\n        return _finish_err(None, \"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n\n    ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n    if not ws:\n        return _finish_err(None, \"NOT_FOUND\", \"Workspace not found.\")\n\n    # Ambient auth: if it exists, it's considered accessible here.\n    _finish_ok(workspace_id, {\"workspace_id\": workspace_id})\n    return {\"workspace\": ws}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0148000",
+    "index": 148,
+    "name": "Linear MCP Server",
+    "description": "This backend stores a Linear-like workspace with teams, projects, and issues, supporting creation, updates, listing, and retrieval. It also supports full-text search over issues and basic API auditing of requests so the MCP tools can list/search/get and mutate issues reliably. Repository: https://gi",
+    "taxonomy": {
+      "L1_id": "L1-08",
+      "L1_name": "System & Cloud Infrastructure",
+      "L1_name_zh": "系统与云基础设施",
+      "L2_id": "L2-22",
+      "L2_name": "DevOps & Workflow Automation",
+      "L2_name_zh": "DevOps 与流程自动化",
+      "L3_name": "Project & Issue Tracking",
+      "L3_name_zh": "项目与问题跟踪"
+    },
+    "database_dir": "./environment_mix/0148000",
+    "mount_path": "/app/database",
+    "n_tools": 8,
+    "n_collections": 5,
+    "n_records": 116,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 8,
+      "loaded": 8,
+      "reads_returning_data": 5,
+      "read_operations": 6,
+      "mutations_persisted": 1,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 8,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_issues",
+      "returned_chars": 2678
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

@@ -1,0 +1,148 @@
+{
+  "index": 447,
+  "local_files_dir": "./environment_mix/0447000",
+  "file_list": [
+    "./environment_mix/0447000/README.md",
+    "./environment_mix/0447000/contacts.json",
+    "./environment_mix/0447000/departments.json",
+    "./environment_mix/0447000/messages.csv"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "contacts.json": "Array of contact profiles (contact_id, name, email, phone, department_id).",
+        "departments.json": "Array of departments (department_id, name, head).",
+        "messages.csv": "CSV of messages (message_id, from_contact_id, to_contact_id, timestamp, body).",
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "contacts_get",
+          "description": "Looks up a single contact by contact_id and returns the contact record when it exists, otherwise indicates it was not found. Refuses requests that omit contact_id or provide an invalid/empty identifier. Refuses lookups for contact_id values that do not correspond to any contact in the directory.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "contact_id": {
+                "type": "string",
+                "description": "Contact id."
+              }
+            },
+            "required": [
+              "contact_id"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0447000\" if __import__(\"os\").path.isdir(\"./environment_mix/0447000\") else \"/app/database\")\ndef contacts_get(contact_id):\n    import json\n    with open(__import__(\"os\").path.join(_DB, 'contacts.json')) as f:\n        cs = json.load(f)\n    for c in cs:\n        if c.get('contact_id') == contact_id:\n            return c\n    return {'found': False, 'contact_id': contact_id}",
+          "description_restored": true
+        },
+        {
+          "name": "contacts_search",
+          "description": "Searches the directory for contacts whose name or email contains the provided query substring (case-insensitive) and returns the matching contacts. Refuses requests with a missing, empty, or non-string query. Refuses queries that are too vague to evaluate (for example, whitespace-only input) and reports that the search term is invalid.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Name or email substring."
+              }
+            },
+            "required": [
+              "query"
+            ]
+          },
+          "implementation": "def contacts_search(query, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0447000\" if __import__(\"os\").path.isdir(\"./environment_mix/0447000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = datetime.datetime.utcnow()\n\n    audits = _load(\"audit_log.json\")\n    if not isinstance(audits, list):\n        audits = []\n\n    # Rate limit: max 60 calls per rolling 60 seconds (global, since auth is ambient)\n    now = datetime.datetime.utcnow()\n    window_start = now - datetime.timedelta(seconds=60)\n    recent = 0\n    for e in audits:\n        ts = e.get(\"timestamp\")\n        if isinstance(ts, str):\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                continue\n            if dt >= window_start:\n                recent += 1\n    if recent >= 60:\n        audits.append({\n            \"event_id\": \"evt_\" + now.strftime(\"%Y%m%d%H%M%S%f\"),\n            \"endpoint\": \"contacts_search\",\n            \"status\": \"RATE_LIMIT\",\n            \"timestamp\": now.isoformat() + \"Z\",\n            \"latency_ms\": 0\n        })\n        _save(\"audit_log.json\", audits)\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded. Please retry shortly.\")\n\n    # Validate\n    if query is None or not isinstance(query, str):\n        status = \"VALIDATION_ERROR\"\n        out = _err(\"VALIDATION_ERROR\", \"query is required and must be a string.\", field=\"query\")\n    else:\n        q = query.strip()\n        if q == \"\":\n            status = \"VALIDATION_ERROR\"\n            out = _err(\"VALIDATION_ERROR\", \"Search term is invalid.\", field=\"query\")\n        else:\n            contacts = _load(\"contacts.json\")\n            if not isinstance(contacts, list):\n                contacts = []\n            ql = q.lower()\n            matches = []\n            for c in contacts:\n                if not isinstance(c, dict):\n                    continue\n                name = (c.get(\"name\") or \"\")\n                email = (c.get(\"email\") or \"\")\n                if isinstance(name, str) and ql in name.lower():\n                    matches.append(c)\n                elif isinstance(email, str) and ql in email.lower():\n                    matches.append(c)\n            status = \"OK\"\n            out = {\n                \"data\": matches,\n                \"meta\": {\"total\": len(matches), \"has_more\": False, \"next_cursor\": None}\n            }\n\n    t1 = datetime.datetime.utcnow()\n    audits.append({\n        \"event_id\": \"evt_\" + t1.strftime(\"%Y%m%d%H%M%S%f\"),\n        \"endpoint\": \"contacts_search\",\n        \"status\": status,\n        \"timestamp\": t1.isoformat() + \"Z\",\n        \"latency_ms\": int((t1 - t0).total_seconds() * 1000)\n    })\n    _save(\"audit_log.json\", audits)\n    return out\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "contacts_send_message",
+          "description": "Queues a simulated message addressed to the specified contact and returns the queued message envelope. Refuses requests missing contact_id or body, or where either value is empty or not a string. Refuses sending when the recipient contact_id does not exist in the directory, because it cannot deliver to an unknown contact.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "contact_id": {
+                "type": "string",
+                "description": "Recipient contact id."
+              },
+              "body": {
+                "type": "string",
+                "description": "Message body."
+              }
+            },
+            "required": [
+              "contact_id",
+              "body"
+            ]
+          },
+          "implementation": "def contacts_send_message(contact_id, body, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0447000\" if __import__(\"os\").path.isdir(\"./environment_mix/0447000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = datetime.datetime.utcnow()\n\n    audits = _load(\"audit_log.json\")\n    if not isinstance(audits, list):\n        audits = []\n\n    # Rate limit: max 60 calls per rolling 60 seconds (global)\n    now = datetime.datetime.utcnow()\n    window_start = now - datetime.timedelta(seconds=60)\n    recent = 0\n    for e in audits:\n        ts = e.get(\"timestamp\")\n        if isinstance(ts, str):\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                continue\n            if dt >= window_start:\n                recent += 1\n    if recent >= 60:\n        audits.append({\n            \"event_id\": \"evt_\" + now.strftime(\"%Y%m%d%H%M%S%f\"),\n            \"endpoint\": \"contacts_send_message\",\n            \"status\": \"RATE_LIMIT\",\n            \"timestamp\": now.isoformat() + \"Z\",\n            \"latency_ms\": 0\n        })\n        _save(\"audit_log.json\", audits)\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded. Please retry shortly.\")\n\n    # Validate inputs\n    if contact_id is None or not isinstance(contact_id, str) or contact_id.strip() == \"\":\n        status = \"VALIDATION_ERROR\"\n        out = _err(\"VALIDATION_ERROR\", \"contact_id is required and must be a non-empty string.\", field=\"contact_id\")\n    elif body is None or not isinstance(body, str) or body.strip() == \"\":\n        status = \"VALIDATION_ERROR\"\n        out = _err(\"VALIDATION_ERROR\", \"body is required and must be a non-empty string.\", field=\"body\")\n    else:\n        cid = contact_id.strip()\n        contacts = _load(\"contacts.json\")\n        if not isinstance(contacts, list):\n            contacts = []\n        recipient = None\n        for c in contacts:\n            if isinstance(c, dict) and c.get(\"contact_id\") == cid:\n                recipient = c\n                break\n\n        if recipient is None:\n            status = \"NOT_FOUND\"\n            out = _err(\"NOT_FOUND\", \"Recipient contact_id does not exist.\", contact_id=cid)\n        else:\n            # Persist message to messages.json (created if missing)\n            messages = _load(\"messages.json\")\n            if not isinstance(messages, list):\n                messages = []\n\n            # Id generation\n            ts = datetime.datetime.utcnow()\n            msg_id = \"msg_\" + ts.strftime(\"%Y%m%d%H%M%S%f\")\n            existing_ids = {m.get(\"message_id\") for m in messages if isinstance(m, dict)}\n            while msg_id in existing_ids:\n                ts = datetime.datetime.utcnow()\n                msg_id = \"msg_\" + ts.strftime(\"%Y%m%d%H%M%S%f\")\n\n            msg = {\n                \"message_id\": msg_id,\n                \"from_contact_id\": None,\n                \"to_contact_id\": cid,\n                \"body\": body,\n                \"status\": \"queued\",\n                \"queued_at\": ts.isoformat() + \"Z\"\n            }\n            messages.append(msg)\n            _save(\"messages.json\", messages)\n\n            status = \"OK\"\n            out = {\n                \"data\": {\n                    \"message_id\": msg_id,\n                    \"status\": \"queued\",\n                    \"to\": cid,\n                    \"recipient_email\": recipient.get(\"email\"),\n                    \"body\": body,\n                    \"queued_at\": msg[\"queued_at\"]\n                }\n            }\n\n    t1 = datetime.datetime.utcnow()\n    audits.append({\n        \"event_id\": \"evt_\" + t1.strftime(\"%Y%m%d%H%M%S%f\"),\n        \"endpoint\": \"contacts_send_message\",\n        \"status\": status,\n        \"timestamp\": t1.isoformat() + \"Z\",\n        \"latency_ms\": int((t1 - t0).total_seconds() * 1000)\n    })\n    _save(\"audit_log.json\", audits)\n    return out\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "list_departments",
+          "description": "Returns the full list of department objects in the directory. Refuses requests that include unsupported parameters, since this endpoint does not accept filters or pagination. Refuses access when department listings are not available in the current service state.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0447000\" if __import__(\"os\").path.isdir(\"./environment_mix/0447000\") else \"/app/database\")\ndef list_departments():\n    import json\n    with open(__import__(\"os\").path.join(_DB, 'departments.json')) as f:\n        return json.load(f)",
+          "description_restored": true
+        },
+        {
+          "name": "get_message_history",
+          "description": "Returns message history, either all messages or only those involving the specified contact_id as sender or recipient. Refuses requests where contact_id is provided but is empty or not a valid identifier. Refuses filtered requests for a contact_id that does not exist, because there is no history to associate with an unknown contact.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "contact_id": {
+                "type": "string",
+                "description": "Optional contact id to filter messages sent to or from."
+              }
+            }
+          },
+          "implementation": "def get_message_history(contact_id=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0447000\" if __import__(\"os\").path.isdir(\"./environment_mix/0447000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = datetime.datetime.utcnow()\n\n    audits = _load(\"audit_log.json\")\n    if not isinstance(audits, list):\n        audits = []\n\n    # Rate limit: max 60 calls per rolling 60 seconds (global)\n    now = datetime.datetime.utcnow()\n    window_start = now - datetime.timedelta(seconds=60)\n    recent = 0\n    for e in audits:\n        ts = e.get(\"timestamp\")\n        if isinstance(ts, str):\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                continue\n            if dt >= window_start:\n                recent += 1\n    if recent >= 60:\n        audits.append({\n            \"event_id\": \"evt_\" + now.strftime(\"%Y%m%d%H%M%S%f\"),\n            \"endpoint\": \"get_message_history\",\n            \"status\": \"RATE_LIMIT\",\n            \"timestamp\": now.isoformat() + \"Z\",\n            \"latency_ms\": 0\n        })\n        _save(\"audit_log.json\", audits)\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded. Please retry shortly.\")\n\n    # Validate optional filter\n    if contact_id is not None:\n        if (not isinstance(contact_id, str)) or contact_id.strip() == \"\":\n            status = \"VALIDATION_ERROR\"\n            out = _err(\"VALIDATION_ERROR\", \"contact_id must be a non-empty string when provided.\", field=\"contact_id\")\n        else:\n            cid = contact_id.strip()\n            contacts = _load(\"contacts.json\")\n            if not isinstance(contacts, list):\n                contacts = []\n            exists = any(isinstance(c, dict) and c.get(\"contact_id\") == cid for c in contacts)\n            if not exists:\n                status = \"NOT_FOUND\"\n                out = _err(\"NOT_FOUND\", \"contact_id does not exist.\", contact_id=cid)\n            else:\n                messages = _load(\"messages.json\")\n                if not isinstance(messages, list):\n                    messages = []\n                filtered = []\n                for m in messages:\n                    if not isinstance(m, dict):\n                        continue\n                    if m.get(\"from_contact_id\") == cid or m.get(\"to_contact_id\") == cid:\n                        filtered.append(m)\n                status = \"OK\"\n                out = {\n                    \"data\": filtered,\n                    \"meta\": {\"total\": len(filtered), \"has_more\": False, \"next_cursor\": None}\n                }\n    else:\n        messages = _load(\"messages.json\")\n        if not isinstance(messages, list):\n            messages = []\n        status = \"OK\"\n        out = {\n            \"data\": [m for m in messages if isinstance(m, dict)],\n            \"meta\": {\"total\": len([m for m in messages if isinstance(m, dict)]), \"has_more\": False, \"next_cursor\": None}\n        }\n\n    t1 = datetime.datetime.utcnow()\n    audits.append({\n        \"event_id\": \"evt_\" + t1.strftime(\"%Y%m%d%H%M%S%f\"),\n        \"endpoint\": \"get_message_history\",\n        \"status\": status,\n        \"timestamp\": t1.isoformat() + \"Z\",\n        \"latency_ms\": int((t1 - t0).total_seconds() * 1000)\n    })\n    _save(\"audit_log.json\", audits)\n    return out\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0447000",
+    "index": 447,
+    "name": "Orchard Contact Exchange",
+    "description": "A lightweight organizational directory that lets users search contacts by department and send messages while tracking conversation history.",
+    "taxonomy": {
+      "L1_id": "L1-20",
+      "L1_name": "Communication & General Utilities",
+      "L1_name_zh": "通信与通用工具",
+      "L2_id": "L2-48",
+      "L2_name": "Messaging & Notification",
+      "L2_name_zh": "即时通信与通知",
+      "L3_name": "Team Chat & Messaging",
+      "L3_name_zh": "团队聊天与即时通讯"
+    },
+    "database_dir": "./environment_mix/0447000",
+    "mount_path": "/app/database",
+    "n_tools": 5,
+    "n_collections": 2,
+    "n_records": 130,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 5,
+      "loaded": 5,
+      "reads_returning_data": 4,
+      "read_operations": 4,
+      "mutations_persisted": 1,
+      "mutations_attempted": 1
+    },
+    "tools_loadable_from_database_dir": 5,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "contacts_get",
+      "returned_chars": 142
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

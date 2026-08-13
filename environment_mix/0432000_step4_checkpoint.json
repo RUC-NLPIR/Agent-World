@@ -1,0 +1,435 @@
+{
+  "index": 432,
+  "local_files_dir": "./environment_mix/0432000",
+  "file_list": [
+    "./environment_mix/0432000/README.md",
+    "./environment_mix/0432000/artifacts.json",
+    "./environment_mix/0432000/projects.json",
+    "./environment_mix/0432000/runs.csv",
+    "./environment_mix/0432000/traces.json",
+    "./environment_mix/0432000/users.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "users.json": "JSON array of 10 user objects. Each object contains:\n- user_id (e.g., \"U0001\")\n- username (e.g., \"user1\")\n- email (e.g., \"user1@example.com\")\n- entity (always \"example-team\")\n- created_at (ISO‑8601 timestamp).",
+        "projects.json": "JSON array of 5 project objects for the entity \"example-team\". Each object includes:\n- name (project slug, e.g., \"image-classification\")\n- entity\n- description\n- visibility (\"public\" or \"private\")\n- created_at / updated_at (ISO timestamps)\n- tags (list of 3 descriptive tags).",
+        "runs.csv": "CSV file with 100 synthetic run records (plus header). Columns:\n- run_id (8‑character alphanumeric ID)\n- project_name (one of the 5 projects)\n- display_name (human‑readable name, e.g., \"image-classification_run_3\")\n- state (\"finished\", \"running\" or \"failed\")\n- created_at (ISO timestamp)\n- accuracy (float, 0.6‑0.99)\n- loss (float, 0.1‑2.0)\n- learning_rate (float, e.g., 0.0001)\n- batch_size (16/32/64/128)\n- epochs (5/10/20/50)\n- user_id (links to a user in users.json).",
+        "artifacts.json": "JSON array of 50 artifact entries (10 per project). Each artifact includes:\n- artifact_id (unique ID)\n- project_name\n- name (e.g., \"image-classification_artifact_7\")\n- version (e.g., \"v3\")\n- digest (UUID hex string)\n- size_bytes (1 MiB – 1 GiB)\n- created_at (ISO timestamp)\n- metadata object with fields:\n  • framework (\"torch\", \"tensorflow\" or \"jax\")\n  • model_type (e.g., \"resnet\", \"bert\", \"gpt\", \"dqn\", \"vae\")\n  • description (text describing the artifact).",
+        "traces.json": "JSON array of 227 Weave trace objects (roots + children). Each trace record contains:\n- id (unique sequential ID like \"T000001\")\n- trace_id (UUID shared among related traces)\n- parent_id (null for root traces; otherwise points to the parent trace id)\n- project_name (one of the 5 projects)\n- op_name (URI style string, e.g., \"weave:///root_op_4\")\n- display_name (readable label)\n- started_at / ended_at (ISO timestamps)\n- status (\"success\" or \"error\")\n- latency_ms (integer)\n- costs object with:\n  • prompt_tokens_total_cost (float)\n  • completion_tokens_total_cost (float)\n  • total_cost (sum of the two)\n- attributes object with:\n  • model_name (e.g., \"gpt-4\")\n  • token_count (integer).\nThe traces reflect a realistic parent‑child hierarchy (15 root traces per project, each with 1‑3 child traces).",
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "list_users",
+          "description": "Lists users, optionally filtered by identifiers, exact fields (username/email/entity), creation time window, or a free-text query, and can paginate/sort the results; it returns the matching user objects and, when requested, a total count. It refuses requests that provide unknown parameters, unsupported sort fields or sort directions, or invalid pagination inputs (for example a non-integer limit or a cursor it can’t interpret). It also refuses invalid timestamps for created_after/created_before and rejects filter combinations it cannot apply consistently (such as an invalid user_id format).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of users to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque cursor for pagination to fetch the next page of results."
+              },
+              "sort_by": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "username",
+                  "user_id"
+                ],
+                "description": "Field to sort users by."
+              },
+              "sort_order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              },
+              "user_id": {
+                "type": "string",
+                "description": "Filter to a specific user identifier, e.g., \"U0001\"."
+              },
+              "username": {
+                "type": "string",
+                "description": "Filter users by exact username."
+              },
+              "email": {
+                "type": "string",
+                "description": "Filter users by exact email address."
+              },
+              "entity": {
+                "type": "string",
+                "description": "Filter users by entity/organization."
+              },
+              "created_after": {
+                "type": "string",
+                "description": "Include users created at or after this timestamp (ISO 8601)."
+              },
+              "created_before": {
+                "type": "string",
+                "description": "Include users created at or before this timestamp (ISO 8601)."
+              },
+              "q": {
+                "type": "string",
+                "description": "Free-text search over common user fields (e.g., username/email)."
+              },
+              "include_total": {
+                "type": "boolean",
+                "description": "Whether to include the total count of matching users (may be slower)."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_users(limit=None, cursor=None, sort_by=None, sort_order=None, user_id=None, username=None, email=None, entity=None, created_after=None, created_before=None, q=None, include_total=None, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0432000\" if __import__(\"os\").path.isdir(\"./environment_mix/0432000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _iso_parse(s):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s:\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s2 = s[:-1] + \"+00:00\"\n            else:\n                s2 = s\n            return datetime.datetime.fromisoformat(s2)\n        except Exception:\n            return None\n\n    # Validation\n    if limit is not None and (not isinstance(limit, int) or limit <= 0):\n        return _err(\"VALIDATION_ERROR\", \"limit must be a positive integer\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n    if sort_by is not None and sort_by not in (\"created_at\", \"username\", \"user_id\"):\n        return _err(\"VALIDATION_ERROR\", \"Unsupported sort_by\", allowed=[\"created_at\", \"username\", \"user_id\"])\n    if sort_order is not None and sort_order not in (\"asc\", \"desc\"):\n        return _err(\"VALIDATION_ERROR\", \"Unsupported sort_order\", allowed=[\"asc\", \"desc\"])\n    if user_id is not None and not isinstance(user_id, str):\n        return _err(\"VALIDATION_ERROR\", \"user_id must be a string\")\n    if username is not None and not isinstance(username, str):\n        return _err(\"VALIDATION_ERROR\", \"username must be a string\")\n    if email is not None and not isinstance(email, str):\n        return _err(\"VALIDATION_ERROR\", \"email must be a string\")\n    if entity is not None and not isinstance(entity, str):\n        return _err(\"VALIDATION_ERROR\", \"entity must be a string\")\n    if q is not None and not isinstance(q, str):\n        return _err(\"VALIDATION_ERROR\", \"q must be a string\")\n    if include_total is not None and not isinstance(include_total, bool):\n        return _err(\"VALIDATION_ERROR\", \"include_total must be a boolean\")\n\n    dt_after = _iso_parse(created_after)\n    if created_after is not None and dt_after is None:\n        return _err(\"VALIDATION_ERROR\", \"created_after must be an ISO 8601 timestamp\")\n    dt_before = _iso_parse(created_before)\n    if created_before is not None and dt_before is None:\n        return _err(\"VALIDATION_ERROR\", \"created_before must be an ISO 8601 timestamp\")\n\n    users = _load(\"users.json\")\n    if isinstance(users, dict) and \"data\" in users and isinstance(users[\"data\"], list):\n        users = users[\"data\"]\n    if not isinstance(users, list):\n        users = []\n\n    # Filtering\n    q_l = q.lower() if isinstance(q, str) and q else None\n    out = []\n    for u in users:\n        if not isinstance(u, dict):\n            continue\n        if user_id is not None and u.get(\"user_id\") != user_id:\n            continue\n        if username is not None and u.get(\"username\") != username:\n            continue\n        if email is not None and u.get(\"email\") != email:\n            continue\n        if entity is not None and u.get(\"entity\") != entity:\n            continue\n\n        if dt_after is not None or dt_before is not None:\n            u_dt = _iso_parse(u.get(\"created_at\"))\n            if u_dt is None:\n                continue\n            if dt_after is not None and u_dt < dt_after:\n                continue\n            if dt_before is not None and u_dt > dt_before:\n                continue\n\n        if q_l:\n            blob = \" \".join([str(u.get(\"user_id\", \"\")), str(u.get(\"username\", \"\")), str(u.get(\"email\", \"\")), str(u.get(\"entity\", \"\"))]).lower()\n            if q_l not in blob:\n                continue\n\n        out.append(u)\n\n    # Sorting\n    sb = sort_by or \"created_at\"\n    so = sort_order or \"desc\"\n\n    def _sort_key(row):\n        v = row.get(sb)\n        if sb == \"created_at\":\n            dt = _iso_parse(v)\n            return dt if dt is not None else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n        return \"\" if v is None else str(v)\n\n    out.sort(key=_sort_key, reverse=(so == \"desc\"))\n\n    # Cursor pagination: cursor is an integer offset encoded as \"offset:<n>\"\n    start = 0\n    if cursor:\n        m = re.fullmatch(r\"offset:(\\d+)\", cursor.strip())\n        if not m:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n        start = int(m.group(1))\n        if start < 0:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n\n    lim = limit if limit is not None else 100\n    page = out[start:start + lim]\n    next_cursor = None\n    has_more = start + lim < len(out)\n    if has_more:\n        next_cursor = f\"offset:{start + lim}\"\n\n    body = {\n        \"data\": page,\n        \"meta\": {\n            \"limit\": lim,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more\n        }\n    }\n    if include_total:\n        body[\"meta\"][\"total\"] = len(out)\n\n    return body\n",
+          "params_reconstructed": true,
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "get_user",
+          "description": "Fetches and returns the single user object identified by user_id. It refuses requests missing user_id or with a malformed user_id value. It also refuses the request when no user exists for the given identifier.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "user_id": {
+                "type": "string",
+                "description": "The identifier of the user, e.g., \"U0001\"."
+              }
+            },
+            "required": [
+              "user_id"
+            ]
+          },
+          "implementation": "def get_user(user_id, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0432000\" if __import__(\"os\").path.isdir(\"./environment_mix/0432000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    if user_id is None or not isinstance(user_id, str) or not user_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"user_id is required and must be a non-empty string\")\n\n    users = _load(\"users.json\")\n    if isinstance(users, dict) and \"data\" in users and isinstance(users[\"data\"], list):\n        users = users[\"data\"]\n    if not isinstance(users, list):\n        users = []\n\n    for u in users:\n        if isinstance(u, dict) and u.get(\"user_id\") == user_id:\n            return {\"data\": u}\n\n    return _err(\"NOT_FOUND\", \"User not found\", user_id=user_id)\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "list_projects",
+          "description": "Lists projects, with optional filtering by project slug, owning entity, visibility, tag, created/updated time windows, and free-text search, and supports pagination and sorting; it returns the matching project objects and, when requested, a total count. It refuses requests that include unknown parameters, invalid sort_by/sort_order values, or pagination inputs it cannot validate (such as a non-integer limit or an unreadable cursor). It also refuses invalid ISO 8601 timestamps for created_*/updated_* filters and rejects visibility or project_name values outside the supported set.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of projects to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque cursor for pagination to fetch the next page of results."
+              },
+              "sort_by": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "name"
+                ],
+                "description": "Field to sort projects by."
+              },
+              "sort_order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              },
+              "project_name": {
+                "type": "string",
+                "enum": [
+                  "data-preprocessing",
+                  "gan-experiments",
+                  "image-classification",
+                  "nlp-sentiment",
+                  "reinforcement-learning"
+                ],
+                "description": "Filter to a specific project slug/name."
+              },
+              "entity": {
+                "type": "string",
+                "description": "Filter projects by owning entity/organization."
+              },
+              "visibility": {
+                "type": "string",
+                "enum": [
+                  "private",
+                  "public"
+                ],
+                "description": "Filter projects by visibility."
+              },
+              "tag": {
+                "type": "string",
+                "description": "Filter projects that contain this tag."
+              },
+              "created_after": {
+                "type": "string",
+                "description": "Include projects created at or after this timestamp (ISO 8601)."
+              },
+              "created_before": {
+                "type": "string",
+                "description": "Include projects created at or before this timestamp (ISO 8601)."
+              },
+              "updated_after": {
+                "type": "string",
+                "description": "Include projects updated at or after this timestamp (ISO 8601)."
+              },
+              "updated_before": {
+                "type": "string",
+                "description": "Include projects updated at or before this timestamp (ISO 8601)."
+              },
+              "q": {
+                "type": "string",
+                "description": "Free-text search over common project fields (e.g., name/description)."
+              },
+              "include_total": {
+                "type": "boolean",
+                "description": "Whether to include the total count of matching projects (may be slower)."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_projects(limit=None, cursor=None, sort_by=None, sort_order=None, project_name=None, entity=None, visibility=None, tag=None, created_after=None, created_before=None, updated_after=None, updated_before=None, q=None, include_total=None, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0432000\" if __import__(\"os\").path.isdir(\"./environment_mix/0432000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    ALLOWED_PROJECTS = {\"data-preprocessing\", \"gan-experiments\", \"image-classification\", \"nlp-sentiment\", \"reinforcement-learning\"}\n    ALLOWED_VIS = {\"private\", \"public\"}\n    ALLOWED_SORT_BY = {\"created_at\", \"updated_at\", \"name\"}\n    ALLOWED_SORT_ORDER = {\"asc\", \"desc\"}\n\n    def _iso_parse(s):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s:\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s2 = s[:-1] + \"+00:00\"\n            else:\n                s2 = s\n            return datetime.datetime.fromisoformat(s2)\n        except Exception:\n            return None\n\n    # Validation\n    if limit is not None and (not isinstance(limit, int) or limit <= 0):\n        return _err(\"VALIDATION_ERROR\", \"limit must be a positive integer\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n    if sort_by is not None and sort_by not in ALLOWED_SORT_BY:\n        return _err(\"VALIDATION_ERROR\", \"Unsupported sort_by\", allowed=sorted(ALLOWED_SORT_BY))\n    if sort_order is not None and sort_order not in ALLOWED_SORT_ORDER:\n        return _err(\"VALIDATION_ERROR\", \"Unsupported sort_order\", allowed=sorted(ALLOWED_SORT_ORDER))\n    if project_name is not None:\n        if not isinstance(project_name, str):\n            return _err(\"VALIDATION_ERROR\", \"project_name must be a string\")\n        if project_name not in ALLOWED_PROJECTS:\n            return _err(\"VALIDATION_ERROR\", \"Unsupported project_name\", allowed=sorted(ALLOWED_PROJECTS))\n    if entity is not None and not isinstance(entity, str):\n        return _err(\"VALIDATION_ERROR\", \"entity must be a string\")\n    if visibility is not None:\n        if not isinstance(visibility, str) or visibility not in ALLOWED_VIS:\n            return _err(\"VALIDATION_ERROR\", \"Unsupported visibility\", allowed=sorted(ALLOWED_VIS))\n    if tag is not None and not isinstance(tag, str):\n        return _err(\"VALIDATION_ERROR\", \"tag must be a string\")\n    if q is not None and not isinstance(q, str):\n        return _err(\"VALIDATION_ERROR\", \"q must be a string\")\n    if include_total is not None and not isinstance(include_total, bool):\n        return _err(\"VALIDATION_ERROR\", \"include_total must be a boolean\")\n\n    dt_ca = _iso_parse(created_after)\n    if created_after is not None and dt_ca is None:\n        return _err(\"VALIDATION_ERROR\", \"created_after must be an ISO 8601 timestamp\")\n    dt_cb = _iso_parse(created_before)\n    if created_before is not None and dt_cb is None:\n        return _err(\"VALIDATION_ERROR\", \"created_before must be an ISO 8601 timestamp\")\n    dt_ua = _iso_parse(updated_after)\n    if updated_after is not None and dt_ua is None:\n        return _err(\"VALIDATION_ERROR\", \"updated_after must be an ISO 8601 timestamp\")\n    dt_ub = _iso_parse(updated_before)\n    if updated_before is not None and dt_ub is None:\n        return _err(\"VALIDATION_ERROR\", \"updated_before must be an ISO 8601 timestamp\")\n\n    projects = _load(\"projects.json\")\n    if isinstance(projects, dict) and \"data\" in projects and isinstance(projects[\"data\"], list):\n        projects = projects[\"data\"]\n    if not isinstance(projects, list):\n        projects = []\n\n    q_l = q.lower() if isinstance(q, str) and q else None\n\n    out = []\n    for p in projects:\n        if not isinstance(p, dict):\n            continue\n        if project_name is not None and p.get(\"name\") != project_name:\n            continue\n        if entity is not None and p.get(\"entity\") != entity:\n            continue\n        if visibility is not None and p.get(\"visibility\") != visibility:\n            continue\n        if tag is not None:\n            tags = p.get(\"tags\")\n            if not isinstance(tags, list) or tag not in tags:\n                continue\n\n        if dt_ca is not None or dt_cb is not None:\n            p_dt = _iso_parse(p.get(\"created_at\"))\n            if p_dt is None:\n                continue\n            if dt_ca is not None and p_dt < dt_ca:\n                continue\n            if dt_cb is not None and p_dt > dt_cb:\n                continue\n\n        if dt_ua is not None or dt_ub is not None:\n            p_dt = _iso_parse(p.get(\"updated_at\"))\n            if p_dt is None:\n                continue\n            if dt_ua is not None and p_dt < dt_ua:\n                continue\n            if dt_ub is not None and p_dt > dt_ub:\n                continue\n\n        if q_l:\n            blob = \" \".join([str(p.get(\"name\", \"\")), str(p.get(\"description\", \"\")), str(p.get(\"entity\", \"\"))]).lower()\n            if q_l not in blob:\n                continue\n\n        out.append(p)\n\n    sb = sort_by or \"updated_at\"\n    so = sort_order or \"desc\"\n\n    def _sort_key(row):\n        v = row.get(sb)\n        if sb in (\"created_at\", \"updated_at\"):\n            dt = _iso_parse(v)\n            return dt if dt is not None else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n        return \"\" if v is None else str(v)\n\n    out.sort(key=_sort_key, reverse=(so == \"desc\"))\n\n    start = 0\n    if cursor:\n        m = re.fullmatch(r\"offset:(\\d+)\", cursor.strip())\n        if not m:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n        start = int(m.group(1))\n        if start < 0:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n\n    lim = limit if limit is not None else 100\n    page = out[start:start + lim]\n    has_more = start + lim < len(out)\n    next_cursor = f\"offset:{start + lim}\" if has_more else None\n\n    body = {\n        \"data\": page,\n        \"meta\": {\n            \"limit\": lim,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more\n        }\n    }\n    if include_total:\n        body[\"meta\"][\"total\"] = len(out)\n    return body\n",
+          "params_reconstructed": true,
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "get_project",
+          "description": "Fetches and returns the single project identified by project_name. It refuses requests missing project_name or with a project_name value outside the supported slugs. It also refuses the request when no project matches the given name.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "project_name": {
+                "type": "string",
+                "description": "The slug/name of the project, e.g., \"image-classification\"."
+              }
+            },
+            "required": [
+              "project_name"
+            ]
+          },
+          "implementation": "def get_project(project_name, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0432000\" if __import__(\"os\").path.isdir(\"./environment_mix/0432000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    ALLOWED_PROJECTS = {\"data-preprocessing\", \"gan-experiments\", \"image-classification\", \"nlp-sentiment\", \"reinforcement-learning\"}\n\n    if project_name is None or not isinstance(project_name, str) or not project_name.strip():\n        return _err(\"VALIDATION_ERROR\", \"project_name is required and must be a non-empty string\")\n    if project_name not in ALLOWED_PROJECTS:\n        return _err(\"VALIDATION_ERROR\", \"Unsupported project_name\", allowed=sorted(ALLOWED_PROJECTS))\n\n    projects = _load(\"projects.json\")\n    if isinstance(projects, dict) and \"data\" in projects and isinstance(projects[\"data\"], list):\n        projects = projects[\"data\"]\n    if not isinstance(projects, list):\n        projects = []\n\n    for p in projects:\n        if isinstance(p, dict) and p.get(\"name\") == project_name:\n            return {\"data\": p}\n\n    return _err(\"NOT_FOUND\", \"Project not found\", project_name=project_name)\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "list_runs",
+          "description": "Lists run records and returns the runs that match the provided filters such as project_name, state, user_id, metric thresholds (accuracy/loss), and training settings (batch_size/epochs). It refuses requests with unknown parameters or filters of the wrong type (for example non-numeric min/max values or non-integer batch_size/epochs). It also refuses conflicting ranges (such as min_accuracy greater than max_accuracy or min_loss greater than max_loss) and rejects filters that reference entities that don’t exist or can’t be resolved (such as an unknown project_name or user_id).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "project_name": {
+                "type": "string",
+                "description": "Filter runs belonging to a specific project."
+              },
+              "state": {
+                "type": "string",
+                "description": "Filter by run state (e.g., \"finished\", \"running\", \"failed\")."
+              },
+              "user_id": {
+                "type": "string",
+                "description": "Filter by the user who launched the run."
+              },
+              "min_accuracy": {
+                "type": "number",
+                "description": "Include runs with accuracy greater than or equal to this value."
+              },
+              "max_accuracy": {
+                "type": "number",
+                "description": "Include runs with accuracy less than or equal to this value."
+              },
+              "min_loss": {
+                "type": "number",
+                "description": "Include runs with loss greater than or equal to this value."
+              },
+              "max_loss": {
+                "type": "number",
+                "description": "Include runs with loss less than or equal to this value."
+              },
+              "batch_size": {
+                "type": "integer",
+                "description": "Filter runs that used a specific batch size."
+              },
+              "epochs": {
+                "type": "integer",
+                "description": "Filter runs that were trained for a specific number of epochs."
+              }
+            },
+            "required": []
+          },
+          "implementation": "def list_runs(project_name=None, state=None, user_id=None, min_accuracy=None, max_accuracy=None, min_loss=None, max_loss=None, batch_size=None, epochs=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0432000\" if __import__(\"os\").path.isdir(\"./environment_mix/0432000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _utcnow_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_iso(s):\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s2 = s[:-1] + \"+00:00\"\n            else:\n                s2 = s\n            return datetime.datetime.fromisoformat(s2)\n        except Exception:\n            return None\n\n    # ---- validation (tool contract) ----\n    if project_name is not None and not isinstance(project_name, str):\n        return _err(\"VALIDATION_ERROR\", \"project_name must be a string\")\n    if state is not None and not isinstance(state, str):\n        return _err(\"VALIDATION_ERROR\", \"state must be a string\")\n    if user_id is not None and not isinstance(user_id, str):\n        return _err(\"VALIDATION_ERROR\", \"user_id must be a string\")\n\n    for k, v in ((\"min_accuracy\", min_accuracy), (\"max_accuracy\", max_accuracy), (\"min_loss\", min_loss), (\"max_loss\", max_loss)):\n        if v is not None:\n            if isinstance(v, bool) or not isinstance(v, (int, float)):\n                return _err(\"VALIDATION_ERROR\", f\"{k} must be a number\")\n\n    if min_accuracy is not None and max_accuracy is not None and float(min_accuracy) > float(max_accuracy):\n        return _err(\"VALIDATION_ERROR\", \"min_accuracy cannot be greater than max_accuracy\")\n    if min_loss is not None and max_loss is not None and float(min_loss) > float(max_loss):\n        return _err(\"VALIDATION_ERROR\", \"min_loss cannot be greater than max_loss\")\n\n    if batch_size is not None and (isinstance(batch_size, bool) or not isinstance(batch_size, int)):\n        return _err(\"VALIDATION_ERROR\", \"batch_size must be an integer\")\n    if epochs is not None and (isinstance(epochs, bool) or not isinstance(epochs, int)):\n        return _err(\"VALIDATION_ERROR\", \"epochs must be an integer\")\n\n    # ---- observable dynamics: usage log + rate limit ----\n    t0 = datetime.datetime.utcnow()\n    usage_name = \"usage.json\"\n    usage = _load(usage_name)\n    if not isinstance(usage, list):\n        usage = []\n\n    now = datetime.datetime.utcnow()\n    window_s = 60\n    limit_per_window = 120\n    recent = 0\n    for r in usage:\n        if not isinstance(r, dict):\n            continue\n        ts = r.get(\"timestamp\")\n        dt = _parse_iso(ts) if ts is not None else None\n        if dt is None:\n            continue\n        if (now - dt).total_seconds() <= window_s:\n            recent += 1\n    if recent >= limit_per_window:\n        # log the refused call\n        usage.append({\n            \"timestamp\": _utcnow_iso(),\n            \"endpoint\": \"list_runs\",\n            \"status\": \"RATE_LIMIT\",\n            \"latency_ms\": int((datetime.datetime.utcnow() - t0).total_seconds() * 1000),\n        })\n        _save(usage_name, usage)\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n\n    # ---- read runs from real datastore (map to traces collection) ----\n    traces = _load(\"traces.json\")\n    if isinstance(traces, dict) and \"rows\" in traces and isinstance(traces.get(\"rows\"), list):\n        traces = traces[\"rows\"]\n    if not isinstance(traces, list):\n        traces = []\n\n    users = _load(\"users.json\")\n    if isinstance(users, dict) and \"rows\" in users and isinstance(users.get(\"rows\"), list):\n        users = users[\"rows\"]\n    if not isinstance(users, list):\n        users = []\n\n    projects = _load(\"projects.json\")\n    if isinstance(projects, dict) and \"rows\" in projects and isinstance(projects.get(\"rows\"), list):\n        projects = projects[\"rows\"]\n    if not isinstance(projects, list):\n        projects = []\n\n    # validate project_name existence if provided (realistic referential check)\n    if project_name is not None:\n        if not any(isinstance(p, dict) and p.get(\"name\") == project_name for p in projects):\n            usage.append({\n                \"timestamp\": _utcnow_iso(),\n                \"endpoint\": \"list_runs\",\n                \"status\": \"NOT_FOUND\",\n                \"latency_ms\": int((datetime.datetime.utcnow() - t0).total_seconds() * 1000),\n            })\n            _save(usage_name, usage)\n            return _err(\"NOT_FOUND\", \"project_name not found\")\n\n    # validate user_id existence if provided (referential check)\n    if user_id is not None:\n        if not any(isinstance(u, dict) and u.get(\"user_id\") == user_id for u in users):\n            usage.append({\n                \"timestamp\": _utcnow_iso(),\n                \"endpoint\": \"list_runs\",\n                \"status\": \"NOT_FOUND\",\n                \"latency_ms\": int((datetime.datetime.utcnow() - t0).total_seconds() * 1000),\n            })\n            _save(usage_name, usage)\n            return _err(\"NOT_FOUND\", \"user_id not found\")\n\n    # The datastore doesn't have a separate runs collection; treat traces as runs.\n    # Map filters best-effort:\n    # - project_name -> trace.project_name\n    # - state -> trace.status (success/error) OR allow common synonyms\n    # - user_id / accuracy/loss/batch_size/epochs are not present in schema; ignore safely (no failure).\n    state_map = {\n        \"finished\": \"success\",\n        \"succeeded\": \"success\",\n        \"success\": \"success\",\n        \"failed\": \"error\",\n        \"error\": \"error\",\n        \"errored\": \"error\",\n    }\n    wanted_status = None\n    if state is not None:\n        key = state.strip().lower()\n        wanted_status = state_map.get(key, state)  # if caller already uses \"success\"/\"error\", keep it\n\n    out = []\n    for tr in traces:\n        if not isinstance(tr, dict):\n            continue\n        if project_name is not None and tr.get(\"project_name\") != project_name:\n            continue\n        if wanted_status is not None:\n            # if trace has no status, it can't match\n            if tr.get(\"status\") != wanted_status:\n                continue\n        # user_id/accuracy/loss/batch_size/epochs cannot be applied (fields absent); do not exclude rows.\n        out.append(tr)\n\n    # success log\n    usage.append({\n        \"timestamp\": _utcnow_iso(),\n        \"endpoint\": \"list_runs\",\n        \"status\": \"OK\",\n        \"latency_ms\": int((datetime.datetime.utcnow() - t0).total_seconds() * 1000),\n        \"result_count\": len(out),\n    })\n    _save(usage_name, usage)\n\n    return {\n        \"runs\": out,\n        \"count\": len(out),\n    }\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "get_run",
+          "description": "Fetches and returns the single run record identified by run_id. It refuses requests missing run_id or where run_id is not an 8-character alphanumeric identifier. It also refuses the request when no run exists with that ID.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "run_id": {
+                "type": "string",
+                "description": "The 8‑character alphanumeric ID of the run."
+              }
+            },
+            "required": [
+              "run_id"
+            ]
+          },
+          "implementation": "def get_run(run_id, **_extra):\n    import json, os, datetime, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0432000\" if __import__(\"os\").path.isdir(\"./environment_mix/0432000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    if run_id is None or not isinstance(run_id, str):\n        return _err(\"VALIDATION_ERROR\", \"run_id is required and must be a string\")\n    if not re.fullmatch(r\"[A-Za-z0-9]{8}\", run_id):\n        return _err(\"VALIDATION_ERROR\", \"run_id must be an 8-character alphanumeric identifier\")\n\n    # No runs collection exists in this service schema/datastore.\n    return _err(\"NOT_FOUND\", \"Run not found\", run_id=run_id)\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "list_artifacts",
+          "description": "Lists artifact entries and returns the artifacts that match the optional filters for project_name, framework, and model_type. It refuses requests with unknown parameters or a framework value outside the supported set. It also refuses filters that reference a project that doesn’t exist or can’t be resolved.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "project_name": {
+                "type": "string",
+                "description": "Filter artifacts belonging to a specific project."
+              },
+              "framework": {
+                "type": "string",
+                "enum": [
+                  "torch",
+                  "tensorflow",
+                  "jax"
+                ],
+                "description": "Filter by the ML framework used."
+              },
+              "model_type": {
+                "type": "string",
+                "description": "Filter by model type (e.g., \"resnet\", \"bert\")."
+              }
+            },
+            "required": []
+          },
+          "implementation": "def list_artifacts(project_name=None, framework=None, model_type=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0432000\" if __import__(\"os\").path.isdir(\"./environment_mix/0432000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    ALLOWED_PROJECTS = {\"data-preprocessing\", \"gan-experiments\", \"image-classification\", \"nlp-sentiment\", \"reinforcement-learning\"}\n    ALLOWED_FW = {\"torch\", \"tensorflow\", \"jax\"}\n\n    if project_name is not None:\n        if not isinstance(project_name, str):\n            return _err(\"VALIDATION_ERROR\", \"project_name must be a string\")\n        if project_name not in ALLOWED_PROJECTS:\n            return _err(\"VALIDATION_ERROR\", \"Unsupported project_name\", allowed=sorted(ALLOWED_PROJECTS))\n\n        # must reference an existing project\n        projects = _load(\"projects.json\")\n        if isinstance(projects, dict) and \"data\" in projects and isinstance(projects[\"data\"], list):\n            projects = projects[\"data\"]\n        if not isinstance(projects, list):\n            projects = []\n        if not any(isinstance(p, dict) and p.get(\"name\") == project_name for p in projects):\n            return _err(\"NOT_FOUND\", \"Project not found\", project_name=project_name)\n\n    if framework is not None:\n        if not isinstance(framework, str) or framework not in ALLOWED_FW:\n            return _err(\"VALIDATION_ERROR\", \"Unsupported framework\", allowed=sorted(ALLOWED_FW))\n    if model_type is not None and not isinstance(model_type, str):\n        return _err(\"VALIDATION_ERROR\", \"model_type must be a string\")\n\n    artifacts = _load(\"artifacts.json\")\n    if isinstance(artifacts, dict) and \"data\" in artifacts and isinstance(artifacts[\"data\"], list):\n        artifacts = artifacts[\"data\"]\n    if not isinstance(artifacts, list):\n        artifacts = []\n\n    out = []\n    for a in artifacts:\n        if not isinstance(a, dict):\n            continue\n        if project_name is not None and a.get(\"project_name\") != project_name:\n            continue\n        md = a.get(\"metadata\") if isinstance(a.get(\"metadata\"), dict) else {}\n        if framework is not None and md.get(\"framework\") != framework:\n            continue\n        if model_type is not None and md.get(\"model_type\") != model_type:\n            continue\n        out.append(a)\n\n    return {\"data\": out, \"meta\": {\"total\": len(out)}}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "get_artifact",
+          "description": "Fetches and returns the single artifact entry identified by artifact_id. It refuses requests missing artifact_id or with an artifact_id value it cannot validate. It also refuses the request when no artifact exists for the given identifier.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "artifact_id": {
+                "type": "string",
+                "description": "The unique identifier of the artifact."
+              }
+            },
+            "required": [
+              "artifact_id"
+            ]
+          },
+          "implementation": "def get_artifact(artifact_id, **_extra):\n    import json, os, datetime, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0432000\" if __import__(\"os\").path.isdir(\"./environment_mix/0432000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    if artifact_id is None or not isinstance(artifact_id, str) or not artifact_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"artifact_id is required and must be a non-empty string\")\n    # Minimal validation: ensure it's not whitespace and is reasonably shaped\n    if len(artifact_id) > 200:\n        return _err(\"VALIDATION_ERROR\", \"artifact_id is too long\")\n\n    artifacts = _load(\"artifacts.json\")\n    if isinstance(artifacts, dict) and \"data\" in artifacts and isinstance(artifacts[\"data\"], list):\n        artifacts = artifacts[\"data\"]\n    if not isinstance(artifacts, list):\n        artifacts = []\n\n    for a in artifacts:\n        if isinstance(a, dict) and a.get(\"artifact_id\") == artifact_id:\n            return {\"data\": a}\n\n    return _err(\"NOT_FOUND\", \"Artifact not found\", artifact_id=artifact_id)\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "list_traces",
+          "description": "Lists trace records and returns traces matching the optional filters for project_name, status, parent_id, and an op_name substring. It refuses requests with unknown parameters, a status value outside the supported set, or filter values it cannot interpret (such as an invalid parent_id). It also refuses requests that reference a project that doesn’t exist or can’t be resolved.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "project_name": {
+                "type": "string",
+                "description": "Filter traces belonging to a specific project."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "success",
+                  "error"
+                ],
+                "description": "Filter by trace status."
+              },
+              "parent_id": {
+                "type": "string",
+                "description": "Return only child traces of the given parent trace ID."
+              },
+              "op_name_contains": {
+                "type": "string",
+                "description": "Return traces whose `op_name` contains this substring."
+              }
+            },
+            "required": []
+          },
+          "implementation": "def list_traces(project_name=None, status=None, parent_id=None, op_name_contains=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0432000\" if __import__(\"os\").path.isdir(\"./environment_mix/0432000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    ALLOWED_PROJECTS = {\"data-preprocessing\", \"gan-experiments\", \"image-classification\", \"nlp-sentiment\", \"reinforcement-learning\"}\n    ALLOWED_STATUS = {\"success\", \"error\"}\n\n    if project_name is not None:\n        if not isinstance(project_name, str):\n            return _err(\"VALIDATION_ERROR\", \"project_name must be a string\")\n        if project_name not in ALLOWED_PROJECTS:\n            return _err(\"VALIDATION_ERROR\", \"Unsupported project_name\", allowed=sorted(ALLOWED_PROJECTS))\n        projects = _load(\"projects.json\")\n        if isinstance(projects, dict) and \"data\" in projects and isinstance(projects[\"data\"], list):\n            projects = projects[\"data\"]\n        if not isinstance(projects, list):\n            projects = []\n        if not any(isinstance(p, dict) and p.get(\"name\") == project_name for p in projects):\n            return _err(\"NOT_FOUND\", \"Project not found\", project_name=project_name)\n\n    if status is not None:\n        if not isinstance(status, str) or status not in ALLOWED_STATUS:\n            return _err(\"VALIDATION_ERROR\", \"Unsupported status\", allowed=sorted(ALLOWED_STATUS))\n    if parent_id is not None:\n        if not isinstance(parent_id, str) or not parent_id.strip():\n            return _err(\"VALIDATION_ERROR\", \"parent_id must be a non-empty string\")\n    if op_name_contains is not None and not isinstance(op_name_contains, str):\n        return _err(\"VALIDATION_ERROR\", \"op_name_contains must be a string\")\n\n    traces = _load(\"traces.json\")\n    if isinstance(traces, dict) and \"data\" in traces and isinstance(traces[\"data\"], list):\n        traces = traces[\"data\"]\n    if not isinstance(traces, list):\n        traces = []\n\n    out = []\n    substr = op_name_contains if isinstance(op_name_contains, str) and op_name_contains else None\n    for tr in traces:\n        if not isinstance(tr, dict):\n            continue\n        if project_name is not None and tr.get(\"project_name\") != project_name:\n            continue\n        if status is not None and tr.get(\"status\") != status:\n            continue\n        if parent_id is not None and tr.get(\"parent_id\") != parent_id:\n            continue\n        if substr is not None:\n            opn = tr.get(\"op_name\") or \"\"\n            if not isinstance(opn, str) or substr not in opn:\n                continue\n        out.append(tr)\n\n    return {\"data\": out, \"meta\": {\"total\": len(out)}}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "get_trace",
+          "description": "Fetches and returns the single trace record identified by trace_id. It refuses requests missing trace_id or with a trace_id that is not a valid UUID. It also refuses the request when no trace exists for the given identifier.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "trace_id": {
+                "type": "string",
+                "description": "The UUID identifying the trace (shared among related spans)."
+              }
+            },
+            "required": [
+              "trace_id"
+            ]
+          },
+          "implementation": "def get_trace(trace_id, **_extra):\n    import json, os, datetime, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0432000\" if __import__(\"os\").path.isdir(\"./environment_mix/0432000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    if trace_id is None or not isinstance(trace_id, str) or not trace_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"trace_id is required and must be a non-empty string\")\n    try:\n        uuid.UUID(trace_id)\n    except Exception:\n        return _err(\"VALIDATION_ERROR\", \"trace_id must be a valid UUID\")\n\n    traces = _load(\"traces.json\")\n    if isinstance(traces, dict) and \"data\" in traces and isinstance(traces[\"data\"], list):\n        traces = traces[\"data\"]\n    if not isinstance(traces, list):\n        traces = []\n\n    # traces are span-like rows; multiple rows can share a trace_id; return the first matching row as \"the trace record\"\n    for tr in traces:\n        if isinstance(tr, dict) and tr.get(\"trace_id\") == trace_id:\n            return {\"data\": tr}\n\n    return _err(\"NOT_FOUND\", \"Trace not found\", trace_id=trace_id)\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0432000",
+    "index": 432,
+    "name": "SageTrail ML Workspace",
+    "description": "A lightweight backend for browsing machine learning projects, users, runs, artifacts, and execution traces via simple listing and retrieval APIs.",
+    "taxonomy": {
+      "L1_id": "L1-10",
+      "L1_name": "Data Storage & Databases",
+      "L1_name_zh": "数据存储与数据库",
+      "L2_id": "L2-27",
+      "L2_name": "Memory & Knowledge Management",
+      "L2_name_zh": "记忆与知识管理",
+      "L3_name": "Workspace Docs & Notes",
+      "L3_name_zh": "工作空间文档与笔记"
+    },
+    "database_dir": "./environment_mix/0432000",
+    "mount_path": "/app/database",
+    "n_tools": 10,
+    "n_collections": 4,
+    "n_records": 292,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 10,
+      "loaded": 10,
+      "reads_returning_data": 6,
+      "read_operations": 10,
+      "mutations_persisted": 0,
+      "mutations_attempted": 0
+    },
+    "tools_loadable_from_database_dir": 10,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_users",
+      "returned_chars": 68
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

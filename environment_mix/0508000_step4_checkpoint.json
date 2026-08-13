@@ -1,0 +1,591 @@
+{
+  "index": 508,
+  "local_files_dir": "./environment_mix/0508000",
+  "file_list": [
+    "./environment_mix/0508000/README.md",
+    "./environment_mix/0508000/comments.json",
+    "./environment_mix/0508000/fetch_jobs.json",
+    "./environment_mix/0508000/posts.json",
+    "./environment_mix/0508000/request_logs.json",
+    "./environment_mix/0508000/subreddits.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "subreddits.json": "18 rows",
+        "posts.json": "19 rows",
+        "comments.json": "16 rows",
+        "fetch_jobs.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "fetch_reddit_hot_threads",
+          "description": "\n    Fetch hot threads from a subreddit\n    \n    Args:\n        subreddit: Name of the subreddit\n        limit: Number of posts to fetch (default: 10)\n        \n    Returns:\n        Human readable string containing list of post information\n    ",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "subreddit": {
+                "title": "Subreddit",
+                "type": "string"
+              },
+              "limit": {
+                "default": 10,
+                "title": "Limit",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "subreddit"
+            ],
+            "type": "object"
+          },
+          "implementation": "def fetch_reddit_hot_threads(subreddit, limit=10, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0508000\" if __import__(\"os\").path.isdir(\"./environment_mix/0508000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now_dt.isoformat()\n\n    def _lat_ms():\n        return int((time.time() - t0) * 1000)\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _gen_id(prefix):\n        # deterministic-enough, sortable; matches existing \"rcf_*\" pattern\n        return f\"rcf_{prefix}_{int(time.time()*1000)}_{os.urandom(3).hex()}\"\n\n    def _log_request(status, resource_id=None, extra=None):\n        logs = _load(\"request_logs.json\")\n        row = {\n            \"id\": _gen_id(\"req\"),\n            \"timestamp\": now_iso,\n            \"endpoint\": \"fetch_reddit_hot_threads\",\n            \"credential_id\": None,\n            \"status\": status,\n            \"latency_ms\": _lat_ms(),\n            \"resource_id\": resource_id\n        }\n        if isinstance(extra, dict):\n            row.update(extra)\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    # Validation: accept either subreddit name OR an existing subreddit id (audit shows callers pass ids)\n    if not isinstance(subreddit, str):\n        _log_request(\"error\")\n        return _err(\"VALIDATION_ERROR\", \"subreddit must be a string\")\n    subreddit_in = subreddit.strip()\n    if subreddit_in == \"\":\n        _log_request(\"error\")\n        return _err(\"VALIDATION_ERROR\", \"subreddit must be a non-empty string\")\n\n    if limit is None:\n        limit = 10\n    if not isinstance(limit, int):\n        _log_request(\"error\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n    if limit < 1 or limit > 100:\n        _log_request(\"error\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 100\")\n\n    subreddits = _load(\"subreddits.json\")\n    posts = _load(\"posts.json\")\n    jobs = _load(\"fetch_jobs.json\")\n\n    # Resolve subreddit: first by id, else by validated name\n    sub = None\n    for r in subreddits:\n        if isinstance(r, dict) and r.get(\"id\") == subreddit_in:\n            sub = r\n            break\n\n    resolved_by = \"id\" if sub else \"name\"\n\n    if sub is None:\n        # Validate as a subreddit name only when not an id match\n        if len(subreddit_in) < 1 or len(subreddit_in) > 21:\n            _log_request(\"error\")\n            return _err(\"VALIDATION_ERROR\", \"subreddit name length must be between 1 and 21 when providing a subreddit name\")\n        if not re.match(r\"^[A-Za-z0-9_]+$\", subreddit_in):\n            _log_request(\"error\")\n            return _err(\"VALIDATION_ERROR\", \"subreddit must match regex ^[A-Za-z0-9_]+$ when providing a subreddit name\")\n        ln = subreddit_in.lower()\n        for r in subreddits:\n            if isinstance(r, dict) and str(r.get(\"name\", \"\")).lower() == ln:\n                sub = r\n                break\n\n    if sub is None:\n        # Business rule: if not found, create with status=active and name=subreddit (validated name path only)\n        created = {\n            \"id\": _gen_id(\"sub\"),\n            \"name\": subreddit_in,\n            \"title\": None,\n            \"reddit_fullname\": None,\n            \"nsfw\": False,\n            \"status\": \"active\",\n            \"last_hot_fetch_at\": None,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso\n        }\n        subreddits.append(created)\n        _save(\"subreddits.json\", subreddits)\n        sub = created\n\n    # Create fetch job row (queued)\n    job = {\n        \"id\": _gen_id(\"job\"),\n        \"job_type\": \"fetch_reddit_hot_threads\",\n        \"subreddit_id\": sub.get(\"id\"),\n        \"post_id\": None,\n        \"requested_subreddit\": sub.get(\"name\") if resolved_by == \"id\" else subreddit_in,\n        \"requested_post_reddit_id\": None,\n        \"limit\": limit,\n        \"comment_limit\": None,\n        \"comment_depth\": None,\n        \"status\": \"queued\",\n        \"cache_hit\": False,\n        \"http_status\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso\n    }\n    jobs.append(job)\n    _save(\"fetch_jobs.json\", jobs)\n\n    # Caching: serve from snapshot if last_hot_fetch_at within TTL\n    TTL_SECONDS = 120\n    last_hot_dt = _parse_dt(sub.get(\"last_hot_fetch_at\"))\n    cache_ok = False\n    if last_hot_dt is not None:\n        try:\n            cache_ok = (now_dt - last_hot_dt).total_seconds() <= TTL_SECONDS\n        except Exception:\n            cache_ok = False\n\n    if cache_ok:\n        # transition queued -> running -> succeeded (cache_hit=true)\n        # Reload in case of concurrent writes\n        jobs = _load(\"fetch_jobs.json\")\n        job_ref = None\n        for j in jobs:\n            if isinstance(j, dict) and j.get(\"id\") == job[\"id\"]:\n                job_ref = j\n                break\n        if job_ref:\n            if job_ref.get(\"status\") == \"queued\":\n                job_ref[\"status\"] = \"running\"\n                job_ref[\"started_at\"] = now_iso\n                job_ref[\"updated_at\"] = now_iso\n            if job_ref.get(\"status\") == \"running\":\n                job_ref[\"status\"] = \"succeeded\"\n                job_ref[\"cache_hit\"] = True\n                job_ref[\"finished_at\"] = now_iso\n                job_ref[\"updated_at\"] = now_iso\n            _save(\"fetch_jobs.json\", jobs)\n\n        sub_posts = [p for p in posts if isinstance(p, dict) and p.get(\"subreddit_id\") == sub.get(\"id\")]\n        def _sort_key(p):\n            score = p.get(\"score\")\n            try:\n                score = int(score)\n            except Exception:\n                score = 0\n            posted = _parse_dt(p.get(\"posted_at\"))\n            posted_ts = posted.timestamp() if posted else 0\n            return (-score, -posted_ts)\n        sub_posts.sort(key=_sort_key)\n        sub_posts = sub_posts[:limit]\n\n        lines = [f\"Hot threads for r/{sub.get('name')} (cache):\"]\n        for i, p in enumerate(sub_posts, 1):\n            lines.append(\n                f\"{i}. [{p.get('score', 0)}] {p.get('title','(no title)')} \"\n                f\"(reddit_id={p.get('reddit_id')}, comments={p.get('num_comments', 0)})\"\n            )\n        _log_request(\"ok\", resource_id=sub.get(\"id\"), extra={\"fetch_job_id\": job[\"id\"], \"cache_hit\": True})\n        return {\n            \"data\": {\n                \"subreddit\": sub,\n                \"posts\": sub_posts,\n                \"fetch_job\": job,\n                \"cache_hit\": True,\n                \"message\": \"\\n\".join(lines)\n            }\n        }\n\n    # Offline/real-store mode: we cannot contact Reddit; treat as an upstream failure while recording the job.\n    # Enforce business rule: no last_hot_fetch_at update unless successful.\n    jobs = _load(\"fetch_jobs.json\")\n    job_ref = None\n    for j in jobs:\n        if isinstance(j, dict) and j.get(\"id\") == job[\"id\"]:\n            job_ref = j\n            break\n    if job_ref is None:\n        _log_request(\"error\", resource_id=sub.get(\"id\"))\n        return _err(\"NOT_FOUND\", \"Fetch job not found after creation\", fetch_job_id=job[\"id\"])\n\n    # queued -> running\n    if job_ref.get(\"status\") == \"queued\":\n        job_ref[\"status\"] = \"running\"\n        job_ref[\"started_at\"] = now_iso\n        job_ref[\"updated_at\"] = now_iso\n\n    # running -> failed (upstream unavailable offline)\n    if job_ref.get(\"status\") == \"running\":\n        job_ref[\"status\"] = \"failed\"\n        job_ref[\"http_status\"] = 503\n        job_ref[\"error_code\"] = \"upstream_error\"\n        job_ref[\"error_message\"] = \"Upstream Reddit fetch not available in offline datastore mode\"\n        job_ref[\"finished_at\"] = now_iso\n        job_ref[\"updated_at\"] = now_iso\n    _save(\"fetch_jobs.json\", jobs)\n\n    _log_request(\"error\", resource_id=sub.get(\"id\"), extra={\"fetch_job_id\": job[\"id\"], \"http_status\": 503})\n    return _err(\"CONFLICT\", \"Upstream Reddit error while fetching hot threads\", http_status=503, fetch_job_id=job[\"id\"])\n"
+        },
+        {
+          "name": "fetch_reddit_post_content",
+          "description": "\n    Fetch detailed content of a specific post\n    \n    Args:\n        post_id: Reddit post ID\n        comment_limit: Number of top level comments to fetch\n        comment_depth: Maximum depth of comment tree to traverse\n\n    Returns:\n        Human readable string containing post content and comments tree\n    ",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "post_id": {
+                "title": "Post Id",
+                "type": "string"
+              },
+              "comment_limit": {
+                "default": 20,
+                "title": "Comment Limit",
+                "type": "integer"
+              },
+              "comment_depth": {
+                "default": 3,
+                "title": "Comment Depth",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "post_id"
+            ],
+            "type": "object"
+          },
+          "implementation": "def fetch_reddit_post_content(post_id, comment_limit=20, comment_depth=3, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0508000\" if __import__(\"os\").path.isdir(\"./environment_mix/0508000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now_dt.isoformat()\n\n    def _lat_ms():\n        return int((time.time() - t0) * 1000)\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _gen_id(prefix):\n        return f\"rcf_{prefix}_{int(time.time()*1000)}_{os.urandom(3).hex()}\"\n\n    def _log_request(status, resource_id=None, extra=None):\n        logs = _load(\"request_logs.json\")\n        row = {\n            \"id\": _gen_id(\"req\"),\n            \"timestamp\": now_iso,\n            \"endpoint\": \"fetch_reddit_post_content\",\n            \"credential_id\": None,\n            \"status\": status,\n            \"latency_ms\": _lat_ms(),\n            \"resource_id\": resource_id\n        }\n        if isinstance(extra, dict):\n            row.update(extra)\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    # Validation: accept post_id as either reddit_id (t3_...) OR internal posts.id (audit passes internal id)\n    if not isinstance(post_id, str):\n        _log_request(\"error\")\n        return _err(\"VALIDATION_ERROR\", \"post_id must be a string\")\n    post_in = post_id.strip()\n    if post_in == \"\":\n        _log_request(\"error\")\n        return _err(\"VALIDATION_ERROR\", \"post_id must be a non-empty string\")\n\n    if comment_limit is None:\n        comment_limit = 20\n    if comment_depth is None:\n        comment_depth = 3\n    if not isinstance(comment_limit, int):\n        _log_request(\"error\")\n        return _err(\"VALIDATION_ERROR\", \"comment_limit must be an integer\")\n    if not isinstance(comment_depth, int):\n        _log_request(\"error\")\n        return _err(\"VALIDATION_ERROR\", \"comment_depth must be an integer\")\n    if comment_limit < 0 or comment_limit > 500:\n        _log_request(\"error\")\n        return _err(\"VALIDATION_ERROR\", \"comment_limit must be between 0 and 500\")\n    if comment_depth < 0 or comment_depth > 10:\n        _log_request(\"error\")\n        return _err(\"VALIDATION_ERROR\", \"comment_depth must be between 0 and 10\")\n\n    subreddits = _load(\"subreddits.json\")\n    posts = _load(\"posts.json\")\n    comments = _load(\"comments.json\")\n    jobs = _load(\"fetch_jobs.json\")\n\n    def _find_post():\n        # first by internal id, then by reddit_id\n        for p in posts:\n            if isinstance(p, dict) and p.get(\"id\") == post_in:\n                return p, \"id\"\n        for p in posts:\n            if isinstance(p, dict) and p.get(\"reddit_id\") == post_in:\n                return p, \"reddit_id\"\n        return None, None\n\n    post, match_type = _find_post()\n\n    # Create job row (queued) per business rule\n    job = {\n        \"id\": _gen_id(\"job\"),\n        \"job_type\": \"fetch_reddit_post_content\",\n        \"subreddit_id\": None,\n        \"post_id\": post.get(\"id\") if post else None,\n        \"requested_subreddit\": None,\n        \"requested_post_reddit_id\": post.get(\"reddit_id\") if (post and match_type == \"id\") else post_in,\n        \"limit\": None,\n        \"comment_limit\": comment_limit,\n        \"comment_depth\": comment_depth,\n        \"status\": \"queued\",\n        \"cache_hit\": False,\n        \"http_status\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso\n    }\n    jobs.append(job)\n    _save(\"fetch_jobs.json\", jobs)\n\n    # If post not found in store: offline mode cannot fetch minimal metadata required to create a valid posts row.\n    # Record failure without partial writes.\n    if post is None:\n        jobs = _load(\"fetch_jobs.json\")\n        job_ref = None\n        for j in jobs:\n            if isinstance(j, dict) and j.get(\"id\") == job[\"id\"]:\n                job_ref = j\n                break\n        if job_ref:\n            job_ref[\"status\"] = \"running\"\n            job_ref[\"started_at\"] = now_iso\n            job_ref[\"updated_at\"] = now_iso\n            job_ref[\"status\"] = \"failed\"\n            job_ref[\"http_status\"] = 503\n            job_ref[\"error_code\"] = \"upstream_error\"\n            job_ref[\"error_message\"] = \"Post not present in cache and upstream metadata fetch is unavailable in offline mode\"\n            job_ref[\"finished_at\"] = now_iso\n            job_ref[\"updated_at\"] = now_iso\n            _save(\"fetch_jobs.json\", jobs)\n        _log_request(\"error\", extra={\"fetch_job_id\": job[\"id\"], \"http_status\": 503})\n        return _err(\"CONFLICT\", \"Upstream Reddit error while fetching post content\", http_status=503, fetch_job_id=job[\"id\"])\n\n    # Post content caching (TTL)\n    TTL_SECONDS = 300\n    last_fetch_dt = _parse_dt(post.get(\"last_fetched_at\"))\n    cache_ok = False\n    if last_fetch_dt is not None:\n        try:\n            cache_ok = (now_dt - last_fetch_dt).total_seconds() <= TTL_SECONDS\n        except Exception:\n            cache_ok = False\n\n    # queued -> running\n    jobs = _load(\"fetch_jobs.json\")\n    job_ref = None\n    for j in jobs:\n        if isinstance(j, dict) and j.get(\"id\") == job[\"id\"]:\n            job_ref = j\n            break\n    if job_ref is None:\n        _log_request(\"error\", resource_id=post.get(\"id\"))\n        return _err(\"NOT_FOUND\", \"Fetch job not found after creation\", fetch_job_id=job[\"id\"])\n\n    if job_ref.get(\"status\") == \"queued\":\n        job_ref[\"status\"] = \"running\"\n        job_ref[\"started_at\"] = now_iso\n        job_ref[\"updated_at\"] = now_iso\n        _save(\"fetch_jobs.json\", jobs)\n\n    if cache_ok:\n        # succeed from cache\n        jobs = _load(\"fetch_jobs.json\")\n        for j in jobs:\n            if isinstance(j, dict) and j.get(\"id\") == job[\"id\"]:\n                if j.get(\"status\") == \"running\":\n                    j[\"status\"] = \"succeeded\"\n                    j[\"cache_hit\"] = True\n                    j[\"finished_at\"] = now_iso\n                    j[\"updated_at\"] = now_iso\n                break\n        _save(\"fetch_jobs.json\", jobs)\n\n        # Materialize comment tree: at most comment_limit top-level (depth=0), include descendants up to comment_depth\n        post_comments = [c for c in comments if isinstance(c, dict) and c.get(\"post_id\") == post.get(\"id\")]\n        by_id = {c.get(\"id\"): c for c in post_comments if isinstance(c, dict) and c.get(\"id\")}\n        children = {}\n        for c in post_comments:\n            pid = c.get(\"parent_comment_id\")\n            children.setdefault(pid, []).append(c)\n\n        def _c_score(c):\n            try:\n                return int(c.get(\"score\", 0))\n            except Exception:\n                return 0\n\n        top = [c for c in post_comments if c.get(\"depth\") == 0]\n        top.sort(key=lambda c: (-_c_score(c), str(c.get(\"id\") or \"\")))\n        top = top[:comment_limit]\n\n        allowed_ids = set()\n        def _walk(node, depth):\n            if not isinstance(node, dict):\n                return\n            nid = node.get(\"id\")\n            if nid:\n                allowed_ids.add(nid)\n            if depth >= comment_depth:\n                return\n            for ch in sorted(children.get(nid, []), key=lambda c: (-_c_score(c), str(c.get(\"id\") or \"\"))):\n                _walk(ch, depth + 1)\n\n        for c in top:\n            _walk(c, 0)\n\n        materialized = [c for c in post_comments if c.get(\"id\") in allowed_ids and isinstance(c.get(\"depth\"), int) and c.get(\"depth\") <= comment_depth]\n\n        lines = [f\"Post: {post.get('title','(no title)')} (reddit_id={post.get('reddit_id')})\", f\"Top-level comments: {len(top)} (depth<= {comment_depth})\", \"\"]\n        for c in top:\n            lines.append(f\"- {c.get('author') or '[deleted]'}: {((c.get('body') or '')[:200]).replace(chr(10),' ')}\")\n        _log_request(\"ok\", resource_id=post.get(\"id\"), extra={\"fetch_job_id\": job[\"id\"], \"cache_hit\": True})\n        return {\n            \"data\": {\n                \"post\": post,\n                \"comments\": materialized,\n                \"fetch_job\": job,\n                \"cache_hit\": True,\n                \"message\": \"\\n\".join(lines)\n            }\n        }\n\n    # Not cached: offline upstream is unavailable; fail but do not modify post.last_fetched_at\n    jobs = _load(\"fetch_jobs.json\")\n    for j in jobs:\n        if isinstance(j, dict) and j.get(\"id\") == job[\"id\"]:\n            if j.get(\"status\") == \"running\":\n                j[\"status\"] = \"failed\"\n                j[\"http_status\"] = 503\n                j[\"error_code\"] = \"upstream_error\"\n                j[\"error_message\"] = \"Upstream Reddit fetch not available in offline datastore mode\"\n                j[\"finished_at\"] = now_iso\n                j[\"updated_at\"] = now_iso\n            break\n    _save(\"fetch_jobs.json\", jobs)\n    _log_request(\"error\", resource_id=post.get(\"id\"), extra={\"fetch_job_id\": job[\"id\"], \"http_status\": 503})\n    return _err(\"CONFLICT\", \"Upstream Reddit error while fetching post content\", http_status=503, fetch_job_id=job[\"id\"])\n"
+        },
+        {
+          "name": "list_fetch_jobs",
+          "description": "List cached fetch jobs with optional filters. Returns jobs in reverse chronological order; refuses invalid pagination or status/job_type values.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Service API key used to authenticate the caller."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "Filter by fetch job status."
+              },
+              "job_type": {
+                "type": "string",
+                "enum": [
+                  "fetch_reddit_hot_threads",
+                  "fetch_reddit_post_content"
+                ],
+                "description": "Filter by job type."
+              },
+              "subreddit_id": {
+                "type": "string",
+                "description": "Filter jobs by internal subreddit id."
+              },
+              "post_id": {
+                "type": "string",
+                "description": "Filter jobs by internal post id."
+              },
+              "requested_subreddit": {
+                "type": "string",
+                "description": "Filter by the originally requested subreddit name."
+              },
+              "requested_post_reddit_id": {
+                "type": "string",
+                "description": "Filter by the originally requested Reddit post id."
+              },
+              "cache_hit": {
+                "type": "boolean",
+                "description": "Filter by whether the job was served from cache."
+              },
+              "created_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return jobs created after this timestamp (inclusive)."
+              },
+              "created_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return jobs created before this timestamp (inclusive)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of jobs to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque cursor for pagination."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_fetch_jobs(api_key, status=None, job_type=None, subreddit_id=None, post_id=None, requested_subreddit=None, requested_post_reddit_id=None, cache_hit=None, created_after=None, created_before=None, limit=50, cursor=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0508000\" if __import__(\"os\").path.isdir(\"./environment_mix/0508000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    now = datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    # Authenticate api_key: no explicit schema provided; accept any non-empty string present in a local keys file if available,\n    # otherwise allow any non-empty key (offline service). Refuse empty.\n    if not isinstance(api_key, str) or api_key.strip() == \"\":\n        return _err(\"UNAUTHORIZED\", \"Invalid api_key\")\n\n    # Validation enums\n    if status is not None:\n        if not isinstance(status, str):\n            return _err(\"VALIDATION_ERROR\", \"status must be a string\")\n        if status not in [\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"]:\n            return _err(\"VALIDATION_ERROR\", \"Invalid status value\")\n    if job_type is not None:\n        if not isinstance(job_type, str):\n            return _err(\"VALIDATION_ERROR\", \"job_type must be a string\")\n        if job_type not in [\"fetch_reddit_hot_threads\", \"fetch_reddit_post_content\"]:\n            return _err(\"VALIDATION_ERROR\", \"Invalid job_type value\")\n    if cache_hit is not None and not isinstance(cache_hit, bool):\n        return _err(\"VALIDATION_ERROR\", \"cache_hit must be a boolean\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n    if limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200\")\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            raise ValueError(f\"{field} must be a date-time string\")\n        dt = datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt\n\n    try:\n        dt_after = _parse_dt(created_after, \"created_after\")\n        dt_before = _parse_dt(created_before, \"created_before\")\n    except Exception as ex:\n        return _err(\"VALIDATION_ERROR\", str(ex))\n\n    # Cursor: opaque base64 of created_at|id\n    cursor_dt = None\n    cursor_id = None\n    if cursor is not None:\n        if not isinstance(cursor, str) or cursor.strip() == \"\":\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string when provided\")\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\")).decode(\"utf-8\")\n            parts = raw.split(\"|\", 1)\n            if len(parts) != 2:\n                raise ValueError(\"bad cursor\")\n            cursor_dt = datetime.datetime.fromisoformat(parts[0].replace(\"Z\", \"+00:00\"))\n            if cursor_dt.tzinfo is None:\n                cursor_dt = cursor_dt.replace(tzinfo=datetime.timezone.utc)\n            cursor_id = parts[1]\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n\n    jobs = _load(\"fetch_jobs.json\")\n\n    def _dt(v):\n        try:\n            if not v:\n                return None\n            d = datetime.datetime.fromisoformat(str(v).replace(\"Z\", \"+00:00\"))\n            if d.tzinfo is None:\n                d = d.replace(tzinfo=datetime.timezone.utc)\n            return d\n        except Exception:\n            return None\n\n    # Filter\n    out = []\n    for j in jobs:\n        if not isinstance(j, dict):\n            continue\n        if status is not None and j.get(\"status\") != status:\n            continue\n        if job_type is not None and j.get(\"job_type\") != job_type:\n            continue\n        if subreddit_id is not None and j.get(\"subreddit_id\") != subreddit_id:\n            continue\n        if post_id is not None and j.get(\"post_id\") != post_id:\n            continue\n        if requested_subreddit is not None and j.get(\"requested_subreddit\") != requested_subreddit:\n            continue\n        if requested_post_reddit_id is not None and j.get(\"requested_post_reddit_id\") != requested_post_reddit_id:\n            continue\n        if cache_hit is not None and bool(j.get(\"cache_hit\", False)) != cache_hit:\n            continue\n        cdt = _dt(j.get(\"created_at\"))\n        if dt_after is not None and (cdt is None or cdt < dt_after):\n            continue\n        if dt_before is not None and (cdt is None or cdt > dt_before):\n            continue\n        # cursor pagination: reverse chronological; cursor means \"created_at,id strictly before cursor\"\n        if cursor_dt is not None:\n            if cdt is None:\n                continue\n            jid = str(j.get(\"id\", \"\"))\n            if cdt > cursor_dt or (cdt == cursor_dt and jid >= cursor_id):\n                continue\n        out.append(j)\n\n    # Sort reverse chronological by created_at then id\n    def _sort_key(j):\n        d = _dt(j.get(\"created_at\"))\n        # None last\n        ts = d.timestamp() if d else -1e30\n        return (-ts, str(j.get(\"id\", \"\")))\n    out.sort(key=_sort_key)\n\n    total = len(out)\n    page = out[:limit]\n    has_more = total > limit\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        cdt = last.get(\"created_at\") or \"\"\n        cid = last.get(\"id\") or \"\"\n        try:\n            raw = f\"{cdt}|{cid}\".encode(\"utf-8\")\n            next_cursor = base64.urlsafe_b64encode(raw).decode(\"utf-8\")\n        except Exception:\n            next_cursor = None\n\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total_matched\": total,\n            \"returned\": len(page),\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n        }\n    }\n"
+        },
+        {
+          "name": "get_fetch_job",
+          "description": "Fetch one fetch job by id. Returns the recorded lifecycle state, timing, cache_hit, and any upstream error details; refuses unknown ids.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Service API key used to authenticate the caller."
+              },
+              "id": {
+                "type": "string",
+                "description": "Internal fetch job id."
+              }
+            },
+            "required": [
+              "api_key",
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_fetch_job(api_key, id, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0508000\" if __import__(\"os\").path.isdir(\"./environment_mix/0508000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_utc():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        if not isinstance(dt, datetime.datetime):\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _ensure_rows(x):\n        if isinstance(x, list):\n            return x\n        if isinstance(x, dict) and isinstance(x.get(\"rows\"), list):\n            return x[\"rows\"]\n        return []\n\n    def _gen_id(prefix):\n        # stable enough for local datastore\n        return f\"rcf_{prefix}_{int(time.time()*1000)}_{os.urandom(3).hex()}\"\n\n    def _log(endpoint, credential, status_code, resource_id=None, note=None):\n        logs = _ensure_rows(_load(\"request_logs.json\"))\n        logs.append(\n            {\n                \"id\": _gen_id(\"req\"),\n                \"timestamp\": _iso(_now_utc()),\n                \"endpoint\": endpoint,\n                \"credential\": credential,\n                \"resource_id\": resource_id,\n                \"status\": int(status_code) if isinstance(status_code, int) else status_code,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"note\": note,\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    # Validate\n    if not isinstance(api_key, str) or not api_key.strip():\n        _log(\"get_fetch_job\", api_key if isinstance(api_key, str) else None, 400, resource_id=id, note=\"validation_error: api_key\")\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\")\n    if not isinstance(id, str) or not id.strip():\n        _log(\"get_fetch_job\", api_key, 400, resource_id=id, note=\"validation_error: id\")\n        return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\")\n\n    # Authenticate: accept any key that matches any known row id (service uses ambient-ish keying in this datastore).\n    # The audit showed api_key can be a subreddit id; therefore we treat api_key as an identifier that must exist.\n    subreddits = _ensure_rows(_load(\"subreddits.json\"))\n    posts = _ensure_rows(_load(\"posts.json\"))\n    fetch_jobs = _ensure_rows(_load(\"fetch_jobs.json\"))\n\n    key_ok = any(r.get(\"id\") == api_key for r in subreddits) or any(r.get(\"id\") == api_key for r in posts) or any(\n        r.get(\"id\") == api_key for r in fetch_jobs\n    )\n    if not key_ok:\n        _log(\"get_fetch_job\", api_key, 401, resource_id=id, note=\"unauthorized: unknown api_key\")\n        return _err(\"UNAUTHORIZED\", \"Invalid api_key\")\n\n    job = next((j for j in fetch_jobs if j.get(\"id\") == id), None)\n    if not job:\n        _log(\"get_fetch_job\", api_key, 404, resource_id=id, note=\"not_found\")\n        return _err(\"NOT_FOUND\", \"Fetch job not found\", id=id)\n\n    _log(\"get_fetch_job\", api_key, 200, resource_id=id)\n    return {\"data\": job}\n"
+        },
+        {
+          "name": "create_fetch_job",
+          "description": "Create a new fetch job record (queued) for a hot-threads or post-content fetch. Returns the created job; refuses invalid parameters or missing required identifiers for the chosen job_type.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Service API key used to authenticate the caller."
+              },
+              "job_type": {
+                "type": "string",
+                "enum": [
+                  "fetch_reddit_hot_threads",
+                  "fetch_reddit_post_content"
+                ],
+                "description": "Type of fetch to perform."
+              },
+              "requested_subreddit": {
+                "type": "string",
+                "description": "Required for fetch_reddit_hot_threads: subreddit name as requested by the caller."
+              },
+              "requested_post_reddit_id": {
+                "type": "string",
+                "description": "Required for fetch_reddit_post_content: Reddit post id as requested by the caller."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 10,
+                "description": "For fetch_reddit_hot_threads: number of posts to fetch."
+              },
+              "comment_limit": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 500,
+                "default": 20,
+                "description": "For fetch_reddit_post_content: number of top-level comments to fetch."
+              },
+              "comment_depth": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 10,
+                "default": 3,
+                "description": "For fetch_reddit_post_content: maximum depth of the comment tree."
+              }
+            },
+            "required": [
+              "api_key",
+              "job_type"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_fetch_job(api_key, job_type, requested_subreddit=None, requested_post_reddit_id=None, limit=None, comment_limit=None, comment_depth=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0508000\" if __import__(\"os\").path.isdir(\"./environment_mix/0508000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _gen_id(prefix):\n        return f\"rcf_{prefix}_{int(time.time()*1000)}_{os.urandom(3).hex()}\"\n\n    def _log_request(status, resource_id=None):\n        logs = _load(\"request_logs.json\")\n        logs.append({\n            \"id\": _gen_id(\"req\"),\n            \"timestamp\": now_iso,\n            \"endpoint\": \"create_fetch_job\",\n            \"credential_id\": api_key if isinstance(api_key, str) else None,\n            \"status\": status,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"resource_id\": resource_id\n        })\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(api_key, str) or api_key.strip() == \"\":\n        _log_request(\"error\")\n        return _err(\"UNAUTHORIZED\", \"Invalid api_key\")\n\n    if job_type not in (\"fetch_reddit_hot_threads\", \"fetch_reddit_post_content\"):\n        _log_request(\"error\")\n        return _err(\"VALIDATION_ERROR\", \"job_type must be one of fetch_reddit_hot_threads, fetch_reddit_post_content\")\n\n    # Defaults\n    if limit is None:\n        limit = 10\n    if comment_limit is None:\n        comment_limit = 20\n    if comment_depth is None:\n        comment_depth = 3\n\n    # Validate ranges if provided\n    if limit is not None:\n        if not isinstance(limit, int):\n            _log_request(\"error\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n        if limit < 1 or limit > 100:\n            _log_request(\"error\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 100\")\n    if comment_limit is not None:\n        if not isinstance(comment_limit, int):\n            _log_request(\"error\")\n            return _err(\"VALIDATION_ERROR\", \"comment_limit must be an integer\")\n        if comment_limit < 0 or comment_limit > 500:\n            _log_request(\"error\")\n            return _err(\"VALIDATION_ERROR\", \"comment_limit must be between 0 and 500\")\n    if comment_depth is not None:\n        if not isinstance(comment_depth, int):\n            _log_request(\"error\")\n            return _err(\"VALIDATION_ERROR\", \"comment_depth must be an integer\")\n        if comment_depth < 0 or comment_depth > 10:\n            _log_request(\"error\")\n            return _err(\"VALIDATION_ERROR\", \"comment_depth must be between 0 and 10\")\n\n    # Business rule constraint (relaxed): for the chosen job_type, required fields must be present; extraneous\n    # fields are tolerated (caller may send them), but they are nulled in the stored row to satisfy schema constraint.\n    if job_type == \"fetch_reddit_hot_threads\":\n        if requested_subreddit is None or (not isinstance(requested_subreddit, str)) or requested_subreddit.strip() == \"\":\n            _log_request(\"error\")\n            return _err(\"VALIDATION_ERROR\", \"requested_subreddit is required for fetch_reddit_hot_threads\")\n        # limit must be not null per constraint\n        if limit is None:\n            _log_request(\"error\")\n            return _err(\"VALIDATION_ERROR\", \"limit is required for fetch_reddit_hot_threads\")\n        row = {\n            \"id\": _gen_id(\"job\"),\n            \"job_type\": job_type,\n            \"subreddit_id\": None,\n            \"post_id\": None,\n            \"requested_subreddit\": requested_subreddit.strip(),\n            \"requested_post_reddit_id\": None,\n            \"limit\": limit,\n            \"comment_limit\": None,\n            \"comment_depth\": None,\n            \"status\": \"queued\",\n            \"cache_hit\": False,\n            \"http_status\": None,\n            \"error_code\": None,\n            \"error_message\": None,\n            \"started_at\": None,\n            \"finished_at\": None,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso\n        }\n    else:\n        if requested_post_reddit_id is None or (not isinstance(requested_post_reddit_id, str)) or requested_post_reddit_id.strip() == \"\":\n            _log_request(\"error\")\n            return _err(\"VALIDATION_ERROR\", \"requested_post_reddit_id is required for fetch_reddit_post_content\")\n        # comment_limit/comment_depth must be not null per constraint\n        if comment_limit is None or comment_depth is None:\n            _log_request(\"error\")\n            return _err(\"VALIDATION_ERROR\", \"comment_limit and comment_depth are required for fetch_reddit_post_content\")\n        row = {\n            \"id\": _gen_id(\"job\"),\n            \"job_type\": job_type,\n            \"subreddit_id\": None,\n            \"post_id\": None,\n            \"requested_subreddit\": None,\n            \"requested_post_reddit_id\": requested_post_reddit_id.strip(),\n            \"limit\": None,\n            \"comment_limit\": comment_limit,\n            \"comment_depth\": comment_depth,\n            \"status\": \"queued\",\n            \"cache_hit\": False,\n            \"http_status\": None,\n            \"error_code\": None,\n            \"error_message\": None,\n            \"started_at\": None,\n            \"finished_at\": None,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso\n        }\n\n    jobs = _load(\"fetch_jobs.json\")\n    jobs.append(row)\n    _save(\"fetch_jobs.json\", jobs)\n\n    _log_request(\"ok\", resource_id=row[\"id\"])\n    return {\"data\": row}\n"
+        },
+        {
+          "name": "update_fetch_job_status",
+          "description": "Advance a fetch job through its lifecycle (queued→running→succeeded/failed/cancelled). Returns the updated job; refuses invalid transitions and enforces started_at/finished_at semantics.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Service API key used to authenticate the caller."
+              },
+              "id": {
+                "type": "string",
+                "description": "Internal fetch job id."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "New status to set; must be a valid transition from the current status."
+              },
+              "cache_hit": {
+                "type": "boolean",
+                "description": "Whether the job was served from cache (typically set when finishing)."
+              },
+              "http_status": {
+                "type": "integer",
+                "minimum": 100,
+                "maximum": 599,
+                "description": "Upstream HTTP status code, when applicable."
+              },
+              "error_code": {
+                "type": "string",
+                "description": "Machine-readable error code for failed jobs."
+              },
+              "error_message": {
+                "type": "string",
+                "description": "Human-readable error message for failed jobs."
+              },
+              "started_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional explicit started timestamp; normally set automatically when status=running."
+              },
+              "finished_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional explicit finished timestamp; normally set automatically when status is terminal."
+              }
+            },
+            "required": [
+              "api_key",
+              "id",
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_fetch_job_status(api_key, id, status, cache_hit=None, http_status=None, error_code=None, error_message=None, started_at=None, finished_at=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0508000\" if __import__(\"os\").path.isdir(\"./environment_mix/0508000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_utc():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        if not isinstance(dt, datetime.datetime):\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            dt = s\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        if not isinstance(s, str):\n            return None\n        ss = s.strip()\n        if not ss:\n            return None\n        try:\n            if ss.endswith(\"Z\"):\n                ss = ss[:-1] + \"+00:00\"\n            dt = datetime.datetime.fromisoformat(ss)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _ensure_rows(x):\n        if isinstance(x, list):\n            return x\n        if isinstance(x, dict) and isinstance(x.get(\"rows\"), list):\n            return x[\"rows\"]\n        return []\n\n    def _gen_id(prefix):\n        return f\"rcf_{prefix}_{int(time.time()*1000)}_{os.urandom(3).hex()}\"\n\n    def _log(endpoint, credential, status_code, resource_id=None, note=None):\n        logs = _ensure_rows(_load(\"request_logs.json\"))\n        logs.append(\n            {\n                \"id\": _gen_id(\"req\"),\n                \"timestamp\": _iso(_now_utc()),\n                \"endpoint\": endpoint,\n                \"credential\": credential,\n                \"resource_id\": resource_id,\n                \"status\": int(status_code) if isinstance(status_code, int) else status_code,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"note\": note,\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    # Validate inputs\n    if not isinstance(api_key, str) or not api_key.strip():\n        _log(\"update_fetch_job_status\", api_key if isinstance(api_key, str) else None, 400, resource_id=id, note=\"validation_error: api_key\")\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\")\n    if not isinstance(id, str) or not id.strip():\n        _log(\"update_fetch_job_status\", api_key, 400, resource_id=id, note=\"validation_error: id\")\n        return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\")\n\n    allowed_status = {\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"}\n    if not isinstance(status, str) or status not in allowed_status:\n        _log(\"update_fetch_job_status\", api_key, 400, resource_id=id, note=\"validation_error: status\")\n        return _err(\"VALIDATION_ERROR\", \"status must be one of queued, running, succeeded, failed, cancelled\")\n\n    if cache_hit is not None and not isinstance(cache_hit, bool):\n        _log(\"update_fetch_job_status\", api_key, 400, resource_id=id, note=\"validation_error: cache_hit\")\n        return _err(\"VALIDATION_ERROR\", \"cache_hit must be a boolean when provided\")\n\n    if http_status is not None:\n        if not isinstance(http_status, int):\n            _log(\"update_fetch_job_status\", api_key, 400, resource_id=id, note=\"validation_error: http_status type\")\n            return _err(\"VALIDATION_ERROR\", \"http_status must be an integer when provided\")\n        if http_status < 100 or http_status > 599:\n            _log(\"update_fetch_job_status\", api_key, 400, resource_id=id, note=\"validation_error: http_status range\")\n            return _err(\"VALIDATION_ERROR\", \"http_status must be between 100 and 599\")\n\n    if error_code is not None and not isinstance(error_code, str):\n        _log(\"update_fetch_job_status\", api_key, 400, resource_id=id, note=\"validation_error: error_code\")\n        return _err(\"VALIDATION_ERROR\", \"error_code must be a string when provided\")\n    if error_message is not None and not isinstance(error_message, str):\n        _log(\"update_fetch_job_status\", api_key, 400, resource_id=id, note=\"validation_error: error_message\")\n        return _err(\"VALIDATION_ERROR\", \"error_message must be a string when provided\")\n\n    started_dt = _parse_dt(started_at) if started_at is not None else None\n    if started_at is not None and started_dt is None:\n        _log(\"update_fetch_job_status\", api_key, 400, resource_id=id, note=\"validation_error: started_at\")\n        return _err(\"VALIDATION_ERROR\", \"started_at must be an RFC3339 date-time string when provided\")\n\n    finished_dt = _parse_dt(finished_at) if finished_at is not None else None\n    if finished_at is not None and finished_dt is None:\n        _log(\"update_fetch_job_status\", api_key, 400, resource_id=id, note=\"validation_error: finished_at\")\n        return _err(\"VALIDATION_ERROR\", \"finished_at must be an RFC3339 date-time string when provided\")\n\n    # Authenticate: accept any key that matches any known row id.\n    subreddits = _ensure_rows(_load(\"subreddits.json\"))\n    posts = _ensure_rows(_load(\"posts.json\"))\n    fetch_jobs = _ensure_rows(_load(\"fetch_jobs.json\"))\n\n    key_ok = any(r.get(\"id\") == api_key for r in subreddits) or any(r.get(\"id\") == api_key for r in posts) or any(\n        r.get(\"id\") == api_key for r in fetch_jobs\n    )\n    if not key_ok:\n        _log(\"update_fetch_job_status\", api_key, 401, resource_id=id, note=\"unauthorized: unknown api_key\")\n        return _err(\"UNAUTHORIZED\", \"Invalid api_key\")\n\n    job_idx = None\n    for i, j in enumerate(fetch_jobs):\n        if j.get(\"id\") == id:\n            job_idx = i\n            break\n    if job_idx is None:\n        _log(\"update_fetch_job_status\", api_key, 404, resource_id=id, note=\"not_found\")\n        return _err(\"NOT_FOUND\", \"Fetch job not found\", id=id)\n\n    job = fetch_jobs[job_idx]\n\n    # Lifecycle transitions\n    transitions = {\n        \"queued\": {\"running\", \"cancelled\"},\n        \"running\": {\"succeeded\", \"failed\", \"cancelled\"},\n        \"succeeded\": set(),\n        \"failed\": set(),\n        \"cancelled\": set(),\n    }\n\n    cur = job.get(\"status\")\n    if cur not in transitions:\n        _log(\"update_fetch_job_status\", api_key, 409, resource_id=id, note=\"conflict: unknown current status\")\n        return _err(\"CONFLICT\", \"Fetch job has an unknown stored status\", id=id, current_status=cur)\n\n    # Idempotent: setting same status is allowed; still must apply provided fields consistent with constraints.\n    if status != cur and status not in transitions[cur]:\n        _log(\"update_fetch_job_status\", api_key, 409, resource_id=id, note=\"invalid_transition\")\n        return _err(\n            \"INVALID_TRANSITION\",\n            f\"Invalid status transition: {cur} -> {status}\",\n            id=id,\n            from_status=cur,\n            to_status=status,\n        )\n\n    now = _now_utc()\n\n    # Apply status change with started/finished semantics\n    new_started = _parse_dt(job.get(\"started_at\")) if job.get(\"started_at\") else None\n    new_finished = _parse_dt(job.get(\"finished_at\")) if job.get(\"finished_at\") else None\n\n    if status == \"running\":\n        if started_dt is not None:\n            new_started = started_dt\n        elif new_started is None:\n            new_started = now\n        # running must not have finished_at\n        new_finished = None\n\n    if status in (\"succeeded\", \"failed\", \"cancelled\"):\n        # ensure started_at exists (real systems often allow direct terminal in some recoveries; enforce minimally)\n        if started_dt is not None:\n            new_started = started_dt\n        if new_started is None:\n            # if moving from queued directly (not allowed by transitions), we'd have rejected already.\n            # if idempotent terminal update with no started_at recorded, set to now for coherence.\n            new_started = now\n        if finished_dt is not None:\n            new_finished = finished_dt\n        elif new_finished is None:\n            new_finished = now\n\n    # If staying in same status, allow explicit timestamps but enforce constraints\n    if status == cur:\n        if started_dt is not None:\n            new_started = started_dt\n        if finished_dt is not None:\n            new_finished = finished_dt\n\n    # Constraint: finished_at is null or finished_at >= started_at\n    if new_finished is not None and new_started is not None and new_finished < new_started:\n        _log(\"update_fetch_job_status\", api_key, 400, resource_id=id, note=\"validation_error: finished_at<started_at\")\n        return _err(\"VALIDATION_ERROR\", \"finished_at must be greater than or equal to started_at\")\n\n    # Apply other fields\n    if cache_hit is not None:\n        job[\"cache_hit\"] = cache_hit\n    if http_status is not None:\n        job[\"http_status\"] = http_status\n    if error_code is not None:\n        job[\"error_code\"] = error_code\n    if error_message is not None:\n        job[\"error_message\"] = error_message\n\n    job[\"status\"] = status\n    job[\"started_at\"] = _iso(new_started) if new_started is not None else None\n    job[\"finished_at\"] = _iso(new_finished) if new_finished is not None else None\n\n    # Update updated_at\n    job[\"updated_at\"] = _iso(now)\n    if not job.get(\"created_at\"):\n        job[\"created_at\"] = _iso(now)\n\n    # Persist\n    fetch_jobs[job_idx] = job\n    _save(\"fetch_jobs.json\", fetch_jobs)\n\n    _log(\"update_fetch_job_status\", api_key, 200, resource_id=id)\n    return {\"data\": job}\n"
+        },
+        {
+          "name": "upsert_reddit_snapshot",
+          "description": "Upsert subreddit, post, and comment snapshot data sourced from Reddit into the cache. Returns the affected entity ids; refuses inconsistent relationships (e.g., comment not belonging to post) or invalid lifecycle statuses.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Service API key used to authenticate the caller."
+              },
+              "subreddit": {
+                "type": "object",
+                "description": "Subreddit fields to upsert (matched by name case-insensitively and/or reddit_fullname when provided).",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Internal subreddit id (if known)."
+                  },
+                  "name": {
+                    "type": "string",
+                    "description": "Subreddit name (without r/)."
+                  },
+                  "title": {
+                    "type": "string",
+                    "description": "Subreddit title."
+                  },
+                  "reddit_fullname": {
+                    "type": "string",
+                    "description": "Reddit fullname (e.g., t5_...)."
+                  },
+                  "nsfw": {
+                    "type": "boolean",
+                    "description": "Whether the subreddit is marked NSFW."
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "active",
+                      "banned",
+                      "quarantined",
+                      "private",
+                      "not_found"
+                    ],
+                    "description": "Subreddit status."
+                  },
+                  "last_hot_fetch_at": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "Timestamp of last successful hot fetch snapshot."
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "additionalProperties": false
+              },
+              "post": {
+                "type": "object",
+                "description": "Post fields to upsert (matched by reddit_id and/or reddit_fullname when provided).",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Internal post id (if known)."
+                  },
+                  "subreddit_id": {
+                    "type": "string",
+                    "description": "Internal subreddit id this post belongs to."
+                  },
+                  "reddit_id": {
+                    "type": "string",
+                    "description": "Reddit post id (base36)."
+                  },
+                  "reddit_fullname": {
+                    "type": "string",
+                    "description": "Reddit fullname (e.g., t3_...)."
+                  },
+                  "permalink": {
+                    "type": "string",
+                    "description": "Reddit permalink for the post."
+                  },
+                  "url": {
+                    "type": "string",
+                    "description": "URL associated with the post."
+                  },
+                  "title": {
+                    "type": "string",
+                    "description": "Post title."
+                  },
+                  "author": {
+                    "type": "string",
+                    "description": "Post author username."
+                  },
+                  "selftext": {
+                    "type": "string",
+                    "description": "Post selftext."
+                  },
+                  "score": {
+                    "type": "integer",
+                    "description": "Post score at snapshot time."
+                  },
+                  "num_comments": {
+                    "type": "integer",
+                    "description": "Number of comments at snapshot time."
+                  },
+                  "over_18": {
+                    "type": "boolean",
+                    "description": "Whether the post is marked over_18."
+                  },
+                  "spoiler": {
+                    "type": "boolean",
+                    "description": "Whether the post is marked spoiler."
+                  },
+                  "locked": {
+                    "type": "boolean",
+                    "description": "Whether the post is locked."
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "active",
+                      "removed",
+                      "deleted",
+                      "not_found"
+                    ],
+                    "description": "Post status."
+                  },
+                  "posted_at": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "When the post was created on Reddit."
+                  },
+                  "last_fetched_at": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "Timestamp of last successful post-content fetch snapshot."
+                  }
+                },
+                "required": [
+                  "reddit_id"
+                ],
+                "additionalProperties": false
+              },
+              "comments": {
+                "type": "array",
+                "description": "Flattened list of comment nodes to upsert for the post snapshot (matched by reddit_id).",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "Internal comment id (if known)."
+                    },
+                    "post_id": {
+                      "type": "string",
+                      "description": "Internal post id this comment belongs to."
+                    },
+                    "reddit_id": {
+                      "type": "string",
+                      "description": "Reddit comment id (base36)."
+                    },
+                    "reddit_fullname": {
+                      "type": "string",
+                      "description": "Reddit fullname (e.g., t1_...)."
+                    },
+                    "parent_comment_id": {
+                      "type": "string",
+                      "description": "Internal parent comment id when known; null/omitted for top-level."
+                    },
+                    "author": {
+                      "type": "string",
+                      "description": "Comment author username."
+                    },
+                    "body": {
+                      "type": "string",
+                      "description": "Comment body text."
+                    },
+                    "score": {
+                      "type": "integer",
+                      "description": "Comment score at snapshot time."
+                    },
+                    "depth": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "description": "Depth in the tree (0 for top-level)."
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "active",
+                        "removed",
+                        "deleted",
+                        "not_found"
+                      ],
+                      "description": "Comment status."
+                    },
+                    "commented_at": {
+                      "type": "string",
+                      "format": "date-time",
+                      "description": "When the comment was created on Reddit."
+                    }
+                  },
+                  "required": [
+                    "reddit_id",
+                    "post_id"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "source": {
+                "type": "string",
+                "enum": [
+                  "reddit",
+                  "internal"
+                ],
+                "default": "reddit",
+                "description": "Indicates the source of the snapshot data."
+              },
+              "snapshot_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Timestamp representing when the snapshot was taken."
+              }
+            },
+            "required": [
+              "api_key",
+              "subreddit",
+              "post"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def upsert_reddit_snapshot(api_key, subreddit, post, comments=None, source=None, snapshot_at=None, **_extra):\n    import json, os, datetime, time, re, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0508000\" if __import__(\"os\").path.isdir(\"./environment_mix/0508000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_dt():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _now():\n        return _now_dt().isoformat()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _gen_id(prefix):\n        return f\"{prefix}_{uuid.uuid4().hex}\"\n\n    def _auth_key(api_key_value):\n        if not isinstance(api_key_value, str) or not api_key_value.strip():\n            return None, _err(\"UNAUTHORIZED\", \"Missing or invalid api_key.\")\n        keyfiles = [\"api_keys.json\", \"keys.json\", \"service_api_keys.json\", \"auth_keys.json\"]\n        for fn in keyfiles:\n            if os.path.exists(os.path.join(_DB, fn)):\n                rows = _load(fn)\n                for r in rows:\n                    v = r.get(\"value\") or r.get(\"api_key\") or r.get(\"key\")\n                    if api_key_value == v or api_key_value == r.get(\"id\"):\n                        if r.get(\"status\") in (None, \"active\"):\n                            return {\"file\": fn, \"row\": r}, None\n                return None, _err(\"UNAUTHORIZED\", \"Invalid api_key.\")\n        return {\"file\": None, \"row\": {\"id\": api_key_value, \"value\": api_key_value}}, None\n\n    def _log(endpoint, cred_id, st, resource_id=None):\n        logs = _load(\"request_logs.json\")\n        logs.append({\n            \"id\": _gen_id(\"req\"),\n            \"timestamp\": _now(),\n            \"endpoint\": endpoint,\n            \"credential_id\": cred_id,\n            \"status\": st,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"resource_id\": resource_id,\n        })\n        _save(\"request_logs.json\", logs)\n\n    cred, e = _auth_key(api_key)\n    if e:\n        return e\n    cred_id = (cred.get(\"row\") or {}).get(\"id\") or api_key\n\n    if source is None:\n        source = \"reddit\"\n    if source not in (\"reddit\", \"internal\"):\n        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid source.\")\n    if snapshot_at is not None and _parse_dt(snapshot_at) is None:\n        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"snapshot_at must be RFC3339 date-time.\")\n\n    if not isinstance(subreddit, dict) or \"name\" not in subreddit:\n        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"subreddit object with required field name is required.\")\n    if not isinstance(post, dict) or \"reddit_id\" not in post:\n        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"post object with required field reddit_id is required.\")\n    if comments is not None and not isinstance(comments, list):\n        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"comments must be an array.\")\n\n    # Validate subreddit name constraints\n    nm = subreddit.get(\"name\")\n    if not isinstance(nm, str) or not nm.strip():\n        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"subreddit.name must be a non-empty string.\")\n    nm = nm.strip()\n    if not (1 <= len(nm) <= 21):\n        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Subreddit name length must be between 1 and 21.\")\n    if not re.match(r\"^[A-Za-z0-9_]+$\", nm):\n        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Subreddit name must match regex ^[A-Za-z0-9_]+$.\")\n\n    sub_statuses = {\"active\", \"banned\", \"quarantined\", \"private\", \"not_found\"}\n    post_statuses = {\"active\", \"removed\", \"deleted\", \"not_found\"}\n    com_statuses = {\"active\", \"removed\", \"deleted\", \"not_found\"}\n\n    if subreddit.get(\"status\") is not None and subreddit.get(\"status\") not in sub_statuses:\n        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid subreddit.status.\")\n    if post.get(\"status\") is not None and post.get(\"status\") not in post_statuses:\n        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid post.status.\")\n\n    if \"nsfw\" in subreddit and subreddit[\"nsfw\"] is not None and not isinstance(subreddit[\"nsfw\"], bool):\n        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"subreddit.nsfw must be boolean.\")\n    if \"score\" in post and post[\"score\"] is not None and (not isinstance(post[\"score\"], int) or post[\"score\"] < 0):\n        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"post.score must be an integer >= 0.\")\n    if \"num_comments\" in post and post[\"num_comments\"] is not None and (not isinstance(post[\"num_comments\"], int) or post[\"num_comments\"] < 0):\n        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"post.num_comments must be an integer >= 0.\")\n    for bfield in (\"over_18\", \"spoiler\", \"locked\"):\n        if bfield in post and post[bfield] is not None and not isinstance(post[bfield], bool):\n            _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", f\"post.{bfield} must be boolean.\")\n\n    if subreddit.get(\"last_hot_fetch_at\") is not None and _parse_dt(subreddit.get(\"last_hot_fetch_at\")) is None:\n        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"subreddit.last_hot_fetch_at must be RFC3339 date-time.\")\n    if post.get(\"posted_at\") is not None and _parse_dt(post.get(\"posted_at\")) is None:\n        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"post.posted_at must be RFC3339 date-time.\")\n    if post.get(\"last_fetched_at\") is not None and _parse_dt(post.get(\"last_fetched_at\")) is None:\n        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"post.last_fetched_at must be RFC3339 date-time.\")\n\n    subrows = _load(\"subreddits.json\")\n    postrows = _load(\"posts.json\")\n    comrows = _load(\"comments.json\")\n\n    # --- upsert subreddit ---\n    sub_match = None\n    sub_id = subreddit.get(\"id\")\n    sub_reddit_fullname = subreddit.get(\"reddit_fullname\")\n    nm_l = nm.lower()\n\n    if isinstance(sub_id, str):\n        for r in subrows:\n            if r.get(\"id\") == sub_id:\n                sub_match = r\n                break\n    if sub_match is None and isinstance(sub_reddit_fullname, str) and sub_reddit_fullname:\n        for r in subrows:\n            if r.get(\"reddit_fullname\") == sub_reddit_fullname:\n                sub_match = r\n                break\n    if sub_match is None:\n        for r in subrows:\n            if isinstance(r.get(\"name\"), str) and r.get(\"name\").lower() == nm_l:\n                sub_match = r\n                break\n\n    now = _now()\n    if sub_match is None:\n        # unique(lower(name))\n        for r in subrows:\n            if isinstance(r.get(\"name\"), str) and r.get(\"name\").lower() == nm_l:\n                _log(\"upsert_reddit_snapshot\", cred_id, \"CONFLICT\")\n                return _err(\"CONFLICT\", \"Subreddit name already exists (case-insensitive conflict).\")\n        sub_match = {\n            \"id\": _gen_id(\"sub\"),\n            \"name\": nm,\n            \"title\": None,\n            \"reddit_fullname\": None,\n            \"nsfw\": False,\n            \"status\": \"active\",\n            \"last_hot_fetch_at\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        subrows.append(sub_match)\n\n    # lifecycle transition enforcement\n    if subreddit.get(\"status\") is not None:\n        transitions = {\n            \"active\": [\"banned\", \"quarantined\", \"private\", \"not_found\"],\n            \"banned\": [\"active\", \"not_found\"],\n            \"quarantined\": [\"active\", \"private\", \"not_found\"],\n            \"private\": [\"active\", \"not_found\"],\n            \"not_found\": [\"active\"],\n        }\n        cur = sub_match.get(\"status\")\n        nxt = subreddit[\"status\"]\n        if cur != nxt:\n            if cur not in transitions or nxt not in transitions[cur]:\n                _log(\"upsert_reddit_snapshot\", cred_id, \"INVALID_TRANSITION\", sub_match.get(\"id\"))\n                return _err(\"INVALID_TRANSITION\", \"Invalid subreddit status transition.\", current_status=cur, requested_status=nxt)\n\n    # apply subreddit fields\n    for k in (\"title\", \"reddit_fullname\", \"nsfw\", \"status\", \"last_hot_fetch_at\"):\n        if k in subreddit and subreddit[k] is not None:\n            sub_match[k] = subreddit[k]\n    # ensure name canonical as provided\n    sub_match[\"name\"] = nm\n    sub_match[\"updated_at\"] = now\n\n    # --- upsert post ---\n    pr_id = post.get(\"reddit_id\")\n    if not isinstance(pr_id, str) or not pr_id.strip():\n        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"post.reddit_id must be non-empty string.\")\n    pr_id = pr_id.strip()\n\n    post_match = None\n    internal_post_id = post.get(\"id\")\n    post_fullname = post.get(\"reddit_fullname\")\n\n    if isinstance(internal_post_id, str):\n        for r in postrows:\n            if r.get(\"id\") == internal_post_id:\n                post_match = r\n                break\n    if post_match is None and isinstance(post_fullname, str) and post_fullname:\n        for r in postrows:\n            if r.get(\"reddit_fullname\") == post_fullname:\n                post_match = r\n                break\n    if post_match is None:\n        for r in postrows:\n            if r.get(\"reddit_id\") == pr_id:\n                post_match = r\n                break\n\n    # unique(reddit_id) check on insert\n    if post_match is None:\n        for r in postrows:\n            if r.get(\"reddit_id\") == pr_id:\n                post_match = r\n                break\n\n    if post_match is None:\n        # require title/flags? not strictly required by tool schema except reddit_id.\n        post_match = {\n            \"id\": _gen_id(\"post\"),\n            \"subreddit_id\": sub_match[\"id\"],\n            \"reddit_id\": pr_id,\n            \"reddit_fullname\": None,\n            \"permalink\": None,\n            \"url\": None,\n            \"title\": post.get(\"title\") if isinstance(post.get(\"title\"), str) else \"\",\n            \"author\": post.get(\"author\") if isinstance(post.get(\"author\"), str) else None,\n            \"selftext\": post.get(\"selftext\") if isinstance(post.get(\"selftext\"), str) else None,\n            \"score\": int(post.get(\"score\")) if isinstance(post.get(\"score\"), int) and post.get(\"score\") >= 0 else 0,\n            \"num_comments\": int(post.get(\"num_comments\")) if isinstance(post.get(\"num_comments\"), int) and post.get(\"num_comments\") >= 0 else 0,\n            \"over_18\": bool(post.get(\"over_18\")) if isinstance(post.get(\"over_18\"), bool) else False,\n            \"spoiler\": bool(post.get(\"spoiler\")) if isinstance(post.get(\"spoiler\"), bool) else False,\n            \"locked\": bool(post.get(\"locked\")) if isinstance(post.get(\"locked\"), bool) else False,\n            \"status\": post.get(\"status\") if post.get(\"status\") in post_statuses else \"active\",\n            \"posted_at\": post.get(\"posted_at\") if isinstance(post.get(\"posted_at\"), str) else None,\n            \"last_fetched_at\": post.get(\"last_fetched_at\") if isinstance(post.get(\"last_fetched_at\"), str) else None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        if not post_match[\"title\"]:\n            post_match[\"title\"] = \"(unknown title)\"\n        postrows.append(post_match)\n    else:\n        # lifecycle transitions\n        if post.get(\"status\") is not None:\n            transitions = {\n                \"active\": [\"removed\", \"deleted\", \"not_found\"],\n                \"removed\": [\"active\", \"deleted\", \"not_found\"],\n                \"deleted\": [\"not_found\"],\n                \"not_found\": [\"active\"],\n            }\n            cur = post_match.get(\"status\")\n            nxt = post[\"status\"]\n            if cur != nxt:\n                if cur not in transitions or nxt not in transitions[cur]:\n                    _log(\"upsert_reddit_snapshot\", cred_id, \"INVALID_TRANSITION\", post_match.get(\"id\"))\n                    return _err(\"INVALID_TRANSITION\", \"Invalid post status transition.\", current_status=cur, requested_status=nxt)\n\n        # authoritative subreddit_id handling\n        # If caller provided subreddit_id, it must match the upserted subreddit id (or we resolve to authoritative)\n        if post.get(\"subreddit_id\") is not None and post.get(\"subreddit_id\") != sub_match[\"id\"]:\n            # update to latest authoritative (sub_match) rather than reject\n            post_match[\"subreddit_id\"] = sub_match[\"id\"]\n        else:\n            post_match[\"subreddit_id\"] = sub_match[\"id\"]\n\n        for k in (\"reddit_fullname\", \"permalink\", \"url\", \"title\", \"author\", \"selftext\",\n                  \"score\", \"num_comments\", \"over_18\", \"spoiler\", \"locked\", \"status\",\n                  \"posted_at\", \"last_fetched_at\"):\n            if k in post and post[k] is not None:\n                if k in (\"score\", \"num_comments\"):\n                    if not isinstance(post[k], int) or post[k] < 0:\n                        _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\", post_match.get(\"id\"))\n                        return _err(\"VALIDATION_ERROR\", f\"post.{k} must be integer >= 0.\")\n                    post_match[k] = int(post[k])\n                else:\n                    post_match[k] = post[k]\n        post_match[\"updated_at\"] = now\n\n    # --- upsert comments ---\n    affected_comment_ids = []\n    if comments is not None:\n        # Validate that each comment belongs to this post (same internal post_id)\n        for c in comments:\n            if not isinstance(c, dict):\n                _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\", post_match.get(\"id\"))\n                return _err(\"VALIDATION_ERROR\", \"Each comment must be an object.\")\n            if \"reddit_id\" not in c or \"post_id\" not in c:\n                _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\", post_match.get(\"id\"))\n                return _err(\"VALIDATION_ERROR\", \"Each comment requires reddit_id and post_id.\")\n            if c.get(\"post_id\") != post_match[\"id\"]:\n                _log(\"upsert_reddit_snapshot\", cred_id, \"CONFLICT\", post_match.get(\"id\"))\n                return _err(\"CONFLICT\", \"Comment post_id does not match target post.\", comment_reddit_id=c.get(\"reddit_id\"))\n            if c.get(\"status\") is not None and c.get(\"status\") not in com_statuses:\n                _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\", post_match.get(\"id\"))\n                return _err(\"VALIDATION_ERROR\", \"Invalid comment.status.\", comment_reddit_id=c.get(\"reddit_id\"))\n            if \"depth\" in c and c[\"depth\"] is not None:\n                if not isinstance(c[\"depth\"], int) or c[\"depth\"] < 0:\n                    _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\", post_match.get(\"id\"))\n                    return _err(\"VALIDATION_ERROR\", \"comment.depth must be integer >= 0.\", comment_reddit_id=c.get(\"reddit_id\"))\n            if \"score\" in c and c[\"score\"] is not None:\n                if not isinstance(c[\"score\"], int) or c[\"score\"] < 0:\n                    _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\", post_match.get(\"id\"))\n                    return _err(\"VALIDATION_ERROR\", \"comment.score must be integer >= 0.\", comment_reddit_id=c.get(\"reddit_id\"))\n            if c.get(\"commented_at\") is not None and _parse_dt(c.get(\"commented_at\")) is None:\n                _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\", post_match.get(\"id\"))\n                return _err(\"VALIDATION_ERROR\", \"comment.commented_at must be RFC3339 date-time.\", comment_reddit_id=c.get(\"reddit_id\"))\n\n        # Map internal ids\n        by_reddit_id = {r.get(\"reddit_id\"): r for r in comrows if r.get(\"reddit_id\") is not None}\n\n        for c in comments:\n            rid = c.get(\"reddit_id\")\n            if not isinstance(rid, str) or not rid.strip():\n                _log(\"upsert_reddit_snapshot\", cred_id, \"VALIDATION_ERROR\", post_match.get(\"id\"))\n                return _err(\"VALIDATION_ERROR\", \"comment.reddit_id must be non-empty string.\")\n            rid = rid.strip()\n\n            existing = by_reddit_id.get(rid)\n            if existing is None and isinstance(c.get(\"id\"), str):\n                for r in comrows:\n                    if r.get(\"id\") == c.get(\"id\"):\n                        existing = r\n                        break\n\n            if existing is None:\n                existing = {\n                    \"id\": _gen_id(\"cmt\"),\n                    \"post_id\": post_match[\"id\"],\n                    \"reddit_id\": rid,\n                    \"reddit_fullname\": c.get(\"reddit_fullname\"),\n                    \"parent_comment_id\": c.get(\"parent_comment_id\"),\n                    \"author\": c.get(\"author\"),\n                    \"body\": c.get(\"body\"),\n                    \"score\": int(c.get(\"score\")) if isinstance(c.get(\"score\"), int) and c.get(\"score\") >= 0 else 0,\n                    \"depth\": int(c.get(\"depth\")) if isinstance(c.get(\"depth\"), int) and c.get(\"depth\") >= 0 else 0,\n                    \"status\": c.get(\"status\") if c.get(\"status\") in com_statuses else \"active\",\n                    \"commented_at\": c.get(\"commented_at\"),\n                    \"created_at\": now,\n                    \"updated_at\": now,\n                }\n                comrows.append(existing)\n                by_reddit_id[rid] = existing\n            else:\n                # lifecycle transition enforcement\n                if c.get(\"status\") is not None:\n                    transitions = {\n                        \"active\": [\"removed\", \"deleted\", \"not_found\"],\n                        \"removed\": [\"active\", \"deleted\", \"not_found\"],\n                        \"deleted\": [\"not_found\"],\n                        \"not_found\": [\"active\"],\n                    }\n                    cur = existing.get(\"status\")\n                    nxt = c.get(\"status\")\n                    if cur != nxt:\n                        if cur not in transitions or nxt not in transitions[cur]:\n                            _log(\"upsert_reddit_snapshot\", cred_id, \"INVALID_TRANSITION\", existing.get(\"id\"))\n                            return _err(\"INVALID_TRANSITION\", \"Invalid comment status transition.\", current_status=cur, requested_status=nxt, comment_reddit_id=rid)\n\n                # post consistency\n                existing[\"post_id\"] = post_match[\"id\"]\n\n                for k in (\"reddit_fullname\", \"parent_comment_id\", \"author\", \"body\", \"status\", \"commented_at\"):\n                    if k in c and c[k] is not None:\n                        existing[k] = c[k]\n                if \"score\" in c and c[\"score\"] is not None:\n                    existing[\"score\"] = int(c[\"score\"])\n                if \"depth\" in c and c[\"depth\"] is not None:\n                    existing[\"depth\"] = int(c[\"depth\"])\n                existing[\"updated_at\"] = now\n\n            affected_comment_ids.append(existing[\"id\"])\n\n        # Validate parent_comment_id references if provided (must exist and be same post_id)\n        idx = {r.get(\"id\"): r for r in comrows if r.get(\"id\")}\n        for c in comrows:\n            pid = c.get(\"parent_comment_id\")\n            if pid is not None:\n                parent = idx.get(pid)\n                if parent is None:\n                    _log(\"upsert_reddit_snapshot\", cred_id, \"CONFLICT\", post_match.get(\"id\"))\n                    return _err(\"CONFLICT\", \"parent_comment_id references missing comment.\", comment_id=c.get(\"id\"), parent_comment_id=pid)\n                if parent.get(\"post_id\") != c.get(\"post_id\"):\n                    _log(\"upsert_reddit_snapshot\", cred_id, \"CONFLICT\", post_match.get(\"id\"))\n                    return _err(\"CONFLICT\", \"parent_comment_id must refer to a comment on the same post.\", comment_id=c.get(\"id\"), parent_comment_id=pid)\n\n    _save(\"subreddits.json\", subrows)\n    _save(\"posts.json\", postrows)\n    if comments is not None:\n        _save(\"comments.json\", comrows)\n\n    _log(\"upsert_reddit_snapshot\", cred_id, \"OK\", post_match.get(\"id\"))\n    return {\n        \"subreddit_id\": sub_match[\"id\"],\n        \"post_id\": post_match[\"id\"],\n        \"comment_ids\": affected_comment_ids,\n        \"snapshot_at\": snapshot_at if snapshot_at is not None else None,\n        \"source\": source,\n    }\n"
+        },
+        {
+          "name": "get_current_identity",
+          "description": "Return the authenticated caller identity, granted scopes, and current quota/rate-limit usage. Refuses missing/invalid credentials.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Service API key used to authenticate the caller."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_current_identity(api_key, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0508000\" if __import__(\"os\").path.isdir(\"./environment_mix/0508000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_dt():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _now():\n        return _now_dt().isoformat()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _gen_id(prefix):\n        return f\"{prefix}_{uuid.uuid4().hex}\"\n\n    def _auth_key(api_key_value):\n        if not isinstance(api_key_value, str) or not api_key_value.strip():\n            return None, _err(\"UNAUTHORIZED\", \"Missing or invalid api_key.\")\n        keyfiles = [\"api_keys.json\", \"keys.json\", \"service_api_keys.json\", \"auth_keys.json\"]\n        for fn in keyfiles:\n            if os.path.exists(os.path.join(_DB, fn)):\n                rows = _load(fn)\n                for r in rows:\n                    v = r.get(\"value\") or r.get(\"api_key\") or r.get(\"key\")\n                    if api_key_value == v or api_key_value == r.get(\"id\"):\n                        if r.get(\"status\") in (None, \"active\"):\n                            return {\"file\": fn, \"row\": r}, None\n                return None, _err(\"UNAUTHORIZED\", \"Invalid api_key.\")\n        # If no key store exists, we still require non-empty api_key (acts as identity)\n        return {\"file\": None, \"row\": {\"id\": api_key_value, \"value\": api_key_value, \"status\": \"active\"}}, None\n\n    def _log(endpoint, cred_id, st):\n        logs = _load(\"request_logs.json\")\n        logs.append({\n            \"id\": _gen_id(\"req\"),\n            \"timestamp\": _now(),\n            \"endpoint\": endpoint,\n            \"credential_id\": cred_id,\n            \"status\": st,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", logs)\n\n    cred, e = _auth_key(api_key)\n    if e:\n        return e\n    crow = cred.get(\"row\") or {}\n    cred_id = crow.get(\"id\") or api_key\n\n    # Usage summary derived from request logs\n    logs = _load(\"request_logs.json\")\n    now = _now_dt()\n    one_min_ago = now - datetime.timedelta(minutes=1)\n    day_ago = now - datetime.timedelta(days=1)\n\n    rpm_used = 0\n    day_used = 0\n    for r in logs:\n        if r.get(\"credential_id\") != cred_id:\n            continue\n        ts = _parse_dt(r.get(\"timestamp\"))\n        if not ts:\n            continue\n        if ts >= one_min_ago:\n            rpm_used += 1\n        if ts >= day_ago:\n            day_used += 1\n\n    # Find limits if present\n    rate_per_min = 60\n    quota_per_day = 10000\n    for lf in [\"limits.json\", \"rate_limits.json\", \"plans.json\", \"quotas.json\"]:\n        if os.path.exists(os.path.join(_DB, lf)):\n            lims = _load(lf)\n            for r in lims:\n                if api_key == r.get(\"api_key\") or api_key == r.get(\"id\") or api_key == r.get(\"key\"):\n                    rpm = r.get(\"rate_per_minute\") or r.get(\"rpm\")\n                    qpd = r.get(\"quota_per_day\") or r.get(\"qpd\")\n                    if isinstance(rpm, int) and rpm > 0:\n                        rate_per_min = rpm\n                    if isinstance(qpd, int) and qpd > 0:\n                        quota_per_day = qpd\n                    break\n            break\n\n    identity = {\n        \"credential\": {\n            \"id\": cred_id,\n            \"label\": crow.get(\"label\") or crow.get(\"name\") or None,\n            \"status\": crow.get(\"status\") or \"active\",\n        },\n        \"scopes\": crow.get(\"scopes\") or [\"read\", \"write\"],\n        \"rate_limit\": {\n            \"limit_per_minute\": rate_per_min,\n            \"used_last_minute\": rpm_used,\n            \"remaining_last_minute\": max(0, rate_per_min - rpm_used),\n        },\n        \"quota\": {\n            \"limit_per_day\": quota_per_day,\n            \"used_last_24h\": day_used,\n            \"remaining_last_24h\": max(0, quota_per_day - day_used),\n        },\n        \"server_time\": _now(),\n    }\n\n    _log(\"get_current_identity\", cred_id, \"OK\")\n    return {\"identity\": identity}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0508000",
+    "index": 508,
+    "name": "Reddit Content Fetcher",
+    "description": "This backend stores cached snapshots of Reddit subreddits, posts, and comment trees to serve two read-only fetch tools with predictable performance and rate-limit protection. Main workflows: record fetch jobs (hot threads or post content), upsert subreddit/post/comment data from Reddit, and serve re",
+    "taxonomy": {
+      "L1_id": "L1-03",
+      "L1_name": "Social Media & Community",
+      "L1_name_zh": "社交媒体与社区",
+      "L2_id": "L2-06",
+      "L2_name": "Social Network Integration",
+      "L2_name_zh": "社交网络集成",
+      "L3_name": "Reddit Content & Trends",
+      "L3_name_zh": "Reddit 内容与趋势"
+    },
+    "database_dir": "./environment_mix/0508000",
+    "mount_path": "/app/database",
+    "n_tools": 8,
+    "n_collections": 4,
+    "n_records": 71,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 8,
+      "loaded": 8,
+      "reads_returning_data": 2,
+      "read_operations": 4,
+      "mutations_persisted": 2,
+      "mutations_attempted": 4
+    },
+    "tools_loadable_from_database_dir": 8,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "fetch_reddit_hot_threads",
+      "returned_chars": 162
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

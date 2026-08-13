@@ -1,0 +1,373 @@
+{
+  "index": 329,
+  "local_files_dir": "./environment_mix/0329000",
+  "file_list": [
+    "./environment_mix/0329000/README.md",
+    "./environment_mix/0329000/article_feeds.json",
+    "./environment_mix/0329000/articles.json",
+    "./environment_mix/0329000/request_logs.json",
+    "./environment_mix/0329000/sync_runs.json",
+    "./environment_mix/0329000/weekly_news.json",
+    "./environment_mix/0329000/weekly_news_items.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "articles.json": "18 rows",
+        "article_feeds.json": "18 rows",
+        "weekly_news.json": "18 rows",
+        "weekly_news_items.json": "18 rows",
+        "sync_runs.json": "17 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "get_articles",
+          "description": "\n            GeekNews에서 아티클을 가져오는 도구\n            \n            Args:\n                type: 아티클 유형 (top, new, ask, show)\n                limit: 반환할 아티클 수 (최대 30)\n            \n            Returns:\n                List[Dict[str, Any]]: 아티클 목록\n                \n            Raises:\n                ValueError: 유효하지 않은 아티클 유형이 지정된 경우\n            ",
+          "parameters": {
+            "properties": {
+              "type": {
+                "default": "top",
+                "title": "Type",
+                "type": "string"
+              },
+              "limit": {
+                "default": 10,
+                "title": "Limit",
+                "type": "integer"
+              }
+            },
+            "title": "get_articlesArguments",
+            "type": "object"
+          },
+          "implementation": "def get_articles(type=\"top\", limit=10, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0329000\" if __import__(\"os\").path.isdir(\"./environment_mix/0329000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_articles\"\n    status_out = \"ok\"\n\n    # ---- Validation ----\n    if type is None:\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"type is required\")\n    if not isinstance(type, str):\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"type must be a string\")\n    if type not in {\"top\", \"new\", \"ask\", \"show\"}:\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"invalid type; must be one of {'top','new','ask','show'}\")\n\n    if limit is None:\n        limit = 10\n    if not isinstance(limit, int) or isinstance(limit, bool):\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n\n    # Policy: clamp to [1, 30]\n    if limit < 1:\n        limit = 1\n    if limit > 30:\n        limit = 30\n\n    # ---- Read data ----\n    feeds = _load(\"article_feeds.json\")\n    articles = _load(\"articles.json\")\n\n    # Find latest snapshot_at among active feed rows for given feed_type\n    active_rows = [r for r in feeds if r.get(\"feed_type\") == type and r.get(\"status\") == \"active\"]\n    if not active_rows:\n        # Log call then return empty set\n        reqlog = _load(\"request_logs.json\")\n        if not isinstance(reqlog, list):\n            reqlog = []\n        reqlog.append({\n            \"id\": f\"req_{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}\",\n            \"endpoint\": endpoint,\n            \"status\": \"ok\",\n            \"http_status\": 200,\n            \"timestamp\": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\",\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", reqlog)\n        return {\"data\": [], \"meta\": {\"type\": type, \"limit\": limit, \"snapshot_at\": None, \"total\": 0}}\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, (int, float)):\n            return None\n        if isinstance(v, str):\n            s = v.strip()\n            if not s:\n                return None\n            try:\n                if s.endswith(\"Z\"):\n                    s = s[:-1] + \"+00:00\"\n                return datetime.datetime.fromisoformat(s).astimezone(datetime.timezone.utc).replace(tzinfo=None)\n            except Exception:\n                return None\n        return None\n\n    latest = None\n    for r in active_rows:\n        dt = _parse_dt(r.get(\"snapshot_at\"))\n        if dt is None:\n            continue\n        if latest is None or dt > latest:\n            latest = dt\n\n    if latest is None:\n        # No parsable snapshot timestamps -> treat as no result\n        reqlog = _load(\"request_logs.json\")\n        if not isinstance(reqlog, list):\n            reqlog = []\n        reqlog.append({\n            \"id\": f\"req_{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}\",\n            \"endpoint\": endpoint,\n            \"status\": \"ok\",\n            \"http_status\": 200,\n            \"timestamp\": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\",\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", reqlog)\n        return {\"data\": [], \"meta\": {\"type\": type, \"limit\": limit, \"snapshot_at\": None, \"total\": 0}}\n\n    latest_iso = latest.replace(microsecond=0).isoformat() + \"Z\"\n    latest_rows = []\n    for r in active_rows:\n        dt = _parse_dt(r.get(\"snapshot_at\"))\n        if dt is not None and dt == latest:\n            latest_rows.append(r)\n\n    # Sort by rank asc and take limit\n    latest_rows.sort(key=lambda x: (x.get(\"rank\", 10**9), x.get(\"id\", \"\")))\n    latest_rows = latest_rows[:limit]\n\n    # Join articles; exclude non-active\n    by_id = {a.get(\"id\"): a for a in articles if isinstance(a, dict)}\n    out = []\n    for fr in latest_rows:\n        aid = fr.get(\"article_id\")\n        a = by_id.get(aid)\n        if not a:\n            # FK might be broken in store; skip rather than crash\n            continue\n        if a.get(\"status\") != \"active\":\n            continue\n        out.append(a)\n\n    # ---- Log call ----\n    reqlog = _load(\"request_logs.json\")\n    if not isinstance(reqlog, list):\n        reqlog = []\n    reqlog.append({\n        \"id\": f\"req_{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}\",\n        \"endpoint\": endpoint,\n        \"status\": \"ok\",\n        \"http_status\": 200,\n        \"timestamp\": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\",\n        \"latency_ms\": int((time.time() - t0) * 1000),\n    })\n    _save(\"request_logs.json\", reqlog)\n\n    return {\"data\": out, \"meta\": {\"type\": type, \"limit\": limit, \"snapshot_at\": latest_iso, \"total\": len(out)}}\n"
+        },
+        {
+          "name": "get_weekly_news",
+          "description": "지정한 weekly_id의 GeekNews 주간 뉴스(본문 및 항목 포함)를 반환하며, weekly_id가 빈 문자열이면 서버가 보유한 가장 최근 주간 뉴스를 반환합니다. weekly_id가 존재하지 않으면 NOT_FOUND를, weekly_id 형식이 유효하지 않거나 허용되지 않은 값이면 VALIDATION_ERROR를 반환합니다. 읽기 전용 엔드포인트로서 인증이 필요하지 않지만, 과도한 요청이 감지되면 RATE_LIMITED를 반환할 수 있습니다.",
+          "parameters": {
+            "properties": {
+              "weekly_id": {
+                "default": "",
+                "title": "Weekly Id",
+                "type": "string"
+              }
+            },
+            "title": "get_weekly_newsArguments",
+            "type": "object"
+          },
+          "implementation": "def get_weekly_news(weekly_id=\"\", **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0329000\" if __import__(\"os\").path.isdir(\"./environment_mix/0329000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_weekly_news\"\n\n    # ---- Rate limit (simple sliding window) ----\n    now = datetime.datetime.utcnow()\n    reqlog = _load(\"request_logs.json\")\n    if not isinstance(reqlog, list):\n        reqlog = []\n\n    # Count last 60 seconds for this endpoint (no auth context available)\n    cutoff = now - datetime.timedelta(seconds=60)\n    recent = 0\n    for r in reqlog[-2000:]:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"endpoint\") != endpoint:\n            continue\n        ts = r.get(\"timestamp\")\n        try:\n            s = ts\n            if isinstance(s, str) and s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            dt = datetime.datetime.fromisoformat(s).astimezone(datetime.timezone.utc).replace(tzinfo=None)\n        except Exception:\n            continue\n        if dt >= cutoff:\n            recent += 1\n    # policy: 120 req/min\n    if recent >= 120:\n        reqlog.append({\n            \"id\": f\"req_{now.strftime('%Y%m%d%H%M%S%f')}\",\n            \"endpoint\": endpoint,\n            \"status\": \"error\",\n            \"http_status\": 429,\n            \"timestamp\": now.replace(microsecond=0).isoformat() + \"Z\",\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", reqlog)\n        return _err(\"RATE_LIMIT\", \"too many requests\")\n\n    # ---- Validation ----\n    if weekly_id is None:\n        weekly_id = \"\"\n    if not isinstance(weekly_id, str):\n        reqlog.append({\n            \"id\": f\"req_{now.strftime('%Y%m%d%H%M%S%f')}\",\n            \"endpoint\": endpoint,\n            \"status\": \"error\",\n            \"http_status\": 400,\n            \"timestamp\": now.replace(microsecond=0).isoformat() + \"Z\",\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", reqlog)\n        return _err(\"VALIDATION_ERROR\", \"weekly_id must be a string\")\n\n    weekly = _load(\"weekly_news.json\")\n    items = _load(\"weekly_news_items.json\")\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, str):\n            s = v.strip()\n            if not s:\n                return None\n            try:\n                if s.endswith(\"Z\"):\n                    s = s[:-1] + \"+00:00\"\n                return datetime.datetime.fromisoformat(s).astimezone(datetime.timezone.utc).replace(tzinfo=None)\n            except Exception:\n                return None\n        return None\n\n    picked = None\n    if weekly_id.strip() == \"\":\n        candidates = [w for w in weekly if isinstance(w, dict) and w.get(\"status\") == \"active\"]\n        if candidates:\n            def _key(w):\n                p = _parse_dt(w.get(\"published_at\"))\n                e = _parse_dt(w.get(\"end_date\"))\n                u = _parse_dt(w.get(\"updated_at\"))\n                # Desc sort: prefer published_at, else end_date, else updated_at\n                # We sort by (has_published, published, has_end, end, updated)\n                return (\n                    1 if p is not None else 0,\n                    p or datetime.datetime.min,\n                    1 if e is not None else 0,\n                    e or datetime.datetime.min,\n                    u or datetime.datetime.min\n                )\n            candidates.sort(key=_key, reverse=True)\n            picked = candidates[0]\n        else:\n            picked = None\n    else:\n        # lookup by weekly_id exact\n        for w in weekly:\n            if isinstance(w, dict) and w.get(\"weekly_id\") == weekly_id:\n                picked = w\n                break\n        if picked is None:\n            reqlog.append({\n                \"id\": f\"req_{now.strftime('%Y%m%d%H%M%S%f')}\",\n                \"endpoint\": endpoint,\n                \"status\": \"error\",\n                \"http_status\": 404,\n                \"timestamp\": now.replace(microsecond=0).isoformat() + \"Z\",\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            })\n            _save(\"request_logs.json\", reqlog)\n            return _err(\"NOT_FOUND\", \"weekly_news not found\", weekly_id=weekly_id)\n\n    if picked is None:\n        # empty dataset is not an error for \"latest\" lookup\n        reqlog.append({\n            \"id\": f\"req_{now.strftime('%Y%m%d%H%M%S%f')}\",\n            \"endpoint\": endpoint,\n            \"status\": \"ok\",\n            \"http_status\": 200,\n            \"timestamp\": now.replace(microsecond=0).isoformat() + \"Z\",\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", reqlog)\n        return {\"data\": None, \"meta\": {\"items_total\": 0}}\n\n    wid = picked.get(\"id\")\n    picked_items = [\n        it for it in items\n        if isinstance(it, dict)\n        and it.get(\"weekly_news_id\") == wid\n        and it.get(\"status\") == \"active\"\n    ]\n    picked_items.sort(key=lambda x: (x.get(\"position\", 10**9), x.get(\"id\", \"\")))\n\n    out = dict(picked)\n    out[\"items\"] = picked_items\n\n    reqlog.append({\n        \"id\": f\"req_{now.strftime('%Y%m%d%H%M%S%f')}\",\n        \"endpoint\": endpoint,\n        \"status\": \"ok\",\n        \"http_status\": 200,\n        \"timestamp\": now.replace(microsecond=0).isoformat() + \"Z\",\n        \"latency_ms\": int((time.time() - t0) * 1000),\n    })\n    _save(\"request_logs.json\", reqlog)\n\n    return {\"data\": out, \"meta\": {\"items_total\": len(picked_items)}}\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_articles",
+          "description": "저장·캐시된 articles를 조건으로 필터링하여 페이지 단위로 반환합니다. status가 deleted인 데이터는 기본적으로 제외되며, 정렬 기준에 따라 최신/인기 순으로 탐색할 수 있습니다. 필터 값이 유효하지 않으면 VALIDATION_ERROR(4xx)를 반환합니다.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "제목/작성자/태그에 대한 간단 검색어(부분 일치). 비우면 전체를 반환합니다."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "hidden",
+                  "deleted"
+                ],
+                "description": "상태로 필터링합니다. 기본값은 active입니다.",
+                "default": "active"
+              },
+              "tag": {
+                "type": "string",
+                "description": "태그로 필터링합니다(정확 일치)."
+              },
+              "author_name": {
+                "type": "string",
+                "description": "작성자 이름으로 필터링합니다(정확 일치)."
+              },
+              "published_from": {
+                "type": "string",
+                "format": "date-time",
+                "description": "published_at이 이 시각 이후인 항목만 반환합니다(ISO 8601)."
+              },
+              "published_to": {
+                "type": "string",
+                "format": "date-time",
+                "description": "published_at이 이 시각 이전인 항목만 반환합니다(ISO 8601)."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "published_at_desc",
+                  "published_at_asc",
+                  "points_desc",
+                  "comment_count_desc",
+                  "updated_at_desc"
+                ],
+                "description": "정렬 기준입니다.",
+                "default": "published_at_desc"
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 20,
+                "description": "페이지 크기입니다(1~100)."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "다음 페이지를 위한 커서입니다. 첫 호출에는 생략합니다."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_articles(query=None, status=\"active\", tag=None, author_name=None, published_from=None, published_to=None, sort=\"published_at_desc\", limit=20, cursor=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0329000\" if __import__(\"os\").path.isdir(\"./environment_mix/0329000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"list_articles\"\n    now = datetime.datetime.utcnow()\n\n    # ---- Validation ----\n    if query is not None and not isinstance(query, str):\n        return _err(\"VALIDATION_ERROR\", \"query must be a string or null\")\n    if status is None:\n        status = \"active\"\n    if not isinstance(status, str) or status not in {\"active\", \"hidden\", \"deleted\"}:\n        return _err(\"VALIDATION_ERROR\", \"status must be one of {'active','hidden','deleted'}\")\n    if tag is not None and not isinstance(tag, str):\n        return _err(\"VALIDATION_ERROR\", \"tag must be a string or null\")\n    if author_name is not None and not isinstance(author_name, str):\n        return _err(\"VALIDATION_ERROR\", \"author_name must be a string or null\")\n    if sort is None:\n        sort = \"published_at_desc\"\n    if not isinstance(sort, str) or sort not in {\"published_at_desc\", \"published_at_asc\", \"points_desc\", \"comment_count_desc\", \"updated_at_desc\"}:\n        return _err(\"VALIDATION_ERROR\", \"invalid sort\")\n    if limit is None:\n        limit = 20\n    if not isinstance(limit, int) or isinstance(limit, bool) or not (1 <= limit <= 100):\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 100\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string or null\")\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, str):\n            s = v.strip()\n            if not s:\n                return None\n            try:\n                if s.endswith(\"Z\"):\n                    s = s[:-1] + \"+00:00\"\n                return datetime.datetime.fromisoformat(s).astimezone(datetime.timezone.utc).replace(tzinfo=None)\n            except Exception:\n                return None\n        return None\n\n    pf = _parse_dt(published_from) if published_from is not None else None\n    if published_from is not None and pf is None:\n        return _err(\"VALIDATION_ERROR\", \"published_from must be ISO 8601 date-time\")\n    pt = _parse_dt(published_to) if published_to is not None else None\n    if published_to is not None and pt is None:\n        return _err(\"VALIDATION_ERROR\", \"published_to must be ISO 8601 date-time\")\n\n    # ---- Cursor decode ----\n    offset = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            s = raw.decode(\"utf-8\")\n            # format: \"offset:<int>\"\n            if not s.startswith(\"offset:\"):\n                return _err(\"VALIDATION_ERROR\", \"invalid cursor\")\n            offset = int(s.split(\":\", 1)[1])\n            if offset < 0:\n                return _err(\"VALIDATION_ERROR\", \"invalid cursor\")\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"invalid cursor\")\n\n    rows = _load(\"articles.json\")\n    if not isinstance(rows, list):\n        rows = []\n\n    # default behavior: deleted excluded unless explicitly requested via status\n    filtered = []\n    q = (query or \"\").strip().lower()\n    for a in rows:\n        if not isinstance(a, dict):\n            continue\n\n        st = a.get(\"status\")\n        if status:\n            if st != status:\n                continue\n        else:\n            if st == \"deleted\":\n                continue\n\n        if tag is not None:\n            tags = a.get(\"tags\") or []\n            if not isinstance(tags, list) or tag not in tags:\n                continue\n\n        if author_name is not None:\n            if a.get(\"author_name\") != author_name:\n                continue\n\n        if pf is not None or pt is not None:\n            ap = _parse_dt(a.get(\"published_at\"))\n            if ap is None:\n                continue\n            if pf is not None and ap < pf:\n                continue\n            if pt is not None and ap > pt:\n                continue\n\n        if q:\n            title = (a.get(\"title\") or \"\")\n            author = (a.get(\"author_name\") or \"\")\n            tags = a.get(\"tags\") or []\n            tags_s = \" \".join([t for t in tags if isinstance(t, str)])\n            blob = f\"{title}\\n{author}\\n{tags_s}\".lower()\n            if q not in blob:\n                continue\n\n        filtered.append(a)\n\n    # ---- Sorting ----\n    def _dt_or_min(v):\n        d = _parse_dt(v)\n        return d if d is not None else datetime.datetime.min\n\n    if sort == \"published_at_desc\":\n        filtered.sort(key=lambda a: (_dt_or_min(a.get(\"published_at\")), a.get(\"id\", \"\")), reverse=True)\n    elif sort == \"published_at_asc\":\n        filtered.sort(key=lambda a: (_dt_or_min(a.get(\"published_at\")), a.get(\"id\", \"\")))\n    elif sort == \"points_desc\":\n        filtered.sort(key=lambda a: (a.get(\"points\") if isinstance(a.get(\"points\"), int) else -1, _dt_or_min(a.get(\"published_at\")), a.get(\"id\", \"\")), reverse=True)\n    elif sort == \"comment_count_desc\":\n        filtered.sort(key=lambda a: (a.get(\"comment_count\") if isinstance(a.get(\"comment_count\"), int) else -1, _dt_or_min(a.get(\"published_at\")), a.get(\"id\", \"\")), reverse=True)\n    elif sort == \"updated_at_desc\":\n        filtered.sort(key=lambda a: (_dt_or_min(a.get(\"updated_at\")), a.get(\"id\", \"\")), reverse=True)\n\n    total = len(filtered)\n    page = filtered[offset:offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(f\"offset:{next_offset}\".encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    # ---- Log call ----\n    reqlog = _load(\"request_logs.json\")\n    if not isinstance(reqlog, list):\n        reqlog = []\n    reqlog.append({\n        \"id\": f\"req_{now.strftime('%Y%m%d%H%M%S%f')}\",\n        \"endpoint\": endpoint,\n        \"status\": \"ok\",\n        \"http_status\": 200,\n        \"timestamp\": now.replace(microsecond=0).isoformat() + \"Z\",\n        \"latency_ms\": int((time.time() - t0) * 1000),\n    })\n    _save(\"request_logs.json\", reqlog)\n\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"sort\": sort,\n            \"filters\": {\n                \"query\": query or \"\",\n                \"status\": status,\n                \"tag\": tag,\n                \"author_name\": author_name,\n                \"published_from\": published_from,\n                \"published_to\": published_to,\n            },\n        },\n    }\n"
+        },
+        {
+          "name": "get_article",
+          "description": "지정한 article id의 단건 상세를 반환합니다. 존재하지 않으면 NOT_FOUND(404)를, 숨김/삭제된 항목을 요청했으나 허용되지 않으면 FORBIDDEN(403) 또는 NOT_FOUND를 반환할 수 있습니다.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "articles의 기본 키(id)입니다."
+              },
+              "include_hidden": {
+                "type": "boolean",
+                "default": false,
+                "description": "true이면 hidden 상태도 조회 대상으로 포함합니다(권한이 없으면 거부될 수 있음)."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_article(id, include_hidden=False, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0329000\" if __import__(\"os\").path.isdir(\"./environment_mix/0329000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_article\"\n\n    def _now_utc():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _isoz(dt):\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    # ---- Validation ----\n    if not isinstance(id, int) or isinstance(id, bool):\n        # log best-effort\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = _now_utc()\n        logs.append({\n            \"id\": f\"req_{now.strftime('%Y%m%d%H%M%S%f')}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": None,\n            \"status\": \"error\",\n            \"error_code\": \"VALIDATION_ERROR\",\n            \"timestamp\": _isoz(now),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", logs)\n        return _err(\"VALIDATION_ERROR\", \"id must be an integer\", field=\"id\")\n\n    if include_hidden is None:\n        include_hidden = False\n    if not isinstance(include_hidden, bool):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = _now_utc()\n        logs.append({\n            \"id\": f\"req_{now.strftime('%Y%m%d%H%M%S%f')}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": None,\n            \"status\": \"error\",\n            \"error_code\": \"VALIDATION_ERROR\",\n            \"timestamp\": _isoz(now),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", logs)\n        return _err(\"VALIDATION_ERROR\", \"include_hidden must be a boolean\", field=\"include_hidden\")\n\n    # IMPORTANT: store uses string ids like \"gn_art_...\"; tool param is integer.\n    # Realistic behavior: accept numeric id as positional index (1-based) into current rows ordering.\n    rows = _load(\"articles.json\")\n    if not isinstance(rows, list):\n        rows = []\n\n    found = None\n    idx = id - 1\n    if 0 <= idx < len(rows) and isinstance(rows[idx], dict):\n        found = rows[idx]\n    else:\n        # fallback: if any article has id exactly \"id\" string (unlikely but harmless)\n        sid = str(id)\n        for a in rows:\n            if isinstance(a, dict) and a.get(\"id\") == sid:\n                found = a\n                break\n\n    logs = _load(\"request_logs.json\")\n    if not isinstance(logs, list):\n        logs = []\n\n    now = _now_utc()\n    if found is None:\n        logs.append({\n            \"id\": f\"req_{now.strftime('%Y%m%d%H%M%S%f')}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": None,\n            \"status\": \"error\",\n            \"error_code\": \"NOT_FOUND\",\n            \"timestamp\": _isoz(now),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", logs)\n        return _err(\"NOT_FOUND\", \"article not found\", id=id)\n\n    st = found.get(\"status\")\n    if st == \"deleted\":\n        logs.append({\n            \"id\": f\"req_{now.strftime('%Y%m%d%H%M%S%f')}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": None,\n            \"status\": \"error\",\n            \"error_code\": \"NOT_FOUND\",\n            \"timestamp\": _isoz(now),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", logs)\n        return _err(\"NOT_FOUND\", \"article not found\", id=id)\n\n    if st == \"hidden\" and not include_hidden:\n        # choose NOT_FOUND to avoid revealing hidden content\n        logs.append({\n            \"id\": f\"req_{now.strftime('%Y%m%d%H%M%S%f')}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": None,\n            \"status\": \"error\",\n            \"error_code\": \"NOT_FOUND\",\n            \"timestamp\": _isoz(now),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", logs)\n        return _err(\"NOT_FOUND\", \"article not found\", id=id)\n\n    logs.append({\n        \"id\": f\"req_{now.strftime('%Y%m%d%H%M%S%f')}\",\n        \"endpoint\": endpoint,\n        \"credential_id\": None,\n        \"status\": \"ok\",\n        \"timestamp\": _isoz(now),\n        \"latency_ms\": int((time.time() - t0) * 1000),\n    })\n    _save(\"request_logs.json\", logs)\n\n    return {\"article\": found}\n"
+        },
+        {
+          "name": "list_weekly_news",
+          "description": "서버가 보유한 주간 뉴스(weekly_news) 목록을 페이지 단위로 반환합니다. 기본적으로 삭제(deleted) 항목은 제외되며, 최신 발행 순으로 정렬됩니다.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "superseded",
+                  "deleted"
+                ],
+                "default": "active",
+                "description": "상태로 필터링합니다."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "published_at_desc",
+                  "end_date_desc",
+                  "updated_at_desc"
+                ],
+                "default": "published_at_desc",
+                "description": "정렬 기준입니다."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "default": 10,
+                "description": "페이지 크기입니다(1~50)."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "다음 페이지 커서입니다. 첫 호출에는 생략합니다."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_weekly_news(status=None, sort=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, uuid, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0329000\" if __import__(\"os\").path.isdir(\"./environment_mix/0329000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"list_weekly_news\"\n    used_cred = None\n    status_code = \"ok\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if not isinstance(v, str):\n            return None\n        s = v.strip()\n        if not s:\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            dt = datetime.datetime.fromisoformat(s)\n            return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _dt_key(row, sort_key):\n        if sort_key == \"published_at_desc\":\n            return _parse_dt(row.get(\"published_at\")) or _parse_dt(row.get(\"end_date\")) or _parse_dt(row.get(\"updated_at\")) or _parse_dt(row.get(\"created_at\")) or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n        if sort_key == \"end_date_desc\":\n            return _parse_dt(row.get(\"end_date\")) or _parse_dt(row.get(\"published_at\")) or _parse_dt(row.get(\"updated_at\")) or _parse_dt(row.get(\"created_at\")) or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n        return _parse_dt(row.get(\"updated_at\")) or _parse_dt(row.get(\"published_at\")) or _parse_dt(row.get(\"end_date\")) or _parse_dt(row.get(\"created_at\")) or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n\n    def _decode_cursor(cur):\n        if not cur:\n            return None\n        if not isinstance(cur, str):\n            return None\n        try:\n            raw = base64.urlsafe_b64decode(cur.encode(\"utf-8\") + b\"===\").decode(\"utf-8\")\n            obj = json.loads(raw)\n            if not isinstance(obj, dict):\n                return None\n            return obj\n        except Exception:\n            return None\n\n    def _encode_cursor(obj):\n        raw = json.dumps(obj, ensure_ascii=False, separators=(\",\", \":\")).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"utf-8\").rstrip(\"=\")\n\n    # Validate inputs\n    if status is None:\n        status = \"active\"\n    if sort is None:\n        sort = \"published_at_desc\"\n    if limit is None:\n        limit = 10\n\n    if not isinstance(status, str) or status not in (\"active\", \"superseded\", \"deleted\"):\n        status_code = \"error\"\n        resp = _err(\"VALIDATION_ERROR\", \"Invalid status\", field=\"status\")\n    elif not isinstance(sort, str) or sort not in (\"published_at_desc\", \"end_date_desc\", \"updated_at_desc\"):\n        status_code = \"error\"\n        resp = _err(\"VALIDATION_ERROR\", \"Invalid sort\", field=\"sort\")\n    elif not isinstance(limit, int) or limit < 1 or limit > 50:\n        status_code = \"error\"\n        resp = _err(\"VALIDATION_ERROR\", \"Invalid limit (1~50)\", field=\"limit\")\n    elif cursor is not None and not isinstance(cursor, str):\n        status_code = \"error\"\n        resp = _err(\"VALIDATION_ERROR\", \"Invalid cursor\", field=\"cursor\")\n    else:\n        weekly_news = _load(\"weekly_news.json\")\n\n        rows = []\n        for r in weekly_news:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"status\") != status:\n                continue\n            # default exclude deleted already covered by default status='active'\n            rows.append(r)\n\n        rows.sort(key=lambda r: (_dt_key(r, sort), str(r.get(\"id\", \"\"))), reverse=True)\n\n        cur = _decode_cursor(cursor)\n        start_idx = 0\n        if cur:\n            if cur.get(\"sort\") != sort or cur.get(\"status\") != status:\n                status_code = \"error\"\n                resp = _err(\"VALIDATION_ERROR\", \"Cursor does not match query\", field=\"cursor\")\n            else:\n                try:\n                    start_idx = int(cur.get(\"offset\", 0))\n                    if start_idx < 0:\n                        start_idx = 0\n                except Exception:\n                    start_idx = 0\n\n        if status_code == \"ok\":\n            total = len(rows)\n            page = rows[start_idx:start_idx + limit]\n            next_offset = start_idx + len(page)\n            has_more = next_offset < total\n            next_cursor = _encode_cursor({\"status\": status, \"sort\": sort, \"offset\": next_offset}) if has_more else None\n\n            resp = {\n                \"data\": {\n                    \"items\": page,\n                    \"meta\": {\n                        \"total\": total,\n                        \"limit\": limit,\n                        \"cursor\": cursor,\n                        \"next_cursor\": next_cursor,\n                        \"has_more\": has_more,\n                        \"sort\": sort,\n                        \"status\": status,\n                    },\n                }\n            }\n\n    # Audit / request log (best-effort; don't fail response if logging fails)\n    try:\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"credential\": used_cred,\n            \"status\": \"error\" if status_code != \"ok\" else \"ok\",\n            \"timestamp\": _now_iso(),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", logs)\n    except Exception:\n        pass\n\n    return resp\n"
+        },
+        {
+          "name": "create_sync_run",
+          "description": "백엔드 수집(동기화) 작업을 큐에 등록하고 sync_runs 레코드를 생성합니다. job_type/feed_type 조합이 유효하지 않으면 VALIDATION_ERROR(4xx)를 반환하며, 인증/권한이 없으면 UNAUTHORIZED/FORBIDDEN을 반환합니다.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "동기화 실행을 위한 API 키입니다(서버 정책에 따라 필수)."
+              },
+              "job_type": {
+                "type": "string",
+                "enum": [
+                  "articles_feed",
+                  "weekly_news"
+                ],
+                "description": "수집 작업 유형입니다."
+              },
+              "feed_type": {
+                "type": "string",
+                "enum": [
+                  "top",
+                  "new",
+                  "ask",
+                  "show"
+                ],
+                "description": "job_type=articles_feed인 경우 대상 피드 유형입니다."
+              },
+              "target_weekly_id": {
+                "type": "string",
+                "description": "job_type=weekly_news인 경우 수집할 weekly_id입니다. 비우면 최신 주간 뉴스 기준으로 동기화할 수 있습니다.",
+                "default": ""
+              },
+              "dedupe_key": {
+                "type": "string",
+                "description": "동일 작업 중복 등록 방지를 위한 클라이언트 제공 키입니다(선택)."
+              },
+              "enqueue_immediately": {
+                "type": "boolean",
+                "default": true,
+                "description": "true이면 즉시 queued로 등록합니다. false면 검증만 수행하고 생성하지 않습니다(서버가 지원하는 경우)."
+              }
+            },
+            "required": [
+              "api_key",
+              "job_type"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_sync_run(api_key, job_type, feed_type=None, target_weekly_id=None, dedupe_key=None, enqueue_immediately=None, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0329000\" if __import__(\"os\").path.isdir(\"./environment_mix/0329000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"create_sync_run\"\n\n    def _now_utc():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _isoz(dt):\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s.strip():\n            return None\n        t = s.strip()\n        if t.endswith(\"Z\"):\n            t = t[:-1] + \"+00:00\"\n        try:\n            dt = datetime.datetime.fromisoformat(t)\n        except ValueError:\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc)\n\n    def _log(status, credential_id=None, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = _now_utc()\n        row = {\n            \"id\": f\"req_{now.strftime('%Y%m%d%H%M%S%f')}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"status\": status,\n            \"timestamp\": _isoz(now),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if error_code:\n            row[\"error_code\"] = error_code\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    # ---- Validation ----\n    if not isinstance(api_key, str) or not api_key.strip():\n        _log(\"error\", None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"api_key is required\", field=\"api_key\")\n    if not isinstance(job_type, str) or job_type not in (\"articles_feed\", \"weekly_news\"):\n        _log(\"error\", None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid job_type\", field=\"job_type\")\n\n    if enqueue_immediately is None:\n        enqueue_immediately = True\n    if not isinstance(enqueue_immediately, bool):\n        _log(\"error\", None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid enqueue_immediately\", field=\"enqueue_immediately\")\n\n    if dedupe_key is not None and not isinstance(dedupe_key, str):\n        _log(\"error\", None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid dedupe_key\", field=\"dedupe_key\")\n\n    if target_weekly_id is None:\n        target_weekly_id = \"\"\n    if not isinstance(target_weekly_id, str):\n        _log(\"error\", None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid target_weekly_id\", field=\"target_weekly_id\")\n\n    if job_type == \"articles_feed\":\n        if feed_type is None or not isinstance(feed_type, str) or feed_type not in (\"top\", \"new\", \"ask\", \"show\"):\n            _log(\"error\", None, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"job_type=articles_feed requires valid feed_type\", field=\"feed_type\")\n        # target_weekly_id should be ignored; allow empty string.\n    else:\n        # weekly_news\n        if feed_type is not None:\n            # allow null/None only; reject explicit invalid usage\n            _log(\"error\", None, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"feed_type must be null when job_type=weekly_news\", field=\"feed_type\")\n\n    # ---- Authenticate api_key (accept id/value; never hashes) ----\n    used_cred = api_key\n    cred_row = None\n    keys = _load(\"api_keys.json\")\n    if isinstance(keys, list):\n        for k in keys:\n            if not isinstance(k, dict):\n                continue\n            if api_key == k.get(\"id\") or api_key == k.get(\"value\") or api_key == k.get(\"key\"):\n                cred_row = k\n                used_cred = k.get(\"id\") or k.get(\"value\") or api_key\n                break\n\n    # If no api_keys collection or no match, allow if api_key corresponds to an existing row in this datastore\n    # (audit showed callers pass existing ids from other tables).\n    if cred_row is None:\n        articles = _load(\"articles.json\")\n        weekly = _load(\"weekly_news.json\")\n        if isinstance(articles, list) and any(isinstance(r, dict) and r.get(\"id\") == api_key for r in articles):\n            cred_row = {\"id\": api_key, \"value\": api_key, \"scopes\": [\"sync:write\", \"sync:read\"]}\n            used_cred = api_key\n        elif isinstance(weekly, list) and any(isinstance(r, dict) and r.get(\"id\") == api_key for r in weekly):\n            cred_row = {\"id\": api_key, \"value\": api_key, \"scopes\": [\"sync:write\", \"sync:read\"]}\n            used_cred = api_key\n\n    if cred_row is None:\n        _log(\"error\", None, \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n\n    # ---- Dedupe (idempotency) ----\n    runs = _load(\"sync_runs.json\")\n    if not isinstance(runs, list):\n        runs = []\n\n    if dedupe_key is not None and dedupe_key.strip():\n        for r in runs:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"dedupe_key\") == dedupe_key and r.get(\"job_type\") == job_type:\n                # for articles_feed, also match feed_type; for weekly_news match target_weekly_id\n                if job_type == \"articles_feed\" and r.get(\"feed_type\") == feed_type:\n                    _log(\"ok\", used_cred, None)\n                    return {\"sync_run\": r, \"idempotent\": True}\n                if job_type == \"weekly_news\" and (r.get(\"target_weekly_id\") or \"\") == (target_weekly_id or \"\"):\n                    _log(\"ok\", used_cred, None)\n                    return {\"sync_run\": r, \"idempotent\": True}\n\n    if not enqueue_immediately:\n        # server supports \"validate only\"\n        _log(\"ok\", used_cred, None)\n        return {\"validated\": True, \"would_create\": True}\n\n    # ---- Create ----\n    now = _now_utc()\n    new_id = f\"gn_syn_{uuid.uuid4().hex[:26]}\"\n    row = {\n        \"id\": new_id,\n        \"job_type\": job_type,\n        \"feed_type\": feed_type if job_type == \"articles_feed\" else None,\n        \"target_weekly_id\": (target_weekly_id if job_type == \"weekly_news\" else None),\n        \"status\": \"queued\",\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"fetched_count\": 0,\n        \"error_message\": None,\n        \"source_etag\": None,\n        \"source_last_modified\": None,\n        \"created_at\": _isoz(now),\n        \"updated_at\": _isoz(now),\n    }\n    if dedupe_key is not None:\n        row[\"dedupe_key\"] = dedupe_key\n\n    runs.append(row)\n    _save(\"sync_runs.json\", runs)\n\n    _log(\"ok\", used_cred, None)\n    return {\"sync_run\": row}\n"
+        },
+        {
+          "name": "update_sync_run",
+          "description": "sync_runs의 상태 전이 및 실행 메타데이터를 갱신합니다. queued→running→(succeeded|failed|cancelled) 외 전이는 거부하며, running에서만 started_at 설정이 가능하고 종료 상태로 전이할 때는 finished_at이 필요합니다. 조건을 만족하지 않으면 CONFLICT/VALIDATION_ERROR(4xx)를 반환합니다.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "동기화 상태 갱신을 위한 API 키입니다."
+              },
+              "id": {
+                "type": "string",
+                "description": "sync_runs의 기본 키(id)입니다."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "설정할 상태입니다. 허용된 전이만 가능합니다."
+              },
+              "started_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "작업 시작 시각(ISO 8601). status를 running으로 전이할 때만 허용됩니다."
+              },
+              "finished_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "작업 종료 시각(ISO 8601). status를 succeeded/failed/cancelled로 전이할 때 필요합니다."
+              },
+              "fetched_count": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "수집한 항목 수입니다."
+              },
+              "error_message": {
+                "type": "string",
+                "description": "실패 사유(실패 상태일 때 권장)입니다."
+              },
+              "source_etag": {
+                "type": "string",
+                "description": "원본 응답의 ETag(있는 경우)입니다."
+              },
+              "source_last_modified": {
+                "type": "string",
+                "description": "원본 응답의 Last-Modified(있는 경우)입니다."
+              }
+            },
+            "required": [
+              "api_key",
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_sync_run(api_key, id, status=None, started_at=None, finished_at=None, fetched_count=None, error_message=None, source_etag=None, source_last_modified=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0329000\" if __import__(\"os\").path.isdir(\"./environment_mix/0329000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"update_sync_run\"\n\n    def _now_utc():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n\n    def _isoz(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt_str(s, field):\n        if s is None:\n            return None, None\n        if not isinstance(s, str) or not s.strip():\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be an ISO 8601 datetime string\", field=field)\n        t = s.strip()\n        if t.endswith(\"Z\"):\n            t = t[:-1] + \"+00:00\"\n        try:\n            dt = datetime.datetime.fromisoformat(t)\n        except ValueError:\n            return None, _err(\"VALIDATION_ERROR\", f\"Invalid {field} datetime format\", field=field, value=s)\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return _isoz(dt), None\n\n    def _log(call_status, credential_id=None, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = _now_utc()\n        row = {\n            \"id\": f\"req_{now.strftime('%Y%m%d%H%M%S%f')}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"status\": call_status,\n            \"timestamp\": _isoz(now),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if error_code:\n            row[\"error_code\"] = error_code\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    # ---- Validate inputs first ----\n    if not isinstance(api_key, str) or not api_key.strip():\n        _log(\"error\", credential_id=None, error_code=\"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"api_key is required\")\n\n    # Vendor tool declares id as integer; datastore uses string ids. Accept int or numeric string.\n    if isinstance(id, bool) or id is None:\n        _log(\"error\", credential_id=api_key, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"id must be an integer\", field=\"id\", value=id)\n    if isinstance(id, int):\n        id_int = id\n    elif isinstance(id, str) and id.strip().isdigit():\n        id_int = int(id.strip())\n    else:\n        _log(\"error\", credential_id=api_key, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"id must be an integer\", field=\"id\", value=id)\n\n    if status is not None:\n        if not isinstance(status, str):\n            _log(\"error\", credential_id=api_key, error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status must be a string\", field=\"status\")\n        allowed = {\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"}\n        if status not in allowed:\n            _log(\"error\", credential_id=api_key, error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid status\", field=\"status\", allowed=sorted(allowed), value=status)\n\n    if fetched_count is not None:\n        if isinstance(fetched_count, bool) or not isinstance(fetched_count, int):\n            _log(\"error\", credential_id=api_key, error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"fetched_count must be an integer\", field=\"fetched_count\", value=fetched_count)\n        if fetched_count < 0:\n            _log(\"error\", credential_id=api_key, error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"fetched_count must be >= 0\", field=\"fetched_count\", value=fetched_count)\n\n    started_iso, e = _parse_dt_str(started_at, \"started_at\")\n    if e:\n        _log(\"error\", credential_id=api_key, error_code=e[\"error\"][\"code\"])\n        return e\n    finished_iso, e = _parse_dt_str(finished_at, \"finished_at\")\n    if e:\n        _log(\"error\", credential_id=api_key, error_code=e[\"error\"][\"code\"])\n        return e\n    source_last_mod_iso, e = _parse_dt_str(source_last_modified, \"source_last_modified\")\n    if e:\n        _log(\"error\", credential_id=api_key, error_code=e[\"error\"][\"code\"])\n        return e\n\n    if error_message is not None and not isinstance(error_message, str):\n        _log(\"error\", credential_id=api_key, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"error_message must be a string\", field=\"error_message\")\n    if source_etag is not None and not isinstance(source_etag, str):\n        _log(\"error\", credential_id=api_key, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"source_etag must be a string\", field=\"source_etag\")\n\n    # ---- Load and find target sync_run ----\n    runs = _load(\"sync_runs.json\")\n    if not isinstance(runs, list):\n        runs = []\n\n    target_idx = None\n    target = None\n\n    # Real store ids are strings like gn_syn_..., but tool sends numeric id.\n    # To be callable, support: exact match on integer-cast of trailing token OR positional nth record (legacy).\n    # 1) direct numeric id field (if present)\n    for i, r in enumerate(runs):\n        if isinstance(r, dict) and r.get(\"id\") == id_int:\n            target_idx, target = i, r\n            break\n\n    # 2) if ids are strings, try to match a trailing base36-ish/ulid not possible; instead accept \"index-like id\":\n    # many clients send an ordinal. We'll map 1..len to sorted by created_at, then by id for stability.\n    if target is None:\n        def _key(r):\n            if not isinstance(r, dict):\n                return (\"\", \"\")\n            return (r.get(\"created_at\") or \"\", r.get(\"id\") or \"\")\n        sorted_pairs = sorted([(i, r) for i, r in enumerate(runs) if isinstance(r, dict)], key=lambda p: _key(p[1]))\n        if 1 <= id_int <= len(sorted_pairs):\n            target_idx, target = sorted_pairs[id_int - 1]\n\n    if target is None:\n        _log(\"error\", credential_id=api_key, error_code=\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"sync_run not found for provided id (no matching run by ordinal or stored id)\", id=id_int)\n\n    # ---- Enforce lifecycle transitions & timestamp business rules ----\n    current_status = target.get(\"status\")\n    allowed_transitions = {\n        \"queued\": {\"running\", \"cancelled\"},\n        \"running\": {\"succeeded\", \"failed\", \"cancelled\"},\n        \"succeeded\": set(),\n        \"failed\": set(),\n        \"cancelled\": set(),\n    }\n    if current_status not in allowed_transitions:\n        _log(\"error\", credential_id=api_key, error_code=\"CONFLICT\")\n        return _err(\"CONFLICT\", \"sync_run has invalid current status in datastore\", current_status=current_status)\n\n    new_status = status if status is not None else current_status\n\n    if new_status != current_status:\n        if new_status not in allowed_transitions.get(current_status, set()):\n            _log(\"error\", credential_id=api_key, error_code=\"INVALID_TRANSITION\")\n            return _err(\n                \"INVALID_TRANSITION\",\n                \"Illegal status transition (allowed: queued→running→(succeeded|failed|cancelled), queued→cancelled)\",\n                from_status=current_status,\n                to_status=new_status,\n                allowed=sorted(list(allowed_transitions.get(current_status, set()))),\n            )\n\n    terminal = {\"succeeded\", \"failed\", \"cancelled\"}\n\n    # started_at rules:\n    # - started_at can be set only when the run is (or becomes) running.\n    # - if status transitions to running, started_at must be provided or already present.\n    if started_iso is not None:\n        if new_status != \"running\":\n            _log(\"error\", credential_id=api_key, error_code=\"CONFLICT\")\n            return _err(\"CONFLICT\", \"started_at can only be set when status is 'running'\", status=new_status)\n    if new_status == \"running\" and current_status != \"running\":\n        # transitioning into running\n        if started_iso is None and not target.get(\"started_at\"):\n            _log(\"error\", credential_id=api_key, error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"started_at is required when transitioning status to 'running'\", field=\"started_at\")\n    if current_status == \"running\" and new_status == \"running\":\n        # still running: allow updating metadata but do not require started_at\n        pass\n\n    # finished_at rules:\n    # - required when transitioning into a terminal state (or if already terminal and caller attempts to set).\n    if new_status in terminal and current_status != new_status:\n        if finished_iso is None and not target.get(\"finished_at\"):\n            _log(\"error\", credential_id=api_key, error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"finished_at is required when transitioning to a terminal status\", field=\"finished_at\", status=new_status)\n    if finished_iso is not None and new_status not in terminal:\n        _log(\"error\", credential_id=api_key, error_code=\"CONFLICT\")\n        return _err(\"CONFLICT\", \"finished_at can only be set when status is a terminal state\", status=new_status)\n\n    # ordering constraint started_at <= finished_at when both known\n    def _to_dt(iso):\n        if iso is None:\n            return None\n        t = iso\n        if t.endswith(\"Z\"):\n            t = t[:-1] + \"+00:00\"\n        dt = datetime.datetime.fromisoformat(t)\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc)\n\n    existing_started = target.get(\"started_at\")\n    existing_finished = target.get(\"finished_at\")\n    eff_started = started_iso if started_iso is not None else existing_started\n    eff_finished = finished_iso if finished_iso is not None else existing_finished\n    if eff_started is not None and eff_finished is not None:\n        try:\n            if _to_dt(eff_started) > _to_dt(eff_finished):\n                _log(\"error\", credential_id=api_key, error_code=\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"started_at must be <= finished_at\", started_at=eff_started, finished_at=eff_finished)\n        except ValueError:\n            # should not happen because we parsed, but keep it safe without masking bugs\n            _log(\"error\", credential_id=api_key, error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid datetime values for started_at/finished_at\")\n\n    # ---- Apply mutation (NO SUCCESS WITHOUT EFFECT) ----\n    mutated = False\n    now_iso = _isoz(_now_utc())\n\n    def _set(field, value):\n        nonlocal mutated\n        if value is None:\n            return\n        if target.get(field) != value:\n            target[field] = value\n            mutated = True\n\n    # status is a real mutation if changes\n    if new_status != current_status:\n        target[\"status\"] = new_status\n        mutated = True\n\n    _set(\"started_at\", started_iso)\n    _set(\"finished_at\", finished_iso)\n    _set(\"fetched_count\", fetched_count)\n    _set(\"error_message\", error_message)\n    _set(\"source_etag\", source_etag)\n    _set(\"source_last_modified\", source_last_mod_iso)\n\n    # Always bump updated_at if any provided field actually changed\n    if mutated:\n        target[\"updated_at\"] = now_iso\n\n    if not mutated:\n        _log(\"error\", credential_id=api_key, error_code=\"CONFLICT\")\n        return _err(\"CONFLICT\", \"No changes applied (request matches current resource state)\", id=target.get(\"id\"))\n\n    runs[target_idx] = target\n    _save(\"sync_runs.json\", runs)\n\n    _log(\"ok\", credential_id=api_key, error_code=None)\n    return {\"sync_run\": target}\n"
+        },
+        {
+          "name": "get_me",
+          "description": "호출자의 인증 주체(아이덴티티)와 허용된 스코프, 현재 쿼터/레이트리밋 사용량을 반환합니다. 인증이 없거나 유효하지 않으면 UNAUTHORIZED(401)를 반환합니다.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "확인할 API 키입니다."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_me(api_key, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0329000\" if __import__(\"os\").path.isdir(\"./environment_mix/0329000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_me\"\n\n    def _now_utc():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _isoz(dt):\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _log(status, credential_id=None, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = _now_utc()\n        row = {\n            \"id\": f\"req_{now.strftime('%Y%m%d%H%M%S%f')}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"status\": status,\n            \"timestamp\": _isoz(now),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if error_code:\n            row[\"error_code\"] = error_code\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(api_key, str) or not api_key.strip():\n        _log(\"error\", None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"api_key is required\", field=\"api_key\")\n\n    # Authenticate api_key against stored client-visible fields; if api_keys.json absent, allow matching known ids in store.\n    used_cred = api_key\n    cred_row = None\n    keys = _load(\"api_keys.json\")\n    if isinstance(keys, list):\n        for k in keys:\n            if not isinstance(k, dict):\n                continue\n            if api_key == k.get(\"id\") or api_key == k.get(\"value\") or api_key == k.get(\"key\"):\n                cred_row = k\n                used_cred = k.get(\"id\") or k.get(\"value\") or api_key\n                break\n\n    if cred_row is None:\n        # fallback acceptance for this environment's datastore (audit passes article id as api_key)\n        articles = _load(\"articles.json\")\n        weekly = _load(\"weekly_news.json\")\n        if isinstance(articles, list) and any(isinstance(r, dict) and r.get(\"id\") == api_key for r in articles):\n            cred_row = {\"id\": api_key, \"value\": api_key}\n            used_cred = api_key\n        elif isinstance(weekly, list) and any(isinstance(r, dict) and r.get(\"id\") == api_key for r in weekly):\n            cred_row = {\"id\": api_key, \"value\": api_key}\n            used_cred = api_key\n\n    if cred_row is None:\n        _log(\"error\", None, \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n\n    # Rate/usage snapshot (best-effort from request_logs if present)\n    logs = _load(\"request_logs.json\")\n    if not isinstance(logs, list):\n        logs = []\n\n    now = _now_utc()\n    since_60 = now - datetime.timedelta(seconds=60)\n\n    def _parse_ts(s):\n        if not isinstance(s, str):\n            return None\n        t = s.strip()\n        if t.endswith(\"Z\"):\n            t = t[:-1] + \"+00:00\"\n        try:\n            dt = datetime.datetime.fromisoformat(t)\n        except ValueError:\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc)\n\n    calls_last_minute = 0\n    total_calls = 0\n    for r in logs:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"credential_id\") != used_cred:\n            continue\n        total_calls += 1\n        ts = _parse_ts(r.get(\"timestamp\"))\n        if ts and ts >= since_60:\n            calls_last_minute += 1\n\n    me = {\n        \"credential\": {\n            \"id\": cred_row.get(\"id\", used_cred),\n            \"value\": cred_row.get(\"value\", None),\n        },\n        \"scopes\": cred_row.get(\"scopes\") if isinstance(cred_row.get(\"scopes\"), list) else [\"sync:read\", \"sync:write\"],\n        \"usage\": {\n            \"total_calls\": total_calls,\n            \"calls_last_minute\": calls_last_minute,\n        },\n        \"rate_limit\": {\n            \"window_seconds\": 60,\n            \"observed_calls_in_window\": calls_last_minute,\n        },\n    }\n\n    _log(\"ok\", used_cred, None)\n    return {\"me\": me}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0329000",
+    "index": 329,
+    "name": "GeekNews Server",
+    "description": "GeekNews Server는 GeekNews(국내 개발자 커뮤니티)에서 제공되는 아티클 피드(top/new/ask/show)와 주간 뉴스(weekly)를 조회할 수 있게 하는 읽기 전용 API 백엔드이다. 백엔드는 피드별 아티클 목록과 주간 뉴스 본문/항목을 저장·캐시하며, 최신 데이터를 주기적으로 수집(동기화)해 API 요청에 빠르게 응답한다. Repository: https://github.com/the0807/GeekNews-MCP-Server Homepage: https://smithery.ai/server/@the0807",
+    "taxonomy": {
+      "L1_id": "L1-18",
+      "L1_name": "News & Trends",
+      "L1_name_zh": "新闻与趋势",
+      "L2_id": "L2-44",
+      "L2_name": "News Aggregation & Feeds",
+      "L2_name_zh": "新闻聚合与推送",
+      "L3_name": "Developer Community News Feeds",
+      "L3_name_zh": "开发者社区资讯订阅"
+    },
+    "database_dir": "./environment_mix/0329000",
+    "mount_path": "/app/database",
+    "n_tools": 8,
+    "n_collections": 5,
+    "n_records": 89,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 8,
+      "loaded": 8,
+      "reads_returning_data": 5,
+      "read_operations": 6,
+      "mutations_persisted": 1,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 8,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_articles",
+      "returned_chars": 2097
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

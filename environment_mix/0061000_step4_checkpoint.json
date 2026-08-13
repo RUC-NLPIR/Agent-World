@@ -1,0 +1,208 @@
+{
+  "index": 61,
+  "local_files_dir": "./environment_mix/0061000",
+  "file_list": [
+    "./environment_mix/0061000/README.md",
+    "./environment_mix/0061000/calendars.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "calendars.json": "calendar_name -> list of event dicts (uid,summary,dtstart,dtend,description,location; optional attendees,organizer,status,recurrence). 5 calendars (team_qc, procurement, manufacturing, management, suppliers) with ~50 events Mar-Apr 2024.",
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "list_calendars",
+          "description": "Returns the calendars available in ChronaSchedule Hub along with the current count of events in each calendar. This endpoint refuses requests only when the service cannot enumerate calendars (for example, if calendars are unavailable), and it reports that listing is not possible rather than returning partial results.",
+          "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0061000\" if __import__(\"os\").path.isdir(\"./environment_mix/0061000\") else \"/app/database\")\ndef list_calendars():\n    import json, os\n    cals = json.load(open(os.path.join(_DB, \"calendars.json\"), encoding=\"utf-8\"))\n    return [{\"name\": k, \"events\": len(v)} for k, v in cals.items()]\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_events",
+          "description": "Returns events from the named calendar, optionally limited to those that fall within the provided ISO 8601 datetime range. It refuses requests when the calendar_name does not exist, when start or end is not a valid ISO datetime, or when the range is invalid (such as start occurring after end).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "calendar_name": {
+                "type": "string",
+                "description": "Calendar name."
+              },
+              "start": {
+                "type": "string",
+                "description": "ISO start datetime."
+              },
+              "end": {
+                "type": "string",
+                "description": "ISO end datetime."
+              }
+            },
+            "required": [
+              "calendar_name"
+            ]
+          },
+          "implementation": "def get_events(calendar_name, start=None, end=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0061000\" if __import__(\"os\").path.isdir(\"./environment_mix/0061000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    status = \"ok\"\n    cal_name = calendar_name\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_iso(dt):\n        if dt is None:\n            return None\n        if not isinstance(dt, str) or not dt.strip():\n            raise ValueError(\"datetime must be a non-empty string\")\n        s = dt.strip()\n        # Allow trailing Z\n        if s.endswith(\"Z\"):\n            s2 = s[:-1]\n            try:\n                return datetime.datetime.fromisoformat(s2).replace(tzinfo=datetime.timezone.utc)\n            except ValueError:\n                pass\n        # Try as-is\n        d = datetime.datetime.fromisoformat(s)\n        if d.tzinfo is None:\n            d = d.replace(tzinfo=datetime.timezone.utc)\n        return d.astimezone(datetime.timezone.utc)\n\n    # Audit log (create if missing)\n    audits = _load(\"audit.json\")\n    if not isinstance(audits, list):\n        audits = []\n\n    def _log_and_return(payload):\n        nonlocal audits\n        latency_ms = int((time.time() - t0) * 1000)\n        audits.append({\n            \"ts\": _now_iso(),\n            \"endpoint\": \"get_events\",\n            \"status\": status,\n            \"latency_ms\": latency_ms,\n            \"meta\": {\"calendar_name\": cal_name}\n        })\n        _save(\"audit.json\", audits)\n        return payload\n\n    # Validate inputs\n    if not isinstance(calendar_name, str) or not calendar_name.strip():\n        status = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"calendar_name must be a non-empty string\"))\n\n    if start is not None and (not isinstance(start, str) or not start.strip()):\n        status = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"start must be a non-empty ISO 8601 datetime string when provided\"))\n    if end is not None and (not isinstance(end, str) or not end.strip()):\n        status = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"end must be a non-empty ISO 8601 datetime string when provided\"))\n\n    try:\n        start_dt = _parse_iso(start) if start is not None else None\n        end_dt = _parse_iso(end) if end is not None else None\n    except ValueError:\n        status = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"start/end must be valid ISO 8601 datetimes\"))\n\n    if start_dt and end_dt and start_dt > end_dt:\n        status = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"Invalid range: start occurs after end\"))\n\n    # Load calendars datastore\n    store = _load(\"calendars.json\")\n    if not isinstance(store, dict):\n        # If file empty/invalid, treat as no calendars configured\n        store = {}\n\n    if calendar_name not in store:\n        status = \"error\"\n        return _log_and_return(_err(\"NOT_FOUND\", \"calendar_name does not exist\", calendar_name=calendar_name))\n\n    evs = store.get(calendar_name) or []\n    if not isinstance(evs, list):\n        evs = []\n\n    # Filter events that \"fall within\" provided range: overlap [start,end]\n    out = []\n    for e in evs:\n        if not isinstance(e, dict):\n            continue\n        ds = e.get(\"dtstart\")\n        de = e.get(\"dtend\")\n        try:\n            e_start = _parse_iso(ds) if isinstance(ds, str) else None\n            e_end = _parse_iso(de) if isinstance(de, str) else None\n        except ValueError:\n            # Ignore malformed event rows rather than failing the whole request\n            continue\n        if e_start is None or e_end is None:\n            continue\n\n        if start_dt or end_dt:\n            # overlap check\n            if start_dt and e_end < start_dt:\n                continue\n            if end_dt and e_start > end_dt:\n                continue\n        out.append(e)\n\n    # Sort by dtstart then uid for stable output\n    def _key(e):\n        try:\n            return (e.get(\"dtstart\") or \"\", e.get(\"uid\") or \"\")\n        except Exception:\n            return (\"\", \"\")\n    out.sort(key=_key)\n\n    return _log_and_return({\n        \"calendar_name\": calendar_name,\n        \"start\": start,\n        \"end\": end,\n        \"events\": out,\n        \"total\": len(out),\n        \"has_more\": False,\n        \"next_cursor\": None\n    })\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "find_events",
+          "description": "Searches the named calendar and returns events whose summary contains the provided substring. It refuses requests when the calendar_name does not exist or when summary_contains is empty or not provided, because it cannot perform a meaningful match.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "calendar_name": {
+                "type": "string",
+                "description": "Calendar name."
+              },
+              "summary_contains": {
+                "type": "string",
+                "description": "Substring to match in event summary."
+              }
+            },
+            "required": [
+              "calendar_name",
+              "summary_contains"
+            ]
+          },
+          "implementation": "def find_events(calendar_name, summary_contains, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0061000\" if __import__(\"os\").path.isdir(\"./environment_mix/0061000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    status = \"ok\"\n    cal_name = calendar_name\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    audits = _load(\"audit.json\")\n    if not isinstance(audits, list):\n        audits = []\n\n    def _log_and_return(payload):\n        nonlocal audits\n        latency_ms = int((time.time() - t0) * 1000)\n        audits.append({\n            \"ts\": _now_iso(),\n            \"endpoint\": \"find_events\",\n            \"status\": status,\n            \"latency_ms\": latency_ms,\n            \"meta\": {\"calendar_name\": cal_name}\n        })\n        _save(\"audit.json\", audits)\n        return payload\n\n    # Validate inputs\n    if not isinstance(calendar_name, str) or not calendar_name.strip():\n        status = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"calendar_name must be a non-empty string\"))\n    if not isinstance(summary_contains, str) or not summary_contains.strip():\n        status = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"summary_contains must be a non-empty string\"))\n\n    store = _load(\"calendars.json\")\n    if not isinstance(store, dict):\n        store = {}\n\n    if calendar_name not in store:\n        status = \"error\"\n        return _log_and_return(_err(\"NOT_FOUND\", \"calendar_name does not exist\", calendar_name=calendar_name))\n\n    needle = summary_contains.lower()\n    evs = store.get(calendar_name) or []\n    if not isinstance(evs, list):\n        evs = []\n\n    out = []\n    for e in evs:\n        if not isinstance(e, dict):\n            continue\n        s = e.get(\"summary\", \"\")\n        if isinstance(s, str) and needle in s.lower():\n            out.append(e)\n\n    # Stable sort\n    out.sort(key=lambda e: ((e.get(\"dtstart\") or \"\"), (e.get(\"uid\") or \"\")))\n    return _log_and_return({\n        \"calendar_name\": calendar_name,\n        \"summary_contains\": summary_contains,\n        \"events\": out,\n        \"total\": len(out),\n        \"has_more\": False,\n        \"next_cursor\": None\n    })\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "add_event",
+          "description": "Creates a new event in the named calendar and returns the created event’s UID. It refuses requests when the calendar does not exist, when required fields (summary, dtstart, dtend) are missing or empty, when dtstart/dtend are not valid ISO datetimes or dtend is not after dtstart, or when an explicit uid is provided that conflicts with an existing event in that calendar.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "calendar_name": {
+                "type": "string",
+                "description": "Calendar name."
+              },
+              "summary": {
+                "type": "string",
+                "description": "Event title."
+              },
+              "dtstart": {
+                "type": "string",
+                "description": "ISO start datetime."
+              },
+              "dtend": {
+                "type": "string",
+                "description": "ISO end datetime."
+              },
+              "description": {
+                "type": "string",
+                "description": "Optional description."
+              },
+              "location": {
+                "type": "string",
+                "description": "Optional location."
+              },
+              "uid": {
+                "type": "string",
+                "description": "Optional explicit UID."
+              }
+            },
+            "required": [
+              "calendar_name",
+              "summary",
+              "dtstart",
+              "dtend"
+            ]
+          },
+          "implementation": "def add_event(calendar_name, summary, dtstart, dtend, description=\"\", location=\"\", uid=None, **_extra):\n    import json, os, datetime, time, random\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0061000\" if __import__(\"os\").path.isdir(\"./environment_mix/0061000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    status = \"ok\"\n    cal_name = calendar_name\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_iso(dt):\n        if not isinstance(dt, str) or not dt.strip():\n            raise ValueError(\"datetime must be a non-empty string\")\n        s = dt.strip()\n        if s.endswith(\"Z\"):\n            s2 = s[:-1]\n            d = datetime.datetime.fromisoformat(s2).replace(tzinfo=datetime.timezone.utc)\n            return d\n        d = datetime.datetime.fromisoformat(s)\n        if d.tzinfo is None:\n            d = d.replace(tzinfo=datetime.timezone.utc)\n        return d.astimezone(datetime.timezone.utc)\n\n    audits = _load(\"audit.json\")\n    if not isinstance(audits, list):\n        audits = []\n\n    def _log_and_return(payload):\n        nonlocal audits\n        latency_ms = int((time.time() - t0) * 1000)\n        audits.append({\n            \"ts\": _now_iso(),\n            \"endpoint\": \"add_event\",\n            \"status\": status,\n            \"latency_ms\": latency_ms,\n            \"meta\": {\"calendar_name\": cal_name}\n        })\n        _save(\"audit.json\", audits)\n        return payload\n\n    # Validate\n    if not isinstance(calendar_name, str) or not calendar_name.strip():\n        status = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"calendar_name must be a non-empty string\"))\n    for field_name, val in [(\"summary\", summary), (\"dtstart\", dtstart), (\"dtend\", dtend)]:\n        if not isinstance(val, str) or not val.strip():\n            status = \"error\"\n            return _log_and_return(_err(\"VALIDATION_ERROR\", f\"{field_name} must be a non-empty string\"))\n\n    if description is not None and not isinstance(description, str):\n        status = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"description must be a string when provided\"))\n    if location is not None and not isinstance(location, str):\n        status = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"location must be a string when provided\"))\n    if uid is not None and (not isinstance(uid, str) or not uid.strip()):\n        status = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"uid must be a non-empty string when provided\"))\n\n    try:\n        sdt = _parse_iso(dtstart)\n        edt = _parse_iso(dtend)\n    except ValueError:\n        status = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"dtstart/dtend must be valid ISO 8601 datetimes\"))\n    if edt <= sdt:\n        status = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"dtend must be after dtstart\"))\n\n    store = _load(\"calendars.json\")\n    if not isinstance(store, dict):\n        store = {}\n\n    if calendar_name not in store:\n        status = \"error\"\n        return _log_and_return(_err(\"NOT_FOUND\", \"calendar does not exist\", calendar_name=calendar_name))\n\n    evs = store.get(calendar_name)\n    if not isinstance(evs, list):\n        evs = []\n        store[calendar_name] = evs\n\n    existing_uids = set()\n    for e in evs:\n        if isinstance(e, dict) and isinstance(e.get(\"uid\"), str):\n            existing_uids.add(e[\"uid\"])\n\n    if uid is not None:\n        if uid in existing_uids:\n            status = \"error\"\n            return _log_and_return(_err(\"CONFLICT\", \"uid already exists in this calendar\", uid=uid, calendar_name=calendar_name))\n        new_uid = uid\n    else:\n        # Generate unique uid with service-like prefix\n        # Ensure non-collision even across deletes\n        base = int(time.time() * 1000)\n        new_uid = f\"evt-{base}\"\n        if new_uid in existing_uids:\n            new_uid = f\"evt-{base}-{random.randint(1000,9999)}\"\n        i = 0\n        while new_uid in existing_uids and i < 50:\n            i += 1\n            new_uid = f\"evt-{base}-{random.randint(10000,99999)}\"\n        if new_uid in existing_uids:\n            status = \"error\"\n            return _log_and_return(_err(\"CONFLICT\", \"could not allocate unique uid\"))\n\n    ev = {\n        \"uid\": new_uid,\n        \"summary\": summary,\n        \"dtstart\": dtstart,\n        \"dtend\": dtend,\n        \"description\": description or \"\",\n        \"location\": location or \"\",\n        \"attendees\": [],\n        \"organizer\": \"\",\n        \"recurrence\": \"\",\n        \"status\": \"confirmed\"\n    }\n\n    evs.append(ev)\n    _save(\"calendars.json\", store)\n\n    return _log_and_return({\n        \"calendar_name\": calendar_name,\n        \"uid\": new_uid,\n        \"event\": ev\n    })\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "delete_event",
+          "description": "Deletes the event with the given UID from the named calendar and returns a confirmation of the deletion. It refuses requests when the calendar does not exist, when no event with that UID is present in the calendar, or when the UID is missing or empty so the target event cannot be identified.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "calendar_name": {
+                "type": "string",
+                "description": "Calendar name."
+              },
+              "uid": {
+                "type": "string",
+                "description": "Event UID."
+              }
+            },
+            "required": [
+              "calendar_name",
+              "uid"
+            ]
+          },
+          "implementation": "def delete_event(calendar_name, uid, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0061000\" if __import__(\"os\").path.isdir(\"./environment_mix/0061000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    status = \"ok\"\n    cal_name = calendar_name\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    audits = _load(\"audit.json\")\n    if not isinstance(audits, list):\n        audits = []\n\n    def _log_and_return(payload):\n        nonlocal audits\n        latency_ms = int((time.time() - t0) * 1000)\n        audits.append({\n            \"ts\": _now_iso(),\n            \"endpoint\": \"delete_event\",\n            \"status\": status,\n            \"latency_ms\": latency_ms,\n            \"meta\": {\"calendar_name\": cal_name, \"uid\": uid}\n        })\n        _save(\"audit.json\", audits)\n        return payload\n\n    # Validate\n    if not isinstance(calendar_name, str) or not calendar_name.strip():\n        status = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"calendar_name must be a non-empty string\"))\n    if not isinstance(uid, str) or not uid.strip():\n        status = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"uid must be a non-empty string\"))\n\n    store = _load(\"calendars.json\")\n    if not isinstance(store, dict):\n        store = {}\n\n    if calendar_name not in store:\n        status = \"error\"\n        return _log_and_return(_err(\"NOT_FOUND\", \"calendar does not exist\", calendar_name=calendar_name))\n\n    evs = store.get(calendar_name)\n    if not isinstance(evs, list):\n        evs = []\n        store[calendar_name] = evs\n\n    idx = None\n    for i, e in enumerate(evs):\n        if isinstance(e, dict) and e.get(\"uid\") == uid:\n            idx = i\n            break\n\n    if idx is None:\n        status = \"error\"\n        return _log_and_return(_err(\"NOT_FOUND\", \"event not found in calendar\", calendar_name=calendar_name, uid=uid))\n\n    deleted_event = evs.pop(idx)\n    _save(\"calendars.json\", store)\n\n    return _log_and_return({\n        \"calendar_name\": calendar_name,\n        \"uid\": uid,\n        \"deleted\": True,\n        \"event\": deleted_event\n    })\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "create_calendar",
+          "description": "Creates a new empty calendar with the given name and returns the created calendar. It refuses requests when name is missing or empty, or when a calendar with the same name already exists, because calendar names must be unique within the service.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "New calendar name."
+              }
+            },
+            "required": [
+              "name"
+            ]
+          },
+          "implementation": "def create_calendar(name, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0061000\" if __import__(\"os\").path.isdir(\"./environment_mix/0061000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    status = \"ok\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    audits = _load(\"audit.json\")\n    if not isinstance(audits, list):\n        audits = []\n\n    def _log_and_return(payload):\n        nonlocal audits\n        latency_ms = int((time.time() - t0) * 1000)\n        audits.append({\n            \"ts\": _now_iso(),\n            \"endpoint\": \"create_calendar\",\n            \"status\": status,\n            \"latency_ms\": latency_ms,\n            \"meta\": {\"name\": name}\n        })\n        _save(\"audit.json\", audits)\n        return payload\n\n    # Validate\n    if not isinstance(name, str) or not name.strip():\n        status = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"name must be a non-empty string\"))\n\n    cal_name = name.strip()\n\n    store = _load(\"calendars.json\")\n    if not isinstance(store, dict):\n        store = {}\n\n    if cal_name in store:\n        status = \"error\"\n        return _log_and_return(_err(\"CONFLICT\", \"calendar with that name already exists\", name=cal_name))\n\n    store[cal_name] = []\n    _save(\"calendars.json\", store)\n\n    return _log_and_return({\n        \"calendar\": {\"name\": cal_name, \"events\": []}\n    })\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0061000",
+    "index": 61,
+    "name": "ChronaSchedule Hub",
+    "description": "A calendar platform service that lets users create and manage multiple calendars and add, search, list, and delete scheduled events across them.",
+    "taxonomy": {
+      "L1_id": "L1-20",
+      "L1_name": "Communication & General Utilities",
+      "L1_name_zh": "通信与通用工具",
+      "L2_id": "L2-49",
+      "L2_name": "Time, Calendar & Scheduling",
+      "L2_name_zh": "时间、日历与调度",
+      "L3_name": "Calendar Events & Directories",
+      "L3_name_zh": "日历事件与目录查询"
+    },
+    "database_dir": "./environment_mix/0061000",
+    "mount_path": "/app/database",
+    "n_tools": 6,
+    "n_collections": 1,
+    "n_records": 5,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 6,
+      "loaded": 6,
+      "reads_returning_data": 1,
+      "read_operations": 3,
+      "mutations_persisted": 1,
+      "mutations_attempted": 3
+    },
+    "tools_loadable_from_database_dir": 6,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_calendars",
+      "returned_chars": 188
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

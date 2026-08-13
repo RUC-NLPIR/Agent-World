@@ -1,0 +1,447 @@
+{
+  "index": 175,
+  "local_files_dir": "./environment_mix/0175000",
+  "file_list": [
+    "./environment_mix/0175000/README.md",
+    "./environment_mix/0175000/api_keys.json",
+    "./environment_mix/0175000/email_messages.json",
+    "./environment_mix/0175000/email_provider_attempts.json",
+    "./environment_mix/0175000/email_recipients.json",
+    "./environment_mix/0175000/send_requests.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "api_keys.json": "17 rows",
+        "email_messages.json": "18 rows",
+        "email_recipients.json": "18 rows",
+        "email_provider_attempts.json": "18 rows",
+        "send_requests.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "send-email",
+          "description": "Creates an outbound email message, expands the provided To/Cc/Bcc/Reply-To recipients into recipient records, stores the content (subject plus text_body and/or html_body), queues initial provider delivery attempts, and returns the created message identifier and initial lifecycle state. Raises UNAUTHORIZED when the API key is missing or invalid, FORBIDDEN when the key is not permitted to send from the specified from_email, and TOO_MANY_REQUESTS when the client exceeds configured send-rate or quota limits. Raises VALIDATION_ERROR when required fields are missing, recipient lists are empty, any email address is malformed, headers contain non-string values, or both text_body and html_body are omitted; raises CONFLICT when an identical send request is rejected as a duplicate under the service’s idempotency/duplication rules.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "from_email": {
+                "type": "string",
+                "description": "Sender email address to use for the message."
+              },
+              "from_name": {
+                "type": "string",
+                "description": "Optional display name for the sender."
+              },
+              "to": {
+                "type": "array",
+                "description": "Primary recipient list (To).",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "email": {
+                      "type": "string",
+                      "description": "Recipient email address."
+                    },
+                    "name": {
+                      "type": "string",
+                      "description": "Optional recipient display name."
+                    }
+                  },
+                  "required": [
+                    "email"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "cc": {
+                "type": "array",
+                "description": "Carbon copy recipient list (Cc).",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "email": {
+                      "type": "string",
+                      "description": "Recipient email address."
+                    },
+                    "name": {
+                      "type": "string",
+                      "description": "Optional recipient display name."
+                    }
+                  },
+                  "required": [
+                    "email"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "bcc": {
+                "type": "array",
+                "description": "Blind carbon copy recipient list (Bcc).",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "email": {
+                      "type": "string",
+                      "description": "Recipient email address."
+                    },
+                    "name": {
+                      "type": "string",
+                      "description": "Optional recipient display name."
+                    }
+                  },
+                  "required": [
+                    "email"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "reply_to": {
+                "type": "array",
+                "description": "Reply-To addresses for the message.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "email": {
+                      "type": "string",
+                      "description": "Reply-To email address."
+                    },
+                    "name": {
+                      "type": "string",
+                      "description": "Optional Reply-To display name."
+                    }
+                  },
+                  "required": [
+                    "email"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "subject": {
+                "type": "string",
+                "description": "Email subject line."
+              },
+              "text_body": {
+                "type": "string",
+                "description": "Plain-text email body."
+              },
+              "html_body": {
+                "type": "string",
+                "description": "HTML email body."
+              },
+              "headers": {
+                "type": "object",
+                "description": "Additional email headers to include with the message.",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              },
+              "tags": {
+                "type": "array",
+                "description": "Tags to associate with the message for tracking and filtering.",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "from_email",
+              "to",
+              "subject"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def send_email(from_email, to, subject, from_name=None, cc=None, bcc=None, reply_to=None, text_body=None, html_body=None, headers=None, tags=None, **_extra):\n    import json, os, datetime, time, re, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0175000\" if __import__(\"os\").path.isdir(\"./environment_mix/0175000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    email_re = re.compile(r\"^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$\")\n\n    def _iso(dt):\n        if isinstance(dt, str):\n            return dt\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt(x):\n        if x is None:\n            return None\n        if isinstance(x, datetime.datetime):\n            return x.astimezone(datetime.timezone.utc)\n        if isinstance(x, str):\n            s = x.strip()\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                dt = datetime.datetime.fromisoformat(s)\n            except ValueError:\n                return None\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        return None\n\n    def _day_boundary_utc(dt):\n        dt = dt.astimezone(datetime.timezone.utc)\n        return datetime.datetime(dt.year, dt.month, dt.day, tzinfo=datetime.timezone.utc)\n\n    def _new_id(prefix):\n        return f\"{prefix}_{uuid.uuid4().hex}\"\n\n    def _validate_recipient_list(lst, name):\n        if lst is None:\n            return []\n        if not isinstance(lst, list):\n            return _err(\"VALIDATION_ERROR\", f\"'{name}' must be an array\")\n        out = []\n        for i, it in enumerate(lst):\n            if not isinstance(it, dict):\n                return _err(\"VALIDATION_ERROR\", f\"'{name}[{i}]' must be an object\")\n            extra = set(it.keys()) - {\"email\", \"name\"}\n            if extra:\n                return _err(\"VALIDATION_ERROR\", f\"'{name}[{i}]' contains unknown fields: {sorted(list(extra))}\")\n            if \"email\" not in it:\n                return _err(\"VALIDATION_ERROR\", f\"'{name}[{i}].email' is required\")\n            em = it.get(\"email\")\n            if not isinstance(em, str) or not email_re.match(em.strip()):\n                return _err(\"VALIDATION_ERROR\", f\"'{name}[{i}].email' must be a valid email address\")\n            nm = it.get(\"name\")\n            if nm is not None and not isinstance(nm, str):\n                return _err(\"VALIDATION_ERROR\", f\"'{name}[{i}].name' must be a string when provided\")\n            out.append({\"email\": em.strip(), \"name\": nm})\n        return out\n\n    def _record_request(send_requests, api_key_id, status, resolved_payload=None, result_message_id=None, error_message=None):\n        now_iso = _iso(now)\n        row = {\n            \"id\": _new_id(\"req\"),\n            \"api_key_id\": api_key_id,\n            \"tool_name\": \"send-email\",\n            \"request_parameters\": {},  # tool schema: empty object only\n            \"resolved_payload\": resolved_payload,\n            \"result_message_id\": result_message_id,\n            \"status\": status,\n            \"error_message\": error_message,\n            \"ip_address\": None,\n            \"user_agent\": None,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n        }\n        send_requests.append(row)\n        return row\n\n    def _count_recent_requests(send_requests, api_key_id, window_seconds=60):\n        cutoff = now - datetime.timedelta(seconds=window_seconds)\n        c = 0\n        for r in send_requests:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"api_key_id\") != api_key_id:\n                continue\n            created = _parse_dt(r.get(\"created_at\"))\n            if created is None:\n                continue\n            if created >= cutoff:\n                c += 1\n        return c\n\n    # ---- Validate input payload types and constraints ----\n    if not isinstance(from_email, str) or not email_re.match(from_email.strip()):\n        return _err(\"VALIDATION_ERROR\", \"'from_email' must be a valid email address\")\n    if from_name is not None and not isinstance(from_name, str):\n        return _err(\"VALIDATION_ERROR\", \"'from_name' must be a string when provided\")\n    if not isinstance(subject, str):\n        return _err(\"VALIDATION_ERROR\", \"'subject' must be a string\")\n    if len(subject) > 998:\n        return _err(\"VALIDATION_ERROR\", \"length(subject) must be <= 998\")\n    if text_body is not None and not isinstance(text_body, str):\n        return _err(\"VALIDATION_ERROR\", \"'text_body' must be a string when provided\")\n    if html_body is not None and not isinstance(html_body, str):\n        return _err(\"VALIDATION_ERROR\", \"'html_body' must be a string when provided\")\n    if text_body is None and html_body is None:\n        return _err(\"VALIDATION_ERROR\", \"At least one of 'text_body' or 'html_body' must be provided\")\n\n    to_v = _validate_recipient_list(to, \"to\")\n    if isinstance(to_v, dict):\n        return to_v\n    cc_v = _validate_recipient_list(cc, \"cc\")\n    if isinstance(cc_v, dict):\n        return cc_v\n    bcc_v = _validate_recipient_list(bcc, \"bcc\")\n    if isinstance(bcc_v, dict):\n        return bcc_v\n    reply_to_v = _validate_recipient_list(reply_to, \"reply_to\")\n    if isinstance(reply_to_v, dict):\n        return reply_to_v\n\n    if len(to_v) + len(cc_v) + len(bcc_v) < 1:\n        return _err(\"VALIDATION_ERROR\", \"At least one recipient across ('to','cc','bcc') is required\")\n\n    if headers is not None:\n        if not isinstance(headers, dict):\n            return _err(\"VALIDATION_ERROR\", \"'headers' must be an object when provided\")\n        for k, v in headers.items():\n            if not isinstance(k, str):\n                return _err(\"VALIDATION_ERROR\", \"'headers' keys must be strings\")\n            if not isinstance(v, str):\n                return _err(\"VALIDATION_ERROR\", f\"'headers.{k}' must be a string\")\n    if tags is not None:\n        if not isinstance(tags, list):\n            return _err(\"VALIDATION_ERROR\", \"'tags' must be an array when provided\")\n        for i, t in enumerate(tags):\n            if not isinstance(t, str):\n                return _err(\"VALIDATION_ERROR\", f\"'tags[{i}]' must be a string\")\n\n    # ---- Resolve authentication context (ambient): find an active key capable of sending ----\n    api_keys = _load(\"api_keys.json\")\n    send_requests = _load(\"send_requests.json\")\n    email_messages = _load(\"email_messages.json\")\n    email_recipients = _load(\"email_recipients.json\")\n    provider_attempts = _load(\"email_provider_attempts.json\")\n\n    active_keys = [k for k in api_keys if isinstance(k, dict) and k.get(\"status\") == \"active\"]\n    if not active_keys:\n        # No key can serve the request: no place to log a send_requests row with valid FK.\n        return _err(\"UNAUTHORIZED\", \"No active API key available to authenticate this request\")\n\n    # choose a working combination: key must have valid quotas and rate limits configured\n    chosen = None\n    for k in active_keys:\n        rlm = k.get(\"rate_limit_per_minute\")\n        dsl = k.get(\"daily_send_limit\")\n        if isinstance(rlm, int) and 1 <= rlm <= 6000 and isinstance(dsl, int) and dsl >= 0:\n            chosen = k\n            break\n    if chosen is None:\n        return _err(\"UNAUTHORIZED\", \"No active API key with valid limits available to authenticate this request\")\n\n    api_key_id = chosen.get(\"id\")\n\n    # ---- Daily counter normalization/reset check ----\n    ds_date = _parse_dt(chosen.get(\"daily_send_count_date\"))\n    today0 = _day_boundary_utc(now)\n    if ds_date is None or ds_date != today0:\n        # reset counter (simulating daily job boundary normalization)\n        chosen[\"daily_send_count_date\"] = _iso(today0)\n        chosen[\"daily_send_count\"] = 0\n\n    # ---- Enforce rate limit per minute (sliding window by send_requests entries) ----\n    rate_limit = int(chosen.get(\"rate_limit_per_minute\"))\n    recent = _count_recent_requests(send_requests, api_key_id, 60)\n    if recent >= rate_limit:\n        _record_request(\n            send_requests,\n            api_key_id=api_key_id,\n            status=\"rejected\",\n            resolved_payload=None,\n            result_message_id=None,\n            error_message=f\"rate limit exceeded ({rate_limit}/min)\"\n        )\n        _save(\"send_requests.json\", send_requests)\n        chosen[\"last_used_at\"] = _iso(now)\n        chosen[\"updated_at\"] = _iso(now)\n        _save(\"api_keys.json\", api_keys)\n        return _err(\"RATE_LIMIT\", f\"Rate limit exceeded ({rate_limit}/min)\")\n\n    # ---- Enforce daily send limit (0 = unlimited) and increment atomically in store ----\n    daily_limit = int(chosen.get(\"daily_send_limit\"))\n    daily_count = int(chosen.get(\"daily_send_count\") if isinstance(chosen.get(\"daily_send_count\"), int) else 0)\n    if daily_limit != 0 and daily_count + 1 > daily_limit:\n        _record_request(\n            send_requests,\n            api_key_id=api_key_id,\n            status=\"rejected\",\n            resolved_payload=None,\n            result_message_id=None,\n            error_message=f\"daily send limit reached ({daily_limit}/day)\"\n        )\n        _save(\"send_requests.json\", send_requests)\n        chosen[\"last_used_at\"] = _iso(now)\n        chosen[\"updated_at\"] = _iso(now)\n        _save(\"api_keys.json\", api_keys)\n        return _err(\"QUOTA_EXCEEDED\", f\"Daily send limit reached ({daily_limit}/day)\")\n\n    # ---- Create message + recipients + initial provider attempt ----\n    msg_id = _new_id(\"eml\")\n    now_iso = _iso(now)\n    resolved_payload = {\n        \"from_email\": from_email.strip(),\n        \"from_name\": from_name,\n        \"to\": to_v,\n        \"cc\": cc_v,\n        \"bcc\": bcc_v,\n        \"reply_to\": reply_to_v,\n        \"subject\": subject,\n        \"text_body\": text_body,\n        \"html_body\": html_body,\n        \"headers\": headers,\n        \"tags\": tags,\n    }\n\n    msg_row = {\n        \"id\": msg_id,\n        \"api_key_id\": api_key_id,\n        \"status\": \"queued\",\n        \"from_email\": from_email.strip(),\n        \"from_name\": from_name,\n        \"subject\": subject,\n        \"text_body\": text_body,\n        \"html_body\": html_body,\n        \"headers\": headers,\n        \"reply_to\": reply_to_v if reply_to is not None else None,\n        \"tags\": tags,\n        \"provider_message_id\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"queued_at\": now_iso,\n        \"sent_at\": None,\n        \"finalized_at\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n    }\n\n    # Recipient uniqueness per (message_id, kind, email)\n    seen = set()\n    rcp_rows = []\n    for kind, lst in ((\"to\", to_v), (\"cc\", cc_v), (\"bcc\", bcc_v)):\n        for r in lst:\n            key = (kind, r[\"email\"].lower())\n            if key in seen:\n                continue\n            seen.add(key)\n            rcp_rows.append({\n                \"id\": _new_id(\"rcp\"),\n                \"message_id\": msg_id,\n                \"kind\": kind,\n                \"email\": r[\"email\"],\n                \"name\": r.get(\"name\"),\n                \"status\": \"pending\",\n                \"provider_recipient_id\": None,\n                \"error_code\": None,\n                \"error_message\": None,\n                \"created_at\": now_iso,\n                \"updated_at\": now_iso,\n            })\n\n    if len(rcp_rows) < 1:\n        _record_request(\n            send_requests,\n            api_key_id=api_key_id,\n            status=\"rejected\",\n            resolved_payload=None,\n            result_message_id=None,\n            error_message=\"no recipients after deduplication\"\n        )\n        _save(\"send_requests.json\", send_requests)\n        chosen[\"last_used_at\"] = _iso(now)\n        chosen[\"updated_at\"] = _iso(now)\n        _save(\"api_keys.json\", api_keys)\n        return _err(\"VALIDATION_ERROR\", \"At least one unique recipient is required\")\n\n    # Create initial provider attempt as queued (dispatcher \"queued initial attempts\")\n    att_row = {\n        \"id\": _new_id(\"att\"),\n        \"message_id\": msg_id,\n        \"attempt_no\": 1,\n        \"provider\": \"resend\",\n        \"status\": \"queued\",\n        \"request_payload\": resolved_payload,\n        \"response_payload\": None,\n        \"http_status\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n    }\n\n    # Persist: increment counters, write all rows, then record accepted request\n    chosen[\"daily_send_count\"] = daily_count + 1\n    chosen[\"last_used_at\"] = _iso(now)\n    chosen[\"updated_at\"] = _iso(now)\n\n    email_messages.append(msg_row)\n    email_recipients.extend(rcp_rows)\n    provider_attempts.append(att_row)\n\n    req_row = _record_request(\n        send_requests,\n        api_key_id=api_key_id,\n        status=\"accepted\",\n        resolved_payload=resolved_payload,\n        result_message_id=msg_id,\n        error_message=None\n    )\n\n    _save(\"api_keys.json\", api_keys)\n    _save(\"email_messages.json\", email_messages)\n    _save(\"email_recipients.json\", email_recipients)\n    _save(\"email_provider_attempts.json\", provider_attempts)\n    _save(\"send_requests.json\", send_requests)\n\n    return {\n        \"message\": {\n            \"id\": msg_row[\"id\"],\n            \"status\": msg_row[\"status\"],\n            \"queued_at\": msg_row[\"queued_at\"],\n        },\n        \"request\": {\n            \"id\": req_row[\"id\"],\n            \"status\": req_row[\"status\"],\n        },\n        \"meta\": {\n            \"latency_ms\": int((time.time() - t0) * 1000)\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get-auth-context",
+          "description": "Returns the authenticated API key context for the current request, including key identity, granted scopes, and current quota / rate-limit consumption. Raises UNAUTHORIZED when the API key is missing or invalid and FORBIDDEN when the key is revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "API key used to authenticate the request. If omitted, the call is treated as unauthenticated."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_auth_context(api_key=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0175000\" if __import__(\"os\").path.isdir(\"./environment_mix/0175000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if isinstance(dt, str):\n            return dt\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt(x):\n        if x is None:\n            return None\n        if isinstance(x, datetime.datetime):\n            return x.astimezone(datetime.timezone.utc)\n        if isinstance(x, str):\n            s = x.strip()\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                dt = datetime.datetime.fromisoformat(s)\n            except ValueError:\n                return None\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        return None\n\n    def _day_boundary_utc(dt):\n        dt = dt.astimezone(datetime.timezone.utc)\n        return datetime.datetime(dt.year, dt.month, dt.day, tzinfo=datetime.timezone.utc)\n\n    api_keys = _load(\"api_keys.json\")\n    send_requests = _load(\"send_requests.json\")\n\n    # Validate\n    if api_key is not None and not isinstance(api_key, str):\n        return _err(\"VALIDATION_ERROR\", \"'api_key' must be a string\")\n\n    # Authenticate by id or prefix (never by hash)\n    key_row = None\n    token = api_key.strip() if isinstance(api_key, str) else None\n    if token:\n        for k in api_keys:\n            if not isinstance(k, dict):\n                continue\n            if k.get(\"id\") == token or k.get(\"key_prefix\") == token:\n                key_row = k\n                break\n\n    if key_row is None:\n        # Unauthenticated; still provide a structured response (tool description says UNAUTHORIZED when missing/invalid)\n        return _err(\"UNAUTHORIZED\", \"API key missing or invalid\")\n\n    if key_row.get(\"status\") == \"revoked\":\n        return _err(\"UNAUTHORIZED\", \"API key revoked\")\n\n    # Normalize/reset daily counter boundary (observed behaviour)\n    ds_date = _parse_dt(key_row.get(\"daily_send_count_date\"))\n    today0 = _day_boundary_utc(now)\n    if ds_date is None or ds_date != today0:\n        key_row[\"daily_send_count_date\"] = _iso(today0)\n        key_row[\"daily_send_count\"] = 0\n        key_row[\"updated_at\"] = _iso(now)\n        _save(\"api_keys.json\", api_keys)\n\n    # Rate usage: count requests in last 60s for this key\n    cutoff = now - datetime.timedelta(seconds=60)\n    used_1m = 0\n    for r in send_requests:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"api_key_id\") != key_row.get(\"id\"):\n            continue\n        created = _parse_dt(r.get(\"created_at\"))\n        if created is None:\n            continue\n        if created >= cutoff:\n            used_1m += 1\n\n    daily_limit = key_row.get(\"daily_send_limit\")\n    daily_count = key_row.get(\"daily_send_count\")\n\n    return {\n        \"api_key\": {\n            \"id\": key_row.get(\"id\"),\n            \"key_prefix\": key_row.get(\"key_prefix\"),\n            \"label\": key_row.get(\"label\"),\n            \"status\": key_row.get(\"status\"),\n            \"created_at\": key_row.get(\"created_at\"),\n            \"last_used_at\": key_row.get(\"last_used_at\"),\n        },\n        \"limits\": {\n            \"rate_limit_per_minute\": key_row.get(\"rate_limit_per_minute\"),\n            \"rate_limit_used_last_minute\": used_1m,\n            \"daily_send_limit\": daily_limit,\n            \"daily_send_count\": daily_count,\n            \"daily_send_count_date\": key_row.get(\"daily_send_count_date\"),\n        },\n        \"meta\": {\n            \"latency_ms\": int((time.time() - t0) * 1000)\n        }\n    }\n"
+        },
+        {
+          "name": "list-email-messages",
+          "description": "Lists stored email messages visible to the authenticated API key, with filtering by lifecycle status and time range. Returns a paginated result set ordered by created_at descending. Raises UNAUTHORIZED when the API key is missing or invalid and FORBIDDEN when the key is revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "API key used to authenticate the request."
+              },
+              "status": {
+                "type": "string",
+                "description": "Filter by message lifecycle status.",
+                "enum": [
+                  "queued",
+                  "sending",
+                  "delivered",
+                  "bounced",
+                  "failed",
+                  "cancelled"
+                ]
+              },
+              "tag": {
+                "type": "string",
+                "description": "Filter to messages containing the given tag."
+              },
+              "from_email": {
+                "type": "string",
+                "description": "Filter by sender email address."
+              },
+              "provider_message_id": {
+                "type": "string",
+                "description": "Filter by provider message identifier (if present)."
+              },
+              "created_after": {
+                "type": "string",
+                "description": "Only include messages created at or after this ISO-8601 timestamp."
+              },
+              "created_before": {
+                "type": "string",
+                "description": "Only include messages created before this ISO-8601 timestamp."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of records to return (page size).",
+                "minimum": 1,
+                "maximum": 200
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor returned by a previous call."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_email_messages(api_key, status=None, tag=None, from_email=None, provider_message_id=None, created_after=None, created_before=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, base64, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0175000\" if __import__(\"os\").path.isdir(\"./environment_mix/0175000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n        return str(dt)\n\n    def _parse_iso(s, field_name):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return (\"__bad__\", _err(\"VALIDATION_ERROR\", f\"{field_name} must be an ISO-8601 timestamp string\"))\n        try:\n            ss = s.strip()\n            if ss.endswith(\"Z\"):\n                ss = ss[:-1] + \"+00:00\"\n            dt = datetime.datetime.fromisoformat(ss)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except ValueError:\n            return (\"__bad__\", _err(\"VALIDATION_ERROR\", f\"{field_name} must be a valid ISO-8601 timestamp\"))\n\n    def _mk_request_row(api_key_id, status_val, error_message=None):\n        rid = \"sr_\" + os.urandom(12).hex()\n        ts = _iso(now)\n        return {\n            \"id\": rid,\n            \"api_key_id\": api_key_id,\n            \"tool_name\": \"send-email\",\n            \"request_parameters\": {},   # tool schema: empty object\n            \"resolved_payload\": None,\n            \"result_message_id\": None,\n            \"status\": status_val,       # accepted|rejected|errored\n            \"error_message\": error_message,\n            \"ip_address\": None,\n            \"user_agent\": None,\n            \"created_at\": ts,\n            \"updated_at\": ts\n        }\n\n    def _find_api_key_row(api_key_value, api_keys_rows):\n        # Authenticate by client-visible value: accept api_keys.id OR api_keys.key_prefix.\n        if not isinstance(api_key_value, str) or not api_key_value.strip():\n            return None\n        v = api_key_value.strip()\n        for r in api_keys_rows:\n            if r.get(\"id\") == v:\n                return r\n        for r in api_keys_rows:\n            if r.get(\"key_prefix\") == v:\n                return r\n        return None\n\n    def _enforce_rate_limit(key_row, send_req_rows):\n        # Sliding window: count requests for this key in last 60s.\n        rl = key_row.get(\"rate_limit_per_minute\")\n        try:\n            rl = int(rl)\n        except Exception:\n            rl = None\n        if rl is None or rl < 1:\n            return (False, \"API key has invalid rate_limit_per_minute\")\n        window_start = now - datetime.timedelta(seconds=60)\n        c = 0\n        for r in send_req_rows:\n            if r.get(\"api_key_id\") != key_row.get(\"id\"):\n                continue\n            ca = r.get(\"created_at\")\n            if not isinstance(ca, str):\n                continue\n            parsed = _parse_iso(ca, \"created_at\")\n            if isinstance(parsed, tuple) and parsed[0] == \"__bad__\":\n                continue\n            if parsed >= window_start:\n                c += 1\n        if c >= rl:\n            return (False, f\"Rate limit exceeded: {rl}/minute\")\n        return (True, None)\n\n    # Validate inputs\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key is required and must be a non-empty string\")\n\n    allowed_status = {\"queued\", \"sending\", \"delivered\", \"bounced\", \"failed\", \"cancelled\"}\n    if status is not None:\n        if not isinstance(status, str):\n            return _err(\"VALIDATION_ERROR\", \"status must be a string\")\n        if status not in allowed_status:\n            return _err(\"VALIDATION_ERROR\", \"status must be one of queued,sending,delivered,bounced,failed,cancelled\")\n\n    if tag is not None and not isinstance(tag, str):\n        return _err(\"VALIDATION_ERROR\", \"tag must be a string\")\n    if from_email is not None and not isinstance(from_email, str):\n        return _err(\"VALIDATION_ERROR\", \"from_email must be a string\")\n    if provider_message_id is not None and not isinstance(provider_message_id, str):\n        return _err(\"VALIDATION_ERROR\", \"provider_message_id must be a string\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n    if limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200\")\n\n    ca = _parse_iso(created_after, \"created_after\")\n    if isinstance(ca, tuple) and ca[0] == \"__bad__\":\n        return ca[1]\n    cb = _parse_iso(created_before, \"created_before\")\n    if isinstance(cb, tuple) and cb[0] == \"__bad__\":\n        return cb[1]\n\n    # Decode cursor (opaque)\n    cursor_created_at = None\n    cursor_id = None\n    if cursor is not None:\n        if not isinstance(cursor, str):\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            payload = json.loads(raw.decode(\"utf-8\"))\n            cursor_created_at = payload.get(\"created_at\")\n            cursor_id = payload.get(\"id\")\n            if not isinstance(cursor_created_at, str) or not isinstance(cursor_id, str):\n                return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n        except (ValueError, json.JSONDecodeError):\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n\n    # Load data\n    api_keys = _load(\"api_keys.json\")\n    send_requests = _load(\"send_requests.json\")\n    email_messages = _load(\"email_messages.json\")\n\n    # Authenticate\n    key_row = _find_api_key_row(api_key, api_keys)\n    if key_row is None:\n        # Must record request dynamics; use placeholder api_key_id if unknown.\n        sr = _mk_request_row(\"unknown\", \"rejected\", \"UNAUTHORIZED: invalid API key\")\n        send_requests.append(sr)\n        _save(\"send_requests.json\", send_requests)\n        return _err(\"UNAUTHORIZED\", \"API key missing or invalid\")\n\n    # If revoked => FORBIDDEN per tool description (map to UNAUTHORIZED code set: use UNAUTHORIZED with detail)\n    if key_row.get(\"status\") != \"active\":\n        sr = _mk_request_row(key_row.get(\"id\"), \"rejected\", \"FORBIDDEN: API key revoked\")\n        send_requests.append(sr)\n        _save(\"send_requests.json\", send_requests)\n        return _err(\"UNAUTHORIZED\", \"API key is revoked\", forbidden=True)\n\n    # Rate limit (even for reads, per observable dynamics requirement)\n    ok_rl, rl_msg = _enforce_rate_limit(key_row, send_requests)\n    if not ok_rl:\n        sr = _mk_request_row(key_row.get(\"id\"), \"rejected\", rl_msg)\n        send_requests.append(sr)\n        _save(\"send_requests.json\", send_requests)\n        return _err(\"RATE_LIMIT\", rl_msg)\n\n    # Update key last_used_at\n    key_row[\"last_used_at\"] = _iso(now)\n    key_row[\"updated_at\"] = _iso(now)\n    _save(\"api_keys.json\", api_keys)\n\n    # Log request as accepted (it's a successful authenticated call)\n    sr = _mk_request_row(key_row.get(\"id\"), \"accepted\", None)\n    send_requests.append(sr)\n    _save(\"send_requests.json\", send_requests)\n\n    # Filter messages visible to key\n    rows = [m for m in email_messages if m.get(\"api_key_id\") == key_row.get(\"id\")]\n\n    if status is not None:\n        rows = [m for m in rows if m.get(\"status\") == status]\n    if from_email is not None:\n        rows = [m for m in rows if m.get(\"from_email\") == from_email]\n    if provider_message_id is not None:\n        rows = [m for m in rows if m.get(\"provider_message_id\") == provider_message_id]\n    if tag is not None:\n        def _has_tag(m):\n            tg = m.get(\"tags\")\n            return isinstance(tg, list) and tag in tg\n        rows = [m for m in rows if _has_tag(m)]\n    if ca is not None:\n        def _after(m):\n            p = _parse_iso(m.get(\"created_at\"), \"created_at\")\n            if isinstance(p, tuple) and p[0] == \"__bad__\":\n                return False\n            return p >= ca\n        rows = [m for m in rows if _after(m)]\n    if cb is not None:\n        def _before(m):\n            p = _parse_iso(m.get(\"created_at\"), \"created_at\")\n            if isinstance(p, tuple) and p[0] == \"__bad__\":\n                return False\n            return p < cb\n        rows = [m for m in rows if _before(m)]\n\n    def _sort_key(m):\n        p = _parse_iso(m.get(\"created_at\"), \"created_at\")\n        if isinstance(p, tuple) and p[0] == \"__bad__\":\n            p = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n        return (p, m.get(\"id\") or \"\")\n    rows.sort(key=_sort_key, reverse=True)\n\n    # Apply cursor pagination (created_at desc, id desc)\n    if cursor_created_at is not None and cursor_id is not None:\n        cursor_dt = _parse_iso(cursor_created_at, \"cursor.created_at\")\n        if isinstance(cursor_dt, tuple) and cursor_dt[0] == \"__bad__\":\n            return cursor_dt[1]\n        filtered = []\n        for m in rows:\n            md = _parse_iso(m.get(\"created_at\"), \"created_at\")\n            if isinstance(md, tuple) and md[0] == \"__bad__\":\n                continue\n            mid = m.get(\"id\") or \"\"\n            if md < cursor_dt:\n                filtered.append(m)\n            elif md == cursor_dt and mid < cursor_id:\n                filtered.append(m)\n        rows = filtered\n\n    total = len(rows)\n    page = rows[:limit]\n    has_more = total > limit\n\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        payload = {\"created_at\": last.get(\"created_at\"), \"id\": last.get(\"id\")}\n        b = json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(b).decode(\"utf-8\").rstrip(\"=\")\n\n    latency_ms = int((time.time() - t0) * 1000)\n    # Record latency/status in send_requests row we wrote (best-effort update)\n    sr[\"updated_at\"] = _iso(now)\n    sr[\"resolved_payload\"] = {\"endpoint\": \"list-email-messages\", \"latency_ms\": latency_ms}\n\n    _save(\"send_requests.json\", send_requests)\n\n    return {\n        \"object\": \"list\",\n        \"data\": page,\n        \"total\": total,\n        \"limit\": limit,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor\n    }\n"
+        },
+        {
+          "name": "get-email-message",
+          "description": "Fetches a single email message by id, including its current lifecycle state and stored content fields. Raises NOT_FOUND when the message does not exist (or is not visible to the API key), UNAUTHORIZED when the API key is missing or invalid, and FORBIDDEN when the key is revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "API key used to authenticate the request."
+              },
+              "message_id": {
+                "type": "string",
+                "description": "Primary identifier of the email message to fetch."
+              },
+              "include": {
+                "type": "array",
+                "description": "Optional related resources to include inline.",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "recipients",
+                    "provider_attempts"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "api_key",
+              "message_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_email_message(api_key, message_id, include=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0175000\" if __import__(\"os\").path.isdir(\"./environment_mix/0175000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n        return str(dt)\n\n    def _mk_request_row(api_key_id, status_val, error_message=None):\n        rid = \"sr_\" + os.urandom(12).hex()\n        ts = _iso(now)\n        return {\n            \"id\": rid,\n            \"api_key_id\": api_key_id,\n            \"tool_name\": \"send-email\",\n            \"request_parameters\": {},\n            \"resolved_payload\": None,\n            \"result_message_id\": None,\n            \"status\": status_val,\n            \"error_message\": error_message,\n            \"ip_address\": None,\n            \"user_agent\": None,\n            \"created_at\": ts,\n            \"updated_at\": ts\n        }\n\n    def _find_api_key_row(api_key_value, api_keys_rows):\n        if not isinstance(api_key_value, str) or not api_key_value.strip():\n            return None\n        v = api_key_value.strip()\n        for r in api_keys_rows:\n            if r.get(\"id\") == v:\n                return r\n        for r in api_keys_rows:\n            if r.get(\"key_prefix\") == v:\n                return r\n        return None\n\n    def _parse_iso(s):\n        if not isinstance(s, str):\n            return None\n        try:\n            ss = s.strip()\n            if ss.endswith(\"Z\"):\n                ss = ss[:-1] + \"+00:00\"\n            dt = datetime.datetime.fromisoformat(ss)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except ValueError:\n            return None\n\n    def _enforce_rate_limit(key_row, send_req_rows):\n        rl = key_row.get(\"rate_limit_per_minute\")\n        try:\n            rl = int(rl)\n        except Exception:\n            rl = None\n        if rl is None or rl < 1:\n            return (False, \"API key has invalid rate_limit_per_minute\")\n        window_start = now - datetime.timedelta(seconds=60)\n        c = 0\n        for r in send_req_rows:\n            if r.get(\"api_key_id\") != key_row.get(\"id\"):\n                continue\n            ca = _parse_iso(r.get(\"created_at\"))\n            if ca is None:\n                continue\n            if ca >= window_start:\n                c += 1\n        if c >= rl:\n            return (False, f\"Rate limit exceeded: {rl}/minute\")\n        return (True, None)\n\n    # Validate\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key is required and must be a non-empty string\")\n    if not isinstance(message_id, str) or not message_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"message_id is required and must be a non-empty string\")\n    if include is not None:\n        if not isinstance(include, list):\n            return _err(\"VALIDATION_ERROR\", \"include must be an array\")\n        allowed = {\"recipients\", \"provider_attempts\"}\n        for it in include:\n            if not isinstance(it, str) or it not in allowed:\n                return _err(\"VALIDATION_ERROR\", \"include items must be one of recipients,provider_attempts\")\n\n    api_keys = _load(\"api_keys.json\")\n    send_requests = _load(\"send_requests.json\")\n    email_messages = _load(\"email_messages.json\")\n    recipients = _load(\"email_recipients.json\")\n    attempts = _load(\"email_provider_attempts.json\")\n\n    key_row = _find_api_key_row(api_key, api_keys)\n    if key_row is None:\n        sr = _mk_request_row(\"unknown\", \"rejected\", \"UNAUTHORIZED: invalid API key\")\n        send_requests.append(sr)\n        _save(\"send_requests.json\", send_requests)\n        return _err(\"UNAUTHORIZED\", \"API key missing or invalid\")\n\n    if key_row.get(\"status\") != \"active\":\n        sr = _mk_request_row(key_row.get(\"id\"), \"rejected\", \"FORBIDDEN: API key revoked\")\n        send_requests.append(sr)\n        _save(\"send_requests.json\", send_requests)\n        return _err(\"UNAUTHORIZED\", \"API key is revoked\", forbidden=True)\n\n    ok_rl, rl_msg = _enforce_rate_limit(key_row, send_requests)\n    if not ok_rl:\n        sr = _mk_request_row(key_row.get(\"id\"), \"rejected\", rl_msg)\n        send_requests.append(sr)\n        _save(\"send_requests.json\", send_requests)\n        return _err(\"RATE_LIMIT\", rl_msg)\n\n    # Update key last_used_at\n    key_row[\"last_used_at\"] = _iso(now)\n    key_row[\"updated_at\"] = _iso(now)\n    _save(\"api_keys.json\", api_keys)\n\n    # Log call as accepted\n    sr = _mk_request_row(key_row.get(\"id\"), \"accepted\", None)\n    send_requests.append(sr)\n    _save(\"send_requests.json\", send_requests)\n\n    msg = None\n    for m in email_messages:\n        if m.get(\"id\") == message_id and m.get(\"api_key_id\") == key_row.get(\"id\"):\n            msg = m\n            break\n\n    if msg is None:\n        latency_ms = int((time.time() - t0) * 1000)\n        sr[\"updated_at\"] = _iso(now)\n        sr[\"resolved_payload\"] = {\"endpoint\": \"get-email-message\", \"latency_ms\": latency_ms, \"message_id\": message_id}\n        _save(\"send_requests.json\", send_requests)\n        return _err(\"NOT_FOUND\", \"Email message not found\")\n\n    out = {\"data\": msg}\n\n    inc = set(include or [])\n    if \"recipients\" in inc:\n        out[\"recipients\"] = [r for r in recipients if r.get(\"message_id\") == msg.get(\"id\")]\n    if \"provider_attempts\" in inc:\n        out[\"provider_attempts\"] = [a for a in attempts if a.get(\"message_id\") == msg.get(\"id\")]\n\n    latency_ms = int((time.time() - t0) * 1000)\n    sr[\"updated_at\"] = _iso(now)\n    sr[\"resolved_payload\"] = {\"endpoint\": \"get-email-message\", \"latency_ms\": latency_ms, \"message_id\": message_id}\n    _save(\"send_requests.json\", send_requests)\n\n    return out\n"
+        },
+        {
+          "name": "list-email-recipients",
+          "description": "Lists recipients for a given message, or all recipients visible to the API key with optional filters. Returns a paginated result set. Raises NOT_FOUND when the specified message_id does not exist (or is not visible), UNAUTHORIZED when the API key is missing or invalid, and FORBIDDEN when the key is revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "API key used to authenticate the request."
+              },
+              "message_id": {
+                "type": "string",
+                "description": "If provided, restrict results to recipients belonging to this message id."
+              },
+              "kind": {
+                "type": "string",
+                "description": "Filter by recipient kind.",
+                "enum": [
+                  "to",
+                  "cc",
+                  "bcc",
+                  "reply_to"
+                ]
+              },
+              "status": {
+                "type": "string",
+                "description": "Filter by recipient delivery status.",
+                "enum": [
+                  "pending",
+                  "delivered",
+                  "bounced",
+                  "failed"
+                ]
+              },
+              "email": {
+                "type": "string",
+                "description": "Filter by recipient email address (exact match)."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of records to return (page size).",
+                "minimum": 1,
+                "maximum": 500
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor returned by a previous call."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_email_recipients(api_key, message_id=None, kind=None, status=None, email=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, base64, re, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0175000\" if __import__(\"os\").path.isdir(\"./environment_mix/0175000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    def _dt_parse(v):\n        if v is None:\n            return None\n        if isinstance(v, (int, float)):\n            try:\n                return datetime.datetime.fromtimestamp(float(v), tz=datetime.timezone.utc)\n            except Exception:\n                return None\n        if isinstance(v, str):\n            s = v.strip()\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                dt = datetime.datetime.fromisoformat(s)\n                if dt.tzinfo is None:\n                    dt = dt.replace(tzinfo=datetime.timezone.utc)\n                return dt.astimezone(datetime.timezone.utc)\n            except Exception:\n                return None\n        return None\n\n    def _dt_to_iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _day_boundary_utc(dt):\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        dt = dt.astimezone(datetime.timezone.utc)\n        return datetime.datetime(dt.year, dt.month, dt.day, 0, 0, 0, tzinfo=datetime.timezone.utc)\n\n    def _new_id(prefix):\n        return f\"{prefix}_{uuid.uuid4().hex}\"\n\n    # Validate inputs\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key is required and must be a non-empty string\")\n\n    if message_id is not None and (not isinstance(message_id, str) or not message_id.strip()):\n        return _err(\"VALIDATION_ERROR\", \"message_id must be a non-empty string when provided\")\n\n    allowed_kind = {\"to\", \"cc\", \"bcc\", \"reply_to\"}\n    if kind is not None:\n        if not isinstance(kind, str) or kind not in allowed_kind:\n            return _err(\"VALIDATION_ERROR\", \"kind must be one of: to, cc, bcc, reply_to\")\n\n    allowed_status = {\"pending\", \"delivered\", \"bounced\", \"failed\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: pending, delivered, bounced, failed\")\n\n    if email is not None and (not isinstance(email, str) or not email.strip()):\n        return _err(\"VALIDATION_ERROR\", \"email must be a non-empty string when provided\")\n\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int) or limit < 1 or limit > 500:\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 500\")\n\n    if cursor is not None and (not isinstance(cursor, str) or not cursor.strip()):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string when provided\")\n\n    # Load store\n    api_keys = _load(\"api_keys.json\")\n    messages = _load(\"email_messages.json\")\n    recipients = _load(\"email_recipients.json\")\n    attempts = _load(\"email_provider_attempts.json\")\n    send_requests = _load(\"send_requests.json\")\n\n    # Auth: match by id or by key_prefix (client-visible); do NOT compare against key_hash.\n    ak = None\n    for row in api_keys:\n        if not isinstance(row, dict):\n            continue\n        if row.get(\"id\") == api_key or row.get(\"key_prefix\") == api_key:\n            ak = row\n            break\n\n    # Helper to log a request (best-effort, but must not raise)\n    def _log(status_s, error_message=None):\n        try:\n            req_id = _new_id(\"req\")\n            created = now\n            send_requests.append({\n                \"id\": req_id,\n                \"api_key_id\": ak.get(\"id\") if isinstance(ak, dict) else \"unknown\",\n                \"tool_name\": \"send-email\",\n                \"request_parameters\": {},\n                \"resolved_payload\": None,\n                \"result_message_id\": None,\n                \"status\": status_s,\n                \"error_message\": error_message,\n                \"ip_address\": None,\n                \"user_agent\": None,\n                \"created_at\": _dt_to_iso(created),\n                \"updated_at\": _dt_to_iso(created),\n            })\n            _save(\"send_requests.json\", send_requests)\n        except Exception:\n            pass\n\n    # If missing/invalid key => UNAUTHORIZED\n    if ak is None:\n        _log(\"rejected\", \"UNAUTHORIZED: invalid api_key\")\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n\n    # Revoked => FORBIDDEN (tool description)\n    if ak.get(\"status\") == \"revoked\":\n        _log(\"rejected\", \"FORBIDDEN: api_key revoked\")\n        return _err(\"UNAUTHORIZED\", \"API key is revoked\", detail=\"FORBIDDEN\")\n\n    # Enforce rate limit for reads too (observable dynamics)\n    # Sliding window: count send_requests by api_key_id in last 60s\n    try:\n        rl = ak.get(\"rate_limit_per_minute\")\n        if not isinstance(rl, int) or rl < 1 or rl > 6000:\n            # stored data invalid; treat as service error for this key\n            _log(\"errored\", \"Invalid rate_limit_per_minute configuration\")\n            return _err(\"CONFLICT\", \"API key configuration invalid (rate_limit_per_minute)\")\n        window_start = now - datetime.timedelta(seconds=60)\n        c = 0\n        akid = ak.get(\"id\")\n        for r in send_requests:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"api_key_id\") != akid:\n                continue\n            dt = _dt_parse(r.get(\"created_at\"))\n            if dt is None:\n                continue\n            if dt >= window_start:\n                c += 1\n        if c >= rl:\n            _log(\"rejected\", \"RATE_LIMIT exceeded\")\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n    except Exception:\n        _log(\"errored\", \"Rate limit evaluation failed\")\n        return _err(\"CONFLICT\", \"Unable to evaluate rate limit\")\n\n    # Visibility: recipients visible if their message api_key_id equals this key's id\n    akid = ak.get(\"id\")\n\n    # If message_id provided, ensure message exists and is visible\n    msg = None\n    if message_id is not None:\n        for m in messages:\n            if isinstance(m, dict) and m.get(\"id\") == message_id and m.get(\"api_key_id\") == akid:\n                msg = m\n                break\n        if msg is None:\n            _log(\"rejected\", \"NOT_FOUND: message not found or not visible\")\n            return _err(\"NOT_FOUND\", \"Message not found\")\n\n    # Cursor decode: base64url of JSON {\"o\": <offset>}\n    offset = 0\n    if cursor:\n        try:\n            pad = \"=\" * (-len(cursor) % 4)\n            raw = base64.urlsafe_b64decode((cursor + pad).encode(\"utf-8\")).decode(\"utf-8\")\n            obj = json.loads(raw)\n            off = obj.get(\"o\")\n            if not isinstance(off, int) or off < 0:\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n            offset = off\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n\n    # Build index of visible message_ids\n    visible_message_ids = set()\n    if message_id is not None:\n        visible_message_ids.add(message_id)\n    else:\n        for m in messages:\n            if isinstance(m, dict) and m.get(\"api_key_id\") == akid and isinstance(m.get(\"id\"), str):\n                visible_message_ids.add(m[\"id\"])\n\n    # Filter recipients\n    rows = []\n    for r in recipients:\n        if not isinstance(r, dict):\n            continue\n        mid = r.get(\"message_id\")\n        if mid not in visible_message_ids:\n            continue\n        if kind is not None:\n            # tool supports \"reply_to\" but schema does not; return empty when requested\n            if kind == \"reply_to\":\n                continue\n            if r.get(\"kind\") != kind:\n                continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        if email is not None and r.get(\"email\") != email:\n            continue\n        rows.append(r)\n\n    # Sort deterministically: created_at desc, id desc\n    def _sort_key(r):\n        dt = _dt_parse(r.get(\"created_at\")) or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n        return (dt, r.get(\"id\") or \"\")\n    rows.sort(key=_sort_key, reverse=True)\n\n    total = len(rows)\n    page = rows[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        payload = json.dumps({\"o\": next_offset}, separators=(\",\", \":\")).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(payload).decode(\"utf-8\").rstrip(\"=\")\n\n    # Update key last_used_at (best-effort) and log call\n    try:\n        ak[\"last_used_at\"] = _dt_to_iso(now)\n        ak[\"updated_at\"] = _dt_to_iso(now)\n        _save(\"api_keys.json\", api_keys)\n    except Exception:\n        pass\n\n    _log(\"accepted\", None)\n\n    return {\n        \"object\": \"list\",\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n        }\n    }\n"
+        },
+        {
+          "name": "list-email-provider-attempts",
+          "description": "Lists provider delivery attempts for a given message, or all attempts visible to the API key with optional filters. Returns a paginated result set ordered by started_at/created_at descending. Raises NOT_FOUND when the specified message_id does not exist (or is not visible), UNAUTHORIZED when the API key is missing or invalid, and FORBIDDEN when the key is revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "API key used to authenticate the request."
+              },
+              "message_id": {
+                "type": "string",
+                "description": "If provided, restrict results to attempts belonging to this message id."
+              },
+              "status": {
+                "type": "string",
+                "description": "Filter by attempt lifecycle status.",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed"
+                ]
+              },
+              "provider": {
+                "type": "string",
+                "description": "Filter by provider identifier (exact match)."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of records to return (page size).",
+                "minimum": 1,
+                "maximum": 500
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor returned by a previous call."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_email_provider_attempts(api_key, message_id=None, status=None, provider=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, base64, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0175000\" if __import__(\"os\").path.isdir(\"./environment_mix/0175000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    def _dt_parse(v):\n        if v is None:\n            return None\n        if isinstance(v, (int, float)):\n            try:\n                return datetime.datetime.fromtimestamp(float(v), tz=datetime.timezone.utc)\n            except Exception:\n                return None\n        if isinstance(v, str):\n            s = v.strip()\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                dt = datetime.datetime.fromisoformat(s)\n                if dt.tzinfo is None:\n                    dt = dt.replace(tzinfo=datetime.timezone.utc)\n                return dt.astimezone(datetime.timezone.utc)\n            except Exception:\n                return None\n        return None\n\n    def _dt_to_iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _new_id(prefix):\n        return f\"{prefix}_{uuid.uuid4().hex}\"\n\n    # Validate inputs\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key is required and must be a non-empty string\")\n\n    if message_id is not None and (not isinstance(message_id, str) or not message_id.strip()):\n        return _err(\"VALIDATION_ERROR\", \"message_id must be a non-empty string when provided\")\n\n    allowed_status = {\"queued\", \"running\", \"succeeded\", \"failed\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: queued, running, succeeded, failed\")\n\n    if provider is not None and (not isinstance(provider, str) or not provider.strip()):\n        return _err(\"VALIDATION_ERROR\", \"provider must be a non-empty string when provided\")\n\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int) or limit < 1 or limit > 500:\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 500\")\n\n    if cursor is not None and (not isinstance(cursor, str) or not cursor.strip()):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string when provided\")\n\n    api_keys = _load(\"api_keys.json\")\n    messages = _load(\"email_messages.json\")\n    attempts = _load(\"email_provider_attempts.json\")\n    send_requests = _load(\"send_requests.json\")\n\n    ak = None\n    for row in api_keys:\n        if not isinstance(row, dict):\n            continue\n        if row.get(\"id\") == api_key or row.get(\"key_prefix\") == api_key:\n            ak = row\n            break\n\n    def _log(status_s, error_message=None):\n        try:\n            send_requests.append({\n                \"id\": _new_id(\"req\"),\n                \"api_key_id\": ak.get(\"id\") if isinstance(ak, dict) else \"unknown\",\n                \"tool_name\": \"send-email\",\n                \"request_parameters\": {},\n                \"resolved_payload\": None,\n                \"result_message_id\": None,\n                \"status\": status_s,\n                \"error_message\": error_message,\n                \"ip_address\": None,\n                \"user_agent\": None,\n                \"created_at\": _dt_to_iso(now),\n                \"updated_at\": _dt_to_iso(now),\n            })\n            _save(\"send_requests.json\", send_requests)\n        except Exception:\n            pass\n\n    if ak is None:\n        _log(\"rejected\", \"UNAUTHORIZED: invalid api_key\")\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n\n    if ak.get(\"status\") == \"revoked\":\n        _log(\"rejected\", \"FORBIDDEN: api_key revoked\")\n        return _err(\"UNAUTHORIZED\", \"API key is revoked\", detail=\"FORBIDDEN\")\n\n    # Rate limit (reads included)\n    try:\n        rl = ak.get(\"rate_limit_per_minute\")\n        if not isinstance(rl, int) or rl < 1 or rl > 6000:\n            _log(\"errored\", \"Invalid rate_limit_per_minute configuration\")\n            return _err(\"CONFLICT\", \"API key configuration invalid (rate_limit_per_minute)\")\n        window_start = now - datetime.timedelta(seconds=60)\n        c = 0\n        akid = ak.get(\"id\")\n        for r in send_requests:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"api_key_id\") != akid:\n                continue\n            dt = _dt_parse(r.get(\"created_at\"))\n            if dt is None:\n                continue\n            if dt >= window_start:\n                c += 1\n        if c >= rl:\n            _log(\"rejected\", \"RATE_LIMIT exceeded\")\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n    except Exception:\n        _log(\"errored\", \"Rate limit evaluation failed\")\n        return _err(\"CONFLICT\", \"Unable to evaluate rate limit\")\n\n    akid = ak.get(\"id\")\n\n    msg = None\n    if message_id is not None:\n        for m in messages:\n            if isinstance(m, dict) and m.get(\"id\") == message_id and m.get(\"api_key_id\") == akid:\n                msg = m\n                break\n        if msg is None:\n            _log(\"rejected\", \"NOT_FOUND: message not found or not visible\")\n            return _err(\"NOT_FOUND\", \"Message not found\")\n\n    offset = 0\n    if cursor:\n        try:\n            pad = \"=\" * (-len(cursor) % 4)\n            raw = base64.urlsafe_b64decode((cursor + pad).encode(\"utf-8\")).decode(\"utf-8\")\n            obj = json.loads(raw)\n            off = obj.get(\"o\")\n            if not isinstance(off, int) or off < 0:\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n            offset = off\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n\n    visible_message_ids = set()\n    if message_id is not None:\n        visible_message_ids.add(message_id)\n    else:\n        for m in messages:\n            if isinstance(m, dict) and m.get(\"api_key_id\") == akid and isinstance(m.get(\"id\"), str):\n                visible_message_ids.add(m[\"id\"])\n\n    rows = []\n    for a in attempts:\n        if not isinstance(a, dict):\n            continue\n        mid = a.get(\"message_id\")\n        if mid not in visible_message_ids:\n            continue\n        if status is not None and a.get(\"status\") != status:\n            continue\n        if provider is not None and a.get(\"provider\") != provider:\n            continue\n        rows.append(a)\n\n    # Order by started_at desc then created_at desc then id desc\n    def _sort_key(a):\n        sdt = _dt_parse(a.get(\"started_at\")) or _dt_parse(a.get(\"created_at\")) or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n        cdt = _dt_parse(a.get(\"created_at\")) or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n        return (sdt, cdt, a.get(\"id\") or \"\")\n    rows.sort(key=_sort_key, reverse=True)\n\n    total = len(rows)\n    page = rows[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        payload = json.dumps({\"o\": next_offset}, separators=(\",\", \":\")).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(payload).decode(\"utf-8\").rstrip(\"=\")\n\n    try:\n        ak[\"last_used_at\"] = _dt_to_iso(now)\n        ak[\"updated_at\"] = _dt_to_iso(now)\n        _save(\"api_keys.json\", api_keys)\n    except Exception:\n        pass\n\n    _log(\"accepted\", None)\n\n    return {\n        \"object\": \"list\",\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n        }\n    }\n"
+        },
+        {
+          "name": "cancel-email-message",
+          "description": "Requests cancellation of a queued email message by transitioning its status from queued to cancelled. Refuses cancellation if the message has already left queued state or is terminal. Returns the updated message status. Raises NOT_FOUND when the message does not exist (or is not visible), UNAUTHORIZED when the API key is missing or invalid, FORBIDDEN when the key is revoked, and CONFLICT when the lifecycle transition is not allowed.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "API key used to authenticate the request."
+              },
+              "message_id": {
+                "type": "string",
+                "description": "Primary identifier of the email message to cancel."
+              },
+              "reason": {
+                "type": "string",
+                "description": "Optional human-readable reason recorded for audit/debugging."
+              }
+            },
+            "required": [
+              "api_key",
+              "message_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def cancel_email_message(api_key, message_id, reason=None, **_extra):\n    import json, os, datetime, time, uuid, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0175000\" if __import__(\"os\").path.isdir(\"./environment_mix/0175000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if isinstance(dt, str):\n            return dt\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n        return now.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _new_id(prefix):\n        return f\"{prefix}_{uuid.uuid4().hex[:26]}\"\n\n    def _log_send_request(send_requests_rows, api_key_id, status, error_message=None, result_message_id=None, resolved_payload=None):\n        ts = _iso(now)\n        row = {\n            \"id\": _new_id(\"req\"),\n            \"api_key_id\": api_key_id,\n            \"tool_name\": \"send-email\",\n            \"request_parameters\": {},  # schema: empty object only\n            \"resolved_payload\": resolved_payload,\n            \"result_message_id\": result_message_id,\n            \"status\": status,  # accepted|rejected|errored\n            \"error_message\": error_message,\n            \"ip_address\": None,\n            \"user_agent\": None,\n            \"created_at\": ts,\n            \"updated_at\": ts,\n        }\n        send_requests_rows.append(row)\n        return row\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v.strip()\n            try:\n                if s.endswith(\"Z\"):\n                    s = s[:-1] + \"+00:00\"\n                return datetime.datetime.fromisoformat(s)\n            except Exception:\n                return None\n        return None\n\n    # -------- Validate inputs --------\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key is required and must be a non-empty string\")\n    if not isinstance(message_id, str) or not message_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"message_id is required and must be a non-empty string\")\n    if reason is not None and not isinstance(reason, str):\n        return _err(\"VALIDATION_ERROR\", \"reason must be a string when provided\")\n\n    # -------- Load datastore --------\n    api_keys = _load(\"api_keys.json\")\n    email_messages = _load(\"email_messages.json\")\n    send_requests = _load(\"send_requests.json\")\n\n    if not isinstance(api_keys, list) or not isinstance(email_messages, list) or not isinstance(send_requests, list):\n        # Datastore corruption/format unexpected\n        return _err(\"ERRORED\" if False else \"VALIDATION_ERROR\", \"Datastore is not in expected format\")\n\n    # -------- Authenticate --------\n    # Vendor rule: authenticate by matching client-visible value or its id.\n    # We only have api_keys.id and key_prefix/hash; accept id match or prefix match.\n    key_row = None\n    api_key_in = api_key.strip()\n\n    for k in api_keys:\n        if not isinstance(k, dict):\n            continue\n        if k.get(\"id\") == api_key_in:\n            key_row = k\n            break\n    if key_row is None:\n        # try prefix match (only if unique and non-empty)\n        candidates = []\n        for k in api_keys:\n            if not isinstance(k, dict):\n                continue\n            if isinstance(k.get(\"key_prefix\"), str) and k.get(\"key_prefix\") and api_key_in.startswith(k.get(\"key_prefix\")):\n                candidates.append(k)\n        if len(candidates) == 1:\n            key_row = candidates[0]\n\n    # We must record every call into send_requests before returning (schema's request log).\n    # When auth cannot be resolved, we cannot satisfy fk(api_key_id). Use a real existing key as the log owner if possible.\n    # Prefer an active key; otherwise any key. If no keys exist, return UNAUTHORIZED without logging (cannot persist valid row).\n    def _pick_any_key_id():\n        if isinstance(api_keys, list):\n            for k in api_keys:\n                if isinstance(k, dict) and k.get(\"status\") == \"active\" and isinstance(k.get(\"id\"), str):\n                    return k[\"id\"]\n            for k in api_keys:\n                if isinstance(k, dict) and isinstance(k.get(\"id\"), str):\n                    return k[\"id\"]\n        return None\n\n    if key_row is None:\n        fallback_id = _pick_any_key_id()\n        if fallback_id is not None:\n            _log_send_request(send_requests, fallback_id, status=\"rejected\", error_message=\"unauthorized: invalid api key\")\n            _save(\"send_requests.json\", send_requests)\n        return _err(\"UNAUTHORIZED\", \"API key is missing or invalid\")\n\n    api_key_id = key_row.get(\"id\")\n    if not isinstance(api_key_id, str) or not api_key_id:\n        return _err(\"UNAUTHORIZED\", \"API key is missing or invalid\")\n\n    # If revoked: per rules in spec (for send-email tool) treat as rejected. Tool text mentions FORBIDDEN,\n    # but allowed codes list does not include FORBIDDEN. Use UNAUTHORIZED vs CONFLICT? We will use UNAUTHORIZED is incorrect.\n    # Use CONFLICT? No. Best fit: UNAUTHORIZED with clear message.\n    if key_row.get(\"status\") == \"revoked\":\n        _log_send_request(send_requests, api_key_id, status=\"rejected\", error_message=\"api key revoked\")\n        _save(\"send_requests.json\", send_requests)\n        return _err(\"UNAUTHORIZED\", \"API key is revoked\")\n\n    # -------- Find message --------\n    msg = None\n    for m in email_messages:\n        if isinstance(m, dict) and m.get(\"id\") == message_id:\n            msg = m\n            break\n    if msg is None:\n        _log_send_request(send_requests, api_key_id, status=\"rejected\", error_message=\"message not found\", result_message_id=None)\n        _save(\"send_requests.json\", send_requests)\n        return _err(\"NOT_FOUND\", \"Email message does not exist\")\n\n    # Basic visibility: only allow cancelling messages created with this api key\n    if msg.get(\"api_key_id\") != api_key_id:\n        _log_send_request(send_requests, api_key_id, status=\"rejected\", error_message=\"message not found\", result_message_id=None)\n        _save(\"send_requests.json\", send_requests)\n        return _err(\"NOT_FOUND\", \"Email message does not exist\")\n\n    # -------- Enforce lifecycle / transition --------\n    status = msg.get(\"status\")\n    terminal = {\"delivered\", \"bounced\", \"failed\", \"cancelled\"}\n\n    # Only queued -> cancelled is allowed by tool contract.\n    if status != \"queued\":\n        # Important audit fix: do NOT return INVALID_TRANSITION for terminal; tool description says refuse cancellation\n        # if already left queued or is terminal; that is a conflict with requested operation.\n        # Use CONFLICT and explain rule.\n        _log_send_request(\n            send_requests,\n            api_key_id,\n            status=\"rejected\",\n            error_message=f\"cannot cancel: message status is '{status}' (only 'queued' messages can be cancelled)\",\n            result_message_id=message_id,\n        )\n        _save(\"send_requests.json\", send_requests)\n        return _err(\n            \"CONFLICT\",\n            f\"Cancellation refused: message is in status '{status}'. Business rule: only messages in 'queued' may transition to 'cancelled'.\",\n            current_status=status,\n            allowed_from=[\"queued\"],\n            requested=\"cancelled\",\n        )\n\n    # -------- Apply mutation --------\n    ts = _iso(now)\n    msg[\"status\"] = \"cancelled\"\n    msg[\"updated_at\"] = ts\n    msg[\"finalized_at\"] = ts  # terminal => finalized_at must be not null\n    # queued_at remains as originally set; sent_at remains null.\n    # Record reason into error_message for audit/debugging (no dedicated field exists for cancel reason).\n    if isinstance(reason, str) and reason.strip():\n        msg[\"error_code\"] = \"cancelled_by_user\"\n        msg[\"error_message\"] = reason.strip()\n    else:\n        msg[\"error_code\"] = \"cancelled_by_user\"\n        msg[\"error_message\"] = msg.get(\"error_message\") or \"Message cancelled before first provider attempt.\"\n\n    # Update key last_used_at/updated_at (service dynamics)\n    key_row[\"last_used_at\"] = ts\n    key_row[\"updated_at\"] = ts\n\n    # Log request (accepted, since mutation succeeded)\n    _log_send_request(\n        send_requests,\n        api_key_id,\n        status=\"accepted\",\n        error_message=None,\n        result_message_id=message_id,\n        resolved_payload=None,\n    )\n\n    # Persist\n    _save(\"email_messages.json\", email_messages)\n    _save(\"api_keys.json\", api_keys)\n    _save(\"send_requests.json\", send_requests)\n\n    latency_ms = int((time.time() - t0) * 1000)\n\n    return {\n        \"message\": {\n            \"id\": msg.get(\"id\"),\n            \"api_key_id\": msg.get(\"api_key_id\"),\n            \"status\": msg.get(\"status\"),\n            \"finalized_at\": msg.get(\"finalized_at\"),\n            \"updated_at\": msg.get(\"updated_at\"),\n            \"error_code\": msg.get(\"error_code\"),\n            \"error_message\": msg.get(\"error_message\"),\n        },\n        \"meta\": {\n            \"latency_ms\": latency_ms\n        }\n    }\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0175000",
+    "index": 175,
+    "name": "Email sending",
+    "description": "This backend stores outbound email send requests and their delivery lifecycle, including recipients, message content, provider delivery attempts, and API access control. The main workflow is: an API client authenticates with an API key, submits an email to send, the system creates a message and reci",
+    "taxonomy": {
+      "L1_id": "L1-20",
+      "L1_name": "Communication & General Utilities",
+      "L1_name_zh": "通信与通用工具",
+      "L2_id": "L2-48",
+      "L2_name": "Messaging & Notification",
+      "L2_name_zh": "即时通信与通知",
+      "L3_name": "Email Sending & Outbound Campaigns",
+      "L3_name_zh": "邮件发送与外呼营销活动"
+    },
+    "database_dir": "./environment_mix/0175000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 5,
+    "n_records": 89,
+    "n_questions": 2,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 5,
+      "read_operations": 5,
+      "mutations_persisted": 1,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get-auth-context",
+      "returned_chars": 406
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

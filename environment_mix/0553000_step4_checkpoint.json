@@ -1,0 +1,387 @@
+{
+  "index": 553,
+  "local_files_dir": "./environment_mix/0553000",
+  "file_list": [
+    "./environment_mix/0553000/README.md",
+    "./environment_mix/0553000/conversion_jobs.json",
+    "./environment_mix/0553000/conversion_outputs.json",
+    "./environment_mix/0553000/job_artifacts.json",
+    "./environment_mix/0553000/ocr_languages.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "conversion_jobs.json": "18 rows",
+        "conversion_outputs.json": "17 rows",
+        "job_artifacts.json": "18 rows",
+        "ocr_languages.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "parse_documents",
+          "description": "Submits a document to the MinerU conversion pipeline, creates a new conversion job, and returns the created job record (including its initial lifecycle state and any persisted source metadata such as filename, content type, size, and sha256 when provided). Raises VALIDATION_ERROR if source_kind is not one of the allowed values, if required source details are missing/inconsistent for the chosen source_kind (e.g., url/local_path without a locator), or if requested_ocr_language is provided but does not match an existing ocr_languages.code; raises UNAUTHORIZED/FORBIDDEN if the caller is not permitted to submit jobs; raises QUOTA_EXCEEDED if job submission limits are reached; raises CONFLICT if the request attempts to create a duplicate/incompatible job for the same sha256 according to server deduplication rules.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "source_kind": {
+                "type": "string",
+                "enum": [
+                  "upload",
+                  "url",
+                  "local_path"
+                ],
+                "description": "Type of document source being submitted for conversion."
+              },
+              "source_locator": {
+                "type": "string",
+                "description": "Location of the source document (e.g., URL or local path); ignored for upload-based submissions."
+              },
+              "original_filename": {
+                "type": "string",
+                "description": "Original filename for the submitted document (useful for auditing and downstream naming)."
+              },
+              "content_type": {
+                "type": "string",
+                "description": "MIME content type of the source document (e.g., application/pdf)."
+              },
+              "size_bytes": {
+                "type": "integer",
+                "description": "Size of the source document in bytes."
+              },
+              "sha256": {
+                "type": "string",
+                "description": "SHA-256 hex digest of the source document for deduplication/integrity checks."
+              },
+              "requested_ocr_language": {
+                "type": "string",
+                "description": "Requested OCR language code (must exist in ocr_languages.code)."
+              }
+            },
+            "required": [
+              "source_kind"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def parse_documents(source_kind, source_locator=None, original_filename=None, content_type=None, size_bytes=None, sha256=None, requested_ocr_language=None, **_extra):\n    import json, os, datetime, time, uuid, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0553000\" if __import__(\"os\").path.isdir(\"./environment_mix/0553000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    status = \"ok\"\n    jobs_file = \"conversion_jobs.json\"\n    langs_file = \"ocr_languages.json\"\n\n    # --- Validate inputs ---\n    allowed_source_kind = {\"upload\", \"url\", \"local_path\"}\n    if not isinstance(source_kind, str) or source_kind not in allowed_source_kind:\n        return _err(\"VALIDATION_ERROR\", \"source_kind must be one of: upload, url, local_path\", field=\"source_kind\")\n\n    if source_locator is not None and not isinstance(source_locator, str):\n        return _err(\"VALIDATION_ERROR\", \"source_locator must be a string\", field=\"source_locator\")\n    if original_filename is not None and not isinstance(original_filename, str):\n        return _err(\"VALIDATION_ERROR\", \"original_filename must be a string\", field=\"original_filename\")\n    if content_type is not None and not isinstance(content_type, str):\n        return _err(\"VALIDATION_ERROR\", \"content_type must be a string\", field=\"content_type\")\n    if size_bytes is not None:\n        if not isinstance(size_bytes, int):\n            return _err(\"VALIDATION_ERROR\", \"size_bytes must be an integer\", field=\"size_bytes\")\n        if size_bytes < 0:\n            return _err(\"VALIDATION_ERROR\", \"size_bytes must be >= 0\", field=\"size_bytes\")\n    if sha256 is not None:\n        if not isinstance(sha256, str):\n            return _err(\"VALIDATION_ERROR\", \"sha256 must be a string\", field=\"sha256\")\n        if not re.fullmatch(r\"[0-9a-fA-F]{64}\", sha256):\n            return _err(\"VALIDATION_ERROR\", \"sha256 must be a 64-character hex string\", field=\"sha256\")\n\n    # Required source details consistency\n    if source_kind in {\"url\", \"local_path\"}:\n        if not source_locator or not isinstance(source_locator, str) or not source_locator.strip():\n            return _err(\"VALIDATION_ERROR\", \"source_locator is required for source_kind='url' or 'local_path'\", field=\"source_locator\")\n    # For upload, locator is ignored (but may be stored if provided); no extra requirements.\n\n    if requested_ocr_language is not None and not isinstance(requested_ocr_language, str):\n        return _err(\"VALIDATION_ERROR\", \"requested_ocr_language must be a string\", field=\"requested_ocr_language\")\n\n    # If requested_ocr_language provided, it must reference enabled language at submission time\n    if requested_ocr_language is not None:\n        langs = _load(langs_file)\n        ok_lang = any(\n            isinstance(r, dict)\n            and r.get(\"code\") == requested_ocr_language\n            and r.get(\"is_enabled\") is True\n            for r in langs\n        )\n        if not ok_lang:\n            return _err(\"VALIDATION_ERROR\", \"requested_ocr_language must reference an enabled ocr_languages.code\", field=\"requested_ocr_language\")\n\n    # --- Create job (must always create) ---\n    now = datetime.datetime.now(datetime.timezone.utc).isoformat()\n    jobs = _load(jobs_file)\n\n    # ID convention: \"job_\" + uuid4 hex\n    job_id = \"job_\" + uuid.uuid4().hex\n    job_row = {\n        \"id\": job_id,\n        \"status\": \"queued\",\n        \"source_kind\": source_kind,\n        \"source_locator\": source_locator if (source_kind != \"upload\") else None,\n        \"original_filename\": original_filename,\n        \"content_type\": content_type,\n        \"size_bytes\": size_bytes,\n        \"sha256\": sha256.lower() if isinstance(sha256, str) else None,\n        \"requested_ocr_language\": requested_ocr_language,\n        \"engine_version\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # Persist\n    if not isinstance(jobs, list):\n        jobs = []\n    jobs.append(job_row)\n    _save(jobs_file, jobs)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"job\": job_row,\n        \"meta\": {\n            \"status\": status,\n            \"latency_ms\": latency_ms,\n        },\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_ocr_languages",
+          "description": "Returns a paginated list of OCR languages known to the service (optionally filtered by is_enabled and/or engine_provider) along with a next-page cursor when more results are available; results are ordered by the requested sort and page size is controlled by limit. Raises VALIDATION_ERROR if limit is invalid, cursor is malformed/expired, sort is not supported, or engine_provider is not one of the allowed values. Raises UNAUTHORIZED/FORBIDDEN if the caller is not permitted to view the language catalog.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "is_enabled": {
+                "type": "boolean",
+                "description": "If provided, filters languages by enabled/disabled status."
+              },
+              "engine_provider": {
+                "type": "string",
+                "enum": [
+                  "tesseract",
+                  "paddleocr",
+                  "easyocr",
+                  "unknown"
+                ],
+                "description": "If provided, filters languages by OCR engine provider."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of languages to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page of results."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "code",
+                  "-code",
+                  "display_name",
+                  "-display_name",
+                  "created_at",
+                  "-created_at",
+                  "updated_at",
+                  "-updated_at"
+                ],
+                "description": "Sort order for returned languages."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def get_ocr_languages(is_enabled=None, engine_provider=None, limit=None, cursor=None, sort=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0553000\" if __import__(\"os\").path.isdir(\"./environment_mix/0553000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    # Validate filters\n    if is_enabled is not None and not isinstance(is_enabled, bool):\n        return _err(\"VALIDATION_ERROR\", \"is_enabled must be a boolean\", field=\"is_enabled\")\n\n    allowed_provider = {\"tesseract\", \"paddleocr\", \"easyocr\", \"unknown\"}\n    if engine_provider is not None:\n        if not isinstance(engine_provider, str) or engine_provider not in allowed_provider:\n            return _err(\"VALIDATION_ERROR\", \"engine_provider must be one of: tesseract, paddleocr, easyocr, unknown\", field=\"engine_provider\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit <= 0 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer in [1, 200]\", field=\"limit\")\n\n    allowed_sort = {\"code\", \"-code\", \"display_name\", \"-display_name\", \"created_at\", \"-created_at\", \"updated_at\", \"-updated_at\"}\n    if sort is None:\n        sort = \"code\"\n    if not isinstance(sort, str) or sort not in allowed_sort:\n        return _err(\"VALIDATION_ERROR\", \"sort is not supported\", field=\"sort\")\n\n    # Cursor format: base64url(JSON {\"offset\": int})\n    offset = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or not cursor:\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string\", field=\"cursor\")\n        try:\n            pad = \"=\" * (-len(cursor) % 4)\n            raw = base64.urlsafe_b64decode((cursor + pad).encode(\"utf-8\")).decode(\"utf-8\")\n            obj = json.loads(raw)\n            if not isinstance(obj, dict) or \"offset\" not in obj or not isinstance(obj[\"offset\"], int) or obj[\"offset\"] < 0:\n                return _err(\"VALIDATION_ERROR\", \"cursor is malformed\", field=\"cursor\")\n            offset = obj[\"offset\"]\n        except (ValueError, json.JSONDecodeError):\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed\", field=\"cursor\")\n\n    # Business rule: MUST return only enabled rows, derivable solely from ocr_languages\n    langs = _load(\"ocr_languages.json\")\n    if not isinstance(langs, list):\n        langs = []\n\n    rows = []\n    for r in langs:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"is_enabled\") is not True:\n            continue\n        # Optional filter by is_enabled: since only enabled are returned, is_enabled=false yields empty.\n        if is_enabled is not None and is_enabled is False:\n            continue\n        if engine_provider is not None and r.get(\"engine_provider\") != engine_provider:\n            continue\n        rows.append(r)\n\n    key = sort.lstrip(\"-\")\n    desc = sort.startswith(\"-\")\n\n    def _sort_key(x):\n        v = x.get(key)\n        # Ensure stable ordering with None last\n        none_flag = (v is None)\n        return (none_flag, v)\n\n    try:\n        rows.sort(key=_sort_key, reverse=desc)\n    except TypeError:\n        # Fallback: stringification if mixed types\n        rows.sort(key=lambda x: (x.get(key) is None, str(x.get(key))), reverse=desc)\n\n    total = len(rows)\n    page = rows[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n\n    next_cursor = None\n    if has_more:\n        payload = json.dumps({\"offset\": next_offset}, separators=(\",\", \":\")).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(payload).decode(\"utf-8\").rstrip(\"=\")\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"languages\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"sort\": sort,\n            \"latency_ms\": latency_ms,\n        },\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_conversion_jobs",
+          "description": "Returns a paginated list of conversion jobs, optionally filtered by lifecycle status, source_kind, requested OCR language, and created_at range. Results are ordered by the requested sort and include a next-page cursor when more results are available. Raises VALIDATION_ERROR if any filter is malformed (e.g., invalid status/source_kind), if limit is out of range, or if cursor is malformed/expired.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "If provided, filters jobs by lifecycle status."
+              },
+              "source_kind": {
+                "type": "string",
+                "enum": [
+                  "upload",
+                  "url",
+                  "local_path"
+                ],
+                "description": "If provided, filters jobs by source kind."
+              },
+              "requested_ocr_language": {
+                "type": "string",
+                "description": "If provided, filters jobs by requested OCR language code."
+              },
+              "created_at_gte": {
+                "type": "string",
+                "description": "If provided, filters to jobs created at or after this timestamp (RFC 3339)."
+              },
+              "created_at_lte": {
+                "type": "string",
+                "description": "If provided, filters to jobs created at or before this timestamp (RFC 3339)."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of jobs to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page of results."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "-created_at",
+                  "updated_at",
+                  "-updated_at",
+                  "started_at",
+                  "-started_at",
+                  "finished_at",
+                  "-finished_at",
+                  "status",
+                  "-status"
+                ],
+                "description": "Sort order for returned jobs."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_conversion_jobs(status=None, source_kind=None, requested_ocr_language=None, created_at_gte=None, created_at_lte=None, limit=None, cursor=None, sort=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0553000\" if __import__(\"os\").path.isdir(\"./environment_mix/0553000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    allowed_status = {\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: queued, running, succeeded, failed, cancelled\", field=\"status\")\n\n    allowed_source_kind = {\"upload\", \"url\", \"local_path\"}\n    if source_kind is not None:\n        if not isinstance(source_kind, str) or source_kind not in allowed_source_kind:\n            return _err(\"VALIDATION_ERROR\", \"source_kind must be one of: upload, url, local_path\", field=\"source_kind\")\n\n    if requested_ocr_language is not None and not isinstance(requested_ocr_language, str):\n        return _err(\"VALIDATION_ERROR\", \"requested_ocr_language must be a string\", field=\"requested_ocr_language\")\n\n    def _parse_rfc3339(s, field):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s:\n            raise ValueError(field)\n        ss = s\n        if ss.endswith(\"Z\"):\n            ss = ss[:-1] + \"+00:00\"\n        return datetime.datetime.fromisoformat(ss)\n\n    try:\n        dt_gte = _parse_rfc3339(created_at_gte, \"created_at_gte\")\n        dt_lte = _parse_rfc3339(created_at_lte, \"created_at_lte\")\n    except ValueError as e:\n        return _err(\"VALIDATION_ERROR\", \"timestamp must be RFC 3339\", field=str(e))\n\n    if dt_gte is not None and dt_lte is not None and dt_lte < dt_gte:\n        return _err(\"VALIDATION_ERROR\", \"created_at_lte must be >= created_at_gte\", field=\"created_at_lte\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit <= 0 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer in [1, 200]\", field=\"limit\")\n\n    allowed_sort = {\"created_at\", \"-created_at\", \"updated_at\", \"-updated_at\", \"started_at\", \"-started_at\", \"finished_at\", \"-finished_at\", \"status\", \"-status\"}\n    if sort is None:\n        sort = \"-created_at\"\n    if not isinstance(sort, str) or sort not in allowed_sort:\n        return _err(\"VALIDATION_ERROR\", \"sort is not supported\", field=\"sort\")\n\n    offset = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or not cursor:\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string\", field=\"cursor\")\n        try:\n            pad = \"=\" * (-len(cursor) % 4)\n            raw = base64.urlsafe_b64decode((cursor + pad).encode(\"utf-8\")).decode(\"utf-8\")\n            obj = json.loads(raw)\n            if not isinstance(obj, dict) or \"offset\" not in obj or not isinstance(obj[\"offset\"], int) or obj[\"offset\"] < 0:\n                return _err(\"VALIDATION_ERROR\", \"cursor is malformed\", field=\"cursor\")\n            offset = obj[\"offset\"]\n        except (ValueError, json.JSONDecodeError):\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed\", field=\"cursor\")\n\n    jobs = _load(\"conversion_jobs.json\")\n    if not isinstance(jobs, list):\n        jobs = []\n\n    rows = []\n    for r in jobs:\n        if not isinstance(r, dict):\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        if source_kind is not None and r.get(\"source_kind\") != source_kind:\n            continue\n        if requested_ocr_language is not None and r.get(\"requested_ocr_language\") != requested_ocr_language:\n            continue\n\n        if dt_gte is not None or dt_lte is not None:\n            ca = r.get(\"created_at\")\n            if not isinstance(ca, str):\n                continue\n            try:\n                ca_s = ca[:-1] + \"+00:00\" if ca.endswith(\"Z\") else ca\n                ca_dt = datetime.datetime.fromisoformat(ca_s)\n            except ValueError:\n                continue\n            if dt_gte is not None and ca_dt < dt_gte:\n                continue\n            if dt_lte is not None and ca_dt > dt_lte:\n                continue\n        rows.append(r)\n\n    key = sort.lstrip(\"-\")\n    desc = sort.startswith(\"-\")\n\n    def _sort_key(x):\n        v = x.get(key)\n        none_flag = (v is None)\n        return (none_flag, v)\n\n    try:\n        rows.sort(key=_sort_key, reverse=desc)\n    except TypeError:\n        rows.sort(key=lambda x: (x.get(key) is None, str(x.get(key))), reverse=desc)\n\n    total = len(rows)\n    page = rows[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n\n    next_cursor = None\n    if has_more:\n        payload = json.dumps({\"offset\": next_offset}, separators=(\",\", \":\")).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(payload).decode(\"utf-8\").rstrip(\"=\")\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"jobs\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"sort\": sort,\n            \"latency_ms\": latency_ms,\n        },\n    }\n"
+        },
+        {
+          "name": "get_conversion_job",
+          "description": "Fetches a single conversion job by id and returns the persisted job record including lifecycle status and timestamps. Raises NOT_FOUND if no such job exists or is not visible to the caller.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Conversion job id."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_conversion_job(id, **_extra):\n    import json, os, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0553000\" if __import__(\"os\").path.isdir(\"./environment_mix/0553000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    if not isinstance(id, str) or not id:\n        return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\", field=\"id\")\n\n    jobs = _load(\"conversion_jobs.json\")\n    if not isinstance(jobs, list):\n        jobs = []\n\n    found = None\n    for r in jobs:\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            found = r\n            break\n\n    if found is None:\n        return _err(\"NOT_FOUND\", \"conversion job not found\", id=id)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"job\": found,\n        \"meta\": {\n            \"latency_ms\": latency_ms,\n        },\n    }\n"
+        },
+        {
+          "name": "cancel_conversion_job",
+          "description": "Requests cancellation of a conversion job by id. If the job is in queued or running, transitions it to cancelled, sets finished_at, and returns the updated job record. If the job is already succeeded/failed/cancelled, returns the current record without changing state. Raises NOT_FOUND if the job does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Conversion job id."
+              },
+              "reason": {
+                "type": "string",
+                "description": "Optional human-readable reason recorded for auditing."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def cancel_conversion_job(id, reason=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0553000\" if __import__(\"os\").path.isdir(\"./environment_mix/0553000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started_ts = datetime.datetime.utcnow()\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_iso(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        t = s.strip()\n        if t.endswith(\"Z\"):\n            t = t[:-1]\n        try:\n            return datetime.datetime.fromisoformat(t)\n        except ValueError:\n            return None\n\n    def _log(status, job_id=None, detail=None):\n        # Best-effort request log; ignore if schema doesn't include it.\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            latency_ms = int((datetime.datetime.utcnow() - started_ts).total_seconds() * 1000)\n            logs.append({\n                \"id\": \"mnr_req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n                \"endpoint\": \"cancel_conversion_job\",\n                \"job_id\": job_id,\n                \"status\": status,\n                \"detail\": detail,\n                \"latency_ms\": latency_ms,\n                \"created_at\": _now_iso(),\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            return\n\n    # Validate inputs\n    if not isinstance(id, str) or not id.strip():\n        _log(\"error\", job_id=None, detail=\"VALIDATION_ERROR:id\")\n        return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\", field=\"id\")\n    if reason is not None and not isinstance(reason, str):\n        _log(\"error\", job_id=id, detail=\"VALIDATION_ERROR:reason\")\n        return _err(\"VALIDATION_ERROR\", \"reason must be a string\", field=\"reason\")\n    if isinstance(reason, str):\n        reason = reason.strip() or None\n\n    # Load jobs store\n    jobs = _load(\"conversion_jobs.json\")\n    if not isinstance(jobs, list):\n        _log(\"error\", job_id=id, detail=\"NOT_FOUND:store_unavailable\")\n        return _err(\"NOT_FOUND\", \"conversion jobs store is unavailable or corrupted\")\n\n    # Find job\n    job_idx = None\n    for i, j in enumerate(jobs):\n        if isinstance(j, dict) and j.get(\"id\") == id:\n            job_idx = i\n            break\n    if job_idx is None:\n        _log(\"error\", job_id=id, detail=\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"conversion job not found\", id=id)\n\n    job = jobs[job_idx]\n    status = job.get(\"status\")\n    terminal = {\"succeeded\", \"failed\", \"cancelled\"}\n\n    # If already terminal, return record unchanged (idempotent) but still log the call.\n    if status in terminal:\n        latency_ms = int((datetime.datetime.utcnow() - started_ts).total_seconds() * 1000)\n        _log(\"ok\", job_id=id, detail=\"idempotent_noop\")\n        return {\n            \"job\": job,\n            \"latency_ms\": latency_ms,\n            \"status\": \"ok\",\n        }\n\n    # Validate lifecycle status\n    allowed_statuses = {\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"}\n    if status not in allowed_statuses:\n        _log(\"error\", job_id=id, detail=\"VALIDATION_ERROR:bad_status\")\n        return _err(\"VALIDATION_ERROR\", \"job has invalid status in datastore\", field=\"status\", value=status)\n\n    # Enforce valid transition to cancelled\n    transitions = {\n        \"queued\": {\"running\", \"cancelled\"},\n        \"running\": {\"succeeded\", \"failed\", \"cancelled\"},\n        \"succeeded\": set(),\n        \"failed\": set(),\n        \"cancelled\": set(),\n    }\n    if \"cancelled\" not in transitions.get(status, set()):\n        _log(\"error\", job_id=id, detail=\"INVALID_TRANSITION\")\n        return _err(\n            \"INVALID_TRANSITION\",\n            \"job cannot be cancelled from its current status\",\n            from_status=status,\n            to_status=\"cancelled\",\n            id=id,\n        )\n\n    now_iso = _now_iso()\n    now_dt = _parse_iso(now_iso)\n\n    # Apply mutation\n    mutated = False\n    if job.get(\"status\") != \"cancelled\":\n        job[\"status\"] = \"cancelled\"\n        mutated = True\n\n    # Ensure timestamps: finished_at must be set on cancelled; updated_at advanced\n    # Also enforce finished_at >= started_at when started_at exists.\n    started_at_dt = _parse_iso(job.get(\"started_at\"))\n    if started_at_dt is not None and now_dt is not None and now_dt < started_at_dt:\n        # If clock skew would violate constraints, clamp to started_at\n        job[\"finished_at\"] = job.get(\"started_at\")\n    else:\n        job[\"finished_at\"] = now_iso\n    job[\"updated_at\"] = now_iso\n    mutated = True\n\n    # Optional audit detail: record reason if provided (schema doesn't define, but safe to store as extra)\n    if reason is not None:\n        prev_reason = job.get(\"cancel_reason\")\n        if prev_reason != reason:\n            job[\"cancel_reason\"] = reason\n            mutated = True\n\n    # Persist\n    if not mutated:\n        # Should not happen, but avoid \"success without effect\"\n        _log(\"error\", job_id=id, detail=\"CONFLICT:no_effect\")\n        return _err(\"CONFLICT\", \"cancellation request had no effect\", id=id)\n\n    jobs[job_idx] = job\n    try:\n        _save(\"conversion_jobs.json\", jobs)\n    except Exception:\n        _log(\"error\", job_id=id, detail=\"CONFLICT:save_failed\")\n        return _err(\"CONFLICT\", \"failed to persist job cancellation\", id=id)\n\n    latency_ms = int((datetime.datetime.utcnow() - started_ts).total_seconds() * 1000)\n    _log(\"ok\", job_id=id, detail=\"cancelled\")\n    return {\n        \"job\": job,\n        \"latency_ms\": latency_ms,\n        \"status\": \"ok\",\n    }\n"
+        },
+        {
+          "name": "list_conversion_outputs",
+          "description": "Returns a paginated list of conversion outputs for a given job_id, optionally filtered by output_type and/or format. Results are ordered by the requested sort and include a next-page cursor when more results are available. Raises NOT_FOUND if the job does not exist. Raises VALIDATION_ERROR if filters are invalid or cursor is malformed/expired.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "job_id": {
+                "type": "string",
+                "description": "Conversion job id whose outputs should be listed."
+              },
+              "output_type": {
+                "type": "string",
+                "enum": [
+                  "text",
+                  "structured",
+                  "artifact_index",
+                  "metadata",
+                  "log"
+                ],
+                "description": "If provided, filters outputs by output type."
+              },
+              "format": {
+                "type": "string",
+                "description": "If provided, filters outputs by format (e.g., markdown, json, txt)."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of outputs to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page of results."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "-created_at",
+                  "updated_at",
+                  "-updated_at",
+                  "output_type",
+                  "-output_type",
+                  "format",
+                  "-format"
+                ],
+                "description": "Sort order for returned outputs."
+              }
+            },
+            "required": [
+              "job_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_conversion_outputs(job_id, output_type=None, format=None, limit=None, cursor=None, sort=None, **_extra):\n    import json, os, datetime, base64, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0553000\" if __import__(\"os\").path.isdir(\"./environment_mix/0553000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started = datetime.datetime.utcnow()\n\n    def _parse_iso(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            t = s.strip()\n            if t.endswith(\"Z\"):\n                t = t[:-1]\n            return datetime.datetime.fromisoformat(t)\n        except Exception:\n            return None\n\n    def _stable_key(row, field):\n        v = row.get(field)\n        if field in (\"created_at\", \"updated_at\"):\n            dt = _parse_iso(v)\n            return dt if dt is not None else datetime.datetime.min\n        if v is None:\n            return \"\"\n        return v\n\n    # Validation\n    if not isinstance(job_id, str) or not job_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"job_id must be a non-empty string\", field=\"job_id\")\n\n    valid_output_types = {\"text\", \"structured\", \"artifact_index\", \"metadata\", \"log\"}\n    if output_type is not None:\n        if not isinstance(output_type, str) or output_type not in valid_output_types:\n            return _err(\"VALIDATION_ERROR\", \"output_type is invalid\", field=\"output_type\", allowed=sorted(valid_output_types))\n\n    if format is not None and not isinstance(format, str):\n        return _err(\"VALIDATION_ERROR\", \"format must be a string\", field=\"format\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer\", field=\"limit\")\n    if limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200\", field=\"limit\")\n\n    valid_sorts = {\"created_at\", \"-created_at\", \"updated_at\", \"-updated_at\", \"output_type\", \"-output_type\", \"format\", \"-format\"}\n    if sort is None:\n        sort = \"created_at\"\n    if not isinstance(sort, str) or sort not in valid_sorts:\n        return _err(\"VALIDATION_ERROR\", \"sort is invalid\", field=\"sort\", allowed=sorted(valid_sorts))\n\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\", field=\"cursor\")\n\n    # Check job exists\n    jobs = _load(\"conversion_jobs.json\")\n    job_exists = any(isinstance(j, dict) and j.get(\"id\") == job_id for j in jobs)\n    if not job_exists:\n        return _err(\"NOT_FOUND\", \"conversion job not found\", job_id=job_id)\n\n    outputs = _load(\"conversion_outputs.json\")\n\n    # Filter\n    filtered = []\n    for r in outputs:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"job_id\") != job_id:\n            continue\n        if output_type is not None and r.get(\"output_type\") != output_type:\n            continue\n        if format is not None and r.get(\"format\") != format:\n            continue\n        filtered.append(r)\n\n    # Sort\n    desc = sort.startswith(\"-\")\n    field = sort[1:] if desc else sort\n    # Deterministic tie-breaker by id\n    filtered.sort(key=lambda row: (_stable_key(row, field), str(row.get(\"id\", \"\"))), reverse=desc)\n\n    # Cursor handling: base64url(json) with fields:\n    # {v:1, job_id, output_type, format, sort, offset, exp, sig}\n    offset = 0\n    if cursor:\n        try:\n            pad = \"=\" * (-len(cursor) % 4)\n            raw = base64.urlsafe_b64decode((cursor + pad).encode(\"utf-8\"))\n            obj = json.loads(raw.decode(\"utf-8\"))\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed\", field=\"cursor\")\n\n        if not isinstance(obj, dict) or obj.get(\"v\") != 1:\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed\", field=\"cursor\")\n        # expiry (10 minutes)\n        exp = obj.get(\"exp\")\n        if not isinstance(exp, str):\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed\", field=\"cursor\")\n        exp_dt = _parse_iso(exp)\n        if exp_dt is None:\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed\", field=\"cursor\")\n        if datetime.datetime.utcnow() > exp_dt:\n            return _err(\"VALIDATION_ERROR\", \"cursor is expired\", field=\"cursor\")\n\n        # Validate scope matches request\n        if obj.get(\"job_id\") != job_id or obj.get(\"output_type\") != output_type or obj.get(\"format\") != format or obj.get(\"sort\") != sort:\n            return _err(\"VALIDATION_ERROR\", \"cursor does not match request parameters\", field=\"cursor\")\n\n        if not isinstance(obj.get(\"offset\"), int) or obj[\"offset\"] < 0:\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed\", field=\"cursor\")\n\n        # Verify signature to detect tampering (no secret; binds to current store snapshot)\n        sig = obj.get(\"sig\")\n        if not isinstance(sig, str):\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed\", field=\"cursor\")\n        snapshot = json.dumps([r.get(\"id\") for r in filtered], ensure_ascii=False, separators=(\",\", \":\"))\n        expected = hashlib.sha256((snapshot + f\"|{job_id}|{output_type}|{format}|{sort}|{obj['offset']}|{exp}\").encode(\"utf-8\")).hexdigest()\n        if sig != expected:\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed or expired\", field=\"cursor\")\n\n        offset = obj[\"offset\"]\n\n    total = len(filtered)\n    page = filtered[offset:offset + limit]\n    next_cursor = None\n    has_more = offset + limit < total\n    if has_more:\n        exp_dt = datetime.datetime.utcnow() + datetime.timedelta(minutes=10)\n        exp = exp_dt.replace(tzinfo=None).isoformat(timespec=\"seconds\") + \"Z\"\n        next_offset = offset + limit\n        snapshot = json.dumps([r.get(\"id\") for r in filtered], ensure_ascii=False, separators=(\",\", \":\"))\n        sig = hashlib.sha256((snapshot + f\"|{job_id}|{output_type}|{format}|{sort}|{next_offset}|{exp}\").encode(\"utf-8\")).hexdigest()\n        obj = {\n            \"v\": 1,\n            \"job_id\": job_id,\n            \"output_type\": output_type,\n            \"format\": format,\n            \"sort\": sort,\n            \"offset\": next_offset,\n            \"exp\": exp,\n            \"sig\": sig,\n        }\n        raw = json.dumps(obj, ensure_ascii=False, separators=(\",\", \":\")).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(raw).decode(\"utf-8\").rstrip(\"=\")\n\n    latency_ms = int((datetime.datetime.utcnow() - started).total_seconds() * 1000)\n    return {\n        \"outputs\": page,\n        \"pagination\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n        },\n        \"sort\": sort,\n        \"status\": \"ok\",\n        \"latency_ms\": latency_ms,\n    }\n"
+        },
+        {
+          "name": "list_job_artifacts",
+          "description": "Returns a paginated list of artifacts produced for a given job_id, optionally filtered by artifact_type and/or page_number. Results are ordered by the requested sort and include a next-page cursor when more results are available. Raises NOT_FOUND if the job does not exist. Raises VALIDATION_ERROR if filters are invalid or cursor is malformed/expired.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "job_id": {
+                "type": "string",
+                "description": "Conversion job id whose artifacts should be listed."
+              },
+              "artifact_type": {
+                "type": "string",
+                "enum": [
+                  "page_image",
+                  "embedded_image",
+                  "attachment",
+                  "table_snapshot",
+                  "debug"
+                ],
+                "description": "If provided, filters artifacts by type."
+              },
+              "page_number": {
+                "type": "integer",
+                "description": "If provided, filters artifacts to a specific page number (1-based)."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of artifacts to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page of results."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "-created_at",
+                  "updated_at",
+                  "-updated_at",
+                  "page_number",
+                  "-page_number",
+                  "artifact_type",
+                  "-artifact_type"
+                ],
+                "description": "Sort order for returned artifacts."
+              }
+            },
+            "required": [
+              "job_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_job_artifacts(job_id, artifact_type=None, page_number=None, limit=None, cursor=None, sort=None, **_extra):\n    import json, os, datetime, base64, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0553000\" if __import__(\"os\").path.isdir(\"./environment_mix/0553000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started = datetime.datetime.utcnow()\n\n    def _parse_iso(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            t = s.strip()\n            if t.endswith(\"Z\"):\n                t = t[:-1]\n            return datetime.datetime.fromisoformat(t)\n        except Exception:\n            return None\n\n    def _stable_key(row, field):\n        v = row.get(field)\n        if field in (\"created_at\", \"updated_at\"):\n            dt = _parse_iso(v)\n            return dt if dt is not None else datetime.datetime.min\n        if field == \"page_number\":\n            if v is None:\n                return -1\n            return v if isinstance(v, int) else -1\n        if v is None:\n            return \"\"\n        return v\n\n    # Validation\n    if not isinstance(job_id, str) or not job_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"job_id must be a non-empty string\", field=\"job_id\")\n\n    valid_artifact_types = {\"page_image\", \"embedded_image\", \"attachment\", \"table_snapshot\", \"debug\"}\n    if artifact_type is not None:\n        if not isinstance(artifact_type, str) or artifact_type not in valid_artifact_types:\n            return _err(\"VALIDATION_ERROR\", \"artifact_type is invalid\", field=\"artifact_type\", allowed=sorted(valid_artifact_types))\n\n    if page_number is not None:\n        if not isinstance(page_number, int):\n            return _err(\"VALIDATION_ERROR\", \"page_number must be an integer\", field=\"page_number\")\n        if page_number < 1:\n            return _err(\"VALIDATION_ERROR\", \"page_number must be >= 1\", field=\"page_number\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer\", field=\"limit\")\n    if limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200\", field=\"limit\")\n\n    valid_sorts = {\"created_at\", \"-created_at\", \"updated_at\", \"-updated_at\", \"page_number\", \"-page_number\", \"artifact_type\", \"-artifact_type\"}\n    if sort is None:\n        sort = \"created_at\"\n    if not isinstance(sort, str) or sort not in valid_sorts:\n        return _err(\"VALIDATION_ERROR\", \"sort is invalid\", field=\"sort\", allowed=sorted(valid_sorts))\n\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\", field=\"cursor\")\n\n    # Check job exists\n    jobs = _load(\"conversion_jobs.json\")\n    job_exists = any(isinstance(j, dict) and j.get(\"id\") == job_id for j in jobs)\n    if not job_exists:\n        return _err(\"NOT_FOUND\", \"conversion job not found\", job_id=job_id)\n\n    artifacts = _load(\"job_artifacts.json\")\n\n    # Filter\n    filtered = []\n    for r in artifacts:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"job_id\") != job_id:\n            continue\n        if artifact_type is not None and r.get(\"artifact_type\") != artifact_type:\n            continue\n        if page_number is not None and r.get(\"page_number\") != page_number:\n            continue\n        filtered.append(r)\n\n    # Sort\n    desc = sort.startswith(\"-\")\n    field = sort[1:] if desc else sort\n    filtered.sort(key=lambda row: (_stable_key(row, field), str(row.get(\"id\", \"\"))), reverse=desc)\n\n    # Cursor handling (same pattern as outputs)\n    offset = 0\n    if cursor:\n        try:\n            pad = \"=\" * (-len(cursor) % 4)\n            raw = base64.urlsafe_b64decode((cursor + pad).encode(\"utf-8\"))\n            obj = json.loads(raw.decode(\"utf-8\"))\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed\", field=\"cursor\")\n\n        if not isinstance(obj, dict) or obj.get(\"v\") != 1:\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed\", field=\"cursor\")\n\n        exp = obj.get(\"exp\")\n        if not isinstance(exp, str):\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed\", field=\"cursor\")\n        exp_dt = _parse_iso(exp)\n        if exp_dt is None:\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed\", field=\"cursor\")\n        if datetime.datetime.utcnow() > exp_dt:\n            return _err(\"VALIDATION_ERROR\", \"cursor is expired\", field=\"cursor\")\n\n        if obj.get(\"job_id\") != job_id or obj.get(\"artifact_type\") != artifact_type or obj.get(\"page_number\") != page_number or obj.get(\"sort\") != sort:\n            return _err(\"VALIDATION_ERROR\", \"cursor does not match request parameters\", field=\"cursor\")\n\n        if not isinstance(obj.get(\"offset\"), int) or obj[\"offset\"] < 0:\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed\", field=\"cursor\")\n\n        sig = obj.get(\"sig\")\n        if not isinstance(sig, str):\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed\", field=\"cursor\")\n        snapshot = json.dumps([r.get(\"id\") for r in filtered], ensure_ascii=False, separators=(\",\", \":\"))\n        expected = hashlib.sha256((snapshot + f\"|{job_id}|{artifact_type}|{page_number}|{sort}|{obj['offset']}|{exp}\").encode(\"utf-8\")).hexdigest()\n        if sig != expected:\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed or expired\", field=\"cursor\")\n\n        offset = obj[\"offset\"]\n\n    total = len(filtered)\n    page = filtered[offset:offset + limit]\n    next_cursor = None\n    has_more = offset + limit < total\n    if has_more:\n        exp_dt = datetime.datetime.utcnow() + datetime.timedelta(minutes=10)\n        exp = exp_dt.replace(tzinfo=None).isoformat(timespec=\"seconds\") + \"Z\"\n        next_offset = offset + limit\n        snapshot = json.dumps([r.get(\"id\") for r in filtered], ensure_ascii=False, separators=(\",\", \":\"))\n        sig = hashlib.sha256((snapshot + f\"|{job_id}|{artifact_type}|{page_number}|{sort}|{next_offset}|{exp}\").encode(\"utf-8\")).hexdigest()\n        obj = {\n            \"v\": 1,\n            \"job_id\": job_id,\n            \"artifact_type\": artifact_type,\n            \"page_number\": page_number,\n            \"sort\": sort,\n            \"offset\": next_offset,\n            \"exp\": exp,\n            \"sig\": sig,\n        }\n        raw = json.dumps(obj, ensure_ascii=False, separators=(\",\", \":\")).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(raw).decode(\"utf-8\").rstrip(\"=\")\n\n    latency_ms = int((datetime.datetime.utcnow() - started).total_seconds() * 1000)\n    return {\n        \"artifacts\": page,\n        \"pagination\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n        },\n        \"sort\": sort,\n        \"status\": \"ok\",\n        \"latency_ms\": latency_ms,\n    }\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0553000",
+    "index": 553,
+    "name": "MinerU Document Conversion Server",
+    "description": "This backend stores document conversion jobs submitted to the MinerU Document Conversion Server and the produced parse outputs (text/structure/artifacts). It also stores the OCR language catalog exposed by the service so clients can query supported languages, and tracks server-side job lifecycle for",
+    "taxonomy": {
+      "L1_id": "L1-17",
+      "L1_name": "Document & Design",
+      "L1_name_zh": "文档与设计",
+      "L2_id": "L2-42",
+      "L2_name": "Office & Text Processing",
+      "L2_name_zh": "办公与文本处理",
+      "L3_name": "Document Ingestion, OCR & Conversion",
+      "L3_name_zh": "文档导入、OCR与转换"
+    },
+    "database_dir": "./environment_mix/0553000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 4,
+    "n_records": 71,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 5,
+      "read_operations": 5,
+      "mutations_persisted": 2,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_ocr_languages",
+      "returned_chars": 1217
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

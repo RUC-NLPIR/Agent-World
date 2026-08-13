@@ -1,0 +1,186 @@
+{
+  "index": 422,
+  "local_files_dir": "./environment_mix/0422000",
+  "file_list": [
+    "./environment_mix/0422000/README.md",
+    "./environment_mix/0422000/comments.json",
+    "./environment_mix/0422000/tickets.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "tickets.json": "Array of support tickets (ticket_id, subject, status, priority, requester, assignee, created, tags).",
+        "comments.json": "Array of ticket comments (comment_id, ticket_id, author, body, at).",
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "list_tickets",
+          "description": "Returns the tickets in Keystone Support Desk, optionally filtered by status, priority, and/or assignee, and includes the ticket fields needed to identify and triage each result. The request is refused if a provided status is not one of the supported values, or if any filter value is not a string. Filters that don’t match any tickets are allowed and simply return an empty list.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "description": "Optional status filter (open/pending/closed)."
+              },
+              "priority": {
+                "type": "string",
+                "description": "Optional priority filter."
+              },
+              "assignee": {
+                "type": "string",
+                "description": "Optional assignee email filter."
+              }
+            }
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0422000\" if __import__(\"os\").path.isdir(\"./environment_mix/0422000\") else \"/app/database\")\ndef list_tickets(status=None, priority=None, assignee=None):\n    import json\n    with open(__import__(\"os\").path.join(_DB, 'tickets.json')) as f:\n        ts = json.load(f)\n    if status:\n        ts = [t for t in ts if t.get('status') == status]\n    if priority:\n        ts = [t for t in ts if t.get('priority') == priority]\n    if assignee:\n        ts = [t for t in ts if t.get('assignee') == assignee]\n    return ts",
+          "description_restored": true
+        },
+        {
+          "name": "get_ticket",
+          "description": "Returns the ticket identified by ticket_id along with its comments when the ticket exists. The request is refused if ticket_id is missing or not a string; if the ticket cannot be found, the service reports it as not found rather than returning a ticket. Requests are also refused when the caller is not allowed to view that ticket.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "ticket_id": {
+                "type": "string",
+                "description": "Ticket id."
+              }
+            },
+            "required": [
+              "ticket_id"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0422000\" if __import__(\"os\").path.isdir(\"./environment_mix/0422000\") else \"/app/database\")\ndef get_ticket(ticket_id):\n    import json\n    with open(__import__(\"os\").path.join(_DB, 'tickets.json')) as f:\n        ts = json.load(f)\n    with open(__import__(\"os\").path.join(_DB, 'comments.json')) as f:\n        cs = json.load(f)\n    t = next((x for x in ts if x.get('ticket_id') == ticket_id), None)\n    if t is None:\n        return {'found': False, 'ticket_id': ticket_id}\n    out = dict(t)\n    out['comments'] = [c for c in cs if c.get('ticket_id') == ticket_id]\n    return out",
+          "description_restored": true
+        },
+        {
+          "name": "search_tickets",
+          "description": "Searches tickets by subject using a case-insensitive substring match on the provided query and returns the matching tickets. The request is refused if query is missing, not a string, or empty/only whitespace because a searchable term is required. Queries that are valid but match nothing return an empty result set.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Subject substring."
+              }
+            },
+            "required": [
+              "query"
+            ]
+          },
+          "implementation": "def search_tickets(query, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0422000\" if __import__(\"os\").path.isdir(\"./environment_mix/0422000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"search_tickets\"\n    status = \"success\"\n    code_for_log = None\n    resp = None\n\n    # Quota/rate setup (no explicit schema provided; implement minimal observable dynamics)\n    def _utcnow():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ensure_usage_store():\n        meta = _load(\"meta.json\")\n        if not isinstance(meta, dict):\n            meta = {}\n        if \"usage\" not in meta or not isinstance(meta.get(\"usage\"), dict):\n            meta[\"usage\"] = {\"requests\": 0}\n        return meta\n\n    def _enforce_limits(meta):\n        # Simple global rate limit: 120 req/min across all tools\n        # Simple daily quota: 5000 req/day across all tools\n        logs = _load(\"usage.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = datetime.datetime.utcnow()\n        one_min_ago = now - datetime.timedelta(seconds=60)\n        day_ago = now - datetime.timedelta(days=1)\n\n        per_min = 0\n        per_day = 0\n        for r in logs:\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                continue\n            if dt >= one_min_ago:\n                per_min += 1\n            if dt >= day_ago:\n                per_day += 1\n\n        if per_min >= 120:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded. Please retry later.\", limit_per_minute=120)\n        if per_day >= 5000:\n            return _err(\"QUOTA_EXCEEDED\", \"Daily request quota exceeded.\", quota_per_day=5000)\n        return None\n\n    def _log_request(meta, ok, error_obj=None):\n        logs = _load(\"usage.json\")\n        if not isinstance(logs, list):\n            logs = []\n        meta[\"usage\"][\"requests\"] = int(meta[\"usage\"].get(\"requests\") or 0) + 1\n        latency_ms = int(max(0, (time.time() - t0) * 1000))\n        row = {\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"timestamp\": _utcnow(),\n            \"ok\": bool(ok),\n            \"status\": \"success\" if ok else \"error\",\n            \"error_code\": (error_obj or {}).get(\"error\", {}).get(\"code\") if isinstance(error_obj, dict) else None,\n            \"latency_ms\": latency_ms,\n        }\n        logs.append(row)\n        _save(\"usage.json\", logs)\n        _save(\"meta.json\", meta)\n\n    # Enforce unknown params check (tool schema doesn't allow extra)\n    if _extra:\n        meta = _ensure_usage_store()\n        lim = _enforce_limits(meta)\n        if lim:\n            _log_request(meta, False, lim)\n            return lim\n        e = _err(\"VALIDATION_ERROR\", \"Unknown parameter(s) provided.\", unknown_params=sorted(list(_extra.keys())))\n        _log_request(meta, False, e)\n        return e\n\n    meta = _ensure_usage_store()\n    lim = _enforce_limits(meta)\n    if lim:\n        _log_request(meta, False, lim)\n        return lim\n\n    # Validate\n    if not isinstance(query, str):\n        e = _err(\"VALIDATION_ERROR\", \"query must be a string.\")\n        _log_request(meta, False, e)\n        return e\n    if query.strip() == \"\":\n        e = _err(\"VALIDATION_ERROR\", \"query is required and must not be empty.\")\n        _log_request(meta, False, e)\n        return e\n\n    tickets = _load(\"tickets.json\")\n    if not isinstance(tickets, list):\n        tickets = []\n\n    q = query.casefold()\n    matches = []\n    for t in tickets:\n        if not isinstance(t, dict):\n            continue\n        subj = t.get(\"subject\", \"\")\n        if isinstance(subj, str) and q in subj.casefold():\n            matches.append(t)\n\n    resp = {\n        \"tickets\": matches,\n        \"count\": len(matches),\n        \"query\": query,\n    }\n    _log_request(meta, True, None)\n    return resp\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "add_ticket_comment",
+          "description": "Adds a new comment to the specified ticket using the provided author and body, and returns the newly created comment. The request is refused if ticket_id, author, or body is missing or not a string, if the ticket does not exist, or if the ticket is in a state that does not accept new discussion. It is also refused when the author is not permitted to comment on that ticket.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "ticket_id": {
+                "type": "string",
+                "description": "Ticket id."
+              },
+              "author": {
+                "type": "string",
+                "description": "Author email."
+              },
+              "body": {
+                "type": "string",
+                "description": "Comment body."
+              }
+            },
+            "required": [
+              "ticket_id",
+              "author",
+              "body"
+            ]
+          },
+          "implementation": "def add_ticket_comment(ticket_id, author, body, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0422000\" if __import__(\"os\").path.isdir(\"./environment_mix/0422000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"add_ticket_comment\"\n\n    def _utcnow():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ensure_usage_store():\n        meta = _load(\"meta.json\")\n        if not isinstance(meta, dict):\n            meta = {}\n        if \"usage\" not in meta or not isinstance(meta.get(\"usage\"), dict):\n            meta[\"usage\"] = {\"requests\": 0}\n        return meta\n\n    def _enforce_limits(meta):\n        logs = _load(\"usage.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = datetime.datetime.utcnow()\n        one_min_ago = now - datetime.timedelta(seconds=60)\n        day_ago = now - datetime.timedelta(days=1)\n\n        per_min = 0\n        per_day = 0\n        for r in logs:\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                continue\n            if dt >= one_min_ago:\n                per_min += 1\n            if dt >= day_ago:\n                per_day += 1\n\n        if per_min >= 120:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded. Please retry later.\", limit_per_minute=120)\n        if per_day >= 5000:\n            return _err(\"QUOTA_EXCEEDED\", \"Daily request quota exceeded.\", quota_per_day=5000)\n        return None\n\n    def _log_request(meta, ok, error_obj=None):\n        logs = _load(\"usage.json\")\n        if not isinstance(logs, list):\n            logs = []\n        meta[\"usage\"][\"requests\"] = int(meta[\"usage\"].get(\"requests\") or 0) + 1\n        latency_ms = int(max(0, (time.time() - t0) * 1000))\n        row = {\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"timestamp\": _utcnow(),\n            \"ok\": bool(ok),\n            \"status\": \"success\" if ok else \"error\",\n            \"error_code\": (error_obj or {}).get(\"error\", {}).get(\"code\") if isinstance(error_obj, dict) else None,\n            \"latency_ms\": latency_ms,\n        }\n        logs.append(row)\n        _save(\"usage.json\", logs)\n        _save(\"meta.json\", meta)\n\n    # Unknown params are not allowed (not specified)\n    if _extra:\n        meta = _ensure_usage_store()\n        lim = _enforce_limits(meta)\n        if lim:\n            _log_request(meta, False, lim)\n            return lim\n        e = _err(\"VALIDATION_ERROR\", \"Unknown parameter(s) provided.\", unknown_params=sorted(list(_extra.keys())))\n        _log_request(meta, False, e)\n        return e\n\n    meta = _ensure_usage_store()\n    lim = _enforce_limits(meta)\n    if lim:\n        _log_request(meta, False, lim)\n        return lim\n\n    # Validate inputs\n    if not isinstance(ticket_id, str) or ticket_id.strip() == \"\":\n        e = _err(\"VALIDATION_ERROR\", \"ticket_id is required and must be a string.\")\n        _log_request(meta, False, e)\n        return e\n    if not isinstance(author, str) or author.strip() == \"\":\n        e = _err(\"VALIDATION_ERROR\", \"author is required and must be a string.\")\n        _log_request(meta, False, e)\n        return e\n    if not isinstance(body, str) or body.strip() == \"\":\n        e = _err(\"VALIDATION_ERROR\", \"body is required and must be a string.\")\n        _log_request(meta, False, e)\n        return e\n\n    tickets = _load(\"tickets.json\")\n    if not isinstance(tickets, list):\n        tickets = []\n\n    ticket = None\n    for t in tickets:\n        if isinstance(t, dict) and t.get(\"ticket_id\") == ticket_id:\n            ticket = t\n            break\n    if not ticket:\n        e = _err(\"NOT_FOUND\", \"Ticket not found.\", ticket_id=ticket_id)\n        _log_request(meta, False, e)\n        return e\n\n    # Business rules inferred from description:\n    # - Ticket must accept discussion: refuse if solved\n    st = ticket.get(\"status\")\n    if st == \"solved\":\n        e = _err(\"INVALID_TRANSITION\", \"Ticket is solved and does not accept new discussion.\", ticket_id=ticket_id, status=st)\n        _log_request(meta, False, e)\n        return e\n\n    # - Author must be permitted: allow requester or assignee\n    requester = ticket.get(\"requester\")\n    assignee = ticket.get(\"assignee\")\n    if author != requester and author != assignee:\n        e = _err(\"UNAUTHORIZED\", \"Author is not permitted to comment on this ticket.\", ticket_id=ticket_id, author=author)\n        _log_request(meta, False, e)\n        return e\n\n    comments = _load(\"comments.json\")\n    if not isinstance(comments, list):\n        comments = []\n\n    # Generate new comment_id\n    # Convention: comment_<uuid>\n    comment = {\n        \"comment_id\": \"comment_\" + uuid.uuid4().hex,\n        \"ticket_id\": ticket_id,\n        \"author\": author,\n        \"body\": body,\n        \"at\": _utcnow(),\n    }\n\n    comments.append(comment)\n    _save(\"comments.json\", comments)\n\n    resp = {\"comment\": comment}\n    _log_request(meta, True, None)\n    return resp\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "summarize_tickets",
+          "description": "Returns aggregate counts of tickets grouped by status and grouped by priority, optionally restricted to tickets matching the provided status, priority, and/or assignee filters. The request is refused if any filter value is not a string, if status or priority is provided with a value outside the supported enums, or if any unknown parameter is included. Valid filters that match no tickets return a summary with zero counts.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "open",
+                  "pending",
+                  "solved"
+                ],
+                "description": "Optional status filter to restrict which tickets are included in the summary."
+              },
+              "priority": {
+                "type": "string",
+                "enum": [
+                  "high",
+                  "low",
+                  "normal",
+                  "urgent"
+                ],
+                "description": "Optional priority filter to restrict which tickets are included in the summary."
+              },
+              "assignee": {
+                "type": "string",
+                "description": "Optional assignee identifier/email filter to restrict which tickets are included in the summary."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def summarize_tickets(status=None, priority=None, assignee=None, **_extra):\n    import json, os, datetime, time, uuid\n    from collections import Counter\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0422000\" if __import__(\"os\").path.isdir(\"./environment_mix/0422000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"summarize_tickets\"\n\n    def _utcnow():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ensure_usage_store():\n        meta = _load(\"meta.json\")\n        if not isinstance(meta, dict):\n            meta = {}\n        if \"usage\" not in meta or not isinstance(meta.get(\"usage\"), dict):\n            meta[\"usage\"] = {\"requests\": 0}\n        return meta\n\n    def _enforce_limits(meta):\n        logs = _load(\"usage.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = datetime.datetime.utcnow()\n        one_min_ago = now - datetime.timedelta(seconds=60)\n        day_ago = now - datetime.timedelta(days=1)\n\n        per_min = 0\n        per_day = 0\n        for r in logs:\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                continue\n            if dt >= one_min_ago:\n                per_min += 1\n            if dt >= day_ago:\n                per_day += 1\n\n        if per_min >= 120:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded. Please retry later.\", limit_per_minute=120)\n        if per_day >= 5000:\n            return _err(\"QUOTA_EXCEEDED\", \"Daily request quota exceeded.\", quota_per_day=5000)\n        return None\n\n    def _log_request(meta, ok, error_obj=None):\n        logs = _load(\"usage.json\")\n        if not isinstance(logs, list):\n            logs = []\n        meta[\"usage\"][\"requests\"] = int(meta[\"usage\"].get(\"requests\") or 0) + 1\n        latency_ms = int(max(0, (time.time() - t0) * 1000))\n        row = {\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"timestamp\": _utcnow(),\n            \"ok\": bool(ok),\n            \"status\": \"success\" if ok else \"error\",\n            \"error_code\": (error_obj or {}).get(\"error\", {}).get(\"code\") if isinstance(error_obj, dict) else None,\n            \"latency_ms\": latency_ms,\n        }\n        logs.append(row)\n        _save(\"usage.json\", logs)\n        _save(\"meta.json\", meta)\n\n    # Must refuse any unknown parameter\n    if _extra:\n        meta = _ensure_usage_store()\n        lim = _enforce_limits(meta)\n        if lim:\n            _log_request(meta, False, lim)\n            return lim\n        e = _err(\"VALIDATION_ERROR\", \"Unknown parameter(s) provided.\", unknown_params=sorted(list(_extra.keys())))\n        _log_request(meta, False, e)\n        return e\n\n    meta = _ensure_usage_store()\n    lim = _enforce_limits(meta)\n    if lim:\n        _log_request(meta, False, lim)\n        return lim\n\n    # Validate filter types and enums\n    allowed_status = {\"open\", \"pending\", \"solved\"}\n    allowed_priority = {\"high\", \"low\", \"normal\", \"urgent\"}\n\n    if status is not None and not isinstance(status, str):\n        e = _err(\"VALIDATION_ERROR\", \"status must be a string when provided.\")\n        _log_request(meta, False, e)\n        return e\n    if priority is not None and not isinstance(priority, str):\n        e = _err(\"VALIDATION_ERROR\", \"priority must be a string when provided.\")\n        _log_request(meta, False, e)\n        return e\n    if assignee is not None and not isinstance(assignee, str):\n        e = _err(\"VALIDATION_ERROR\", \"assignee must be a string when provided.\")\n        _log_request(meta, False, e)\n        return e\n\n    if status is not None and status not in allowed_status:\n        e = _err(\"VALIDATION_ERROR\", \"Invalid status value.\", allowed=sorted(list(allowed_status)))\n        _log_request(meta, False, e)\n        return e\n    if priority is not None and priority not in allowed_priority:\n        e = _err(\"VALIDATION_ERROR\", \"Invalid priority value.\", allowed=sorted(list(allowed_priority)))\n        _log_request(meta, False, e)\n        return e\n\n    tickets = _load(\"tickets.json\")\n    if not isinstance(tickets, list):\n        tickets = []\n\n    filtered = []\n    for t in tickets:\n        if not isinstance(t, dict):\n            continue\n        if status is not None and t.get(\"status\") != status:\n            continue\n        if priority is not None and t.get(\"priority\") != priority:\n            continue\n        if assignee is not None and t.get(\"assignee\") != assignee:\n            continue\n        filtered.append(t)\n\n    by_status = Counter()\n    by_priority = Counter()\n    for t in filtered:\n        s = t.get(\"status\")\n        p = t.get(\"priority\")\n        if isinstance(s, str):\n            by_status[s] += 1\n        if isinstance(p, str):\n            by_priority[p] += 1\n\n    resp = {\n        \"total\": len(filtered),\n        \"filters\": {\"status\": status, \"priority\": priority, \"assignee\": assignee},\n        \"by_status\": dict(by_status),\n        \"by_priority\": dict(by_priority),\n    }\n    _log_request(meta, True, None)\n    return resp\n",
+          "params_reconstructed": true,
+          "description_restored": true,
+          "implementation_repaired": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0422000",
+    "index": 422,
+    "name": "Keystone Support Desk",
+    "description": "A customer support ticketing service that lets teams track issues, search and retrieve tickets, add discussion comments, and generate ticket summaries.",
+    "taxonomy": {
+      "L1_id": "L1-20",
+      "L1_name": "Communication & General Utilities",
+      "L1_name_zh": "通信与通用工具",
+      "L2_id": "L2-48",
+      "L2_name": "Messaging & Notification",
+      "L2_name_zh": "即时通信与通知",
+      "L3_name": "Support Ticketing & Service Desk",
+      "L3_name_zh": "工单与服务台"
+    },
+    "database_dir": "./environment_mix/0422000",
+    "mount_path": "/app/database",
+    "n_tools": 5,
+    "n_collections": 2,
+    "n_records": 368,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 5,
+      "loaded": 5,
+      "reads_returning_data": 3,
+      "read_operations": 3,
+      "mutations_persisted": 1,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 5,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_tickets",
+      "returned_chars": 449
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

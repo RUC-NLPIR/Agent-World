@@ -1,0 +1,241 @@
+{
+  "index": 404,
+  "local_files_dir": "./environment_mix/0404000",
+  "file_list": [
+    "./environment_mix/0404000/README.md",
+    "./environment_mix/0404000/api_clients.json",
+    "./environment_mix/0404000/generation_requests.json",
+    "./environment_mix/0404000/image_assets.json",
+    "./environment_mix/0404000/request_logs.json",
+    "./environment_mix/0404000/usage_daily.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "api_clients.json": "12 rows",
+        "generation_requests.json": "19 rows",
+        "image_assets.json": "19 rows",
+        "usage_daily.json": "12 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "image_generation",
+          "description": "Creates a text-to-image generation request from an English `image_prompt` and optional `width`/`height` (default 1024×1024), queues it for processing, and returns the generated image asset URL(s) when available. Raises VALIDATION_ERROR if `image_prompt` is missing/empty or if `width`/`height` are not integers or otherwise invalid. Raises UNAUTHORIZED if the API client is not authenticated/allowed to create generation requests, and raises QUOTA_EXCEEDED when the client has exceeded its generation limits.",
+          "parameters": {
+            "properties": {
+              "image_prompt": {
+                "title": "Image Prompt",
+                "type": "string"
+              },
+              "width": {
+                "default": 1024,
+                "title": "Width",
+                "type": "integer"
+              },
+              "height": {
+                "default": 1024,
+                "title": "Height",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "image_prompt"
+            ],
+            "title": "image_generationArguments",
+            "type": "object"
+          },
+          "implementation": "def image_generation(image_prompt, width=None, height=None, **_extra):\n    import json, os, datetime, time, uuid, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0404000\" if __import__(\"os\").path.isdir(\"./environment_mix/0404000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    # Minimal request logging even though no explicit log collection is declared.\n    def _log(status, client_id=None, details=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            row = {\n                \"id\": \"reqlog_\" + uuid.uuid4().hex,\n                \"endpoint\": \"image_generation\",\n                \"client_id\": client_id,\n                \"status\": status,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": now.isoformat(),\n                \"details\": details or {}\n            }\n            logs.append(row)\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            return\n\n    # Validate inputs\n    if not isinstance(image_prompt, str) or len(image_prompt.strip()) == 0:\n        _log(\"error\", None, {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"image_prompt must be a non-empty string.\")\n    prompt = image_prompt.strip()\n    if len(prompt) < 1 or len(prompt) > 4000:\n        _log(\"error\", None, {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"image_prompt length must be between 1 and 4000 characters.\")\n\n    if width is None:\n        width = 1024\n    if height is None:\n        height = 1024\n    if not isinstance(width, int) or not isinstance(height, int):\n        _log(\"error\", None, {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"width and height must be integers.\")\n    if not (64 <= width <= 4096) or not (64 <= height <= 4096) or (width % 8 != 0) or (height % 8 != 0):\n        _log(\"error\", None, {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"width and height must be in [64,4096] and divisible by 8.\",\n                    error_code=\"invalid_dimensions\")\n\n    # Authenticate ambiently: pick an active client that can serve the call.\n    clients = _load(\"api_clients.json\")\n    if not isinstance(clients, list):\n        clients = []\n    active_clients = [c for c in clients if isinstance(c, dict) and c.get(\"status\") == \"active\"]\n    if not active_clients:\n        _log(\"error\", None, {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"No active API client is available for this request.\")\n    # Choose a client that has non-negative quotas (schema constraints) and is able to accept at least 1 request.\n    def _qint(v):\n        try:\n            return int(v)\n        except Exception:\n            return None\n    chosen = None\n    for c in active_clients:\n        qr = _qint(c.get(\"quota_requests_per_day\"))\n        qp = _qint(c.get(\"quota_pixels_per_day\"))\n        if qr is None or qp is None or qr < 0 or qp < 0:\n            continue\n        chosen = c\n        break\n    if not chosen:\n        _log(\"error\", None, {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"No eligible API client is available for this request.\")\n    client_id = chosen.get(\"id\")\n\n    # Enforce quotas: usage_daily per (client_id, today_utc)\n    usage = _load(\"usage_daily.json\")\n    if not isinstance(usage, list):\n        usage = []\n    day = now.astimezone(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)\n    day_iso = day.isoformat()\n    usage_row = None\n    for r in usage:\n        if isinstance(r, dict) and r.get(\"client_id\") == client_id and r.get(\"usage_date\") == day_iso:\n            usage_row = r\n            break\n\n    reqs_used = int(usage_row.get(\"requests_count\", 0)) if usage_row else 0\n    px_used = int(usage_row.get(\"pixels_count\", 0)) if usage_row else 0\n    px_add = width * height\n\n    quota_r = int(chosen.get(\"quota_requests_per_day\", 0))\n    quota_p = int(chosen.get(\"quota_pixels_per_day\", 0))\n\n    # If quota is 0, no requests allowed.\n    if reqs_used + 1 > quota_r or px_used + px_add > quota_p:\n        _log(\"error\", client_id, {\"code\": \"QUOTA_EXCEEDED\"})\n        return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\", error_code=\"quota_exceeded\",\n                    quota_requests_per_day=quota_r, quota_pixels_per_day=quota_p,\n                    requests_used=reqs_used, pixels_used=px_used)\n\n    # Idempotency: tool has no idempotency_key parameter; support via _extra if provided.\n    idempotency_key = _extra.get(\"idempotency_key\", None)\n    if idempotency_key is not None and not isinstance(idempotency_key, str):\n        _log(\"error\", client_id, {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"idempotency_key must be a string when provided.\")\n\n    gen_reqs = _load(\"generation_requests.json\")\n    if not isinstance(gen_reqs, list):\n        gen_reqs = []\n    if idempotency_key:\n        for r in gen_reqs:\n            if isinstance(r, dict) and r.get(\"client_id\") == client_id and r.get(\"idempotency_key\") == idempotency_key:\n                # Return existing request result without incrementing usage.\n                rid = r.get(\"id\")\n                assets = _load(\"image_assets.json\")\n                if not isinstance(assets, list):\n                    assets = []\n                urls = []\n                if r.get(\"status\") == \"succeeded\":\n                    for a in assets:\n                        if isinstance(a, dict) and a.get(\"request_id\") == rid and a.get(\"status\") == \"available\":\n                            pu = a.get(\"public_url\")\n                            if isinstance(pu, str) and pu:\n                                urls.append(pu)\n                body = {\n                    \"request\": r,\n                    \"image_urls\": urls\n                }\n                _log(\"ok\", client_id, {\"idempotent_replay\": True, \"request_id\": rid})\n                return body\n\n    # Accept request: create generation_requests row\n    def _new_id(prefix):\n        return prefix + \"_\" + uuid.uuid4().hex\n\n    created_at = now.isoformat()\n    req_id = _new_id(\"genreq\")\n    # Ensure uniqueness\n    existing_ids = {r.get(\"id\") for r in gen_reqs if isinstance(r, dict)}\n    while req_id in existing_ids:\n        req_id = _new_id(\"genreq\")\n\n    # Detect prompt language: tool requires English; mark unknown if non-ascii heavy.\n    ascii_ratio = sum(1 for ch in prompt if ord(ch) < 128) / max(1, len(prompt))\n    prompt_language = \"en\" if ascii_ratio > 0.9 else \"unknown\"\n\n    req_row = {\n        \"id\": req_id,\n        \"client_id\": client_id,\n        \"image_prompt\": prompt,\n        \"width\": width,\n        \"height\": height,\n        \"prompt_language\": prompt_language,\n        \"expanded_prompt_en\": None,\n        \"status\": \"queued\",\n        \"error_code\": None,\n        \"error_message\": None,\n        \"source_ip\": _extra.get(\"source_ip\") if isinstance(_extra.get(\"source_ip\", None), str) else None,\n        \"idempotency_key\": idempotency_key,\n        \"requested_at\": created_at,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"created_at\": created_at,\n        \"updated_at\": created_at\n    }\n\n    # Enforce unique(client_id, idempotency_key) where idempotency_key not null\n    if idempotency_key:\n        for r in gen_reqs:\n            if isinstance(r, dict) and r.get(\"client_id\") == client_id and r.get(\"idempotency_key\") == idempotency_key:\n                # Another concurrent write may have created it; return that.\n                rid = r.get(\"id\")\n                _log(\"ok\", client_id, {\"idempotent_replay\": True, \"request_id\": rid})\n                return {\"request\": r, \"image_urls\": []}\n\n    # Persist request and usage update atomically-ish (best effort)\n    gen_reqs.append(req_row)\n    _save(\"generation_requests.json\", gen_reqs)\n\n    if usage_row is None:\n        usage_row = {\n            \"id\": _new_id(\"usage\"),\n            \"client_id\": client_id,\n            \"usage_date\": day_iso,\n            \"requests_count\": 0,\n            \"pixels_count\": 0,\n            \"created_at\": created_at,\n            \"updated_at\": created_at\n        }\n        usage.append(usage_row)\n\n    usage_row[\"requests_count\"] = int(usage_row.get(\"requests_count\", 0)) + 1\n    usage_row[\"pixels_count\"] = int(usage_row.get(\"pixels_count\", 0)) + px_add\n    usage_row[\"updated_at\"] = created_at\n    _save(\"usage_daily.json\", usage)\n\n    # Update api client last_used_at\n    for c in clients:\n        if isinstance(c, dict) and c.get(\"id\") == client_id:\n            c[\"last_used_at\"] = created_at\n            c[\"updated_at\"] = created_at\n            break\n    _save(\"api_clients.json\", clients)\n\n    _log(\"ok\", client_id, {\"request_id\": req_id})\n    return {\n        \"request\": req_row,\n        \"image_urls\": []\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_generation_requests",
+          "description": "Lists generation requests belonging to the authenticated API client, newest first, with optional filtering by status and time range. Refuses with UNAUTHORIZED if the API key is missing/invalid.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "Filter by request status."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Filter by an exact idempotency key."
+              },
+              "created_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Return requests created at or after this UTC timestamp."
+              },
+              "created_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Return requests created before this UTC timestamp."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of items to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor returned by a previous call."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_generation_requests(status=None, idempotency_key=None, created_after=None, created_before=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0404000\" if __import__(\"os\").path.isdir(\"./environment_mix/0404000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    def _log(status_s, client_id=None, details=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            logs.append({\n                \"id\": \"reqlog_\" + uuid.uuid4().hex,\n                \"endpoint\": \"list_generation_requests\",\n                \"client_id\": client_id,\n                \"status\": status_s,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": now.isoformat(),\n                \"details\": details or {}\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            return\n\n    # Validate filters\n    allowed_status = {\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            _log(\"error\", None, {\"code\": \"VALIDATION_ERROR\"})\n            return _err(\"VALIDATION_ERROR\", \"Invalid status filter.\")\n    if idempotency_key is not None and not isinstance(idempotency_key, str):\n        _log(\"error\", None, {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"idempotency_key must be a string.\")\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            raise ValueError(field)\n        try:\n            d = datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n            if d.tzinfo is None:\n                d = d.replace(tzinfo=datetime.timezone.utc)\n            return d.astimezone(datetime.timezone.utc)\n        except Exception:\n            raise ValueError(field)\n\n    try:\n        ca = _parse_dt(created_after, \"created_after\")\n        cb = _parse_dt(created_before, \"created_before\")\n    except ValueError as e:\n        _log(\"error\", None, {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", f\"Invalid date-time for {str(e)} (expected ISO 8601).\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        _log(\"error\", None, {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200.\")\n\n    # Authenticate ambiently\n    clients = _load(\"api_clients.json\")\n    if not isinstance(clients, list):\n        clients = []\n    active_clients = [c for c in clients if isinstance(c, dict) and c.get(\"status\") == \"active\"]\n    if not active_clients:\n        _log(\"error\", None, {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"No active API client is available for this request.\")\n    client_id = active_clients[0].get(\"id\")\n\n    # Pagination cursor is an opaque created_at|id marker\n    cursor_dt = None\n    cursor_id = None\n    if cursor is not None:\n        if not isinstance(cursor, str) or \"|\" not in cursor:\n            _log(\"error\", client_id, {\"code\": \"VALIDATION_ERROR\"})\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n        a, b = cursor.split(\"|\", 1)\n        try:\n            cursor_dt = datetime.datetime.fromisoformat(a.replace(\"Z\", \"+00:00\"))\n            if cursor_dt.tzinfo is None:\n                cursor_dt = cursor_dt.replace(tzinfo=datetime.timezone.utc)\n            cursor_dt = cursor_dt.astimezone(datetime.timezone.utc)\n        except Exception:\n            _log(\"error\", client_id, {\"code\": \"VALIDATION_ERROR\"})\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n        cursor_id = b\n\n    gen_reqs = _load(\"generation_requests.json\")\n    if not isinstance(gen_reqs, list):\n        gen_reqs = []\n\n    def _dt(row):\n        v = row.get(\"created_at\")\n        if not isinstance(v, str):\n            return None\n        try:\n            d = datetime.datetime.fromisoformat(v.replace(\"Z\", \"+00:00\"))\n            if d.tzinfo is None:\n                d = d.replace(tzinfo=datetime.timezone.utc)\n            return d.astimezone(datetime.timezone.utc)\n        except Exception:\n            return None\n\n    rows = []\n    for r in gen_reqs:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"client_id\") != client_id:\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        if idempotency_key is not None and r.get(\"idempotency_key\") != idempotency_key:\n            continue\n        d = _dt(r)\n        if ca is not None and (d is None or d < ca):\n            continue\n        if cb is not None and (d is None or d >= cb):\n            continue\n        if cursor_dt is not None:\n            # newest first: skip anything >= cursor marker (already seen)\n            if d is None:\n                continue\n            rid = r.get(\"id\")\n            if d > cursor_dt:\n                continue\n            if d == cursor_dt and isinstance(rid, str) and isinstance(cursor_id, str) and rid >= cursor_id:\n                continue\n        rows.append(r)\n\n    # Sort newest first by created_at then id\n    def _sort_key(r):\n        d = _dt(r)\n        # None goes last\n        if d is None:\n            d = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n        rid = r.get(\"id\")\n        if not isinstance(rid, str):\n            rid = \"\"\n        return (d, rid)\n\n    rows.sort(key=_sort_key, reverse=True)\n\n    total = len(rows)\n    page = rows[:limit]\n    has_more = total > len(page)\n\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        last_dt = _dt(last)\n        last_id = last.get(\"id\") if isinstance(last.get(\"id\"), str) else \"\"\n        if last_dt is not None:\n            next_cursor = f\"{last_dt.isoformat()}|{last_id}\"\n\n    _log(\"ok\", client_id, {\"returned\": len(page), \"has_more\": has_more})\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor\n        }\n    }\n"
+        },
+        {
+          "name": "get_generation_request",
+          "description": "Fetches a single generation request by id (including its status and any terminal error fields) for the authenticated API client. Refuses with NOT_FOUND if the id does not exist or is not owned by the caller, and UNAUTHORIZED if the API key is missing/invalid.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Generation request id."
+              },
+              "include_assets": {
+                "type": "boolean",
+                "default": false,
+                "description": "If true, also returns any image assets for the request."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_generation_request(id, include_assets=None, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0404000\" if __import__(\"os\").path.isdir(\"./environment_mix/0404000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now_dt.replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _log(status_s, client_id=None, code=None, details=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"reqlog_\" + uuid.uuid4().hex,\n            \"endpoint\": \"get_generation_request\",\n            \"client_id\": client_id,\n            \"status\": status_s,\n            \"code\": code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": now_iso,\n            \"details\": details or {}\n        })\n        _save(\"request_logs.json\", logs)\n\n    # Validate inputs\n    if not isinstance(id, str) or not id.strip():\n        _log(\"error\", None, \"VALIDATION_ERROR\", {\"field\": \"id\"})\n        return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string.\", field=\"id\")\n\n    if include_assets is None:\n        include_assets = False\n    if not isinstance(include_assets, bool):\n        _log(\"error\", None, \"VALIDATION_ERROR\", {\"field\": \"include_assets\"})\n        return _err(\"VALIDATION_ERROR\", \"include_assets must be a boolean.\", field=\"include_assets\")\n\n    gen_reqs = _load(\"generation_requests.json\")\n    if not isinstance(gen_reqs, list):\n        gen_reqs = []\n\n    req = None\n    for r in gen_reqs:\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            req = r\n            break\n\n    if req is None:\n        _log(\"error\", None, \"NOT_FOUND\", {\"id\": id})\n        return _err(\"NOT_FOUND\", \"Generation request not found.\")\n\n    # Ambient auth: signature has no credential, so do NOT reject due to \"missing/invalid API key\".\n    # Ownership is inferred from the request row itself; \"deleted\" clients still own historical data.\n    clients = _load(\"api_clients.json\")\n    if not isinstance(clients, list):\n        clients = []\n    owner_id = req.get(\"client_id\")\n    owner = None\n    if isinstance(owner_id, str) and owner_id:\n        for c in clients:\n            if isinstance(c, dict) and c.get(\"id\") == owner_id:\n                owner = c\n                break\n    if owner is None:\n        # If the client row truly doesn't exist, treat as not found to avoid leaking ids\n        _log(\"error\", owner_id, \"NOT_FOUND\", {\"id\": id, \"reason\": \"owner_missing\"})\n        return _err(\"NOT_FOUND\", \"Generation request not found.\")\n\n    out = dict(req)\n\n    if include_assets:\n        assets = _load(\"image_assets.json\")\n        if not isinstance(assets, list):\n            assets = []\n        req_assets = []\n        for a in assets:\n            if isinstance(a, dict) and a.get(\"request_id\") == id:\n                req_assets.append(dict(a))\n        out[\"assets\"] = req_assets\n\n    _log(\"ok\", owner_id, None, {\"include_assets\": include_assets})\n    return {\"generation_request\": out}\n"
+        },
+        {
+          "name": "cancel_generation_request",
+          "description": "Cancels a queued or running generation request owned by the authenticated API client by transitioning it to status='cancelled'. Refuses with CONFLICT if the request is already terminal, NOT_FOUND if not owned/found, and UNAUTHORIZED if the API key is missing/invalid.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Generation request id to cancel."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def cancel_generation_request(id, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0404000\" if __import__(\"os\").path.isdir(\"./environment_mix/0404000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now_dt.replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _log(status_s, client_id=None, code=None, details=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"reqlog_\" + uuid.uuid4().hex,\n            \"endpoint\": \"cancel_generation_request\",\n            \"client_id\": client_id,\n            \"status\": status_s,\n            \"code\": code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": now_iso,\n            \"details\": details or {}\n        })\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(id, str) or not id.strip():\n        _log(\"error\", None, \"VALIDATION_ERROR\", {\"field\": \"id\"})\n        return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string.\", field=\"id\")\n\n    gen_reqs = _load(\"generation_requests.json\")\n    if not isinstance(gen_reqs, list):\n        gen_reqs = []\n\n    idx = None\n    req = None\n    for i, r in enumerate(gen_reqs):\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            idx = i\n            req = r\n            break\n\n    if req is None:\n        _log(\"error\", None, \"NOT_FOUND\", {\"id\": id})\n        return _err(\"NOT_FOUND\", \"Generation request not found.\")\n\n    # Ambient auth: no credential param, so infer ownership from request row.\n    clients = _load(\"api_clients.json\")\n    if not isinstance(clients, list):\n        clients = []\n    owner_id = req.get(\"client_id\")\n    owner = None\n    if isinstance(owner_id, str) and owner_id:\n        for c in clients:\n            if isinstance(c, dict) and c.get(\"id\") == owner_id:\n                owner = c\n                break\n    if owner is None:\n        _log(\"error\", owner_id, \"NOT_FOUND\", {\"id\": id, \"reason\": \"owner_missing\"})\n        return _err(\"NOT_FOUND\", \"Generation request not found.\")\n\n    status = req.get(\"status\")\n    if status not in (\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"):\n        _log(\"error\", owner_id, \"CONFLICT\", {\"id\": id, \"reason\": \"unknown_status\", \"status\": status})\n        return _err(\"CONFLICT\", \"Generation request is in an unknown state and cannot be cancelled.\", status=status)\n\n    # Lifecycle: only queued/running -> cancelled allowed. Terminals refuse with CONFLICT.\n    if status in (\"succeeded\", \"failed\", \"cancelled\"):\n        _log(\"error\", owner_id, \"CONFLICT\", {\"id\": id, \"status\": status})\n        return _err(\"CONFLICT\", \"Generation request is already terminal and cannot be cancelled.\", status=status)\n\n    # Transition queued/running -> cancelled\n    updated = dict(req)\n    updated[\"status\"] = \"cancelled\"\n    updated[\"finished_at\"] = now_iso\n    updated[\"updated_at\"] = now_iso\n    if not updated.get(\"started_at\") and status == \"running\":\n        updated[\"started_at\"] = now_iso  # best-effort consistency\n\n    gen_reqs[idx] = updated\n    _save(\"generation_requests.json\", gen_reqs)\n\n    _log(\"ok\", owner_id, None, {\"from_status\": status, \"to_status\": \"cancelled\"})\n    return {\"generation_request\": updated}\n"
+        },
+        {
+          "name": "list_image_assets",
+          "description": "Lists image assets for the authenticated API client, optionally filtered by generation request and/or asset status. Refuses with UNAUTHORIZED if the API key is missing/invalid.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "description": "Filter assets belonging to a specific generation request id."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "creating",
+                  "available",
+                  "deleted"
+                ],
+                "description": "Filter by asset status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of items to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor returned by a previous call."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_image_assets(request_id=None, status=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, hashlib, base64, urllib.parse\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0404000\" if __import__(\"os\").path.isdir(\"./environment_mix/0404000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # --- Ambient authentication resolution (must find an active client that can serve reads) ---\n    clients = _load(\"api_clients.json\")\n    authed_client = None\n    for c in clients:\n        if c.get(\"status\") == \"active\":\n            authed_client = c\n            break\n    # Record call in audit/usage collection if present; spec says usage/audit must be recorded on EVERY call.\n    # Only usage_daily exists; we will append a non-counter \"audit style\" row only when schema has one.\n    # Since it doesn't, we will still update client last_used_at on successful authenticated requests.\n    if authed_client is None:\n        return _err(\"UNAUTHORIZED\", \"API key missing/invalid (no active client context available).\")\n\n    # --- Validate inputs ---\n    if request_id is not None and not isinstance(request_id, str):\n        return _err(\"VALIDATION_ERROR\", \"request_id must be a string.\")\n    if status is not None:\n        if not isinstance(status, str):\n            return _err(\"VALIDATION_ERROR\", \"status must be a string.\")\n        if status not in (\"creating\", \"available\", \"deleted\"):\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: creating, available, deleted.\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer.\")\n    if limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200.\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n\n    # --- Load data ---\n    assets = _load(\"image_assets.json\")\n    reqs = _load(\"generation_requests.json\")\n\n    # Build request lookup and enforce ownership via generation_requests.client_id\n    req_by_id = {r.get(\"id\"): r for r in reqs if isinstance(r, dict)}\n\n    if request_id is not None:\n        r = req_by_id.get(request_id)\n        if r is None or r.get(\"client_id\") != authed_client.get(\"id\"):\n            # For list, returning empty is acceptable for non-matching filters;\n            # but tool description implies auth-based ownership. We keep it empty, not error.\n            filtered = []\n        else:\n            filtered = [a for a in assets if isinstance(a, dict) and a.get(\"request_id\") == request_id]\n    else:\n        # All assets whose request belongs to client\n        filtered = []\n        for a in assets:\n            if not isinstance(a, dict):\n                continue\n            rid = a.get(\"request_id\")\n            r = req_by_id.get(rid)\n            if r is not None and r.get(\"client_id\") == authed_client.get(\"id\"):\n                filtered.append(a)\n\n    if status is not None:\n        filtered = [a for a in filtered if a.get(\"status\") == status]\n\n    # Sort deterministically by created_at then id\n    def _key(a):\n        ca = a.get(\"created_at\") or \"\"\n        return (ca, a.get(\"id\") or \"\")\n    filtered.sort(key=_key)\n\n    # Cursor handling: opaque base64 of last seen id\n    start = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\").decode(\"utf-8\")\n            # raw format: \"id:<asset_id>\"\n            if raw.startswith(\"id:\"):\n                last_id = raw[3:]\n                # find first item strictly after last_id in the current sorted list, comparing by id within same ordering\n                # We'll advance by scanning for exact id match then start after it.\n                for i, a in enumerate(filtered):\n                    if a.get(\"id\") == last_id:\n                        start = i + 1\n                        break\n            else:\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n    page = filtered[start:start + limit]\n    has_more = (start + limit) < len(filtered)\n    next_cursor = None\n    if has_more and page:\n        next_cursor = base64.urlsafe_b64encode((\"id:\" + str(page[-1].get(\"id\"))).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    # Update last_used_at for successful authenticated call\n    authed_client[\"last_used_at\"] = now\n    authed_client[\"updated_at\"] = now\n    # persist the client update\n    for i, c in enumerate(clients):\n        if c.get(\"id\") == authed_client.get(\"id\"):\n            clients[i] = authed_client\n            break\n    _save(\"api_clients.json\", clients)\n\n    latency_ms = int((time.time() - t0) * 1000)\n\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": len(filtered),\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"cursor\": cursor,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": now\n        }\n    }\n"
+        },
+        {
+          "name": "get_image_asset",
+          "description": "Fetches a single image asset by id for the authenticated API client, including its public_url when available. Refuses with NOT_FOUND if the id does not exist or is not owned by the caller, and UNAUTHORIZED if the API key is missing/invalid.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Image asset id."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_image_asset(id, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0404000\" if __import__(\"os\").path.isdir(\"./environment_mix/0404000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now_dt.replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _log(status_s, client_id=None, code=None, details=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"reqlog_\" + uuid.uuid4().hex,\n            \"endpoint\": \"get_image_asset\",\n            \"client_id\": client_id,\n            \"status\": status_s,\n            \"code\": code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": now_iso,\n            \"details\": details or {}\n        })\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(id, str) or not id.strip():\n        _log(\"error\", None, \"VALIDATION_ERROR\", {\"field\": \"id\"})\n        return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string.\", field=\"id\")\n\n    assets = _load(\"image_assets.json\")\n    if not isinstance(assets, list):\n        assets = []\n\n    asset = None\n    for a in assets:\n        if isinstance(a, dict) and a.get(\"id\") == id:\n            asset = a\n            break\n    if asset is None:\n        _log(\"error\", None, \"NOT_FOUND\", {\"id\": id})\n        return _err(\"NOT_FOUND\", \"Image asset not found.\")\n\n    # Resolve parent request (and therefore owner). Deleted clients still can read historical rows.\n    gen_reqs = _load(\"generation_requests.json\")\n    if not isinstance(gen_reqs, list):\n        gen_reqs = []\n    req_id = asset.get(\"request_id\")\n    req = None\n    if isinstance(req_id, str) and req_id:\n        for r in gen_reqs:\n            if isinstance(r, dict) and r.get(\"id\") == req_id:\n                req = r\n                break\n    if req is None:\n        _log(\"error\", None, \"NOT_FOUND\", {\"id\": id, \"reason\": \"parent_request_missing\"})\n        return _err(\"NOT_FOUND\", \"Image asset not found.\")\n\n    clients = _load(\"api_clients.json\")\n    if not isinstance(clients, list):\n        clients = []\n    owner_id = req.get(\"client_id\")\n    owner = None\n    if isinstance(owner_id, str) and owner_id:\n        for c in clients:\n            if isinstance(c, dict) and c.get(\"id\") == owner_id:\n                owner = c\n                break\n    if owner is None:\n        _log(\"error\", owner_id, \"NOT_FOUND\", {\"id\": id, \"reason\": \"owner_missing\"})\n        return _err(\"NOT_FOUND\", \"Image asset not found.\")\n\n    _log(\"ok\", owner_id, None, {\"request_id\": req_id})\n    return {\"image_asset\": dict(asset)}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0404000",
+    "index": 404,
+    "name": "text2image",
+    "description": "This backend stores text-to-image generation requests, the resulting generated images, and the API clients that create them. The main workflow is: an API client submits an image_generation request (prompt + width/height), a generation job is created and processed, and one or more image assets are st",
+    "taxonomy": {
+      "L1_id": "L1-11",
+      "L1_name": "AI & Machine Learning",
+      "L1_name_zh": "人工智能与机器学习",
+      "L2_id": "L2-29",
+      "L2_name": "Image & Multimedia Generation",
+      "L2_name_zh": "图像与多媒体生成",
+      "L3_name": "General Text-to-Image Job Servers",
+      "L3_name_zh": "通用文生图任务服务"
+    },
+    "database_dir": "./environment_mix/0404000",
+    "mount_path": "/app/database",
+    "n_tools": 6,
+    "n_collections": 4,
+    "n_records": 62,
+    "n_questions": 2,
+    "execution_audit": {
+      "tools": 6,
+      "loaded": 6,
+      "reads_returning_data": 2,
+      "read_operations": 4,
+      "mutations_persisted": 1,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 6,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_generation_requests",
+      "returned_chars": 87
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

@@ -1,0 +1,590 @@
+{
+  "index": 166,
+  "local_files_dir": "./environment_mix/0166000",
+  "file_list": [
+    "./environment_mix/0166000/README.md",
+    "./environment_mix/0166000/collections.json",
+    "./environment_mix/0166000/document_revisions.json",
+    "./environment_mix/0166000/document_search_index.json",
+    "./environment_mix/0166000/documents.json",
+    "./environment_mix/0166000/request_logs.json",
+    "./environment_mix/0166000/workspaces.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "workspaces.json": "12 rows",
+        "collections.json": "12 rows",
+        "documents.json": "35 rows",
+        "document_revisions.json": "31 rows",
+        "document_search_index.json": "35 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "create_document",
+          "description": "Creates a new document in the given collection (optionally nested under a parent document) and returns the created document record. Raises VALIDATION_ERROR if required fields are missing, IDs don’t match the required format, status is not one of the allowed values, or published_at is provided in an invalid date-time format; raises NOT_FOUND if the workspace, collection, or parent document does not exist. Raises FORBIDDEN if you don’t have permission to create documents in the target collection or workspace, and CONFLICT if the parent_document_id is not in the same collection as the new document or if a published document is created without a valid published_at when required by policy.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^out_ws_[0-9A-Z]{18,}$",
+                "description": "ID of the workspace that will own the document."
+              },
+              "collection_id": {
+                "type": "string",
+                "pattern": "^out_col_[0-9A-Z]{18,}$",
+                "description": "ID of the collection to create the document in."
+              },
+              "parent_document_id": {
+                "type": "string",
+                "pattern": "^out_doc_[0-9A-Z]{18,}$",
+                "description": "Optional parent document ID to nest this document under."
+              },
+              "title": {
+                "type": "string",
+                "description": "Document title."
+              },
+              "text": {
+                "type": "string",
+                "description": "Document body/content in plain text/markdown."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "published",
+                  "archived"
+                ],
+                "description": "Initial document status."
+              },
+              "published_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Publish timestamp when creating a published document."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "collection_id",
+              "title",
+              "text"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_document(workspace_id, collection_id, title, text, parent_document_id=None, status=None, published_at=None, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0166000\" if __import__(\"os\").path.isdir(\"./environment_mix/0166000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"create_document\"\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if not isinstance(dt, datetime.datetime):\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None, None\n        if not isinstance(s, str):\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be a date-time string\", field=field)\n        try:\n            dt = datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n        except ValueError:\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} is not a valid date-time format\", field=field)\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc), None\n\n    def _append_request_log(status_code, **extra):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": f\"out_req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": endpoint,\n            \"timestamp\": _iso(_now()),\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if extra:\n            row.update(extra)\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _enforce_rate_limit():\n        policy = _load(\"rate_limits.json\")\n        if not isinstance(policy, list) or not policy:\n            return None\n        p = None\n        for r in policy:\n            if isinstance(r, dict) and r.get(\"endpoint\") == endpoint:\n                p = r\n                break\n        if not p:\n            return None\n        window_s = p.get(\"window_seconds\")\n        limit_ = p.get(\"limit\")\n        if not isinstance(window_s, int) or not isinstance(limit_, int) or window_s <= 0 or limit_ <= 0:\n            return None\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        cutoff = _now() - datetime.timedelta(seconds=window_s)\n        cnt = 0\n        for r in logs:\n            if not isinstance(r, dict) or r.get(\"endpoint\") != endpoint:\n                continue\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\"))\n            except ValueError:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt >= cutoff:\n                cnt += 1\n        if cnt >= limit_:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n        return None\n\n    # Validate inputs\n    try:\n        rl = _enforce_rate_limit()\n        if rl:\n            _append_request_log(\"RATE_LIMIT\")\n            return rl\n\n        if not isinstance(workspace_id, str) or not re.match(r\"^out_ws_[0-9A-Z]{18,}$\", workspace_id):\n            _append_request_log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"workspace_id is malformed\", field=\"workspace_id\")\n        if not isinstance(collection_id, str) or not re.match(r\"^out_col_[0-9A-Z]{18,}$\", collection_id):\n            _append_request_log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"collection_id is malformed\", field=\"collection_id\")\n        if parent_document_id is not None and (not isinstance(parent_document_id, str) or not re.match(r\"^out_doc_[0-9A-Z]{18,}$\", parent_document_id)):\n            _append_request_log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"parent_document_id is malformed\", field=\"parent_document_id\")\n        if not isinstance(title, str) or title.strip() == \"\":\n            _append_request_log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"title must be a non-empty string\", field=\"title\")\n        if not isinstance(text, str):\n            _append_request_log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"text must be a string\", field=\"text\")\n        if status is not None:\n            if not isinstance(status, str) or status not in (\"draft\", \"published\", \"archived\"):\n                _append_request_log(\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"status must be one of: draft, published, archived\", field=\"status\")\n        pub_dt, pub_err = _parse_dt(published_at, \"published_at\")\n        if pub_err:\n            _append_request_log(\"VALIDATION_ERROR\")\n            return pub_err\n\n        if status == \"published\":\n            if pub_dt is None:\n                pub_dt = _now()\n        else:\n            # If not published, ignore any provided published_at (but validate format above)\n            pub_dt = None\n\n        # Load required references\n        workspaces = _load(\"workspaces.json\")\n        if not isinstance(workspaces, list):\n            workspaces = []\n        ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n        if not ws:\n            _append_request_log(\"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Workspace not found\", field=\"workspace_id\")\n        if ws.get(\"status\") == \"deleted\":\n            _append_request_log(\"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Workspace not found\", field=\"workspace_id\")\n\n        collections = _load(\"collections.json\")\n        if not isinstance(collections, list):\n            collections = []\n        col = next((c for c in collections if isinstance(c, dict) and c.get(\"id\") == collection_id), None)\n        if not col:\n            _append_request_log(\"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Collection not found\", field=\"collection_id\")\n        if col.get(\"status\") == \"deleted\":\n            _append_request_log(\"CONFLICT\")\n            return _err(\"CONFLICT\", \"Cannot create document in a deleted collection\", field=\"collection_id\")\n        # Business rule: workspace_id must match collection.workspace_id\n        if col.get(\"workspace_id\") != workspace_id:\n            _append_request_log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"workspace_id must equal collections.workspace_id for the referenced collection_id\", field=\"workspace_id\")\n\n        documents = _load(\"documents.json\")\n        if not isinstance(documents, list):\n            documents = []\n\n        # Parent document constraints\n        parent_doc = None\n        if parent_document_id is not None:\n            parent_doc = next((d for d in documents if isinstance(d, dict) and d.get(\"id\") == parent_document_id), None)\n            if not parent_doc:\n                _append_request_log(\"NOT_FOUND\")\n                return _err(\"NOT_FOUND\", \"Parent document not found\", field=\"parent_document_id\")\n            if parent_doc.get(\"status\") == \"deleted\":\n                _append_request_log(\"CONFLICT\")\n                return _err(\"CONFLICT\", \"Parent document is deleted\", field=\"parent_document_id\")\n            if parent_doc.get(\"workspace_id\") != workspace_id:\n                _append_request_log(\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"parent_document_id implies parent document workspace_id = documents.workspace_id\", field=\"parent_document_id\")\n\n        # Uniqueness: unique(collection_id, title) where status <> 'deleted'\n        for d in documents:\n            if not isinstance(d, dict):\n                continue\n            if d.get(\"collection_id\") == collection_id and d.get(\"title\") == title and d.get(\"status\") != \"deleted\":\n                _append_request_log(\"CONFLICT\")\n                return _err(\"CONFLICT\", \"A non-deleted document with this title already exists in the collection\", field=\"title\")\n\n        # Generate ids\n        def _gen_id(prefix, existing_ids):\n            # time-based + counter to avoid collisions\n            base = int(time.time() * 1000)\n            i = 0\n            while True:\n                cand = f\"{prefix}_{base}{i:03d}\"\n                if cand not in existing_ids:\n                    return cand\n                i += 1\n\n        existing_doc_ids = {d.get(\"id\") for d in documents if isinstance(d, dict)}\n        doc_id = _gen_id(\"out_doc\", existing_doc_ids)\n\n        now_iso = _iso(_now())\n        doc_status = status or \"draft\"\n        doc_row = {\n            \"id\": doc_id,\n            \"workspace_id\": workspace_id,\n            \"collection_id\": collection_id,\n            \"parent_document_id\": parent_document_id,\n            \"title\": title,\n            \"text\": text,\n            \"version\": 1,\n            \"published_at\": _iso(pub_dt) if pub_dt else None,\n            \"status\": doc_status,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n            \"deleted_at\": None,\n        }\n\n        # Create revision v1 (snapshot of created doc)\n        revisions = _load(\"document_revisions.json\")\n        if not isinstance(revisions, list):\n            revisions = []\n        existing_rev_ids = {r.get(\"id\") for r in revisions if isinstance(r, dict)}\n        rev_id = _gen_id(\"out_rev\", existing_rev_ids)\n        rev_row = {\n            \"id\": rev_id,\n            \"document_id\": doc_id,\n            \"workspace_id\": workspace_id,\n            \"version\": 1,\n            \"title\": title,\n            \"text\": text,\n            \"collection_id\": collection_id,\n            \"parent_document_id\": parent_document_id,\n            \"created_at\": now_iso,\n        }\n\n        # Create/update search index row to active\n        sidx = _load(\"document_search_index.json\")\n        if not isinstance(sidx, list):\n            sidx = []\n        existing_sidx = next((r for r in sidx if isinstance(r, dict) and r.get(\"document_id\") == doc_id), None)\n\n        def _norm(s):\n            return \" \".join(str(s).lower().split())\n\n        if existing_sidx:\n            # shouldn't happen for new doc_id, but keep consistent/idempotent-ish\n            existing_sidx[\"workspace_id\"] = workspace_id\n            existing_sidx[\"collection_id\"] = collection_id\n            existing_sidx[\"title_normalized\"] = _norm(title)\n            existing_sidx[\"content_normalized\"] = _norm(text)\n            existing_sidx[\"last_indexed_version\"] = 1\n            existing_sidx[\"status\"] = \"active\"\n            existing_sidx[\"updated_at\"] = now_iso\n        else:\n            existing_sidx_ids = {r.get(\"id\") for r in sidx if isinstance(r, dict)}\n            sidx_id = _gen_id(\"out_sidx\", existing_sidx_ids)\n            sidx.append({\n                \"id\": sidx_id,\n                \"document_id\": doc_id,\n                \"workspace_id\": workspace_id,\n                \"collection_id\": collection_id,\n                \"title_normalized\": _norm(title),\n                \"content_normalized\": _norm(text),\n                \"last_indexed_version\": 1,\n                \"status\": \"active\",\n                \"created_at\": now_iso,\n                \"updated_at\": now_iso,\n            })\n\n        # Persist\n        documents.append(doc_row)\n        revisions.append(rev_row)\n        _save(\"documents.json\", documents)\n        _save(\"document_revisions.json\", revisions)\n        _save(\"document_search_index.json\", sidx)\n\n        _append_request_log(\"OK\", workspace_id=workspace_id, collection_id=collection_id, document_id=doc_id)\n        return {\"document\": doc_row}\n    except Exception as e:\n        _append_request_log(\"ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "delete_document",
+          "description": "Deletes the specified document and returns the deleted document (or a deletion confirmation for that document ID). Raises VALIDATION_ERROR if document_id is missing or malformed, and NOT_FOUND if no document exists for the given ID. Raises FORBIDDEN if you don’t have access to the document, and CONFLICT if the document cannot be deleted due to its current state (for example, already deleted) or other integrity constraints enforced by the workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "document_id": {
+                "type": "string",
+                "pattern": "^out_doc_[0-9A-Z]{18,}$",
+                "description": "ID of the document to delete."
+              }
+            },
+            "required": [
+              "document_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def delete_document(document_id, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0166000\" if __import__(\"os\").path.isdir(\"./environment_mix/0166000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    req_logs = _load(\"request_logs.json\")\n    usage = _load(\"usage.json\")\n\n    def _log(status_code, extra=None):\n        elapsed_ms = int((time.time() - t0) * 1000)\n        row = {\n            \"id\": f\"out_req_{int(time.time()*1000)}\",\n            \"endpoint\": \"delete_document\",\n            \"timestamp\": now,\n            \"status\": status_code,\n            \"latency_ms\": elapsed_ms,\n            \"credential_id\": None,\n        }\n        if extra:\n            row.update(extra)\n        if isinstance(req_logs, list):\n            req_logs.append(row)\n            _save(\"request_logs.json\", req_logs)\n        if isinstance(usage, list) and usage:\n            u0 = usage[0]\n            if isinstance(u0, dict):\n                u0[\"requests\"] = int(u0.get(\"requests\", 0) or 0) + 1\n                _save(\"usage.json\", usage)\n\n    if not isinstance(document_id, str) or not re.match(r\"^out_doc_[0-9A-Z]{18,}$\", document_id):\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"document_id is missing or malformed\", field=\"document_id\")\n\n    documents = _load(\"documents.json\")\n    search_index = _load(\"document_search_index.json\")\n\n    doc = next((d for d in documents if isinstance(d, dict) and d.get(\"id\") == document_id), None)\n    if not doc:\n        _log(\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"document not found\", document_id=document_id)\n\n    if doc.get(\"status\") == \"deleted\":\n        _log(\"CONFLICT\")\n        return _err(\"CONFLICT\", \"document is already deleted\", document_id=document_id)\n\n    # Soft delete document\n    doc[\"status\"] = \"deleted\"\n    doc[\"deleted_at\"] = now\n    doc[\"updated_at\"] = now\n    # version does not need to change for delete in rules\n\n    # Mark search index as deleted (if exists)\n    idx = next((x for x in search_index if isinstance(x, dict) and x.get(\"document_id\") == document_id), None)\n    if idx:\n        idx[\"status\"] = \"deleted\"\n        idx[\"updated_at\"] = now\n\n    _save(\"documents.json\", documents)\n    _save(\"document_search_index.json\", search_index)\n\n    _log(\"OK\", extra={\"document_id\": document_id, \"workspace_id\": doc.get(\"workspace_id\")})\n    return {\"data\": doc}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_document",
+          "description": "Retrieves a single document by document_id and returns the document record. Raises VALIDATION_ERROR if document_id is missing or malformed, and NOT_FOUND if the document does not exist. Raises FORBIDDEN if the document exists but you are not authorized to view it in its workspace/collection.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "document_id": {
+                "type": "string",
+                "pattern": "^out_doc_[0-9A-Z]{18,}$",
+                "description": "ID of the document to retrieve."
+              }
+            },
+            "required": [
+              "document_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_document(document_id, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0166000\" if __import__(\"os\").path.isdir(\"./environment_mix/0166000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    req_logs = _load(\"request_logs.json\")\n    usage = _load(\"usage.json\")\n\n    def _log(status_code, extra=None):\n        elapsed_ms = int((time.time() - t0) * 1000)\n        row = {\n            \"id\": f\"out_req_{int(time.time()*1000)}\",\n            \"endpoint\": \"get_document\",\n            \"timestamp\": now,\n            \"status\": status_code,\n            \"latency_ms\": elapsed_ms,\n            \"credential_id\": None,\n        }\n        if extra:\n            row.update(extra)\n        if isinstance(req_logs, list):\n            req_logs.append(row)\n            _save(\"request_logs.json\", req_logs)\n        if isinstance(usage, list) and usage:\n            u0 = usage[0]\n            if isinstance(u0, dict):\n                u0[\"requests\"] = int(u0.get(\"requests\", 0) or 0) + 1\n                _save(\"usage.json\", usage)\n\n    if not isinstance(document_id, str) or not re.match(r\"^out_doc_[0-9A-Z]{18,}$\", document_id):\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"document_id is missing or malformed\", field=\"document_id\")\n\n    documents = _load(\"documents.json\")\n    doc = next((d for d in documents if isinstance(d, dict) and d.get(\"id\") == document_id), None)\n    if not doc:\n        _log(\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"document not found\", document_id=document_id)\n\n    # Exclude deleted by default\n    if doc.get(\"status\") == \"deleted\":\n        _log(\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"document not found\", document_id=document_id)\n\n    _log(\"OK\", extra={\"document_id\": document_id, \"workspace_id\": doc.get(\"workspace_id\")})\n    return {\"data\": doc}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_documents",
+          "description": "Lists documents in a collection, optionally filtered by status and/or parent_document_id, and returns a page of document records. Results are paged with limit (1–100) and an opaque cursor; when more results exist, the response includes a next cursor to fetch the next page, and sorting is controlled by sort and order. Raises VALIDATION_ERROR for malformed IDs, out-of-range limit, or invalid enum values; raises NOT_FOUND if the collection does not exist; raises FORBIDDEN if you don’t have access to the collection.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "collection_id": {
+                "type": "string",
+                "pattern": "^out_col_[0-9A-Z]{18,}$",
+                "description": "ID of the collection whose documents will be listed."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of documents to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "published",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "Filter documents by status."
+              },
+              "parent_document_id": {
+                "type": "string",
+                "pattern": "^out_doc_[0-9A-Z]{18,}$",
+                "description": "Filter to documents under a specific parent document."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "published_at",
+                  "title",
+                  "position"
+                ],
+                "description": "Field to sort results by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              }
+            },
+            "required": [
+              "collection_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def list_documents(collection_id, limit=None, cursor=None, status=None, parent_document_id=None, sort=None, order=None, **_extra):\n    import json, os, datetime, re, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0166000\" if __import__(\"os\").path.isdir(\"./environment_mix/0166000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    req_logs = _load(\"request_logs.json\")\n    usage = _load(\"usage.json\")\n\n    def _log(status_code, extra=None):\n        elapsed_ms = int((time.time() - t0) * 1000)\n        row = {\n            \"id\": f\"out_req_{int(time.time()*1000)}\",\n            \"endpoint\": \"list_documents\",\n            \"timestamp\": now,\n            \"status\": status_code,\n            \"latency_ms\": elapsed_ms,\n            \"credential_id\": None,\n        }\n        if extra:\n            row.update(extra)\n        if isinstance(req_logs, list):\n            req_logs.append(row)\n            _save(\"request_logs.json\", req_logs)\n        if isinstance(usage, list) and usage:\n            u0 = usage[0]\n            if isinstance(u0, dict):\n                u0[\"requests\"] = int(u0.get(\"requests\", 0) or 0) + 1\n                _save(\"usage.json\", usage)\n\n    if not isinstance(collection_id, str) or not re.match(r\"^out_col_[0-9A-Z]{18,}$\", collection_id):\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"collection_id is missing or malformed\", field=\"collection_id\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 100:\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 100\", field=\"limit\")\n\n    if cursor is not None and not isinstance(cursor, str):\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\", field=\"cursor\")\n\n    allowed_status = {\"draft\", \"published\", \"archived\", \"deleted\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status is invalid\", field=\"status\", allowed=sorted(list(allowed_status)))\n\n    if parent_document_id is not None:\n        if not isinstance(parent_document_id, str) or not re.match(r\"^out_doc_[0-9A-Z]{18,}$\", parent_document_id):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"parent_document_id is malformed\", field=\"parent_document_id\")\n\n    allowed_sort = {\"created_at\", \"updated_at\", \"published_at\", \"title\", \"position\"}\n    if sort is None:\n        sort = \"updated_at\"\n    if not isinstance(sort, str) or sort not in allowed_sort:\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"sort is invalid\", field=\"sort\", allowed=sorted(list(allowed_sort)))\n\n    allowed_order = {\"asc\", \"desc\"}\n    if order is None:\n        order = \"desc\"\n    if not isinstance(order, str) or order not in allowed_order:\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"order is invalid\", field=\"order\", allowed=sorted(list(allowed_order)))\n\n    collections = _load(\"collections.json\")\n    documents = _load(\"documents.json\")\n\n    col = next((c for c in collections if isinstance(c, dict) and c.get(\"id\") == collection_id), None)\n    if not col or col.get(\"status\") == \"deleted\":\n        # For list: vendor description only calls out validation errors; but NOT_FOUND is consistent with other tools\n        _log(\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"collection not found\", collection_id=collection_id)\n\n    # Filter\n    rows = []\n    for d in documents:\n        if not isinstance(d, dict):\n            continue\n        if d.get(\"collection_id\") != collection_id:\n            continue\n        # default exclude deleted\n        if status is None:\n            if d.get(\"status\") == \"deleted\":\n                continue\n        else:\n            if d.get(\"status\") != status:\n                continue\n        if parent_document_id is not None:\n            if d.get(\"parent_document_id\") != parent_document_id:\n                continue\n        rows.append(d)\n\n    # Sorting\n    reverse = (order == \"desc\")\n\n    def _dt_or_none(v):\n        if v is None:\n            return None\n        if not isinstance(v, str):\n            return None\n        try:\n            return datetime.datetime.fromisoformat(v.replace(\"Z\", \"+00:00\"))\n        except ValueError:\n            return None\n\n    def _key(d):\n        if sort in (\"created_at\", \"updated_at\", \"published_at\"):\n            dt = _dt_or_none(d.get(sort))\n            # Put None last for asc, first for desc? Prefer None last always for stability.\n            return (dt is None, dt or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc))\n        if sort == \"title\":\n            return (d.get(\"title\") or \"\").lower()\n        if sort == \"position\":\n            # documents have no position field in schema; treat as 0\n            v = d.get(\"position\")\n            try:\n                return float(v)\n            except Exception:\n                return 0.0\n        return d.get(sort)\n\n    try:\n        rows.sort(key=_key, reverse=reverse)\n    except TypeError:\n        # Fallback to stable string sort if mixed types appear\n        rows.sort(key=lambda d: str(d.get(sort)), reverse=reverse)\n\n    # Cursor pagination: opaque base64 of integer offset\n    start = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            start = int(raw.decode(\"utf-8\"))\n            if start < 0:\n                raise ValueError()\n        except Exception:\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\", field=\"cursor\")\n\n    total = len(rows)\n    page = rows[start:start + limit]\n    next_cursor = None\n    has_more = (start + limit) < total\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(str(start + limit).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    _log(\"OK\", extra={\"collection_id\": collection_id, \"returned\": len(page), \"total\": total})\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n        },\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "move_document",
+          "description": "Moves an existing document to the destination collection and optionally re-parents it under parent_document_id, returning the updated document record. Raises VALIDATION_ERROR if IDs are malformed, and NOT_FOUND if the document, destination collection, or specified parent document does not exist. Raises FORBIDDEN if you lack permission to move the document or write to the destination collection, and CONFLICT if the move is not allowed (for example, the new parent is in a different collection than the destination, or the move would create an invalid hierarchy).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "document_id": {
+                "type": "string",
+                "pattern": "^out_doc_[0-9A-Z]{18,}$",
+                "description": "ID of the document to move."
+              },
+              "collection_id": {
+                "type": "string",
+                "pattern": "^out_col_[0-9A-Z]{18,}$",
+                "description": "ID of the destination collection."
+              },
+              "parent_document_id": {
+                "type": "string",
+                "pattern": "^out_doc_[0-9A-Z]{18,}$",
+                "description": "Optional new parent document ID in the destination location."
+              }
+            },
+            "required": [
+              "document_id",
+              "collection_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def move_document(document_id, collection_id, parent_document_id=None, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0166000\" if __import__(\"os\").path.isdir(\"./environment_mix/0166000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n\n    def _iso(dt):\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _append_request_log(status_code, **extra):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": f\"out_req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": \"move_document\",\n            \"timestamp\": _iso(_now()),\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if extra:\n            row.update(extra)\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _enforce_rate_limit():\n        policy = _load(\"rate_limits.json\")\n        if not isinstance(policy, list) or not policy:\n            return None\n        p = None\n        for r in policy:\n            if isinstance(r, dict) and r.get(\"endpoint\") == \"move_document\":\n                p = r\n                break\n        if not p:\n            return None\n        window_s = p.get(\"window_seconds\")\n        limit_ = p.get(\"limit\")\n        if not isinstance(window_s, int) or not isinstance(limit_, int) or window_s <= 0 or limit_ <= 0:\n            return None\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            return None\n        cutoff = _now() - datetime.timedelta(seconds=window_s)\n        cnt = 0\n        for r in logs:\n            if not isinstance(r, dict) or r.get(\"endpoint\") != \"move_document\":\n                continue\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\"))\n                if dt.tzinfo is None:\n                    dt = dt.replace(tzinfo=datetime.timezone.utc)\n                if dt >= cutoff:\n                    cnt += 1\n            except ValueError:\n                continue\n        if cnt >= limit_:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        return None\n\n    rl = _enforce_rate_limit()\n    if rl:\n        _append_request_log(\"RATE_LIMIT\")\n        return rl\n\n    if not isinstance(document_id, str) or not re.match(r\"^out_doc_[0-9A-Z]{18,}$\", document_id):\n        _append_request_log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"document_id is missing or malformed\", field=\"document_id\")\n    if not isinstance(collection_id, str) or not re.match(r\"^out_col_[0-9A-Z]{18,}$\", collection_id):\n        _append_request_log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"collection_id is missing or malformed\", field=\"collection_id\")\n    if parent_document_id is not None:\n        if not isinstance(parent_document_id, str) or not re.match(r\"^out_doc_[0-9A-Z]{18,}$\", parent_document_id):\n            _append_request_log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"parent_document_id is malformed\", field=\"parent_document_id\")\n\n    documents = _load(\"documents.json\")\n    collections = _load(\"collections.json\")\n    revisions = _load(\"document_revisions.json\")\n    sindex = _load(\"document_search_index.json\")\n    if not isinstance(documents, list):\n        documents = []\n    if not isinstance(collections, list):\n        collections = []\n    if not isinstance(revisions, list):\n        revisions = []\n    if not isinstance(sindex, list):\n        sindex = []\n\n    doc_i = None\n    doc = None\n    for i, d in enumerate(documents):\n        if isinstance(d, dict) and d.get(\"id\") == document_id:\n            doc_i = i\n            doc = d\n            break\n    if not doc or doc.get(\"status\") == \"deleted\":\n        _append_request_log(\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"document not found\", field=\"document_id\")\n\n    dest = next((c for c in collections if isinstance(c, dict) and c.get(\"id\") == collection_id), None)\n    if not dest:\n        _append_request_log(\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"destination collection not found\", field=\"collection_id\")\n    if dest.get(\"status\") == \"deleted\":\n        _append_request_log(\"CONFLICT\")\n        return _err(\"CONFLICT\", \"destination collection is deleted\", field=\"collection_id\")\n\n    # Must be same workspace\n    if dest.get(\"workspace_id\") != doc.get(\"workspace_id\"):\n        _append_request_log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"target collection must be in the same workspace as the document\", field=\"collection_id\")\n\n    parent_doc = None\n    if parent_document_id is not None:\n        parent_doc = next((d for d in documents if isinstance(d, dict) and d.get(\"id\") == parent_document_id), None)\n        if not parent_doc or parent_doc.get(\"status\") == \"deleted\":\n            _append_request_log(\"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"parent document not found\", field=\"parent_document_id\")\n        if parent_doc.get(\"workspace_id\") != doc.get(\"workspace_id\"):\n            _append_request_log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"parent_document_id implies parent document workspace_id = documents.workspace_id\", field=\"parent_document_id\")\n\n    # If no effective change, return unchanged but still log OK\n    if doc.get(\"collection_id\") == collection_id and doc.get(\"parent_document_id\") == parent_document_id:\n        _append_request_log(\"OK\", document_id=document_id)\n        return {\"document\": doc}\n\n    now = _now()\n\n    # Append revision capturing move (post-move snapshot)\n    def _gen_id(prefix):\n        return f\"{prefix}{int(time.time()*1000)}{len(revisions)+1:06d}\"\n\n    new_version = int(doc.get(\"version\") or 1) + 1\n    updated = dict(doc)\n    updated[\"version\"] = new_version\n    updated[\"collection_id\"] = collection_id\n    updated[\"parent_document_id\"] = parent_document_id\n    updated[\"updated_at\"] = _iso(now)\n\n    rev_row = {\n        \"id\": _gen_id(\"out_rev_\"),\n        \"document_id\": document_id,\n        \"workspace_id\": updated.get(\"workspace_id\"),\n        \"version\": new_version,\n        \"title\": updated.get(\"title\"),\n        \"text\": updated.get(\"text\"),\n        \"collection_id\": updated.get(\"collection_id\"),\n        \"parent_document_id\": updated.get(\"parent_document_id\"),\n        \"created_at\": _iso(now),\n    }\n\n    # Update search index collection_id accordingly (and keep active if it was active; otherwise preserve status unless deleted)\n    srow_i = None\n    srow = None\n    for i, r in enumerate(sindex):\n        if isinstance(r, dict) and r.get(\"document_id\") == document_id:\n            srow_i = i\n            srow = r\n            break\n    if srow and srow.get(\"status\") != \"deleted\":\n        s2 = dict(srow)\n        s2[\"collection_id\"] = collection_id\n        s2[\"updated_at\"] = _iso(now)\n        # moving typically makes index consistent in collection scope, no need to mark stale for content\n        sindex[srow_i] = s2\n\n    documents[doc_i] = updated\n    revisions.append(rev_row)\n    _save(\"documents.json\", documents)\n    _save(\"document_revisions.json\", revisions)\n    _save(\"document_search_index.json\", sindex)\n\n    _append_request_log(\"OK\", document_id=document_id)\n    return {\"document\": updated}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "search_documents",
+          "description": "Searches document titles and content within a workspace (optionally scoped to a collection) and returns a paged list of matching documents. Results are paged using limit (1–100) and an opaque cursor, and can be sorted by relevance or timestamp fields with order applied when supported. Raises VALIDATION_ERROR for malformed IDs, invalid enum values, out-of-range limit, or an empty/invalid query; raises NOT_FOUND if the workspace (or provided collection) does not exist; raises FORBIDDEN if you don’t have access to search within the specified workspace/collection.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^out_ws_[0-9A-Z]{18,}$",
+                "description": "Workspace to search within."
+              },
+              "query": {
+                "type": "string",
+                "description": "Full-text query to search titles and content."
+              },
+              "collection_id": {
+                "type": "string",
+                "pattern": "^out_col_[0-9A-Z]{18,}$",
+                "description": "Optional collection ID to scope the search."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "published",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "Filter search results by document status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of search results to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page of results."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "relevance",
+                  "updated_at",
+                  "created_at",
+                  "published_at"
+                ],
+                "description": "How to sort search results."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction when applicable."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "query"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def search_documents(workspace_id, query, collection_id=None, status=None, limit=None, cursor=None, sort=None, order=None, **_extra):\n    import json, os, datetime, re, time, base64, math\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0166000\" if __import__(\"os\").path.isdir(\"./environment_mix/0166000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code, credential_id=None, extra=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": f\"out_req_{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{len(logs)+1}\",\n            \"endpoint\": \"search_documents\",\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": now,\n        }\n        if extra:\n            row.update(extra)\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limit_check():\n        policy = _load(\"rate_limits.json\")\n        if not isinstance(policy, list) or not policy:\n            return None\n        p = None\n        for r in policy:\n            if isinstance(r, dict) and r.get(\"endpoint\") == \"search_documents\":\n                p = r\n                break\n        if not p:\n            return None\n        window_s = p.get(\"window_seconds\")\n        limit_ = p.get(\"limit\")\n        if not isinstance(window_s, int) or not isinstance(limit_, int) or window_s <= 0 or limit_ <= 0:\n            return None\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            return None\n        cutoff = (datetime.datetime.utcnow() - datetime.timedelta(seconds=window_s)).replace(microsecond=0).isoformat() + \"Z\"\n        cnt = 0\n        for r in logs:\n            if isinstance(r, dict) and r.get(\"endpoint\") == \"search_documents\":\n                ts = r.get(\"timestamp\")\n                if isinstance(ts, str) and ts >= cutoff:\n                    cnt += 1\n        if cnt >= limit_:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        return None\n\n    rl = _rate_limit_check()\n    if rl:\n        _log(\"RATE_LIMIT\")\n        return rl\n\n    # Validate\n    if not isinstance(workspace_id, str) or not re.match(r\"^out_ws_[0-9A-Z]{18,}$\", workspace_id):\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"workspace_id is malformed.\")\n    if not isinstance(query, str) or not query.strip():\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"query must be a non-empty string.\")\n    if collection_id is not None and (not isinstance(collection_id, str) or not re.match(r\"^out_col_[0-9A-Z]{18,}$\", collection_id)):\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"collection_id is malformed.\")\n    if status is not None:\n        if status not in (\"draft\", \"published\", \"archived\", \"deleted\"):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status is invalid.\")\n    if limit is None:\n        limit = 20\n    if not isinstance(limit, int) or limit < 1 or limit > 100:\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 100.\")\n    if cursor is not None and not isinstance(cursor, str):\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n    if sort is None:\n        sort = \"relevance\"\n    if sort not in (\"relevance\", \"updated_at\", \"created_at\", \"published_at\"):\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"sort is invalid.\")\n    if order is None:\n        order = \"desc\"\n    if order not in (\"asc\", \"desc\"):\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"order is invalid.\")\n\n    workspaces = _load(\"workspaces.json\")\n    collections = _load(\"collections.json\")\n    documents = _load(\"documents.json\")\n    index = _load(\"document_search_index.json\")\n    if not isinstance(workspaces, list): workspaces = []\n    if not isinstance(collections, list): collections = []\n    if not isinstance(documents, list): documents = []\n    if not isinstance(index, list): index = []\n\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if not ws:\n        _log(\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Workspace not found.\")\n    if ws.get(\"status\") != \"active\":\n        _log(\"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"No active workspace context available to perform this operation.\")\n\n    if collection_id is not None:\n        col = next((c for c in collections if isinstance(c, dict) and c.get(\"id\") == collection_id), None)\n        if not col or col.get(\"workspace_id\") != workspace_id or col.get(\"status\") == \"deleted\":\n            _log(\"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Collection not found.\")\n\n    def _normalize(s):\n        s = s.lower()\n        # lightweight normalization\n        out = []\n        for ch in s:\n            if ch.isalnum() or ch.isspace():\n                out.append(ch)\n            else:\n                out.append(\" \")\n        return \" \".join(\"\".join(out).split())\n\n    qn = _normalize(query)\n    terms = [t for t in qn.split() if t]\n    if not terms:\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"query must contain searchable terms.\")\n\n    doc_by_id = {d.get(\"id\"): d for d in documents if isinstance(d, dict) and isinstance(d.get(\"id\"), str)}\n    eligible_statuses = (\"draft\", \"published\", \"archived\")  # per business rules\n    matches = []\n\n    for idx in index:\n        if not isinstance(idx, dict):\n            continue\n        if idx.get(\"workspace_id\") != workspace_id:\n            continue\n        if idx.get(\"status\") != \"active\":\n            continue\n        if collection_id is not None and idx.get(\"collection_id\") != collection_id:\n            continue\n        did = idx.get(\"document_id\")\n        doc = doc_by_id.get(did)\n        if not doc or doc.get(\"workspace_id\") != workspace_id:\n            continue\n        if doc.get(\"status\") not in eligible_statuses:\n            continue\n        if status is not None and doc.get(\"status\") != status:\n            continue\n\n        tn = idx.get(\"title_normalized\")\n        cn = idx.get(\"content_normalized\")\n        if not isinstance(tn, str) or not isinstance(cn, str):\n            continue\n\n        # Simple ranking: title hits weighted more than content hits; prefix in title gives bonus.\n        score = 0.0\n        for t in terms:\n            if t in tn:\n                score += 5.0\n                if tn.startswith(t):\n                    score += 1.5\n            if t in cn:\n                score += 1.0\n        if score <= 0:\n            continue\n\n        matches.append({\n            \"document\": doc,\n            \"score\": score,\n        })\n\n    # Sorting\n    reverse = (order == \"desc\")\n    if sort == \"relevance\":\n        matches.sort(key=lambda x: (x[\"score\"], x[\"document\"].get(\"updated_at\") or \"\"), reverse=True)\n    else:\n        field = sort\n        def keyf(x):\n            v = x[\"document\"].get(field)\n            if v is None:\n                # push None to end for desc, start for asc\n                return \"\" if reverse else \"~~~~\"\n            return v\n        matches.sort(key=keyf, reverse=reverse)\n\n    # Cursor pagination: cursor is base64url of offset integer\n    offset = 0\n    if cursor:\n        try:\n            pad = \"=\" * ((4 - len(cursor) % 4) % 4)\n            raw = base64.urlsafe_b64decode((cursor + pad).encode(\"utf-8\")).decode(\"utf-8\")\n            if raw.startswith(\"offset:\"):\n                offset = int(raw.split(\":\", 1)[1])\n                if offset < 0:\n                    raise ValueError()\n            else:\n                raise ValueError()\n        except Exception:\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid.\")\n\n    total = len(matches)\n    page = matches[offset:offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(f\"offset:{next_offset}\".encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    data = [p[\"document\"] for p in page]\n\n    _log(\"OK\")\n    return {\n        \"data\": data,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"sort\": sort,\n            \"order\": order,\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "update_document",
+          "description": "Updates fields on an existing document (title, text, status, and/or published_at) and returns the updated document record. Raises VALIDATION_ERROR if document_id is malformed, status is invalid, published_at is not a valid date-time, or the update would result in an invalid combination of fields; raises NOT_FOUND if the document does not exist. Raises FORBIDDEN if you don’t have permission to edit the document, and CONFLICT if the requested state transition is not allowed (for example, updating a deleted document or setting published status without a valid published_at when required).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "document_id": {
+                "type": "string",
+                "pattern": "^out_doc_[0-9A-Z]{18,}$",
+                "description": "ID of the document to update."
+              },
+              "title": {
+                "type": "string",
+                "description": "Updated document title."
+              },
+              "text": {
+                "type": "string",
+                "description": "Updated document body/content in plain text/markdown."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "published",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "Updated document status."
+              },
+              "published_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Updated publish timestamp."
+              }
+            },
+            "required": [
+              "document_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def update_document(document_id, title=None, text=None, status=None, published_at=None, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0166000\" if __import__(\"os\").path.isdir(\"./environment_mix/0166000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"update_document\"\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None, None\n        if not isinstance(s, str):\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be a date-time string\", field=field)\n        try:\n            dt = datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n        except ValueError:\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} is not a valid date-time format\", field=field)\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc), None\n\n    def _append_request_log(status_code, **extra):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": f\"out_req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": endpoint,\n            \"timestamp\": _iso(_now()),\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if extra:\n            row.update(extra)\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _enforce_rate_limit():\n        policy = _load(\"rate_limits.json\")\n        if not isinstance(policy, list) or not policy:\n            return None\n        p = None\n        for r in policy:\n            if isinstance(r, dict) and r.get(\"endpoint\") == endpoint:\n                p = r\n                break\n        if not p:\n            return None\n        window_s = p.get(\"window_seconds\")\n        limit_ = p.get(\"limit\")\n        if not isinstance(window_s, int) or not isinstance(limit_, int) or window_s <= 0 or limit_ <= 0:\n            return None\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        cutoff = _now() - datetime.timedelta(seconds=window_s)\n        cnt = 0\n        for r in logs:\n            if not isinstance(r, dict) or r.get(\"endpoint\") != endpoint:\n                continue\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\"))\n            except ValueError:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt >= cutoff:\n                cnt += 1\n        if cnt >= limit_:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n        return None\n\n    try:\n        rl = _enforce_rate_limit()\n        if rl:\n            _append_request_log(\"RATE_LIMIT\")\n            return rl\n\n        if not isinstance(document_id, str) or not re.match(r\"^out_doc_[0-9A-Z]{18,}$\", document_id):\n            _append_request_log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"document_id is malformed\", field=\"document_id\")\n        if title is not None and (not isinstance(title, str) or title.strip() == \"\"):\n            _append_request_log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"title must be a non-empty string\", field=\"title\")\n        if text is not None and not isinstance(text, str):\n            _append_request_log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"text must be a string\", field=\"text\")\n        if status is not None:\n            if not isinstance(status, str) or status not in (\"draft\", \"published\", \"archived\", \"deleted\"):\n                _append_request_log(\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"status must be one of: draft, published, archived, deleted\", field=\"status\")\n        pub_dt, pub_err = _parse_dt(published_at, \"published_at\")\n        if pub_err:\n            _append_request_log(\"VALIDATION_ERROR\")\n            return pub_err\n\n        if title is None and text is None and status is None and published_at is None:\n            _append_request_log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"No fields to update\")\n\n        documents = _load(\"documents.json\")\n        if not isinstance(documents, list):\n            documents = []\n        doc = next((d for d in documents if isinstance(d, dict) and d.get(\"id\") == document_id), None)\n        if not doc:\n            _append_request_log(\"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Document not found\", field=\"document_id\")\n\n        # Disallow editing deleted document except idempotent delete\n        if doc.get(\"status\") == \"deleted\" and status != \"deleted\":\n            _append_request_log(\"CONFLICT\")\n            return _err(\"CONFLICT\", \"Cannot update a deleted document\", field=\"status\")\n\n        # Lifecycle transition enforcement (documents lifecycle)\n        transitions = {\n            \"draft\": {\"published\", \"archived\", \"deleted\"},\n            \"published\": {\"archived\", \"deleted\"},\n            \"archived\": {\"published\", \"deleted\"},\n            \"deleted\": set(),\n        }\n        old_status = doc.get(\"status\")\n        new_status = old_status if status is None else status\n        if old_status not in transitions:\n            _append_request_log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Document has invalid status in store\", field=\"status\")\n        if new_status != old_status and new_status not in transitions.get(old_status, set()):\n            _append_request_log(\"INVALID_TRANSITION\")\n            return _err(\"INVALID_TRANSITION\", f\"Cannot transition document status from {old_status} to {new_status}\", field=\"status\")\n\n        # Validate published_at rules\n        if new_status == \"published\":\n            if pub_dt is None:\n                # If caller didn't provide, keep existing or set now if missing\n                if doc.get(\"published_at\"):\n                    try:\n                        _ = datetime.datetime.fromisoformat(str(doc.get(\"published_at\")).replace(\"Z\", \"+00:00\"))\n                    except ValueError:\n                        pass\n                else:\n                    pub_dt = _now()\n        else:\n            # Non-published documents should not have published_at\n            if published_at is not None:\n                # caller explicitly trying to set it while not published -> invalid combination\n                _append_request_log(\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"published_at can only be set when status is 'published'\", field=\"published_at\")\n            pub_dt = None\n\n        # Uniqueness: unique(collection_id, title) where status <> 'deleted'\n        new_title = doc.get(\"title\") if title is None else title\n        if new_title != doc.get(\"title\"):\n            for d in documents:\n                if not isinstance(d, dict) or d.get(\"id\") == document_id:\n                    continue\n                if d.get(\"collection_id\") == doc.get(\"collection_id\") and d.get(\"title\") == new_title and d.get(\"status\") != \"deleted\":\n                    _append_request_log(\"CONFLICT\")\n                    return _err(\"CONFLICT\", \"A non-deleted document with this title already exists in the collection\", field=\"title\")\n\n        # Prepare revision snapshot (pre-update snapshot)\n        revisions = _load(\"document_revisions.json\")\n        if not isinstance(revisions, list):\n            revisions = []\n        now = _now()\n        now_iso = _iso(now)\n\n        def _gen_id(prefix, existing_ids):\n            base = int(time.time() * 1000)\n            i = 0\n            while True:\n                cand = f\"{prefix}_{base}{i:03d}\"\n                if cand not in existing_ids:\n                    return cand\n                i += 1\n\n        existing_rev_ids = {r.get(\"id\") for r in revisions if isinstance(r, dict)}\n        rev_id = _gen_id(\"out_rev\", existing_rev_ids)\n\n        old_version = doc.get(\"version\")\n        if not isinstance(old_version, int) or old_version < 1:\n            _append_request_log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Document version is invalid\", field=\"version\")\n\n        # Apply update: bump version always on successful update\n        new_version = old_version + 1\n\n        # Soft delete behavior\n        deleted_at = doc.get(\"deleted_at\")\n        if new_status == \"deleted\":\n            if not deleted_at:\n                deleted_at = now_iso\n        else:\n            deleted_at = None\n\n        # Apply fields\n        if title is not None:\n            doc[\"title\"] = title\n        if text is not None:\n            doc[\"text\"] = text\n        doc[\"status\"] = new_status\n        doc[\"published_at\"] = _iso(pub_dt) if pub_dt else (doc.get(\"published_at\") if new_status == \"published\" else None)\n        doc[\"version\"] = new_version\n        doc[\"updated_at\"] = now_iso\n        doc[\"deleted_at\"] = deleted_at\n\n        # Append revision capturing post-update snapshot at new_version\n        rev_row = {\n            \"id\": rev_id,\n            \"document_id\": document_id,\n            \"workspace_id\": doc.get(\"workspace_id\"),\n            \"version\": new_version,\n            \"title\": doc.get(\"title\"),\n            \"text\": doc.get(\"text\"),\n            \"collection_id\": doc.get(\"collection_id\"),\n            \"parent_document_id\": doc.get(\"parent_document_id\"),\n            \"created_at\": now_iso,\n        }\n        revisions.append(rev_row)\n\n        # Update search index: mark stale or deleted\n        sidx = _load(\"document_search_index.json\")\n        if not isinstance(sidx, list):\n            sidx = []\n        srow = next((r for r in sidx if isinstance(r, dict) and r.get(\"document_id\") == document_id), None)\n\n        if new_status == \"deleted\":\n            if srow:\n                srow[\"status\"] = \"deleted\"\n                srow[\"updated_at\"] = now_iso\n            # else: index missing; don't fabricate beyond rule? We'll leave it missing.\n        else:\n            # mark stale, unless you choose to reindex in same transaction; business rule says mark stale until reindexed.\n            if srow:\n                srow[\"status\"] = \"stale\"\n                srow[\"updated_at\"] = now_iso\n\n        _save(\"documents.json\", documents)\n        _save(\"document_revisions.json\", revisions)\n        _save(\"document_search_index.json\", sidx)\n\n        _append_request_log(\"OK\", document_id=document_id)\n        return {\"document\": doc}\n    except Exception as e:\n        _append_request_log(\"ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_collection",
+          "description": "Creates a new collection in the specified workspace and returns the created collection record. Raises VALIDATION_ERROR if required fields are missing, IDs are malformed, status is not allowed, or provided fields (such as color/position) fail validation; raises NOT_FOUND if the workspace does not exist. Raises FORBIDDEN if you don’t have permission to create collections in the workspace, and CONFLICT if a collection with the same name is not allowed by workspace policy.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^out_ws_[0-9A-Z]{18,}$",
+                "description": "ID of the workspace that will own the collection."
+              },
+              "name": {
+                "type": "string",
+                "description": "Collection name."
+              },
+              "description": {
+                "type": "string",
+                "description": "Collection description."
+              },
+              "color": {
+                "type": "string",
+                "description": "Collection color (typically a hex value)."
+              },
+              "icon": {
+                "type": "string",
+                "description": "Collection icon identifier (e.g., emoji or icon name)."
+              },
+              "position": {
+                "type": "number",
+                "description": "Ordering position for the collection."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived"
+                ],
+                "description": "Initial collection status."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "name"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_collection(workspace_id, name, description=None, color=None, icon=None, position=None, status=None, **_extra):\n    import json, os, datetime, re, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0166000\" if __import__(\"os\").path.isdir(\"./environment_mix/0166000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code, credential_id=None, extra=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": f\"out_req_{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{len(logs)+1}\",\n            \"endpoint\": \"create_collection\",\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": now,\n        }\n        if extra:\n            row.update(extra)\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limit_check():\n        policy = _load(\"rate_limits.json\")\n        if not isinstance(policy, list) or not policy:\n            return None\n        p = None\n        for r in policy:\n            if isinstance(r, dict) and r.get(\"endpoint\") == \"create_collection\":\n                p = r\n                break\n        if not p:\n            return None\n        window_s = p.get(\"window_seconds\")\n        limit_ = p.get(\"limit\")\n        if not isinstance(window_s, int) or not isinstance(limit_, int) or window_s <= 0 or limit_ <= 0:\n            return None\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            return None\n        cutoff = (datetime.datetime.utcnow() - datetime.timedelta(seconds=window_s)).replace(microsecond=0).isoformat() + \"Z\"\n        cnt = 0\n        for r in logs:\n            if isinstance(r, dict) and r.get(\"endpoint\") == \"create_collection\":\n                ts = r.get(\"timestamp\")\n                if isinstance(ts, str) and ts >= cutoff:\n                    cnt += 1\n        if cnt >= limit_:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        return None\n\n    rl = _rate_limit_check()\n    if rl:\n        _log(\"RATE_LIMIT\")\n        return rl\n\n    # Validate\n    if not isinstance(workspace_id, str) or not re.match(r\"^out_ws_[0-9A-Z]{18,}$\", workspace_id):\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"workspace_id is malformed.\")\n    if not isinstance(name, str) or name.strip() == \"\":\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"name is required and must not be empty.\")\n    if description is not None and not isinstance(description, str):\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"description must be a string.\")\n    if color is not None and not isinstance(color, str):\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"color must be a string.\")\n    if icon is not None and not isinstance(icon, str):\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"icon must be a string.\")\n    if position is not None:\n        if not isinstance(position, (int, float)):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"position must be a number.\")\n        if position < 0:\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"position must be >= 0.\")\n    if status is None:\n        status = \"active\"\n    if status not in (\"active\", \"archived\"):\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"status must be 'active' or 'archived'.\")\n\n    workspaces = _load(\"workspaces.json\")\n    collections = _load(\"collections.json\")\n    if not isinstance(workspaces, list): workspaces = []\n    if not isinstance(collections, list): collections = []\n\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if not ws:\n        _log(\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Workspace not found.\")\n    if ws.get(\"status\") != \"active\":\n        _log(\"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"No active workspace context available to perform this operation.\")\n\n    # Enforce unique(workspace_id, name) where status <> 'deleted'\n    for c in collections:\n        if not isinstance(c, dict):\n            continue\n        if c.get(\"workspace_id\") == workspace_id and c.get(\"status\") != \"deleted\" and c.get(\"name\") == name:\n            _log(\"CONFLICT\")\n            return _err(\"CONFLICT\", \"A collection with this name already exists in the workspace.\")\n\n    # Position default: max(position)+1 in workspace if not provided\n    if position is None:\n        maxpos = -1\n        for c in collections:\n            if isinstance(c, dict) and c.get(\"workspace_id\") == workspace_id and c.get(\"status\") != \"deleted\":\n                p = c.get(\"position\")\n                if isinstance(p, (int, float)) and p > maxpos:\n                    maxpos = p\n        position = maxpos + 1\n\n    def _new_id(prefix):\n        alphabet = \"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\"\n        raw = (f\"{datetime.datetime.utcnow().timestamp()}_{len(collections)+1}_{os.getpid()}\").encode(\"utf-8\")\n        enc = base64.b32encode(raw).decode(\"utf-8\").rstrip(\"=\")\n        enc = \"\".join(ch for ch in enc if ch in alphabet)\n        if len(enc) < 18:\n            enc = (enc + \"0\" * 18)[:18]\n        return f\"{prefix}{enc}\"\n\n    new_row = {\n        \"id\": _new_id(\"out_col_\"),\n        \"workspace_id\": workspace_id,\n        \"name\": name,\n        \"description\": description,\n        \"color\": color,\n        \"icon\": icon,\n        \"position\": position,\n        \"status\": status,\n        \"created_at\": now,\n        \"updated_at\": now,\n        \"deleted_at\": None,\n    }\n\n    collections.append(new_row)\n    _save(\"collections.json\", collections)\n\n    _log(\"OK\")\n    return {\"data\": new_row}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "delete_collection",
+          "description": "Deletes the specified collection and returns the deleted collection (or a deletion confirmation for that collection ID). Raises VALIDATION_ERROR if collection_id is missing or malformed, and NOT_FOUND if the collection does not exist. Raises FORBIDDEN if you don’t have permission to delete the collection, and CONFLICT if the collection cannot be deleted due to its current state or existing contents/integrity constraints enforced by the workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "collection_id": {
+                "type": "string",
+                "pattern": "^out_col_[0-9A-Z]{20,}$",
+                "description": "ID of the collection to delete."
+              }
+            },
+            "required": [
+              "collection_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def delete_collection(collection_id, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0166000\" if __import__(\"os\").path.isdir(\"./environment_mix/0166000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"delete_collection\"\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n\n    def _iso(dt):\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _append_request_log(status_code, **extra):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": f\"out_req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": endpoint,\n            \"timestamp\": _iso(_now()),\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if extra:\n            row.update(extra)\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _enforce_rate_limit():\n        policy = _load(\"rate_limits.json\")\n        if not isinstance(policy, list) or not policy:\n            return None\n        p = None\n        for r in policy:\n            if isinstance(r, dict) and r.get(\"endpoint\") == endpoint:\n                p = r\n                break\n        if not p:\n            return None\n        window_s = p.get(\"window_seconds\")\n        limit_ = p.get(\"limit\")\n        if not isinstance(window_s, int) or not isinstance(limit_, int) or window_s <= 0 or limit_ <= 0:\n            return None\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        cutoff = _now() - datetime.timedelta(seconds=window_s)\n        cnt = 0\n        for r in logs:\n            if not isinstance(r, dict) or r.get(\"endpoint\") != endpoint:\n                continue\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\"))\n            except ValueError:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt >= cutoff:\n                cnt += 1\n        if cnt >= limit_:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n        return None\n\n    try:\n        rl = _enforce_rate_limit()\n        if rl:\n            _append_request_log(\"RATE_LIMIT\")\n            return rl\n\n        if not isinstance(collection_id, str) or not re.match(r\"^out_col_[0-9A-Z]{20,}$\", collection_id):\n            _append_request_log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"collection_id is malformed\", field=\"collection_id\")\n\n        collections = _load(\"collections.json\")\n        if not isinstance(collections, list):\n            collections = []\n        col = next((c for c in collections if isinstance(c, dict) and c.get(\"id\") == collection_id), None)\n        if not col:\n            _append_request_log(\"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Collection not found\", field=\"collection_id\")\n\n        # Idempotent soft-delete: if already deleted, return it\n        if col.get(\"status\") == \"deleted\":\n            _append_request_log(\"OK\", collection_id=collection_id)\n            return {\"collection\": col}\n\n        # Business rule: reject if any documents in collection with status <> 'deleted'\n        documents = _load(\"documents.json\")\n        if not isinstance(documents, list):\n            documents = []\n        for d in documents:\n            if not isinstance(d, dict):\n                continue\n            if d.get(\"collection_id\") == collection_id and d.get(\"status\") != \"deleted\":\n                _append_request_log(\"CONFLICT\", collection_id=collection_id)\n                return _err(\"CONFLICT\", \"Collection cannot be deleted because it has non-deleted documents\", rule=\"delete_collection requires no documents with status <> 'deleted'\")\n\n        # Lifecycle transition enforcement for collections\n        transitions = {\n            \"active\": {\"archived\", \"deleted\"},\n            \"archived\": {\"active\", \"deleted\"},\n            \"deleted\": set(),\n        }\n        old_status = col.get(\"status\")\n        if old_status not in transitions:\n            _append_request_log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Collection has invalid status in store\", field=\"status\")\n        if \"deleted\" not in transitions.get(old_status, set()):\n            _append_request_log(\"INVALID_TRANSITION\")\n            return _err(\"INVALID_TRANSITION\", f\"Cannot transition collection status from {old_status} to deleted\", field=\"status\")\n\n        now_iso = _iso(_now())\n        col[\"status\"] = \"deleted\"\n        col[\"deleted_at\"] = now_iso\n        col[\"updated_at\"] = now_iso\n\n        _save(\"collections.json\", collections)\n        _append_request_log(\"OK\", collection_id=collection_id)\n        return {\"collection\": col}\n    except Exception as e:\n        _append_request_log(\"ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_collection",
+          "description": "Retrieves a single collection by collection_id and returns the collection record. Raises VALIDATION_ERROR if collection_id is missing or malformed, and NOT_FOUND if the collection does not exist. Raises FORBIDDEN if the collection exists but you are not authorized to view it.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "collection_id": {
+                "type": "string",
+                "pattern": "^out_col_[0-9A-Z]{20,}$",
+                "description": "ID of the collection to retrieve."
+              }
+            },
+            "required": [
+              "collection_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_collection(collection_id, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0166000\" if __import__(\"os\").path.isdir(\"./environment_mix/0166000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    ts = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status, message=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            logs.append({\n                \"id\": \"out_req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n                \"endpoint\": endpoint,\n                \"status\": status,\n                \"message\": message,\n                \"timestamp\": ts,\n                \"latency_ms\": int((time.time() - t0) * 1000)\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    try:\n        logs = _load(\"request_logs.json\")\n        if isinstance(logs, list):\n            cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=60)\n            recent = 0\n            for r in reversed(logs[-2000:]):\n                tt = r.get(\"timestamp\")\n                if not isinstance(tt, str):\n                    continue\n                try:\n                    dt = datetime.datetime.fromisoformat(tt.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if dt >= cutoff:\n                    recent += 1\n            if recent >= 1200:\n                _log(\"get_collection\", \"RATE_LIMIT\", \"Too many requests\")\n                return _err(\"RATE_LIMIT\", \"Too many requests\")\n    except Exception:\n        pass\n\n    if not isinstance(collection_id, str) or not re.match(r\"^out_col_[0-9A-Z]{20,}$\", collection_id or \"\"):\n        _log(\"get_collection\", \"VALIDATION_ERROR\", \"collection_id malformed\")\n        return _err(\"VALIDATION_ERROR\", \"collection_id is missing or malformed\")\n\n    collections = _load(\"collections.json\")\n    if not isinstance(collections, list):\n        _log(\"get_collection\", \"UNAUTHORIZED\", \"collections store unreadable\")\n        return _err(\"UNAUTHORIZED\", \"No authorized context available\")\n\n    col = next((c for c in collections if isinstance(c, dict) and c.get(\"id\") == collection_id), None)\n    if not col:\n        _log(\"get_collection\", \"NOT_FOUND\", \"collection not found\")\n        return _err(\"NOT_FOUND\", \"Collection not found\")\n\n    # Authorization model not provided; ambient auth assumed.\n    # If workspace is missing, treat as forbidden-esque; only allowed codes are listed by contract.\n    workspaces = _load(\"workspaces.json\")\n    if not isinstance(workspaces, list):\n        _log(\"get_collection\", \"UNAUTHORIZED\", \"workspaces store unreadable\")\n        return _err(\"UNAUTHORIZED\", \"No authorized context available\")\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == col.get(\"workspace_id\")), None)\n    if not ws:\n        _log(\"get_collection\", \"UNAUTHORIZED\", \"workspace missing\")\n        return _err(\"UNAUTHORIZED\", \"Not authorized to view this collection\")\n\n    _log(\"get_collection\", \"OK\")\n    return {\"collection\": col}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_collections",
+          "description": "Searches collections within the given workspace, optionally filtering by lifecycle status and a case-insensitive substring match on the collection name, and returns a sorted, paginated list of collection records. Results are limited by `limit`; when more results exist, a `cursor` is returned and can be passed back to fetch the next page. Raises INVALID_ARGUMENT if `workspace_id` is malformed or `limit/sort/order/status` are invalid, UNAUTHORIZED/FORBIDDEN if you lack access to the workspace, NOT_FOUND if the workspace does not exist, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^out_ws_[0-9A-Z]{20,}$",
+                "description": "Workspace to search collections within."
+              },
+              "query": {
+                "type": "string",
+                "description": "Case-insensitive substring query applied to collection name."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "Filter collections by lifecycle status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of collections to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "name",
+                  "position"
+                ],
+                "description": "Field to sort results by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def list_collections(workspace_id, query=None, status=None, limit=None, cursor=None, sort=None, order=None, **_extra):\n    import json, os, datetime, re, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0166000\" if __import__(\"os\").path.isdir(\"./environment_mix/0166000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    ts = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status_code, message=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            logs.append({\n                \"id\": \"out_req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n                \"endpoint\": endpoint,\n                \"status\": status_code,\n                \"message\": message,\n                \"timestamp\": ts,\n                \"latency_ms\": int((time.time() - t0) * 1000)\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    try:\n        logs = _load(\"request_logs.json\")\n        if isinstance(logs, list):\n            cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=60)\n            recent = 0\n            for r in reversed(logs[-2000:]):\n                tt = r.get(\"timestamp\")\n                if not isinstance(tt, str):\n                    continue\n                try:\n                    dt = datetime.datetime.fromisoformat(tt.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if dt >= cutoff:\n                    recent += 1\n            if recent >= 1200:\n                _log(\"list_collections\", \"RATE_LIMIT\", \"Too many requests\")\n                return _err(\"RATE_LIMIT\", \"Too many requests\")\n    except Exception:\n        pass\n\n    if not isinstance(workspace_id, str) or not re.match(r\"^out_ws_[0-9A-Z]{20,}$\", workspace_id or \"\"):\n        _log(\"list_collections\", \"VALIDATION_ERROR\", \"workspace_id malformed\")\n        return _err(\"VALIDATION_ERROR\", \"workspace_id is missing or malformed\")\n\n    if query is not None and not isinstance(query, str):\n        _log(\"list_collections\", \"VALIDATION_ERROR\", \"query type\")\n        return _err(\"VALIDATION_ERROR\", \"query must be a string\")\n\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"active\", \"archived\", \"deleted\"):\n            _log(\"list_collections\", \"VALIDATION_ERROR\", \"status invalid\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: active, archived, deleted\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 100:\n        _log(\"list_collections\", \"VALIDATION_ERROR\", \"limit invalid\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 100\")\n\n    if sort is None:\n        sort = \"position\"\n    if not isinstance(sort, str) or sort not in (\"created_at\", \"updated_at\", \"name\", \"position\"):\n        _log(\"list_collections\", \"VALIDATION_ERROR\", \"sort invalid\")\n        return _err(\"VALIDATION_ERROR\", \"sort must be one of: created_at, updated_at, name, position\")\n\n    if order is None:\n        order = \"asc\"\n    if not isinstance(order, str) or order not in (\"asc\", \"desc\"):\n        _log(\"list_collections\", \"VALIDATION_ERROR\", \"order invalid\")\n        return _err(\"VALIDATION_ERROR\", \"order must be one of: asc, desc\")\n\n    start = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or cursor == \"\":\n            _log(\"list_collections\", \"VALIDATION_ERROR\", \"cursor invalid\")\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string\")\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\")).decode(\"utf-8\")\n            if not raw.startswith(\"pos:\"):\n                _log(\"list_collections\", \"VALIDATION_ERROR\", \"cursor malformed\")\n                return _err(\"VALIDATION_ERROR\", \"cursor is malformed\")\n            start = int(raw.split(\":\", 1)[1])\n            if start < 0:\n                raise ValueError()\n        except Exception:\n            _log(\"list_collections\", \"VALIDATION_ERROR\", \"cursor malformed\")\n            return _err(\"VALIDATION_ERROR\", \"cursor is malformed\")\n\n    workspaces = _load(\"workspaces.json\")\n    if not isinstance(workspaces, list):\n        _log(\"list_collections\", \"UNAUTHORIZED\", \"workspaces store unreadable\")\n        return _err(\"UNAUTHORIZED\", \"No authorized context available\")\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if not ws:\n        _log(\"list_collections\", \"NOT_FOUND\", \"workspace not found\")\n        return _err(\"NOT_FOUND\", \"Workspace not found\")\n\n    collections = _load(\"collections.json\")\n    if not isinstance(collections, list):\n        _log(\"list_collections\", \"UNAUTHORIZED\", \"collections store unreadable\")\n        return _err(\"UNAUTHORIZED\", \"No authorized context available\")\n\n    q = (query or \"\").strip().lower()\n    rows = []\n    for c in collections:\n        if not isinstance(c, dict):\n            continue\n        if c.get(\"workspace_id\") != workspace_id:\n            continue\n        if status is not None and c.get(\"status\") != status:\n            continue\n        if q:\n            name = c.get(\"name\") or \"\"\n            if not isinstance(name, str):\n                continue\n            if q not in name.lower():\n                continue\n        rows.append(c)\n\n    def _key(v):\n        x = v.get(sort)\n        if sort in (\"created_at\", \"updated_at\"):\n            if isinstance(x, str):\n                return x\n            return \"\"\n        if sort == \"name\":\n            return (x or \"\").lower() if isinstance(x, str) else \"\"\n        if sort == \"position\":\n            return x if isinstance(x, (int, float)) else 0\n        return x\n\n    reverse = (order == \"desc\")\n    rows.sort(key=_key, reverse=reverse)\n\n    total = len(rows)\n    page = rows[start:start + limit]\n    next_cursor = None\n    has_more = start + limit < total\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(f\"pos:{start+limit}\".encode(\"utf-8\")).decode(\"utf-8\")\n\n    _log(\"list_collections\", \"OK\")\n    return {\n        \"collections\": page,\n        \"total\": total,\n        \"limit\": limit,\n        \"cursor\": next_cursor,\n        \"has_more\": has_more\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "update_collection",
+          "description": "Updates mutable fields on an existing collection (such as name, description, color, icon, position, or status) and returns the updated collection record. Only the fields provided are changed; status changes are applied as requested (for example, archiving or deleting a collection). Raises INVALID_ARGUMENT if `collection_id` is malformed, no updatable fields are provided, or any field value is invalid; UNAUTHORIZED/FORBIDDEN if you don’t have permission to edit the collection; NOT_FOUND if the collection does not exist (or is not visible to you); CONFLICT if the requested update is not allowed due to the collection’s current state (for example, attempting to modify a deleted collection); and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "collection_id": {
+                "type": "string",
+                "pattern": "^out_col_[0-9A-Z]{20,}$",
+                "description": "ID of the collection to update."
+              },
+              "name": {
+                "type": "string",
+                "description": "New name for the collection."
+              },
+              "description": {
+                "type": "string",
+                "description": "New description for the collection."
+              },
+              "color": {
+                "type": "string",
+                "description": "New color value for the collection (e.g., hex string)."
+              },
+              "icon": {
+                "type": "string",
+                "description": "New icon identifier for the collection."
+              },
+              "position": {
+                "type": "number",
+                "description": "New ordering position for the collection within the workspace."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "New lifecycle status for the collection."
+              }
+            },
+            "required": [
+              "collection_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def update_collection(collection_id, name=None, description=None, color=None, icon=None, position=None, status=None, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0166000\" if __import__(\"os\").path.isdir(\"./environment_mix/0166000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    ts = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status_code, message=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            logs.append({\n                \"id\": \"out_req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n                \"endpoint\": endpoint,\n                \"status\": status_code,\n                \"message\": message,\n                \"timestamp\": ts,\n                \"latency_ms\": int((time.time() - t0) * 1000)\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    try:\n        logs = _load(\"request_logs.json\")\n        if isinstance(logs, list):\n            cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=60)\n            recent = 0\n            for r in reversed(logs[-2000:]):\n                tt = r.get(\"timestamp\")\n                if not isinstance(tt, str):\n                    continue\n                try:\n                    dt = datetime.datetime.fromisoformat(tt.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if dt >= cutoff:\n                    recent += 1\n            if recent >= 600:\n                _log(\"update_collection\", \"RATE_LIMIT\", \"Too many requests\")\n                return _err(\"RATE_LIMIT\", \"Too many requests\")\n    except Exception:\n        pass\n\n    if not isinstance(collection_id, str) or not re.match(r\"^out_col_[0-9A-Z]{20,}$\", collection_id or \"\"):\n        _log(\"update_collection\", \"VALIDATION_ERROR\", \"collection_id malformed\")\n        return _err(\"VALIDATION_ERROR\", \"collection_id is missing or malformed\")\n\n    provided = {}\n    if name is not None:\n        provided[\"name\"] = name\n    if description is not None:\n        provided[\"description\"] = description\n    if color is not None:\n        provided[\"color\"] = color\n    if icon is not None:\n        provided[\"icon\"] = icon\n    if position is not None:\n        provided[\"position\"] = position\n    if status is not None:\n        provided[\"status\"] = status\n\n    if not provided:\n        _log(\"update_collection\", \"VALIDATION_ERROR\", \"no fields\")\n        return _err(\"VALIDATION_ERROR\", \"No updatable fields were provided\")\n\n    if \"name\" in provided:\n        if not isinstance(name, str) or name.strip() == \"\":\n            _log(\"update_collection\", \"VALIDATION_ERROR\", \"name invalid\")\n            return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string\")\n        provided[\"name\"] = name.strip()\n\n    for field in (\"description\", \"color\", \"icon\"):\n        if field in provided and provided[field] is not None and not isinstance(provided[field], str):\n            _log(\"update_collection\", \"VALIDATION_ERROR\", f\"{field} invalid\")\n            return _err(\"VALIDATION_ERROR\", f\"{field} must be a string\")\n\n    if \"position\" in provided:\n        if not isinstance(position, (int, float)) or position < 0:\n            _log(\"update_collection\", \"VALIDATION_ERROR\", \"position invalid\")\n            return _err(\"VALIDATION_ERROR\", \"position must be a number >= 0\")\n\n    if \"status\" in provided:\n        if not isinstance(status, str) or status not in (\"active\", \"archived\", \"deleted\"):\n            _log(\"update_collection\", \"VALIDATION_ERROR\", \"status invalid\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: active, archived, deleted\")\n\n    collections = _load(\"collections.json\")\n    if not isinstance(collections, list):\n        _log(\"update_collection\", \"UNAUTHORIZED\", \"collections store unreadable\")\n        return _err(\"UNAUTHORIZED\", \"No authorized context available\")\n\n    col = None\n    idx = None\n    for i, c in enumerate(collections):\n        if isinstance(c, dict) and c.get(\"id\") == collection_id:\n            col = c\n            idx = i\n            break\n    if not col:\n        _log(\"update_collection\", \"NOT_FOUND\", \"collection not found\")\n        return _err(\"NOT_FOUND\", \"Collection not found\")\n\n    workspaces = _load(\"workspaces.json\")\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == col.get(\"workspace_id\")), None)\n    if not ws:\n        _log(\"update_collection\", \"CONFLICT\", \"workspace missing for collection\")\n        return _err(\"CONFLICT\", \"Collection cannot be updated due to invalid workspace reference\")\n    if ws.get(\"status\") in (\"deleted\", \"suspended\"):\n        _log(\"update_collection\", \"CONFLICT\", \"workspace not active\")\n        return _err(\"CONFLICT\", \"Collection cannot be updated while workspace is not active\")\n\n    # Unique(workspace_id, name) where status <> 'deleted'\n    if \"name\" in provided:\n        new_name = provided[\"name\"]\n        if col.get(\"status\") != \"deleted\":  # uniqueness applies among non-deleted\n            for c in collections:\n                if not isinstance(c, dict):\n                    continue\n                if c.get(\"id\") == collection_id:\n                    continue\n                if c.get(\"workspace_id\") == col.get(\"workspace_id\") and c.get(\"status\") != \"deleted\" and c.get(\"name\") == new_name:\n                    _log(\"update_collection\", \"CONFLICT\", \"duplicate name\")\n                    return _err(\"CONFLICT\", \"A non-deleted collection with this name already exists in the workspace\")\n\n    # Lifecycle transitions\n    if \"status\" in provided:\n        cur = col.get(\"status\")\n        nxt = provided[\"status\"]\n        transitions = {\n            \"active\": set([\"archived\", \"deleted\"]),\n            \"archived\": set([\"active\", \"deleted\"]),\n            \"deleted\": set([])\n        }\n        if cur != nxt:\n            if cur not in transitions or nxt not in (\"active\", \"archived\", \"deleted\") or nxt not in transitions[cur]:\n                _log(\"update_collection\", \"INVALID_TRANSITION\", \"illegal transition\")\n                return _err(\"INVALID_TRANSITION\", \"Illegal collection status transition\")\n\n        # If requesting deletion via update, enforce delete_collection rule (no non-deleted docs)\n        if cur != \"deleted\" and nxt == \"deleted\":\n            documents = _load(\"documents.json\")\n            if not isinstance(documents, list):\n                _log(\"update_collection\", \"CONFLICT\", \"documents store unreadable\")\n                return _err(\"CONFLICT\", \"Collection cannot be deleted due to existing content\")\n            for d in documents:\n                if not isinstance(d, dict):\n                    continue\n                if d.get(\"collection_id\") == collection_id and d.get(\"status\") != \"deleted\":\n                    _log(\"update_collection\", \"CONFLICT\", \"collection has non-deleted documents\")\n                    return _err(\"CONFLICT\", \"Collection cannot be deleted while it contains non-deleted documents\")\n\n    updated = dict(col)\n    for k, v in provided.items():\n        updated[k] = v\n\n    updated[\"updated_at\"] = ts\n    if \"status\" in provided and provided[\"status\"] == \"deleted\" and col.get(\"status\") != \"deleted\":\n        updated[\"deleted_at\"] = ts\n    if \"status\" in provided and provided[\"status\"] != \"deleted\":\n        # If resurrecting from deleted is not allowed by lifecycle; we already block it.\n        # For active/archived, ensure deleted_at cleared if previously null or not.\n        if updated.get(\"status\") in (\"active\", \"archived\"):\n            # keep deleted_at as-is unless the record was previously deleted (shouldn't happen due to lifecycle)\n            pass\n\n    collections[idx] = updated\n    _save(\"collections.json\", collections)\n\n    _log(\"update_collection\", \"OK\")\n    return {\"collection\": updated}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0166000",
+    "index": 166,
+    "name": "Outline Server",
+    "description": "This backend stores Outline-like knowledge base content: collections (folders/spaces) and documents (pages) that belong to collections and can be searched, moved, updated, or deleted. The main workflows are collection lifecycle management and document lifecycle management, including full-text search",
+    "taxonomy": {
+      "L1_id": "L1-10",
+      "L1_name": "Data Storage & Databases",
+      "L1_name_zh": "数据存储与数据库",
+      "L2_id": "L2-26",
+      "L2_name": "NoSQL & Document Stores",
+      "L2_name_zh": "NoSQL 与文档存储",
+      "L3_name": "Content/Knowledge Base Stores",
+      "L3_name_zh": "内容与知识库存储"
+    },
+    "database_dir": "./environment_mix/0166000",
+    "mount_path": "/app/database",
+    "n_tools": 12,
+    "n_collections": 5,
+    "n_records": 125,
+    "n_questions": 1,
+    "execution_audit": {
+      "tools": 12,
+      "loaded": 12,
+      "reads_returning_data": 5,
+      "read_operations": 5,
+      "mutations_persisted": 4,
+      "mutations_attempted": 7
+    },
+    "tools_loadable_from_database_dir": 12,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_document",
+      "returned_chars": 569
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

@@ -1,0 +1,441 @@
+{
+  "index": 13,
+  "local_files_dir": "./environment_mix/0013000",
+  "file_list": [
+    "./environment_mix/0013000/README.md",
+    "./environment_mix/0013000/api_keys.json",
+    "./environment_mix/0013000/memory_points.json",
+    "./environment_mix/0013000/search_requests.json",
+    "./environment_mix/0013000/vector_collections.json",
+    "./environment_mix/0013000/workspaces.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "workspaces.json": "18 rows",
+        "api_keys.json": "18 rows",
+        "vector_collections.json": "18 rows",
+        "memory_points.json": "20 rows",
+        "search_requests.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "qdrant-store",
+          "description": "Upserts one or more memory points into the specified collection in the given workspace, creating new point IDs when omitted and treating external_point_id as a stable client key for idempotent upserts/deduplication; returns the stored/updated point identifiers (and any per-point status the service provides). Raises VALIDATION_ERROR if workspace_id/collection_id/id formats don’t match the required patterns, if any point is missing required fields (content_text, embedding), or if an embedding vector length does not match the collection’s configured vector_size. Raises UNAUTHORIZED if the caller cannot write to the workspace/collection, NOT_FOUND if the workspace or collection does not exist, CONFLICT if the request attempts an invalid upsert for an existing point (for example, duplicate identifiers that cannot be reconciled within the same request), and QUOTA_EXCEEDED when write limits for the workspace are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^qdr_ws_[A-Za-z0-9]+$",
+                "description": "Workspace id that owns the collection and points."
+              },
+              "collection_id": {
+                "type": "string",
+                "pattern": "^qdr_col_[A-Za-z0-9]+$",
+                "description": "Vector collection id to upsert memories into."
+              },
+              "points": {
+                "type": "array",
+                "description": "List of memory points to upsert into the collection.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "pattern": "^qdr_pt_[A-Za-z0-9]+$",
+                      "description": "Internal memory point id; if omitted a new id is generated."
+                    },
+                    "external_point_id": {
+                      "type": "string",
+                      "description": "Client-provided stable id for idempotent upserts/deduplication."
+                    },
+                    "content_text": {
+                      "type": "string",
+                      "description": "Raw text content of the memory."
+                    },
+                    "embedding": {
+                      "type": "array",
+                      "description": "Vector embedding for the memory (length should match collection.vector_size).",
+                      "items": {
+                        "type": "number"
+                      }
+                    },
+                    "payload": {
+                      "type": "object",
+                      "description": "Arbitrary JSON payload metadata stored alongside the vector.",
+                      "additionalProperties": true
+                    }
+                  },
+                  "required": [
+                    "content_text",
+                    "embedding"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "workspace_id",
+              "collection_id",
+              "points"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def qdrant_store(workspace_id, collection_id, points, **_extra):\n    import json, os, datetime, re, uuid, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0013000\" if __import__(\"os\").path.isdir(\"./environment_mix/0013000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now = now_dt.isoformat() + \"Z\"\n\n    def _new_req_id():\n        return \"qdr_req_\" + uuid.uuid4().hex[:24]\n\n    def _finalize(search_requests, req_row, status, result_count=None, err_code=None, err_msg=None):\n        req_row[\"status\"] = status\n        req_row[\"updated_at\"] = now\n        req_row[\"latency_ms\"] = max(0, int((time.time() - t0) * 1000))\n        if result_count is not None:\n            req_row[\"result_count\"] = int(result_count)\n        if err_code is not None:\n            req_row[\"error_code\"] = err_code\n        if err_msg is not None:\n            req_row[\"error_message\"] = err_msg\n        _save(\"search_requests.json\", search_requests)\n\n    # ---- Validate inputs (schema) ----\n    if not isinstance(workspace_id, str) or not re.match(r\"^qdr_ws_[A-Za-z0-9]+$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if not isinstance(collection_id, str) or not re.match(r\"^qdr_col_[A-Za-z0-9]+$\", collection_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid collection_id.\")\n    if not isinstance(points, list) or len(points) < 1:\n        return _err(\"VALIDATION_ERROR\", \"points must be a non-empty array.\")\n    for i, p in enumerate(points):\n        if not isinstance(p, dict):\n            return _err(\"VALIDATION_ERROR\", f\"points[{i}] must be an object.\")\n        allowed = {\"id\", \"external_point_id\", \"content_text\", \"embedding\", \"payload\"}\n        extra = set(p.keys()) - allowed\n        if extra:\n            return _err(\"VALIDATION_ERROR\", f\"points[{i}] contains unknown fields: {sorted(extra)}.\")\n        if \"content_text\" not in p or \"embedding\" not in p:\n            return _err(\"VALIDATION_ERROR\", f\"points[{i}] must include content_text and embedding.\")\n        if p.get(\"id\") is not None and (not isinstance(p.get(\"id\"), str) or not re.match(r\"^qdr_pt_[A-Za-z0-9]+$\", p.get(\"id\"))):\n            return _err(\"VALIDATION_ERROR\", f\"points[{i}].id must match ^qdr_pt_[A-Za-z0-9]+$.\")\n        if p.get(\"external_point_id\") is not None and not isinstance(p.get(\"external_point_id\"), str):\n            return _err(\"VALIDATION_ERROR\", f\"points[{i}].external_point_id must be a string.\")\n        if not isinstance(p.get(\"content_text\"), str):\n            return _err(\"VALIDATION_ERROR\", f\"points[{i}].content_text must be a string.\")\n        emb = p.get(\"embedding\")\n        if not isinstance(emb, list) or len(emb) < 1:\n            return _err(\"VALIDATION_ERROR\", f\"points[{i}].embedding must be a non-empty array.\")\n        for j, v in enumerate(emb):\n            if not isinstance(v, (int, float)):\n                return _err(\"VALIDATION_ERROR\", f\"points[{i}].embedding[{j}] must be a number.\")\n        if p.get(\"payload\") is not None and not isinstance(p.get(\"payload\"), dict):\n            return _err(\"VALIDATION_ERROR\", f\"points[{i}].payload must be an object.\")\n\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    collections = _load(\"vector_collections.json\")\n    memory_points = _load(\"memory_points.json\")\n    search_requests = _load(\"search_requests.json\")\n\n    # Resolve workspace + collection (must exist and be compatible)\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    col = next((c for c in collections if isinstance(c, dict) and c.get(\"id\") == collection_id), None)\n\n    # Create request log row in 'received' no matter what (best-effort, but must persist)\n    req_row = {\n        \"id\": _new_req_id(),\n        \"workspace_id\": workspace_id,\n        \"api_key_id\": None,\n        \"tool_name\": \"qdrant-store\",\n        \"status\": \"received\",\n        \"collection_id\": collection_id,\n        \"input\": {\"point_count\": len(points)},\n        \"result_count\": None,\n        \"latency_ms\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    search_requests.append(req_row)\n    _save(\"search_requests.json\", search_requests)\n\n    if ws is None:\n        _finalize(search_requests, req_row, \"failed\", err_code=\"WORKSPACE_NOT_FOUND\", err_msg=\"workspace not found\")\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n    if ws.get(\"status\") != \"active\":\n        _finalize(search_requests, req_row, \"failed\", err_code=\"WORKSPACE_SUSPENDED\", err_msg=\"workspace not active; request rejected\")\n        return _err(\"UNAUTHORIZED\", \"Workspace not active; request rejected.\", status=ws.get(\"status\"))\n\n    if col is None or col.get(\"workspace_id\") != workspace_id:\n        _finalize(search_requests, req_row, \"failed\", err_code=\"COLLECTION_NOT_FOUND\", err_msg=\"collection not found for workspace\")\n        return _err(\"NOT_FOUND\", \"Collection not found for workspace.\", collection_id=collection_id)\n    if col.get(\"status\") == \"deleted\":\n        _finalize(search_requests, req_row, \"failed\", err_code=\"COLLECTION_DELETED\", err_msg=\"target collection unavailable or deleted\")\n        return _err(\"UNAUTHORIZED\", \"Target collection unavailable or deleted.\", collection_status=col.get(\"status\"))\n\n    # Ambient auth: pick any active API key in this workspace that has 'store' scope and is not rate-limited.\n    active_keys = [k for k in api_keys if isinstance(k, dict) and k.get(\"workspace_id\") == workspace_id and k.get(\"status\") == \"active\" and isinstance(k.get(\"scopes\"), list) and (\"store\" in k.get(\"scopes\"))]\n    if not active_keys:\n        _finalize(search_requests, req_row, \"failed\", err_code=\"AUTH_REQUIRED\", err_msg=\"missing api key; session not authorized for tool\")\n        return _err(\"UNAUTHORIZED\", \"No active API key with required scope for this workspace/tool.\")\n\n    # Rate limit check (rolling 60s) for any candidate key; select one that is within limit.\n    def _parse_ts(s):\n        try:\n            if not isinstance(s, str) or not s.endswith(\"Z\"):\n                return None\n            return datetime.datetime.fromisoformat(s[:-1])\n        except Exception:\n            return None\n\n    now_ts = now_dt\n    chosen_key = None\n    for k in active_keys:\n        rpm = k.get(\"rate_limit_rpm\")\n        if rpm is None:\n            chosen_key = k\n            break\n        if not isinstance(rpm, int) or rpm < 1:\n            continue\n        window_start = now_ts - datetime.timedelta(seconds=60)\n        used = 0\n        for r in search_requests:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"api_key_id\") != k.get(\"id\"):\n                continue\n            ts = _parse_ts(r.get(\"created_at\"))\n            if ts is None:\n                continue\n            if ts >= window_start and ts <= now_ts:\n                used += 1\n        if used < rpm:\n            chosen_key = k\n            break\n\n    if chosen_key is None:\n        # If all candidates are limited, mark as rate_limited.\n        _finalize(search_requests, req_row, \"rate_limited\", err_code=\"RATE_LIMIT_RPM\", err_msg=\"too many requests in 60s window\")\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded for API key.\", rule=\"api_keys.rate_limit_rpm rolling 60s window\")\n\n    # attach chosen key to request log and update key last_used_at on success later\n    req_row[\"api_key_id\"] = chosen_key.get(\"id\")\n    _save(\"search_requests.json\", search_requests)\n\n    # Enforce embedding length == vector_size for target collection (business rule)\n    vector_size = col.get(\"vector_size\")\n    if not isinstance(vector_size, int) or vector_size < 2:\n        _finalize(search_requests, req_row, \"failed\", err_code=\"COLLECTION_INVALID\", err_msg=\"collection vector_size invalid\")\n        return _err(\"CONFLICT\", \"Target collection configuration invalid.\", vector_size=vector_size)\n\n    for i, p in enumerate(points):\n        if len(p[\"embedding\"]) != vector_size:\n            _finalize(search_requests, req_row, \"failed\", err_code=\"VECTOR_SIZE_MISMATCH\", err_msg=f\"embedding length {len(p['embedding'])} does not match collection vector_size {vector_size}\")\n            return _err(\n                \"VALIDATION_ERROR\",\n                \"Embedding length must equal target collection vector_size (business rule: json_array_length(embedding) = vector_collections.vector_size).\",\n                expected=vector_size,\n                got=len(p[\"embedding\"]),\n                index=i,\n            )\n\n    # Uniqueness constraints within collection: external_point_id unique; content_hash unique (when provided).\n    # (content_hash isn't part of input schema; if present in existing rows, we must still enforce uniqueness when updating via external_point_id/id? We'll enforce only if a point row already has content_hash and update doesn't change it; callers cannot set it here.)\n    existing_by_id = {}\n    existing_by_external = {}\n    existing_external_values = set()\n    existing_content_hash_values = set()\n    for mp in memory_points:\n        if not isinstance(mp, dict):\n            continue\n        if mp.get(\"collection_id\") != collection_id:\n            continue\n        pid = mp.get(\"id\")\n        if isinstance(pid, str):\n            existing_by_id[pid] = mp\n        ext = mp.get(\"external_point_id\")\n        if isinstance(ext, str):\n            existing_by_external[ext] = mp\n            existing_external_values.add(ext)\n        ch = mp.get(\"content_hash\")\n        if isinstance(ch, str):\n            existing_content_hash_values.add(ch)\n\n    # Validate intra-request duplicates for external_point_id and id (avoid conflicts)\n    seen_ids = set()\n    seen_exts = set()\n    for i, p in enumerate(points):\n        if p.get(\"id\") is not None:\n            if p[\"id\"] in seen_ids:\n                _finalize(search_requests, req_row, \"failed\", err_code=\"DUPLICATE_ID\", err_msg=\"duplicate point id in request\")\n                return _err(\"CONFLICT\", \"Duplicate point id in request batch.\", point_id=p[\"id\"], index=i)\n            seen_ids.add(p[\"id\"])\n        if p.get(\"external_point_id\") is not None:\n            if p[\"external_point_id\"] in seen_exts:\n                _finalize(search_requests, req_row, \"failed\", err_code=\"DUPLICATE_EXTERNAL_POINT_ID\", err_msg=\"duplicate external_point_id in request\")\n                return _err(\"CONFLICT\", \"Duplicate external_point_id in request batch.\", external_point_id=p[\"external_point_id\"], index=i)\n            seen_exts.add(p[\"external_point_id\"])\n\n    # Apply upserts\n    def _new_point_id():\n        return \"qdr_pt_\" + uuid.uuid4().hex[:24]\n\n    stored = []\n    written = 0\n\n    for i, p in enumerate(points):\n        pid = p.get(\"id\")\n        ext = p.get(\"external_point_id\")\n\n        target = None\n        # external_point_id upsert within same collection\n        if isinstance(ext, str):\n            target = existing_by_external.get(ext)\n        # else by id if provided\n        if target is None and isinstance(pid, str):\n            target = existing_by_id.get(pid)\n\n        if target is not None:\n            # Reject \"id changes identity\" conflict: if both provided but point doesn't match\n            if isinstance(pid, str) and target.get(\"id\") != pid:\n                _finalize(search_requests, req_row, \"failed\", err_code=\"ID_CONFLICT\", err_msg=\"point id conflicts with existing external_point_id mapping\")\n                return _err(\"CONFLICT\", \"Provided id conflicts with existing external_point_id mapping.\", index=i)\n            if isinstance(ext, str) and target.get(\"external_point_id\") not in (None, ext):\n                _finalize(search_requests, req_row, \"failed\", err_code=\"EXTERNAL_ID_CONFLICT\", err_msg=\"external_point_id conflicts with existing id mapping\")\n                return _err(\"CONFLICT\", \"Provided external_point_id conflicts with existing id mapping.\", index=i)\n\n            # Update allowed fields; do not resurrect tombstoned points (irreversible)\n            if target.get(\"status\") == \"tombstoned\":\n                _finalize(search_requests, req_row, \"failed\", err_code=\"INVALID_TRANSITION\", err_msg=\"cannot update tombstoned point\")\n                return _err(\"INVALID_TRANSITION\", \"Cannot update a tombstoned point (transition irreversible).\", point_id=target.get(\"id\"), index=i)\n\n            target[\"embedding\"] = p[\"embedding\"]\n            target[\"content_text\"] = p.get(\"content_text\")\n            target[\"payload\"] = p.get(\"payload\")\n            if isinstance(ext, str):\n                target[\"external_point_id\"] = ext\n            target[\"updated_at\"] = now\n            written += 1\n            stored.append({\"id\": target.get(\"id\"), \"external_point_id\": target.get(\"external_point_id\"), \"status\": \"updated\"})\n            continue\n\n        # Insert new row\n        if pid is None:\n            pid = _new_point_id()\n\n        # Ensure id not already used globally (primary key)\n        if pid in existing_by_id:\n            _finalize(search_requests, req_row, \"failed\", err_code=\"POINT_ID_EXISTS\", err_msg=\"point id already exists\")\n            return _err(\"CONFLICT\", \"Point id already exists.\", point_id=pid, index=i)\n\n        if isinstance(ext, str) and ext in existing_external_values:\n            _finalize(search_requests, req_row, \"failed\", err_code=\"EXTERNAL_POINT_ID_EXISTS\", err_msg=\"external_point_id already exists in collection\")\n            return _err(\"CONFLICT\", \"external_point_id already exists in this collection.\", external_point_id=ext, index=i)\n\n        new_row = {\n            \"id\": pid,\n            \"workspace_id\": workspace_id,\n            \"collection_id\": collection_id,\n            \"external_point_id\": ext,\n            \"status\": \"active\",\n            \"content_text\": p.get(\"content_text\"),\n            \"embedding\": p[\"embedding\"],\n            \"payload\": p.get(\"payload\"),\n            \"content_hash\": None,\n            \"created_by_api_key_id\": chosen_key.get(\"id\"),\n            \"created_at\": now,\n            \"updated_at\": now,\n            \"deleted_at\": None,\n        }\n        memory_points.append(new_row)\n        existing_by_id[pid] = new_row\n        if isinstance(ext, str):\n            existing_by_external[ext] = new_row\n            existing_external_values.add(ext)\n        written += 1\n        stored.append({\"id\": pid, \"external_point_id\": ext, \"status\": \"inserted\"})\n\n    if written < 1:\n        _finalize(search_requests, req_row, \"failed\", err_code=\"NO_EFFECT\", err_msg=\"no points written\")\n        return _err(\"NOT_FOUND\", \"No points were written.\")\n\n    # Persist mutations\n    _save(\"memory_points.json\", memory_points)\n    # Update API key last_used_at\n    for k in api_keys:\n        if isinstance(k, dict) and k.get(\"id\") == chosen_key.get(\"id\"):\n            k[\"last_used_at\"] = now\n            k[\"updated_at\"] = now\n            break\n    _save(\"api_keys.json\", api_keys)\n\n    _finalize(search_requests, req_row, \"succeeded\", result_count=written)\n\n    return {\n        \"workspace_id\": workspace_id,\n        \"collection_id\": collection_id,\n        \"written\": written,\n        \"points\": stored,\n        \"request_id\": req_row[\"id\"],\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "qdrant-find",
+          "description": "Runs a similarity search over memories within a workspace (and collection when specified), using either query_embedding or query_text (which the server may embed), and returns up to top_k/limit matches ordered by similarity; each match includes only the fields requested via include_payload/include_embedding/include_content and pagination is supported via the returned opaque cursor for subsequent pages. Raises VALIDATION_ERROR if workspace_id (or collection_id when provided) fails validation, if neither query_text nor query_embedding is provided, if top_k/limit are < 1, or if query_embedding length does not match the collection’s vector_size. Raises UNAUTHORIZED if the caller cannot read the workspace/collection, NOT_FOUND if the workspace or collection does not exist, and QUOTA_EXCEEDED when search/read limits for the workspace are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^qdr_ws_[A-Za-z0-9]+$",
+                "description": "Workspace id to search within."
+              },
+              "collection_id": {
+                "type": "string",
+                "pattern": "^qdr_col_[A-Za-z0-9]+$",
+                "description": "Vector collection id to search (defaults to workspace.default_collection_id if omitted by the server)."
+              },
+              "query_text": {
+                "type": "string",
+                "description": "Free-text query to find similar memories (server may embed this to a vector)."
+              },
+              "query_embedding": {
+                "type": "array",
+                "description": "Query embedding vector (alternative to query_text).",
+                "items": {
+                  "type": "number"
+                }
+              },
+              "top_k": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Number of most similar memories to return."
+              },
+              "filter": {
+                "type": "object",
+                "description": "Optional metadata filter applied against stored payload fields.",
+                "additionalProperties": true
+              },
+              "include_payload": {
+                "type": "boolean",
+                "description": "Whether to include the stored payload object in each match."
+              },
+              "include_embedding": {
+                "type": "boolean",
+                "description": "Whether to include the stored embedding vector in each match."
+              },
+              "include_content": {
+                "type": "boolean",
+                "description": "Whether to include the stored content_text in each match."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque cursor for paginating through results."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum number of results to return (used for pagination; may mirror top_k)."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def qdrant_find(workspace_id, collection_id=None, query_text=None, query_embedding=None, top_k=None, filter=None, include_payload=None, include_embedding=None, include_content=None, cursor=None, limit=None, **_extra):\n    import json, os, datetime, re, uuid, time, math, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0013000\" if __import__(\"os\").path.isdir(\"./environment_mix/0013000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now = now_dt.isoformat() + \"Z\"\n\n    def _new_req_id():\n        return \"qdr_req_\" + uuid.uuid4().hex[:24]\n\n    def _parse_ts(s):\n        try:\n            if not isinstance(s, str) or not s.endswith(\"Z\"):\n                return None\n            return datetime.datetime.fromisoformat(s[:-1])\n        except Exception:\n            return None\n\n    # Defaults\n    include_payload = False if include_payload is None else include_payload\n    include_embedding = False if include_embedding is None else include_embedding\n    include_content = False if include_content is None else include_content\n\n    # ---- Validate inputs ----\n    if not isinstance(workspace_id, str) or not re.match(r\"^qdr_ws_[A-Za-z0-9]+$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if collection_id is not None and (not isinstance(collection_id, str) or not re.match(r\"^qdr_col_[A-Za-z0-9]+$\", collection_id)):\n        return _err(\"VALIDATION_ERROR\", \"Invalid collection_id.\")\n    if query_text is not None and not isinstance(query_text, str):\n        return _err(\"VALIDATION_ERROR\", \"query_text must be a string.\")\n    if query_embedding is not None:\n        if not isinstance(query_embedding, list):\n            return _err(\"VALIDATION_ERROR\", \"query_embedding must be an array.\")\n        for j, v in enumerate(query_embedding):\n            if not isinstance(v, (int, float)):\n                return _err(\"VALIDATION_ERROR\", f\"query_embedding[{j}] must be a number.\")\n    if top_k is not None and (not isinstance(top_k, int) or top_k < 1):\n        return _err(\"VALIDATION_ERROR\", \"top_k must be an integer >= 1.\")\n    if limit is not None and (not isinstance(limit, int) or limit < 1):\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer >= 1.\")\n    if filter is not None and not isinstance(filter, dict):\n        return _err(\"VALIDATION_ERROR\", \"filter must be an object.\")\n    for nm, val in [(\"include_payload\", include_payload), (\"include_embedding\", include_embedding), (\"include_content\", include_content)]:\n        if not isinstance(val, bool):\n            return _err(\"VALIDATION_ERROR\", f\"{nm} must be boolean.\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n    if (query_text is None) == (query_embedding is None):\n        return _err(\"VALIDATION_ERROR\", \"Provide exactly one of query_text or query_embedding.\")\n\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    collections = _load(\"vector_collections.json\")\n    memory_points = _load(\"memory_points.json\")\n    search_requests = _load(\"search_requests.json\")\n\n    # Resolve workspace\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n\n    # Resolve collection: explicit or default\n    resolved_collection_id = collection_id\n    if resolved_collection_id is None:\n        if ws and ws.get(\"default_collection_id\"):\n            resolved_collection_id = ws.get(\"default_collection_id\")\n\n    # Create request log row in 'received' and persist immediately\n    req_row = {\n        \"id\": _new_req_id(),\n        \"workspace_id\": workspace_id,\n        \"api_key_id\": None,\n        \"tool_name\": \"qdrant-find\",\n        \"status\": \"received\",\n        \"collection_id\": resolved_collection_id,\n        \"input\": {\n            \"query_text\": query_text if query_text is not None else None,\n            \"has_query_embedding\": query_embedding is not None,\n            \"top_k\": top_k,\n            \"limit\": limit,\n            \"filter\": filter,\n        },\n        \"result_count\": None,\n        \"latency_ms\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    search_requests.append(req_row)\n    _save(\"search_requests.json\", search_requests)\n\n    def _finalize(status, result_count=None, err_code=None, err_msg=None):\n        req_row[\"status\"] = status\n        req_row[\"updated_at\"] = now\n        req_row[\"latency_ms\"] = max(0, int((time.time() - t0) * 1000))\n        if result_count is not None:\n            req_row[\"result_count\"] = int(result_count)\n        if err_code is not None:\n            req_row[\"error_code\"] = err_code\n        if err_msg is not None:\n            req_row[\"error_message\"] = err_msg\n        _save(\"search_requests.json\", search_requests)\n\n    if ws is None:\n        _finalize(\"failed\", err_code=\"WORKSPACE_NOT_FOUND\", err_msg=\"workspace not found\")\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n    if ws.get(\"status\") != \"active\":\n        _finalize(\"failed\", err_code=\"WORKSPACE_SUSPENDED\", err_msg=\"workspace not active; request rejected\")\n        return _err(\"UNAUTHORIZED\", \"Workspace not active; request rejected.\", status=ws.get(\"status\"))\n\n    if resolved_collection_id is None:\n        _finalize(\"failed\", err_code=\"COLLECTION_REQUIRED\", err_msg=\"no collection specified and no workspace default_collection_id set\")\n        return _err(\"VALIDATION_ERROR\", \"No collection_id provided and workspace has no default_collection_id.\")\n    if not isinstance(resolved_collection_id, str) or not re.match(r\"^qdr_col_[A-Za-z0-9]+$\", resolved_collection_id):\n        _finalize(\"failed\", err_code=\"COLLECTION_ID_INVALID\", err_msg=\"invalid collection id\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid collection_id.\")\n\n    col = next((c for c in collections if isinstance(c, dict) and c.get(\"id\") == resolved_collection_id), None)\n    if col is None or col.get(\"workspace_id\") != workspace_id:\n        _finalize(\"failed\", err_code=\"COLLECTION_NOT_FOUND\", err_msg=\"collection not found for workspace\")\n        return _err(\"NOT_FOUND\", \"Collection not found for workspace.\", collection_id=resolved_collection_id)\n    if col.get(\"status\") == \"deleted\":\n        _finalize(\"failed\", err_code=\"COLLECTION_DELETED\", err_msg=\"target collection unavailable or deleted\")\n        return _err(\"UNAUTHORIZED\", \"Target collection unavailable or deleted.\", collection_status=col.get(\"status\"))\n\n    # Ambient auth: pick any active API key with 'find' scope in this workspace and not rate-limited.\n    active_keys = [k for k in api_keys if isinstance(k, dict) and k.get(\"workspace_id\") == workspace_id and k.get(\"status\") == \"active\" and isinstance(k.get(\"scopes\"), list) and (\"find\" in k.get(\"scopes\"))]\n    if not active_keys:\n        _finalize(\"failed\", err_code=\"AUTH_REQUIRED\", err_msg=\"missing api key; session not authorized for tool\")\n        return _err(\"UNAUTHORIZED\", \"No active API key with required scope for this workspace/tool.\")\n\n    chosen_key = None\n    for k in active_keys:\n        rpm = k.get(\"rate_limit_rpm\")\n        if rpm is None:\n            chosen_key = k\n            break\n        if not isinstance(rpm, int) or rpm < 1:\n            continue\n        window_start = now_dt - datetime.timedelta(seconds=60)\n        used = 0\n        for r in search_requests:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"api_key_id\") != k.get(\"id\"):\n                continue\n            ts = _parse_ts(r.get(\"created_at\"))\n            if ts is None:\n                continue\n            if ts >= window_start and ts <= now_dt:\n                used += 1\n        if used < rpm:\n            chosen_key = k\n            break\n\n    if chosen_key is None:\n        _finalize(\"rate_limited\", err_code=\"RATE_LIMIT_RPM\", err_msg=\"too many requests in 60s window\")\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded for API key.\", rule=\"api_keys.rate_limit_rpm rolling 60s window\")\n\n    req_row[\"api_key_id\"] = chosen_key.get(\"id\")\n    req_row[\"collection_id\"] = resolved_collection_id\n    _save(\"search_requests.json\", search_requests)\n\n    # Validate query embedding length if provided\n    vector_size = col.get(\"vector_size\")\n    if query_embedding is not None:\n        if not isinstance(vector_size, int) or vector_size < 2:\n            _finalize(\"failed\", err_code=\"COLLECTION_INVALID\", err_msg=\"collection vector_size invalid\")\n            return _err(\"CONFLICT\", \"Target collection configuration invalid.\", vector_size=vector_size)\n        if len(query_embedding) != vector_size:\n            _finalize(\"failed\", err_code=\"VECTOR_SIZE_MISMATCH\", err_msg=f\"query embedding length {len(query_embedding)} does not match collection vector_size {vector_size}\")\n            return _err(\"VALIDATION_ERROR\", \"query_embedding length must match collection vector_size.\", expected=vector_size, got=len(query_embedding))\n\n    # If query_text is provided, this offline implementation cannot embed; use naive lexical scoring.\n    # This is still \"real\" in the sense it searches and returns deterministic results from the store.\n    q_tokens = None\n    if query_text is not None:\n        q_tokens = [t for t in re.split(r\"[^A-Za-z0-9]+\", query_text.lower()) if t]\n\n    def _payload_matches(payload, flt):\n        if flt is None:\n            return True\n        if not isinstance(payload, dict):\n            return False\n        for k, v in flt.items():\n            if k not in payload:\n                return False\n            pv = payload.get(k)\n            if isinstance(v, dict):\n                if \"$eq\" in v:\n                    if pv != v[\"$eq\"]:\n                        return False\n                elif \"$in\" in v and isinstance(v[\"$in\"], list):\n                    if pv not in v[\"$in\"]:\n                        return False\n                else:\n                    return False\n            else:\n                if pv != v:\n                    return False\n        return True\n\n    # Collect candidates: active points only, in resolved collection, workspace match\n    candidates = []\n    for mp in memory_points:\n        if not isinstance(mp, dict):\n            continue\n        if mp.get(\"workspace_id\") != workspace_id:\n            continue\n        if mp.get(\"collection_id\") != resolved_collection_id:\n            continue\n        if mp.get(\"status\") != \"active\":\n            continue\n        if not _payload_matches(mp.get(\"payload\"), filter):\n            continue\n\n        score = 0.0\n        if query_embedding is not None:\n            emb = mp.get(\"embedding\")\n            if not isinstance(emb, list) or len(emb) != len(query_embedding):\n                continue\n            # cosine similarity (with safe zero norms)\n            dot = 0.0\n            na = 0.0\n            nb = 0.0\n            for a, b in zip(query_embedding, emb):\n                if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):\n                    dot = None\n                    break\n                dot += float(a) * float(b)\n                na += float(a) * float(a)\n                nb += float(b) * float(b)\n            if dot is None:\n                continue\n            denom = math.sqrt(na) * math.sqrt(nb)\n            score = (dot / denom) if denom > 0 else 0.0\n        else:\n            text = mp.get(\"content_text\") or \"\"\n            t_tokens = [t for t in re.split(r\"[^A-Za-z0-9]+\", str(text).lower()) if t]\n            if not t_tokens or not q_tokens:\n                score = 0.0\n            else:\n                # simple overlap\n                s = 0\n                tset = set(t_tokens)\n                for qt in set(q_tokens):\n                    if qt in tset:\n                        s += 1\n                score = float(s)\n\n        candidates.append((score, mp))\n\n    # Sort by descending score, tie-break by updated_at desc then id\n    def _ts_key(s):\n        ts = _parse_ts(s)\n        return ts if ts is not None else datetime.datetime(1970, 1, 1)\n\n    candidates.sort(key=lambda x: (x[0], _ts_key(x[1].get(\"updated_at\")), x[1].get(\"id\") or \"\"), reverse=True)\n\n    # Pagination\n    k = top_k if top_k is not None else col.get(\"default_top_k\")\n    if not isinstance(k, int) or k < 1:\n        k = 10\n    if limit is not None:\n        k = min(k, limit)\n\n    offset = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\")).decode(\"utf-8\")\n            if raw.startswith(\"offset:\"):\n                offset = int(raw.split(\":\", 1)[1])\n                if offset < 0:\n                    offset = 0\n        except Exception:\n            _finalize(\"failed\", err_code=\"CURSOR_INVALID\", err_msg=\"invalid cursor\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n    total = len(candidates)\n    page = candidates[offset:offset + k]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = base64.urlsafe_b64encode(f\"offset:{next_offset}\".encode(\"utf-8\")).decode(\"utf-8\") if has_more else None\n\n    results = []\n    for score, mp in page:\n        item = {\n            \"id\": mp.get(\"id\"),\n            \"external_point_id\": mp.get(\"external_point_id\"),\n            \"score\": score,\n            \"payload\": mp.get(\"payload\") if include_payload else None,\n            \"embedding\": mp.get(\"embedding\") if include_embedding else None,\n            \"content_text\": mp.get(\"content_text\") if include_content else None,\n            \"created_at\": mp.get(\"created_at\"),\n            \"updated_at\": mp.get(\"updated_at\"),\n        }\n        results.append(item)\n\n    # Update key last_used_at and request log\n    for krow in api_keys:\n        if isinstance(krow, dict) and krow.get(\"id\") == chosen_key.get(\"id\"):\n            krow[\"last_used_at\"] = now\n            krow[\"updated_at\"] = now\n            break\n    _save(\"api_keys.json\", api_keys)\n\n    _finalize(\"succeeded\", result_count=len(results))\n\n    return {\n        \"workspace_id\": workspace_id,\n        \"collection_id\": resolved_collection_id,\n        \"results\": results,\n        \"total\": total,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n        \"request_id\": req_row[\"id\"],\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "qdrant-list-collections",
+          "description": "Lists vector collections in a workspace, optionally filtering by status and paginating results; returns collection summaries and refuses with AUTHORIZATION_ERROR if the API key is invalid/revoked or lacks required scope.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^qdr_ws_[A-Za-z0-9]+$",
+                "description": "Workspace id to list collections for."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "rebuilding",
+                  "deleted"
+                ],
+                "description": "Filter collections by lifecycle status."
+              },
+              "name_prefix": {
+                "type": "string",
+                "description": "Optional prefix match filter for collection names."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque cursor for pagination."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of collections to return per page."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def qdrant_list_collections(workspace_id, status=None, name_prefix=None, cursor=None, limit=None, **_extra):\n    import json, os, datetime, time, re, uuid, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0013000\" if __import__(\"os\").path.isdir(\"./environment_mix/0013000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    collections = _load(\"vector_collections.json\")\n    search_requests = _load(\"search_requests.json\")\n\n    def _new_req_id():\n        return \"qdr_req_\" + uuid.uuid4().hex[:24]\n\n    def _resolve_api_key_for_workspace(ws_id):\n        cands = [k for k in api_keys if isinstance(k, dict) and k.get(\"workspace_id\") == ws_id and k.get(\"status\") == \"active\"]\n        # admin scope preferred, else any active key\n        for k in cands:\n            scopes = k.get(\"scopes\")\n            if isinstance(scopes, list) and \"admin\" in scopes:\n                return k\n        return cands[0] if cands else None\n\n    # Log as a request row too (tool_name enum excludes this in schema; keep consistent by not logging there)\n    # Since schema enum only allows qdrant-store/qdrant-find, we cannot append; enforce no logging collection exists for this tool.\n    # Therefore we implement without search_requests logging.\n\n    # Validate\n    if not isinstance(workspace_id, str) or not re.match(r\"^qdr_ws_[A-Za-z0-9]+$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if status is not None:\n        if status not in (\"active\", \"rebuilding\", \"deleted\"):\n            return _err(\"VALIDATION_ERROR\", \"Invalid status.\")\n    if name_prefix is not None and not isinstance(name_prefix, str):\n        return _err(\"VALIDATION_ERROR\", \"name_prefix must be a string.\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n    if limit is not None:\n        if not isinstance(limit, int) or limit < 1 or limit > 200:\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200.\")\n\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if ws is None:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\")\n    if ws.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active or does not exist.\")\n\n    key = _resolve_api_key_for_workspace(workspace_id)\n    if key is None:\n        return _err(\"UNAUTHORIZED\", \"No active API key available for this workspace.\")\n    scopes = key.get(\"scopes\")\n    if not (isinstance(scopes, list) and (\"admin\" in scopes or \"find\" in scopes or \"store\" in scopes)):\n        return _err(\"UNAUTHORIZED\", \"API key lacks required scope.\")\n\n    # Pagination\n    off = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            s = raw.decode(\"utf-8\")\n            if not s.startswith(\"off:\"):\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n            off = int(s.split(\":\", 1)[1])\n            if off < 0:\n                raise ValueError()\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n    eff_limit = limit if limit is not None else 50\n\n    rows = []\n    for c in collections:\n        if not isinstance(c, dict):\n            continue\n        if c.get(\"workspace_id\") != workspace_id:\n            continue\n        if status is not None and c.get(\"status\") != status:\n            continue\n        if name_prefix is not None:\n            nm = c.get(\"name\")\n            if not isinstance(nm, str) or not nm.startswith(name_prefix):\n                continue\n        rows.append(c)\n\n    rows.sort(key=lambda r: (r.get(\"name\") or \"\", r.get(\"id\") or \"\"))\n\n    total = len(rows)\n    page = rows[off: off + eff_limit]\n    next_off = off + len(page)\n    has_more = next_off < total\n    next_cursor = base64.urlsafe_b64encode(f\"off:{next_off}\".encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\") if has_more else None\n\n    summaries = []\n    for c in page:\n        summaries.append({\n            \"id\": c.get(\"id\"),\n            \"workspace_id\": c.get(\"workspace_id\"),\n            \"name\": c.get(\"name\"),\n            \"status\": c.get(\"status\"),\n            \"vector_size\": c.get(\"vector_size\"),\n            \"distance\": c.get(\"distance\"),\n            \"default_top_k\": c.get(\"default_top_k\"),\n            \"created_at\": c.get(\"created_at\"),\n            \"updated_at\": c.get(\"updated_at\"),\n        })\n\n    # Update key last_used_at (best-effort)\n    key[\"last_used_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    key[\"updated_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    _save(\"api_keys.json\", api_keys)\n\n    return {\n        \"workspace_id\": workspace_id,\n        \"collections\": summaries,\n        \"page\": {\n            \"total\": total,\n            \"count\": len(summaries),\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"latency_ms\": max(0, int((time.time() - t0) * 1000)),\n        }\n    }\n"
+        },
+        {
+          "name": "qdrant-get-collection",
+          "description": "Fetches a single vector collection by id; returns the collection configuration (vector_size, distance, payload_schema) and refuses with NOT_FOUND if it does not exist in the workspace or is not visible to the caller.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^qdr_ws_[A-Za-z0-9]+$",
+                "description": "Workspace id that owns the collection."
+              },
+              "collection_id": {
+                "type": "string",
+                "pattern": "^qdr_col_[A-Za-z0-9]+$",
+                "description": "Vector collection id to fetch."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "collection_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def qdrant_get_collection(workspace_id, collection_id, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0013000\" if __import__(\"os\").path.isdir(\"./environment_mix/0013000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    collections = _load(\"vector_collections.json\")\n\n    if not isinstance(workspace_id, str) or not re.match(r\"^qdr_ws_[A-Za-z0-9]+$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if not isinstance(collection_id, str) or not re.match(r\"^qdr_col_[A-Za-z0-9]+$\", collection_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid collection_id.\")\n\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if ws is None:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\")\n    if ws.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active or does not exist.\")\n\n    # Ambient auth: any active key in workspace can read collection config\n    key = next((k for k in api_keys if isinstance(k, dict) and k.get(\"workspace_id\") == workspace_id and k.get(\"status\") == \"active\"), None)\n    if key is None:\n        return _err(\"UNAUTHORIZED\", \"No active API key available for this workspace.\")\n\n    col = next((c for c in collections if isinstance(c, dict) and c.get(\"id\") == collection_id and c.get(\"workspace_id\") == workspace_id), None)\n    if col is None:\n        return _err(\"NOT_FOUND\", \"Collection not found in workspace.\")\n    if col.get(\"status\") == \"deleted\":\n        return _err(\"NOT_FOUND\", \"Collection not found in workspace.\")\n\n    # Update key last_used_at (best-effort)\n    key[\"last_used_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    key[\"updated_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    _save(\"api_keys.json\", api_keys)\n\n    return {\n        \"workspace_id\": workspace_id,\n        \"collection\": {\n            \"id\": col.get(\"id\"),\n            \"workspace_id\": col.get(\"workspace_id\"),\n            \"name\": col.get(\"name\"),\n            \"status\": col.get(\"status\"),\n            \"vector_size\": col.get(\"vector_size\"),\n            \"distance\": col.get(\"distance\"),\n            \"default_top_k\": col.get(\"default_top_k\"),\n            \"payload_schema\": col.get(\"payload_schema\"),\n            \"created_at\": col.get(\"created_at\"),\n            \"updated_at\": col.get(\"updated_at\"),\n        },\n        \"latency_ms\": max(0, int((time.time() - t0) * 1000)),\n    }\n"
+        },
+        {
+          "name": "qdrant-create-collection",
+          "description": "Creates a new vector collection in the workspace with the given vector size and distance metric; returns the created collection record and refuses with VALIDATION_ERROR on invalid configuration or CONFLICT if the name is not unique per workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^qdr_ws_[A-Za-z0-9]+$",
+                "description": "Workspace id to create the collection in."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "Human-readable collection name (must be unique per workspace)."
+              },
+              "vector_size": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65536,
+                "description": "Dimension of vectors stored in this collection."
+              },
+              "distance": {
+                "type": "string",
+                "enum": [
+                  "cosine",
+                  "dot",
+                  "euclid"
+                ],
+                "description": "Distance function used for similarity search."
+              },
+              "default_top_k": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000,
+                "description": "Default number of results to return when top_k is not specified."
+              },
+              "payload_schema": {
+                "type": "object",
+                "description": "Optional schema or hints for payload fields to support filtering/indexing.",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "workspace_id",
+              "name",
+              "vector_size",
+              "distance"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def qdrant_create_collection(workspace_id, name, vector_size, distance, default_top_k=None, payload_schema=None, **_extra):\n    import json, os, datetime, time, re, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0013000\" if __import__(\"os\").path.isdir(\"./environment_mix/0013000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # Validate inputs\n    if not isinstance(workspace_id, str) or not re.match(r\"^qdr_ws_[A-Za-z0-9]+$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if not isinstance(name, str) or not (1 <= len(name) <= 128):\n        return _err(\"VALIDATION_ERROR\", \"Invalid name.\")\n    if not isinstance(vector_size, int):\n        return _err(\"VALIDATION_ERROR\", \"vector_size must be an integer.\")\n    # Tool schema says minimum 1, but collection constraint requires >=2.\n    if vector_size < 2 or vector_size > 65536:\n        return _err(\"VALIDATION_ERROR\", \"vector_size must be between 2 and 65536.\")\n    if distance not in (\"cosine\", \"dot\", \"euclid\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid distance.\")\n    if default_top_k is None:\n        default_top_k = 10\n    if not isinstance(default_top_k, int) or not (1 <= default_top_k <= 1000):\n        return _err(\"VALIDATION_ERROR\", \"default_top_k must be an integer between 1 and 1000.\")\n    if payload_schema is not None and not isinstance(payload_schema, dict):\n        return _err(\"VALIDATION_ERROR\", \"payload_schema must be an object when provided.\")\n\n    workspaces = _load(\"workspaces.json\")\n    collections = _load(\"vector_collections.json\")\n\n    ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n    if not ws:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\")\n    if ws.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active.\")\n\n    # Enforce unique collection name per workspace (case-sensitive, as typical DB constraint)\n    for c in collections:\n        if c.get(\"workspace_id\") == workspace_id and c.get(\"name\") == name and c.get(\"status\") != \"deleted\":\n            return _err(\"CONFLICT\", \"A collection with this name already exists in the workspace.\")\n\n    # Create new collection\n    # Generate id with required convention\n    new_id = \"qdr_col_\" + secrets.token_urlsafe(12).replace(\"-\", \"\").replace(\"_\", \"\")[:18]\n    while any(c.get(\"id\") == new_id for c in collections):\n        new_id = \"qdr_col_\" + secrets.token_urlsafe(12).replace(\"-\", \"\").replace(\"_\", \"\")[:18]\n\n    rec = {\n        \"id\": new_id,\n        \"workspace_id\": workspace_id,\n        \"name\": name,\n        \"status\": \"active\",\n        \"vector_size\": vector_size,\n        \"distance\": distance,\n        \"default_top_k\": default_top_k,\n        \"payload_schema\": payload_schema,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    collections.append(rec)\n    _save(\"vector_collections.json\", collections)\n\n    # Validate workspace.default_collection_id rule (if set) references non-deleted collection in same workspace.\n    # (Do not auto-mutate; just ensure datastore stays consistent where possible.)\n    if ws.get(\"default_collection_id\"):\n        dcid = ws.get(\"default_collection_id\")\n        dc = next((c for c in collections if c.get(\"id\") == dcid), None)\n        if not dc or dc.get(\"workspace_id\") != workspace_id or dc.get(\"status\") == \"deleted\":\n            # Workspace is inconsistent; surface as validation error rather than hiding it.\n            return _err(\"VALIDATION_ERROR\", \"Workspace default_collection_id is invalid or references a deleted collection.\")\n\n    return {\n        \"collection\": rec\n    }\n"
+        },
+        {
+          "name": "qdrant-update-collection",
+          "description": "Updates mutable properties of a vector collection (for example default_top_k, payload_schema, or status transitions); returns the updated collection and refuses with VALIDATION_ERROR for illegal transitions or when attempting to modify a deleted collection.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^qdr_ws_[A-Za-z0-9]+$",
+                "description": "Workspace id that owns the collection."
+              },
+              "collection_id": {
+                "type": "string",
+                "pattern": "^qdr_col_[A-Za-z0-9]+$",
+                "description": "Vector collection id to update."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "New collection name (must remain unique per workspace)."
+              },
+              "default_top_k": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000,
+                "description": "New default top_k for searches."
+              },
+              "payload_schema": {
+                "type": "object",
+                "description": "New payload schema/hints (replaces existing when provided).",
+                "additionalProperties": true
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "rebuilding",
+                  "deleted"
+                ],
+                "description": "Lifecycle status transition for the collection (active↔rebuilding, active/rebuilding→deleted)."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "collection_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def qdrant_update_collection(workspace_id, collection_id, name=None, default_top_k=None, payload_schema=None, status=None, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0013000\" if __import__(\"os\").path.isdir(\"./environment_mix/0013000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # Validate required identifiers\n    if not isinstance(workspace_id, str) or not re.match(r\"^qdr_ws_[A-Za-z0-9]+$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if not isinstance(collection_id, str) or not re.match(r\"^qdr_col_[A-Za-z0-9]+$\", collection_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid collection_id.\")\n\n    # Validate optionals\n    if name is not None:\n        if not isinstance(name, str) or not (1 <= len(name) <= 128):\n            return _err(\"VALIDATION_ERROR\", \"Invalid name.\")\n    if default_top_k is not None:\n        if not isinstance(default_top_k, int) or not (1 <= default_top_k <= 1000):\n            return _err(\"VALIDATION_ERROR\", \"default_top_k must be an integer between 1 and 1000.\")\n    if payload_schema is not None and not isinstance(payload_schema, dict):\n        return _err(\"VALIDATION_ERROR\", \"payload_schema must be an object when provided.\")\n    if status is not None and status not in (\"active\", \"rebuilding\", \"deleted\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid status.\")\n\n    workspaces = _load(\"workspaces.json\")\n    collections = _load(\"vector_collections.json\")\n\n    ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n    if not ws:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\")\n    if ws.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active.\")\n\n    col = next((c for c in collections if c.get(\"id\") == collection_id and c.get(\"workspace_id\") == workspace_id), None)\n    if not col:\n        return _err(\"NOT_FOUND\", \"Collection not found in workspace.\")\n\n    # Cannot modify deleted collection (explicit rule)\n    if col.get(\"status\") == \"deleted\":\n        return _err(\"VALIDATION_ERROR\", \"Cannot modify a deleted collection.\")\n\n    # Name uniqueness per workspace if changing\n    if name is not None and name != col.get(\"name\"):\n        for c in collections:\n            if c.get(\"workspace_id\") == workspace_id and c.get(\"name\") == name and c.get(\"id\") != collection_id and c.get(\"status\") != \"deleted\":\n                return _err(\"CONFLICT\", \"A collection with this name already exists in the workspace.\")\n        col[\"name\"] = name\n\n    # Apply mutable fields\n    if default_top_k is not None:\n        col[\"default_top_k\"] = default_top_k\n    if payload_schema is not None:\n        col[\"payload_schema\"] = payload_schema\n\n    # Status transition enforcement\n    if status is not None and status != col.get(\"status\"):\n        allowed = {\n            \"active\": [\"rebuilding\", \"deleted\"],\n            \"rebuilding\": [\"active\", \"deleted\"],\n            \"deleted\": [],\n        }\n        cur = col.get(\"status\")\n        if cur not in allowed:\n            return _err(\"VALIDATION_ERROR\", \"Collection has an unknown current status.\")\n        if status not in allowed[cur]:\n            return _err(\"INVALID_TRANSITION\", f\"Illegal status transition from '{cur}' to '{status}'.\")\n        col[\"status\"] = status\n\n    # If nothing changed, treat as not found? (Mutation matched a row but no changes requested)\n    # Real APIs typically succeed idempotently; however requirement says \"NO SUCCESS WITHOUT EFFECT\" for mutations\n    # that matched no row. Here we matched a row; if caller sent no fields, it's a validation error.\n    if name is None and default_top_k is None and payload_schema is None and status is None:\n        return _err(\"VALIDATION_ERROR\", \"No updatable fields provided.\")\n\n    col[\"updated_at\"] = now\n    _save(\"vector_collections.json\", collections)\n\n    # Validate workspace.default_collection_id rule (if set) references non-deleted collection in same workspace.\n    if ws.get(\"default_collection_id\"):\n        dcid = ws.get(\"default_collection_id\")\n        dc = next((c for c in collections if c.get(\"id\") == dcid), None)\n        if not dc or dc.get(\"workspace_id\") != workspace_id or dc.get(\"status\") == \"deleted\":\n            return _err(\"VALIDATION_ERROR\", \"Workspace default_collection_id is invalid or references a deleted collection.\")\n\n    return {\n        \"collection\": col\n    }\n"
+        },
+        {
+          "name": "qdrant-get-memory-point",
+          "description": "Fetches a single memory point by id from a collection; returns the point data and refuses with NOT_FOUND if the point does not exist or is tombstoned (unless include_deleted is true).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^qdr_ws_[A-Za-z0-9]+$",
+                "description": "Workspace id that owns the collection and point."
+              },
+              "collection_id": {
+                "type": "string",
+                "pattern": "^qdr_col_[A-Za-z0-9]+$",
+                "description": "Vector collection id that contains the point."
+              },
+              "point_id": {
+                "type": "string",
+                "pattern": "^qdr_pt_[A-Za-z0-9]+$",
+                "description": "Internal memory point id to fetch."
+              },
+              "include_payload": {
+                "type": "boolean",
+                "description": "Whether to include the stored payload object."
+              },
+              "include_embedding": {
+                "type": "boolean",
+                "description": "Whether to include the stored embedding vector."
+              },
+              "include_content": {
+                "type": "boolean",
+                "description": "Whether to include the stored content_text."
+              },
+              "include_deleted": {
+                "type": "boolean",
+                "description": "Whether to allow returning tombstoned points (when true, deleted_at may be returned)."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "collection_id",
+              "point_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def qdrant_get_memory_point(workspace_id, collection_id, point_id, include_payload=None, include_embedding=None, include_content=None, include_deleted=None, **_extra):\n    import json, os, datetime, re, uuid, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0013000\" if __import__(\"os\").path.isdir(\"./environment_mix/0013000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now = now_dt.isoformat() + \"Z\"\n\n    def _new_req_id():\n        return \"qdr_req_\" + uuid.uuid4().hex[:24]\n\n    # defaults\n    include_payload = False if include_payload is None else include_payload\n    include_embedding = False if include_embedding is None else include_embedding\n    include_content = False if include_content is None else include_content\n    include_deleted = False if include_deleted is None else include_deleted\n\n    # Validate\n    if not isinstance(workspace_id, str) or not re.match(r\"^qdr_ws_[A-Za-z0-9]+$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if not isinstance(collection_id, str) or not re.match(r\"^qdr_col_[A-Za-z0-9]+$\", collection_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid collection_id.\")\n    if not isinstance(point_id, str) or not re.match(r\"^qdr_pt_[A-Za-z0-9]+$\", point_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid point_id.\")\n    for nm, val in [(\"include_payload\", include_payload), (\"include_embedding\", include_embedding), (\"include_content\", include_content), (\"include_deleted\", include_deleted)]:\n        if not isinstance(val, bool):\n            return _err(\"VALIDATION_ERROR\", f\"{nm} must be boolean.\")\n\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    collections = _load(\"vector_collections.json\")\n    memory_points = _load(\"memory_points.json\")\n    search_requests = _load(\"search_requests.json\")\n\n    # Resolve workspace and collection\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    col = next((c for c in collections if isinstance(c, dict) and c.get(\"id\") == collection_id), None)\n\n    # Log request (use qdrant-find tool_name since schema enum only allows store/find)\n    req_row = {\n        \"id\": _new_req_id(),\n        \"workspace_id\": workspace_id,\n        \"api_key_id\": None,\n        \"tool_name\": \"qdrant-find\",\n        \"status\": \"received\",\n        \"collection_id\": collection_id,\n        \"input\": {\"op\": \"get_memory_point\", \"point_id\": point_id, \"include_deleted\": include_deleted},\n        \"result_count\": None,\n        \"latency_ms\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    search_requests.append(req_row)\n    _save(\"search_requests.json\", search_requests)\n\n    def _finalize(status, result_count=None, err_code=None, err_msg=None):\n        req_row[\"status\"] = status\n        req_row[\"updated_at\"] = now\n        req_row[\"latency_ms\"] = max(0, int((time.time() - t0) * 1000))\n        if result_count is not None:\n            req_row[\"result_count\"] = int(result_count)\n        if err_code is not None:\n            req_row[\"error_code\"] = err_code\n        if err_msg is not None:\n            req_row[\"error_message\"] = err_msg\n        _save(\"search_requests.json\", search_requests)\n\n    if ws is None:\n        _finalize(\"failed\", err_code=\"WORKSPACE_NOT_FOUND\", err_msg=\"workspace not found\")\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n    if ws.get(\"status\") != \"active\":\n        _finalize(\"failed\", err_code=\"WORKSPACE_SUSPENDED\", err_msg=\"workspace not active; request rejected\")\n        return _err(\"UNAUTHORIZED\", \"Workspace not active; request rejected.\", status=ws.get(\"status\"))\n\n    if col is None or col.get(\"workspace_id\") != workspace_id:\n        _finalize(\"failed\", err_code=\"COLLECTION_NOT_FOUND\", err_msg=\"collection not found for workspace\")\n        return _err(\"NOT_FOUND\", \"Collection not found for workspace.\", collection_id=collection_id)\n    if col.get(\"status\") == \"deleted\":\n        _finalize(\"failed\", err_code=\"COLLECTION_DELETED\", err_msg=\"target collection unavailable or deleted\")\n        return _err(\"UNAUTHORIZED\", \"Target collection unavailable or deleted.\", collection_status=col.get(\"status\"))\n\n    # Ambient auth: require any active key with 'find' scope to read\n    active_keys = [k for k in api_keys if isinstance(k, dict) and k.get(\"workspace_id\") == workspace_id and k.get(\"status\") == \"active\" and isinstance(k.get(\"scopes\"), list) and (\"find\" in k.get(\"scopes\"))]\n    if not active_keys:\n        _finalize(\"failed\", err_code=\"AUTH_REQUIRED\", err_msg=\"missing api key; session not authorized for tool\")\n        return _err(\"UNAUTHORIZED\", \"No active API key with required scope for this workspace/tool.\")\n\n    chosen_key = active_keys[0]\n    req_row[\"api_key_id\"] = chosen_key.get(\"id\")\n    _save(\"search_requests.json\", search_requests)\n\n    mp = next((p for p in memory_points if isinstance(p, dict) and p.get(\"id\") == point_id and p.get(\"workspace_id\") == workspace_id and p.get(\"collection_id\") == collection_id), None)\n    if mp is None:\n        _finalize(\"failed\", err_code=\"POINT_NOT_FOUND\", err_msg=\"point not found\")\n        return _err(\"NOT_FOUND\", \"Memory point not found.\", point_id=point_id)\n\n    if mp.get(\"status\") == \"tombstoned\" and not include_deleted:\n        _finalize(\"failed\", err_code=\"POINT_TOMBSTONED\", err_msg=\"point is deleted\")\n        return _err(\"NOT_FOUND\", \"Memory point not found.\", point_id=point_id)\n\n    # update key last_used_at\n    for k in api_keys:\n        if isinstance(k, dict) and k.get(\"id\") == chosen_key.get(\"id\"):\n            k[\"last_used_at\"] = now\n            k[\"updated_at\"] = now\n            break\n    _save(\"api_keys.json\", api_keys)\n\n    _finalize(\"succeeded\", result_count=1)\n\n    out = {\n        \"workspace_id\": workspace_id,\n        \"collection_id\": collection_id,\n        \"point\": {\n            \"id\": mp.get(\"id\"),\n            \"external_point_id\": mp.get(\"external_point_id\"),\n            \"status\": mp.get(\"status\"),\n            \"payload\": mp.get(\"payload\") if include_payload else None,\n            \"embedding\": mp.get(\"embedding\") if include_embedding else None,\n            \"content_text\": mp.get(\"content_text\") if include_content else None,\n            \"created_at\": mp.get(\"created_at\"),\n            \"updated_at\": mp.get(\"updated_at\"),\n            \"deleted_at\": mp.get(\"deleted_at\") if include_deleted else None,\n        },\n        \"request_id\": req_row[\"id\"],\n    }\n    return out\n"
+        },
+        {
+          "name": "qdrant-whoami",
+          "description": "Returns the calling identity derived from the presented API key, including workspace, key status, scopes, and current rate-limit/quota consumption; refuses with AUTHORIZATION_ERROR if the API key is missing, invalid, or revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^qdr_ws_[A-Za-z0-9]+$",
+                "description": "Optional workspace context for reporting effective permissions and defaults; when omitted, returns the API key’s home workspace."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def qdrant_whoami(workspace_id=None, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0013000\" if __import__(\"os\").path.isdir(\"./environment_mix/0013000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    if workspace_id is not None:\n        if not isinstance(workspace_id, str) or not re.match(r\"^qdr_ws_[A-Za-z0-9]+$\", workspace_id):\n            return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    reqs = _load(\"search_requests.json\")\n\n    def _new_req_id():\n        import secrets\n        return f\"qdr_req_{int(time.time()*1000)}_{secrets.token_hex(6)}\"\n\n    # This endpoint requires an API key, but the tool signature carries none.\n    # Resolve the presented identity from the store by selecting an active key that can serve requests.\n    # If none exist anywhere, return UNAUTHORIZED.\n    key = next((k for k in api_keys if k.get(\"status\") == \"active\"), None)\n    if key is None:\n        # still log request\n        req_row = {\n            \"id\": _new_req_id(),\n            \"workspace_id\": workspace_id or \"qdr_ws_unknown\",\n            \"api_key_id\": None,\n            \"tool_name\": \"qdrant-find\",\n            \"status\": \"received\",\n            \"collection_id\": None,\n            \"input\": {\"endpoint\": \"qdrant-whoami\", \"workspace_id\": workspace_id},\n            \"result_count\": None,\n            \"latency_ms\": None,\n            \"error_code\": None,\n            \"error_message\": None,\n            \"created_at\": now,\n            \"updated_at\": now\n        }\n        reqs.append(req_row)\n        _save(\"search_requests.json\", reqs)\n        req_row[\"status\"] = \"failed\"\n        req_row[\"error_code\"] = \"UNAUTHORIZED\"\n        req_row[\"error_message\"] = \"API key missing or invalid.\"\n        req_row[\"updated_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n        req_row[\"latency_ms\"] = max(0, int(round((time.time() - t0) * 1000)))\n        _save(\"search_requests.json\", reqs)\n        return _err(\"UNAUTHORIZED\", \"API key missing, invalid, or revoked.\")\n\n    home_ws = next((w for w in workspaces if w.get(\"id\") == key.get(\"workspace_id\")), None)\n    ctx_ws = None\n    if workspace_id is None:\n        ctx_ws = home_ws\n    else:\n        ctx_ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n\n    # Log received\n    req_row = {\n        \"id\": _new_req_id(),\n        \"workspace_id\": (ctx_ws.get(\"id\") if ctx_ws else (workspace_id or key.get(\"workspace_id\"))),\n        \"api_key_id\": key.get(\"id\"),\n        \"tool_name\": \"qdrant-find\",\n        \"status\": \"received\",\n        \"collection_id\": None,\n        \"input\": {\"endpoint\": \"qdrant-whoami\", \"workspace_id\": workspace_id},\n        \"result_count\": None,\n        \"latency_ms\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n    reqs.append(req_row)\n    _save(\"search_requests.json\", reqs)\n\n    def _finish(status, error_code=None, error_message=None):\n        req_row[\"status\"] = status\n        req_row[\"error_code\"] = error_code\n        req_row[\"error_message\"] = error_message\n        req_row[\"updated_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n        req_row[\"latency_ms\"] = max(0, int(round((time.time() - t0) * 1000)))\n        _save(\"search_requests.json\", reqs)\n\n    # Validate requested workspace context if provided\n    if workspace_id is not None and ctx_ws is None:\n        _finish(\"failed\", error_code=\"NOT_FOUND\", error_message=\"Workspace not found.\")\n        return _err(\"NOT_FOUND\", \"Workspace not found.\")\n\n    # Authorization: key must be active (already ensured), but also must belong to context workspace for \"effective\" context.\n    # If caller asks for a different workspace than key's home, refuse.\n    if workspace_id is not None and key.get(\"workspace_id\") != workspace_id:\n        _finish(\"failed\", error_code=\"UNAUTHORIZED\", error_message=\"API key does not belong to the specified workspace.\")\n        return _err(\"UNAUTHORIZED\", \"API key does not belong to the specified workspace.\")\n\n    # Compute rolling 60s usage for this key, and effective rpm limit (key override only; no workspace default in schema)\n    now_dt = datetime.datetime.utcnow()\n    window_start = now_dt - datetime.timedelta(seconds=60)\n    def _parse_ts(s):\n        if not s or not isinstance(s, str): return None\n        try:\n            if s.endswith(\"Z\"): s = s[:-1]\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    used_last_60s = 0\n    for r in reqs:\n        if r.get(\"api_key_id\") != key.get(\"id\"):\n            continue\n        ts = _parse_ts(r.get(\"created_at\"))\n        if ts is None:\n            continue\n        if ts >= window_start and ts <= now_dt:\n            used_last_60s += 1\n\n    limit_rpm = key.get(\"rate_limit_rpm\")\n    remaining = None\n    reset_in_s = None\n    if isinstance(limit_rpm, int) and limit_rpm >= 1:\n        remaining = max(0, limit_rpm - used_last_60s)\n        reset_in_s = 60\n\n    # Update last_used_at on successful whoami\n    for k in api_keys:\n        if k.get(\"id\") == key.get(\"id\"):\n            k[\"last_used_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n            k[\"updated_at\"] = k.get(\"updated_at\") or k[\"last_used_at\"]\n            break\n    _save(\"api_keys.json\", api_keys)\n\n    identity = {\n        \"api_key\": {\n            \"id\": key.get(\"id\"),\n            \"name\": key.get(\"name\"),\n            \"status\": key.get(\"status\"),\n            \"scopes\": key.get(\"scopes\"),\n            \"rate_limit_rpm\": limit_rpm,\n            \"last_used_at\": next((k.get(\"last_used_at\") for k in api_keys if k.get(\"id\") == key.get(\"id\")), key.get(\"last_used_at\")),\n            \"created_at\": key.get(\"created_at\"),\n            \"updated_at\": next((k.get(\"updated_at\") for k in api_keys if k.get(\"id\") == key.get(\"id\")), key.get(\"updated_at\")),\n        },\n        \"workspace\": (ctx_ws if ctx_ws is not None else home_ws),\n        \"rate_limit\": {\n            \"window_seconds\": 60,\n            \"used_in_window\": used_last_60s,\n            \"limit_rpm\": limit_rpm,\n            \"remaining_in_window\": remaining,\n            \"reset_in_seconds\": reset_in_s\n        }\n    }\n\n    _finish(\"succeeded\")\n    return {\"identity\": identity}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0013000",
+    "index": 13,
+    "name": "Qdrant Server",
+    "description": "This backend stores vector \"memories\" and supports inserting them into a Qdrant-like store and searching/retrieving them later. The main workflows are: (1) write/upsert memories into a collection, (2) run similarity searches to find relevant memories, and (3) track API usage and operational status f",
+    "taxonomy": {
+      "L1_id": "L1-10",
+      "L1_name": "Data Storage & Databases",
+      "L1_name_zh": "数据存储与数据库",
+      "L2_id": "L2-27",
+      "L2_name": "Memory & Knowledge Management",
+      "L2_name_zh": "记忆与知识管理",
+      "L3_name": "Personal & Agent Memory Stores",
+      "L3_name_zh": "个人与智能体记忆存储"
+    },
+    "database_dir": "./environment_mix/0013000",
+    "mount_path": "/app/database",
+    "n_tools": 8,
+    "n_collections": 5,
+    "n_records": 92,
+    "n_questions": 1,
+    "execution_audit": {
+      "tools": 8,
+      "loaded": 8,
+      "reads_returning_data": 1,
+      "read_operations": 3,
+      "mutations_persisted": 4,
+      "mutations_attempted": 5
+    },
+    "tools_loadable_from_database_dir": 8,
+    "tool_load_errors": 0,
+    "verified_call": null,
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

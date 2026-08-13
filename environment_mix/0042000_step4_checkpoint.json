@@ -1,0 +1,234 @@
+{
+  "index": 42,
+  "local_files_dir": "./environment_mix/0042000",
+  "file_list": [
+    "./environment_mix/0042000/README.md",
+    "./environment_mix/0042000/datasets.json",
+    "./environment_mix/0042000/models.json",
+    "./environment_mix/0042000/papers.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "datasets.json": "Array of dataset objects. Each object contains: id (repo identifier), name, description (concise summary), tasks (list), modalities (list), languages (list), size (e.g., token count or storage size), license, and a direct Hugging Face link.",
+        "models.json": "Array of model objects. Each object includes: id (repo identifier), name, description (brief overview), task (primary ML task), license, and a direct Hugging Face link.",
+        "papers.json": "Array of research paper objects. Each object holds: title, summary (short description of contribution), and category (research area).",
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "list_datasets",
+          "description": "Returns a paginated list of dataset catalog entries, optionally filtered by tasks, modalities, languages, and license. It refuses requests with invalid pagination (negative offset, non-positive or non-integer limit) or malformed filter values (e.g., non-string items in tasks/modalities/languages). If filters reference values we don’t recognize or can’t match, the request is rejected rather than returning an ambiguous result set.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of datasets to return."
+              },
+              "offset": {
+                "type": "integer",
+                "description": "Number of datasets to skip before returning."
+              },
+              "tasks": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Filter datasets that include any of these tasks."
+              },
+              "modalities": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Filter datasets by one or more modalities."
+              },
+              "languages": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Filter datasets by language codes (e.g., 'en', 'fr')."
+              },
+              "license": {
+                "type": "string",
+                "description": "Filter datasets by license."
+              }
+            },
+            "required": []
+          },
+          "implementation": "def list_datasets(limit=None, offset=None, tasks=None, modalities=None, languages=None, license=None, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0042000\" if __import__(\"os\").path.isdir(\"./environment_mix/0042000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()\n\n    def _extract_rows(obj):\n        if isinstance(obj, dict) and isinstance(obj.get(\"rows\"), list):\n            return obj[\"rows\"]\n        if isinstance(obj, list):\n            return obj\n        return []\n\n    t0 = time.time()\n    status = \"ok\"\n    # --- validate pagination ---\n    if offset is None:\n        offset = 0\n    if not isinstance(offset, int):\n        status = \"error\"\n        resp = _err(\"VALIDATION_ERROR\", \"offset must be an integer\", field=\"offset\")\n    elif offset < 0:\n        status = \"error\"\n        resp = _err(\"VALIDATION_ERROR\", \"offset must be >= 0\", field=\"offset\")\n    else:\n        if limit is None:\n            limit_val = 20\n        else:\n            limit_val = limit\n        if not isinstance(limit_val, int):\n            status = \"error\"\n            resp = _err(\"VALIDATION_ERROR\", \"limit must be an integer\", field=\"limit\")\n        elif limit_val <= 0:\n            status = \"error\"\n            resp = _err(\"VALIDATION_ERROR\", \"limit must be > 0\", field=\"limit\")\n        else:\n            # --- validate filters types ---\n            def _validate_str_list(v, field):\n                if v is None:\n                    return None, None\n                if not isinstance(v, list):\n                    return None, _err(\"VALIDATION_ERROR\", f\"{field} must be an array of strings\", field=field)\n                for i, it in enumerate(v):\n                    if not isinstance(it, str) or not it.strip():\n                        return None, _err(\"VALIDATION_ERROR\", f\"{field} must contain only non-empty strings\", field=field, index=i)\n                return [s.strip() for s in v], None\n\n            tasks_v, e = _validate_str_list(tasks, \"tasks\")\n            if e:\n                status = \"error\"\n                resp = e\n            else:\n                modalities_v, e = _validate_str_list(modalities, \"modalities\")\n                if e:\n                    status = \"error\"\n                    resp = e\n                else:\n                    languages_v, e = _validate_str_list(languages, \"languages\")\n                    if e:\n                        status = \"error\"\n                        resp = e\n                    else:\n                        if license is not None and (not isinstance(license, str) or not license.strip()):\n                            status = \"error\"\n                            resp = _err(\"VALIDATION_ERROR\", \"license must be a non-empty string\", field=\"license\")\n                        else:\n                            license_v = license.strip() if isinstance(license, str) else None\n\n                            # --- load data ---\n                            raw = _load(\"datasets.json\")\n                            rows = _extract_rows(raw)\n\n                            # Build known values to validate \"unrecognized/can't match\" filter values\n                            known_tasks = set()\n                            known_modalities = set()\n                            known_languages = set()\n                            known_licenses = set()\n                            for d in rows:\n                                for t in d.get(\"tasks\", []) if isinstance(d.get(\"tasks\", []), list) else []:\n                                    if isinstance(t, str):\n                                        known_tasks.add(t)\n                                for m in d.get(\"modalities\", []) if isinstance(d.get(\"modalities\", []), list) else []:\n                                    if isinstance(m, str):\n                                        known_modalities.add(m)\n                                for l in d.get(\"languages\", []) if isinstance(d.get(\"languages\", []), list) else []:\n                                    if isinstance(l, str):\n                                        known_languages.add(l)\n                                lic = d.get(\"license\")\n                                if isinstance(lic, str):\n                                    known_licenses.add(lic)\n\n                            # Reject filters referencing unrecognized values\n                            if tasks_v:\n                                bad = [t for t in tasks_v if t not in known_tasks]\n                                if bad:\n                                    status = \"error\"\n                                    resp = _err(\"VALIDATION_ERROR\", \"Unrecognized tasks filter value(s)\", field=\"tasks\", values=bad)\n                            if status == \"ok\" and modalities_v:\n                                bad = [m for m in modalities_v if m not in known_modalities]\n                                if bad:\n                                    status = \"error\"\n                                    resp = _err(\"VALIDATION_ERROR\", \"Unrecognized modalities filter value(s)\", field=\"modalities\", values=bad)\n                            if status == \"ok\" and languages_v:\n                                # validate language codes shape too (simple BCP-47-ish)\n                                bad_shape = [l for l in languages_v if not re.fullmatch(r\"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*\", l)]\n                                if bad_shape:\n                                    status = \"error\"\n                                    resp = _err(\"VALIDATION_ERROR\", \"Invalid language code(s)\", field=\"languages\", values=bad_shape)\n                                else:\n                                    bad = [l for l in languages_v if l not in known_languages]\n                                    if bad:\n                                        status = \"error\"\n                                        resp = _err(\"VALIDATION_ERROR\", \"Unrecognized languages filter value(s)\", field=\"languages\", values=bad)\n                            if status == \"ok\" and license_v:\n                                if license_v not in known_licenses:\n                                    status = \"error\"\n                                    resp = _err(\"VALIDATION_ERROR\", \"Unrecognized license filter value\", field=\"license\", value=license_v)\n\n                            if status == \"ok\":\n                                # --- apply filters ---\n                                filtered = rows\n                                if tasks_v:\n                                    filtered = [d for d in filtered if isinstance(d, dict) and any(t in (d.get(\"tasks\") or []) for t in tasks_v)]\n                                if modalities_v:\n                                    filtered = [d for d in filtered if isinstance(d, dict) and any(m in (d.get(\"modalities\") or []) for m in modalities_v)]\n                                if languages_v:\n                                    filtered = [d for d in filtered if isinstance(d, dict) and any(l in (d.get(\"languages\") or []) for l in languages_v)]\n                                if license_v:\n                                    filtered = [d for d in filtered if isinstance(d, dict) and d.get(\"license\") == license_v]\n\n                                # stable sort by id\n                                filtered.sort(key=lambda x: (x.get(\"id\") if isinstance(x, dict) else \"\"))\n\n                                total = len(filtered)\n                                page = filtered[offset: offset + limit_val]\n                                has_more = (offset + limit_val) < total\n                                resp = {\n                                    \"data\": page,\n                                    \"meta\": {\n                                        \"total\": total,\n                                        \"limit\": limit_val,\n                                        \"offset\": offset,\n                                        \"has_more\": has_more,\n                                        \"next_offset\": (offset + limit_val) if has_more else None,\n                                    },\n                                }\n\n    # observable dynamics: try to write request log if collection exists\n    latency_ms = int((time.time() - t0) * 1000)\n    try:\n        for fname in (\"request_logs.json\", \"usage.json\", \"audit.json\"):\n            p = os.path.join(_DB, fname)\n            if os.path.exists(p):\n                obj = _load(fname)\n                if isinstance(obj, dict):\n                    logs = obj.get(\"rows\")\n                    if not isinstance(logs, list):\n                        logs = []\n                    logs.append({\n                        \"id\": f\"req_{int(time.time()*1000)}\",\n                        \"endpoint\": \"list_datasets\",\n                        \"timestamp\": _now(),\n                        \"status\": status,\n                        \"latency_ms\": latency_ms,\n                    })\n                    obj[\"rows\"] = logs\n                    _save(fname, obj)\n                elif isinstance(obj, list):\n                    obj.append({\n                        \"id\": f\"req_{int(time.time()*1000)}\",\n                        \"endpoint\": \"list_datasets\",\n                        \"timestamp\": _now(),\n                        \"status\": status,\n                        \"latency_ms\": latency_ms,\n                    })\n                    _save(fname, obj)\n                break\n    except Exception:\n        pass\n\n    return resp\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "get_dataset",
+          "description": "Returns the full metadata record for the dataset identified by dataset_id (for example, an \"owner/name\" slug). It refuses requests where dataset_id is missing, empty, or not a valid identifier format. It also refuses requests for dataset IDs that do not exist in the catalog.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "dataset_id": {
+                "type": "string",
+                "description": "The unique identifier of the dataset (e.g., 'username/dataset-name')."
+              }
+            },
+            "required": [
+              "dataset_id"
+            ]
+          },
+          "implementation": "def get_dataset(dataset_id, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0042000\" if __import__(\"os\").path.isdir(\"./environment_mix/0042000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()\n\n    def _extract_rows(obj):\n        if isinstance(obj, dict) and isinstance(obj.get(\"rows\"), list):\n            return obj[\"rows\"]\n        if isinstance(obj, list):\n            return obj\n        return []\n\n    t0 = time.time()\n    status = \"ok\"\n\n    if dataset_id is None or not isinstance(dataset_id, str) or not dataset_id.strip():\n        status = \"error\"\n        resp = _err(\"VALIDATION_ERROR\", \"dataset_id is required and must be a non-empty string\", field=\"dataset_id\")\n    else:\n        dsid = dataset_id.strip()\n        # simple slug validation: \"owner/name\" with safe chars\n        if not re.fullmatch(r\"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*\", dsid):\n            status = \"error\"\n            resp = _err(\"VALIDATION_ERROR\", \"dataset_id must be in 'owner/name' format\", field=\"dataset_id\")\n        else:\n            rows = _extract_rows(_load(\"datasets.json\"))\n            found = None\n            for d in rows:\n                if isinstance(d, dict) and d.get(\"id\") == dsid:\n                    found = d\n                    break\n            if not found:\n                status = \"error\"\n                resp = _err(\"NOT_FOUND\", \"Dataset not found\", dataset_id=dsid)\n            else:\n                resp = {\"data\": found}\n\n    latency_ms = int((time.time() - t0) * 1000)\n    try:\n        for fname in (\"request_logs.json\", \"usage.json\", \"audit.json\"):\n            p = os.path.join(_DB, fname)\n            if os.path.exists(p):\n                obj = _load(fname)\n                if isinstance(obj, dict):\n                    logs = obj.get(\"rows\")\n                    if not isinstance(logs, list):\n                        logs = []\n                    logs.append({\n                        \"id\": f\"req_{int(time.time()*1000)}\",\n                        \"endpoint\": \"get_dataset\",\n                        \"timestamp\": _now(),\n                        \"status\": status,\n                        \"latency_ms\": latency_ms,\n                    })\n                    obj[\"rows\"] = logs\n                    _save(fname, obj)\n                elif isinstance(obj, list):\n                    obj.append({\n                        \"id\": f\"req_{int(time.time()*1000)}\",\n                        \"endpoint\": \"get_dataset\",\n                        \"timestamp\": _now(),\n                        \"status\": status,\n                        \"latency_ms\": latency_ms,\n                    })\n                    _save(fname, obj)\n                break\n    except Exception:\n        pass\n\n    return resp\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "list_models",
+          "description": "Returns a paginated list of model catalog entries, optionally filtered by primary task, author, and license. It refuses requests with invalid pagination (negative offset, non-positive or non-integer limit) or non-string filter values. It also refuses filter combinations that cannot be applied (for example, unsupported task/license values) instead of returning misleading partial matches.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of models to return."
+              },
+              "offset": {
+                "type": "integer",
+                "description": "Number of models to skip before returning."
+              },
+              "task": {
+                "type": "string",
+                "description": "Filter models by their primary task."
+              },
+              "author": {
+                "type": "string",
+                "description": "Filter models by author or organization name."
+              },
+              "license": {
+                "type": "string",
+                "description": "Filter models by license."
+              }
+            },
+            "required": []
+          },
+          "implementation": "def list_models(limit=None, offset=None, task=None, author=None, license=None, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0042000\" if __import__(\"os\").path.isdir(\"./environment_mix/0042000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()\n\n    def _extract_rows(obj):\n        if isinstance(obj, dict) and isinstance(obj.get(\"rows\"), list):\n            return obj[\"rows\"]\n        if isinstance(obj, list):\n            return obj\n        return []\n\n    t0 = time.time()\n    status = \"ok\"\n\n    if offset is None:\n        offset = 0\n    if not isinstance(offset, int):\n        status = \"error\"\n        resp = _err(\"VALIDATION_ERROR\", \"offset must be an integer\", field=\"offset\")\n    elif offset < 0:\n        status = \"error\"\n        resp = _err(\"VALIDATION_ERROR\", \"offset must be >= 0\", field=\"offset\")\n    else:\n        if limit is None:\n            limit_val = 20\n        else:\n            limit_val = limit\n        if not isinstance(limit_val, int):\n            status = \"error\"\n            resp = _err(\"VALIDATION_ERROR\", \"limit must be an integer\", field=\"limit\")\n        elif limit_val <= 0:\n            status = \"error\"\n            resp = _err(\"VALIDATION_ERROR\", \"limit must be > 0\", field=\"limit\")\n        else:\n            if task is not None and (not isinstance(task, str) or not task.strip()):\n                status = \"error\"\n                resp = _err(\"VALIDATION_ERROR\", \"task must be a non-empty string\", field=\"task\")\n            elif author is not None and (not isinstance(author, str) or not author.strip()):\n                status = \"error\"\n                resp = _err(\"VALIDATION_ERROR\", \"author must be a non-empty string\", field=\"author\")\n            elif license is not None and (not isinstance(license, str) or not license.strip()):\n                status = \"error\"\n                resp = _err(\"VALIDATION_ERROR\", \"license must be a non-empty string\", field=\"license\")\n            else:\n                task_v = task.strip() if isinstance(task, str) else None\n                author_v = author.strip() if isinstance(author, str) else None\n                license_v = license.strip() if isinstance(license, str) else None\n\n                rows = _extract_rows(_load(\"models.json\"))\n\n                known_tasks = set()\n                known_licenses = set()\n                known_authors = set()\n                for m in rows:\n                    if not isinstance(m, dict):\n                        continue\n                    t = m.get(\"task\")\n                    if isinstance(t, str):\n                        known_tasks.add(t)\n                    lic = m.get(\"license\")\n                    if isinstance(lic, str):\n                        known_licenses.add(lic)\n                    mid = m.get(\"id\")\n                    if isinstance(mid, str) and \"/\" in mid:\n                        known_authors.add(mid.split(\"/\", 1)[0])\n\n                if task_v and task_v not in known_tasks:\n                    status = \"error\"\n                    resp = _err(\"VALIDATION_ERROR\", \"Unrecognized task filter value\", field=\"task\", value=task_v)\n                elif license_v and license_v not in known_licenses:\n                    status = \"error\"\n                    resp = _err(\"VALIDATION_ERROR\", \"Unrecognized license filter value\", field=\"license\", value=license_v)\n                elif author_v:\n                    if not re.fullmatch(r\"[A-Za-z0-9][A-Za-z0-9_.-]*\", author_v):\n                        status = \"error\"\n                        resp = _err(\"VALIDATION_ERROR\", \"author must be an identifier (e.g., 'google')\", field=\"author\")\n                    elif author_v not in known_authors:\n                        status = \"error\"\n                        resp = _err(\"VALIDATION_ERROR\", \"Unrecognized author filter value\", field=\"author\", value=author_v)\n                else:\n                    filtered = rows\n                    if task_v:\n                        filtered = [m for m in filtered if isinstance(m, dict) and m.get(\"task\") == task_v]\n                    if license_v:\n                        filtered = [m for m in filtered if isinstance(m, dict) and m.get(\"license\") == license_v]\n                    if author_v:\n                        filtered = [\n                            m for m in filtered\n                            if isinstance(m, dict)\n                            and isinstance(m.get(\"id\"), str)\n                            and m.get(\"id\").split(\"/\", 1)[0] == author_v\n                        ]\n\n                    filtered.sort(key=lambda x: (x.get(\"id\") if isinstance(x, dict) else \"\"))\n                    total = len(filtered)\n                    page = filtered[offset: offset + limit_val]\n                    has_more = (offset + limit_val) < total\n                    resp = {\n                        \"data\": page,\n                        \"meta\": {\n                            \"total\": total,\n                            \"limit\": limit_val,\n                            \"offset\": offset,\n                            \"has_more\": has_more,\n                            \"next_offset\": (offset + limit_val) if has_more else None,\n                        },\n                    }\n\n    latency_ms = int((time.time() - t0) * 1000)\n    try:\n        for fname in (\"request_logs.json\", \"usage.json\", \"audit.json\"):\n            p = os.path.join(_DB, fname)\n            if os.path.exists(p):\n                obj = _load(fname)\n                if isinstance(obj, dict):\n                    logs = obj.get(\"rows\")\n                    if not isinstance(logs, list):\n                        logs = []\n                    logs.append({\n                        \"id\": f\"req_{int(time.time()*1000)}\",\n                        \"endpoint\": \"list_models\",\n                        \"timestamp\": _now(),\n                        \"status\": status,\n                        \"latency_ms\": latency_ms,\n                    })\n                    obj[\"rows\"] = logs\n                    _save(fname, obj)\n                elif isinstance(obj, list):\n                    obj.append({\n                        \"id\": f\"req_{int(time.time()*1000)}\",\n                        \"endpoint\": \"list_models\",\n                        \"timestamp\": _now(),\n                        \"status\": status,\n                        \"latency_ms\": latency_ms,\n                    })\n                    _save(fname, obj)\n                break\n    except Exception:\n        pass\n\n    return resp\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "get_model",
+          "description": "Returns the full metadata record for the model identified by model_id (for example, an \"owner/name\" slug). It refuses requests where model_id is missing, empty, or not a valid identifier format. It also refuses requests for model IDs that do not exist in the catalog.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "model_id": {
+                "type": "string",
+                "description": "The unique identifier of the model (e.g., 'username/model-name')."
+              }
+            },
+            "required": [
+              "model_id"
+            ]
+          },
+          "implementation": "def get_model(model_id, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0042000\" if __import__(\"os\").path.isdir(\"./environment_mix/0042000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()\n\n    def _extract_rows(obj):\n        if isinstance(obj, dict) and isinstance(obj.get(\"rows\"), list):\n            return obj[\"rows\"]\n        if isinstance(obj, list):\n            return obj\n        return []\n\n    t0 = time.time()\n    status = \"ok\"\n\n    if model_id is None or not isinstance(model_id, str) or not model_id.strip():\n        status = \"error\"\n        resp = _err(\"VALIDATION_ERROR\", \"model_id is required and must be a non-empty string\", field=\"model_id\")\n    else:\n        mid = model_id.strip()\n        if not re.fullmatch(r\"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*\", mid):\n            status = \"error\"\n            resp = _err(\"VALIDATION_ERROR\", \"model_id must be in 'owner/name' format\", field=\"model_id\")\n        else:\n            rows = _extract_rows(_load(\"models.json\"))\n            found = None\n            for m in rows:\n                if isinstance(m, dict) and m.get(\"id\") == mid:\n                    found = m\n                    break\n            if not found:\n                status = \"error\"\n                resp = _err(\"NOT_FOUND\", \"Model not found\", model_id=mid)\n            else:\n                resp = {\"data\": found}\n\n    latency_ms = int((time.time() - t0) * 1000)\n    try:\n        for fname in (\"request_logs.json\", \"usage.json\", \"audit.json\"):\n            p = os.path.join(_DB, fname)\n            if os.path.exists(p):\n                obj = _load(fname)\n                if isinstance(obj, dict):\n                    logs = obj.get(\"rows\")\n                    if not isinstance(logs, list):\n                        logs = []\n                    logs.append({\n                        \"id\": f\"req_{int(time.time()*1000)}\",\n                        \"endpoint\": \"get_model\",\n                        \"timestamp\": _now(),\n                        \"status\": status,\n                        \"latency_ms\": latency_ms,\n                    })\n                    obj[\"rows\"] = logs\n                    _save(fname, obj)\n                elif isinstance(obj, list):\n                    obj.append({\n                        \"id\": f\"req_{int(time.time()*1000)}\",\n                        \"endpoint\": \"get_model\",\n                        \"timestamp\": _now(),\n                        \"status\": status,\n                        \"latency_ms\": latency_ms,\n                    })\n                    _save(fname, obj)\n                break\n    except Exception:\n        pass\n\n    return resp\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "list_papers",
+          "description": "Returns a paginated list of research paper entries, optionally limited to a single category. It refuses requests with invalid pagination (negative offset, non-positive or non-integer limit) or a non-string category value. It also refuses category filters that don’t correspond to a supported paper category.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of papers to return."
+              },
+              "offset": {
+                "type": "integer",
+                "description": "Number of papers to skip before returning."
+              },
+              "category": {
+                "type": "string",
+                "description": "Filter papers by research category."
+              }
+            },
+            "required": []
+          },
+          "implementation": "def list_papers(limit=None, offset=None, category=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0042000\" if __import__(\"os\").path.isdir(\"./environment_mix/0042000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()\n\n    def _extract_rows(obj):\n        if isinstance(obj, dict) and isinstance(obj.get(\"rows\"), list):\n            return obj[\"rows\"]\n        if isinstance(obj, list):\n            return obj\n        return []\n\n    t0 = time.time()\n    status = \"ok\"\n\n    if offset is None:\n        offset = 0\n    if not isinstance(offset, int):\n        status = \"error\"\n        resp = _err(\"VALIDATION_ERROR\", \"offset must be an integer\", field=\"offset\")\n    elif offset < 0:\n        status = \"error\"\n        resp = _err(\"VALIDATION_ERROR\", \"offset must be >= 0\", field=\"offset\")\n    else:\n        if limit is None:\n            limit_val = 20\n        else:\n            limit_val = limit\n        if not isinstance(limit_val, int):\n            status = \"error\"\n            resp = _err(\"VALIDATION_ERROR\", \"limit must be an integer\", field=\"limit\")\n        elif limit_val <= 0:\n            status = \"error\"\n            resp = _err(\"VALIDATION_ERROR\", \"limit must be > 0\", field=\"limit\")\n        else:\n            if category is not None and (not isinstance(category, str) or not category.strip()):\n                status = \"error\"\n                resp = _err(\"VALIDATION_ERROR\", \"category must be a non-empty string\", field=\"category\")\n            else:\n                cat_v = category.strip() if isinstance(category, str) else None\n                rows = _extract_rows(_load(\"papers.json\"))\n\n                known_categories = set()\n                for p in rows:\n                    if isinstance(p, dict) and isinstance(p.get(\"category\"), str):\n                        known_categories.add(p[\"category\"])\n\n                if cat_v and cat_v not in known_categories:\n                    status = \"error\"\n                    resp = _err(\"VALIDATION_ERROR\", \"Unrecognized category filter value\", field=\"category\", value=cat_v)\n                else:\n                    filtered = rows\n                    if cat_v:\n                        filtered = [p for p in filtered if isinstance(p, dict) and p.get(\"category\") == cat_v]\n                    # stable sort by title\n                    filtered.sort(key=lambda x: (x.get(\"title\") if isinstance(x, dict) else \"\"))\n\n                    total = len(filtered)\n                    page = filtered[offset: offset + limit_val]\n                    has_more = (offset + limit_val) < total\n                    resp = {\n                        \"data\": page,\n                        \"meta\": {\n                            \"total\": total,\n                            \"limit\": limit_val,\n                            \"offset\": offset,\n                            \"has_more\": has_more,\n                            \"next_offset\": (offset + limit_val) if has_more else None,\n                        },\n                    }\n\n    latency_ms = int((time.time() - t0) * 1000)\n    try:\n        for fname in (\"request_logs.json\", \"usage.json\", \"audit.json\"):\n            p = os.path.join(_DB, fname)\n            if os.path.exists(p):\n                obj = _load(fname)\n                if isinstance(obj, dict):\n                    logs = obj.get(\"rows\")\n                    if not isinstance(logs, list):\n                        logs = []\n                    logs.append({\n                        \"id\": f\"req_{int(time.time()*1000)}\",\n                        \"endpoint\": \"list_papers\",\n                        \"timestamp\": _now(),\n                        \"status\": status,\n                        \"latency_ms\": latency_ms,\n                    })\n                    obj[\"rows\"] = logs\n                    _save(fname, obj)\n                elif isinstance(obj, list):\n                    obj.append({\n                        \"id\": f\"req_{int(time.time()*1000)}\",\n                        \"endpoint\": \"list_papers\",\n                        \"timestamp\": _now(),\n                        \"status\": status,\n                        \"latency_ms\": latency_ms,\n                    })\n                    _save(fname, obj)\n                break\n    except Exception:\n        pass\n\n    return resp\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "search_papers",
+          "description": "Returns a paginated list of papers whose titles or summaries match the provided free-text query, optionally constrained to a category. It refuses requests where query is missing, empty, or not a string, and it refuses invalid pagination values. If a category is provided, the request is refused when the category is not recognized or cannot be applied.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Search term to match against paper titles and summaries."
+              },
+              "category": {
+                "type": "string",
+                "description": "Optional category to limit results."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of papers to return."
+              },
+              "offset": {
+                "type": "integer",
+                "description": "Number of papers to skip before returning."
+              }
+            },
+            "required": [
+              "query"
+            ]
+          },
+          "implementation": "def search_papers(query, category=None, limit=None, offset=None, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0042000\" if __import__(\"os\").path.isdir(\"./environment_mix/0042000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()\n\n    def _extract_rows(obj):\n        if isinstance(obj, dict) and isinstance(obj.get(\"rows\"), list):\n            return obj[\"rows\"]\n        if isinstance(obj, list):\n            return obj\n        return []\n\n    t0 = time.time()\n    status = \"ok\"\n\n    if query is None or not isinstance(query, str) or not query.strip():\n        status = \"error\"\n        resp = _err(\"VALIDATION_ERROR\", \"query is required and must be a non-empty string\", field=\"query\")\n    else:\n        if offset is None:\n            offset = 0\n        if not isinstance(offset, int):\n            status = \"error\"\n            resp = _err(\"VALIDATION_ERROR\", \"offset must be an integer\", field=\"offset\")\n        elif offset < 0:\n            status = \"error\"\n            resp = _err(\"VALIDATION_ERROR\", \"offset must be >= 0\", field=\"offset\")\n        else:\n            if limit is None:\n                limit_val = 20\n            else:\n                limit_val = limit\n            if not isinstance(limit_val, int):\n                status = \"error\"\n                resp = _err(\"VALIDATION_ERROR\", \"limit must be an integer\", field=\"limit\")\n            elif limit_val <= 0:\n                status = \"error\"\n                resp = _err(\"VALIDATION_ERROR\", \"limit must be > 0\", field=\"limit\")\n            else:\n                if category is not None and (not isinstance(category, str) or not category.strip()):\n                    status = \"error\"\n                    resp = _err(\"VALIDATION_ERROR\", \"category must be a non-empty string\", field=\"category\")\n                else:\n                    q = query.strip()\n                    cat_v = category.strip() if isinstance(category, str) else None\n\n                    rows = _extract_rows(_load(\"papers.json\"))\n                    known_categories = set()\n                    for p in rows:\n                        if isinstance(p, dict) and isinstance(p.get(\"category\"), str):\n                            known_categories.add(p[\"category\"])\n\n                    if cat_v and cat_v not in known_categories:\n                        status = \"error\"\n                        resp = _err(\"VALIDATION_ERROR\", \"Unrecognized category filter value\", field=\"category\", value=cat_v)\n                    else:\n                        # case-insensitive word-ish search: all terms must match somewhere\n                        terms = [t for t in re.split(r\"\\s+\", q.lower()) if t]\n                        def _match(p):\n                            title = (p.get(\"title\") or \"\")\n                            summ = (p.get(\"summary\") or \"\")\n                            hay = (str(title) + \" \" + str(summ)).lower()\n                            return all(t in hay for t in terms)\n\n                        filtered = [p for p in rows if isinstance(p, dict) and _match(p)]\n                        if cat_v:\n                            filtered = [p for p in filtered if p.get(\"category\") == cat_v]\n\n                        filtered.sort(key=lambda x: (x.get(\"title\") if isinstance(x, dict) else \"\"))\n                        total = len(filtered)\n                        page = filtered[offset: offset + limit_val]\n                        has_more = (offset + limit_val) < total\n                        resp = {\n                            \"data\": page,\n                            \"meta\": {\n                                \"total\": total,\n                                \"limit\": limit_val,\n                                \"offset\": offset,\n                                \"has_more\": has_more,\n                                \"next_offset\": (offset + limit_val) if has_more else None,\n                                \"query\": q,\n                            },\n                        }\n\n    latency_ms = int((time.time() - t0) * 1000)\n    try:\n        for fname in (\"request_logs.json\", \"usage.json\", \"audit.json\"):\n            p = os.path.join(_DB, fname)\n            if os.path.exists(p):\n                obj = _load(fname)\n                if isinstance(obj, dict):\n                    logs = obj.get(\"rows\")\n                    if not isinstance(logs, list):\n                        logs = []\n                    logs.append({\n                        \"id\": f\"req_{int(time.time()*1000)}\",\n                        \"endpoint\": \"search_papers\",\n                        \"timestamp\": _now(),\n                        \"status\": status,\n                        \"latency_ms\": latency_ms,\n                    })\n                    obj[\"rows\"] = logs\n                    _save(fname, obj)\n                elif isinstance(obj, list):\n                    obj.append({\n                        \"id\": f\"req_{int(time.time()*1000)}\",\n                        \"endpoint\": \"search_papers\",\n                        \"timestamp\": _now(),\n                        \"status\": status,\n                        \"latency_ms\": latency_ms,\n                    })\n                    _save(fname, obj)\n                break\n    except Exception:\n        pass\n\n    return resp\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0042000",
+    "index": 42,
+    "name": "AtlasForge Research Catalog",
+    "description": "A unified browse-and-search service for retrieving metadata on machine-learning datasets, models, and research papers via simple listing, lookup, and paper search APIs.",
+    "taxonomy": {
+      "L1_id": "L1-02",
+      "L1_name": "Academic & Scientific Research",
+      "L1_name_zh": "学术与科学研究",
+      "L2_id": "L2-04",
+      "L2_name": "Literature Search & Discovery",
+      "L2_name_zh": "文献检索与发现",
+      "L3_name": "Research Enrichment & Catalog Discovery",
+      "L3_name_zh": "研究内容增强与目录发现"
+    },
+    "database_dir": "./environment_mix/0042000",
+    "mount_path": "/app/database",
+    "n_tools": 6,
+    "n_collections": 3,
+    "n_records": 30,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 6,
+      "loaded": 6,
+      "reads_returning_data": 4,
+      "read_operations": 6,
+      "mutations_persisted": 0,
+      "mutations_attempted": 0
+    },
+    "tools_loadable_from_database_dir": 6,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_datasets",
+      "returned_chars": 140
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

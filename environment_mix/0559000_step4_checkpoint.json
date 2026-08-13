@@ -1,0 +1,92 @@
+{
+  "index": 559,
+  "local_files_dir": "./environment_mix/0559000",
+  "file_list": [
+    "./environment_mix/0559000/README.md",
+    "./environment_mix/0559000/amazon_products.csv",
+    "./environment_mix/0559000/counters.json",
+    "./environment_mix/0559000/customers.csv",
+    "./environment_mix/0559000/lazada_products.csv",
+    "./environment_mix/0559000/online_retail.csv",
+    "./environment_mix/0559000/online_retail_subset.csv",
+    "./environment_mix/0559000/order_totals.csv",
+    "./environment_mix/0559000/orders.csv",
+    "./environment_mix/0559000/products.csv",
+    "./environment_mix/0559000/products_raw.csv",
+    "./environment_mix/0559000/shein_products.csv",
+    "./environment_mix/0559000/usage.json",
+    "./environment_mix/0559000/users.csv",
+    "./environment_mix/0559000/walmart_products.csv"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "/app/database/products.csv": "Cleaned e‑commerce product catalogue (≈ 1,000 rows). Columns include: timestamp, title, seller_name, brand, description, initial_price, final_price (numeric USD), currency, availability, reviews_count, categories (JSON list), asin (unique product ID), buybox_seller, number_of_sellers, root_bs_rank, answered_questions, domain, images_count, url, video_count, image_url, item_weight, rating, product_dimensions, seller_id, date_first_available, discount, model_number, manufacturer, department, plus_content, upc, video, top_review, variations (JSON), delivery, features, format, buybox_prices, parent_asin, input_asin, ingredients, origin_url, bought_past_month, is_available, root_bs_category, bs_category, bs_rank, badge, subcategory_rank, amazon_choice, images, product_details, prices_breakdown, country_of_origin, etc.\n\nThe file is derived from the public \"amazon‑products.csv\" sample dataset (BrightData/eCommerce‑dataset‑samples) and saved as a cleaned CSV ready for import.",
+        "/app/database/users.csv": "Synthetic user table (500 records) for a local application. Columns: user_id (int, primary key), first_name, last_name, email (unique, example: john.doe1@example.com), signup_date (date within the last 2 years), city, country. Data generated with Faker to provide realistic personal information.",
+        "/app/database/orders.csv": "Synthetic orders table (1,000 records) linking users to products. Columns: order_id (int, primary key), user_id (foreign key to users.csv), asin (foreign key to products.csv), order_date (date within the last year), quantity (1‑5), unit_price (numeric, taken from product final_price), total_price (quantity × unit_price, rounded to 2 decimals). This file creates a logically consistent transaction dataset for testing joins, analytics, and reporting.",
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "get_product_by_asin",
+          "description": "Returns detailed product information for the Amazon product identified by the provided ASIN. It refuses requests where the ASIN is missing, empty, or not a valid ASIN string, because the product identifier cannot be resolved. It also refuses requests for ASINs that do not correspond to any product available to the service, because there is no product record to return.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "asin": {
+                "type": "string",
+                "description": "Amazon Standard Identification Number of the product."
+              }
+            },
+            "required": [
+              "asin"
+            ]
+          },
+          "implementation": "def get_product_by_asin(asin, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0559000\" if __import__(\"os\").path.isdir(\"./environment_mix/0559000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _gen_id(prefix=\"req\"):\n        # Deterministic enough for local store; avoids non-stdlib deps\n        return f\"{prefix}_{int(time.time() * 1000)}\"\n\n    t0 = time.time()\n    endpoint = \"get_product_by_asin\"\n    status = \"ok\"\n    error_obj = None\n    response_obj = None\n\n    # --- Validate input first ---\n    if not isinstance(asin, str):\n        status = \"error\"\n        error_obj = _err(\"VALIDATION_ERROR\", \"asin must be a string.\")\n    else:\n        asin_s = asin.strip()\n        if not asin_s:\n            status = \"error\"\n            error_obj = _err(\"VALIDATION_ERROR\", \"asin is required and must not be empty.\")\n        else:\n            # ASINs are typically 10 chars, alphanumeric; enforce this since the API refuses invalid ASIN strings\n            if not re.fullmatch(r\"[A-Z0-9]{10}\", asin_s.upper()):\n                status = \"error\"\n                error_obj = _err(\"VALIDATION_ERROR\", \"asin is not a valid ASIN string (expected 10 alphanumeric characters).\")\n            else:\n                asin_s = asin_s.upper()\n\n    # --- Load collections (schema not provided; search real JSON files) ---\n    # We'll search all JSON collections for a row with asin == requested.\n    product_row = None\n    product_source = None\n    if error_obj is None:\n        try:\n            files = []\n            for fn in os.listdir(_DB):\n                if fn.lower().endswith(\".json\"):\n                    files.append(fn)\n        except Exception:\n            files = []\n\n        # Prefer likely product collections first\n        preferred = []\n        for cand in (\"products.json\", \"product.json\", \"catalog.json\", \"items.json\", \"amazon_products.json\"):\n            if cand in files:\n                preferred.append(cand)\n        others = [f for f in files if f not in preferred]\n        search_order = preferred + sorted(others)\n\n        def _iter_rows(data):\n            if isinstance(data, list):\n                for r in data:\n                    if isinstance(r, dict):\n                        yield r\n            elif isinstance(data, dict):\n                # common patterns: {\"data\":[...]} or {\"items\":[...]}\n                for k in (\"data\", \"items\", \"rows\", \"products\", \"results\"):\n                    v = data.get(k)\n                    if isinstance(v, list):\n                        for r in v:\n                            if isinstance(r, dict):\n                                yield r\n\n        for fn in search_order:\n            data = _load(fn)\n            for r in _iter_rows(data):\n                a = r.get(\"asin\")\n                if isinstance(a, str) and a.strip().upper() == asin_s:\n                    product_row = r\n                    product_source = fn\n                    break\n            if product_row is not None:\n                break\n\n        if product_row is None:\n            status = \"error\"\n            error_obj = _err(\"NOT_FOUND\", \"No product found for the provided ASIN.\", asin=asin_s)\n\n    # --- Ensure audit/usage recording exists and is updated on every call (reads included) ---\n    # Since schema doesn't declare collections, we create/maintain service dynamics files:\n    # - usage.json: append-only request log\n    # - counters.json: aggregate counters used by quota/rate enforcement\n    usage_file = \"usage.json\"\n    counters_file = \"counters.json\"\n\n    usage = _load(usage_file)\n    if not isinstance(usage, list):\n        usage = []\n\n    counters = _load(counters_file)\n    if not isinstance(counters, dict):\n        counters = {}\n\n    # --- Rate limit / quota enforcement based on stored usage ---\n    # Conservative defaults (since none declared): 120 req/min and 10,000 req/day\n    rate_per_min = counters.get(\"rate_limit_per_minute\", 120)\n    quota_per_day = counters.get(\"quota_limit_per_day\", 10000)\n\n    now = datetime.datetime.utcnow()\n    minute_ago = now - datetime.timedelta(seconds=60)\n    day_ago = now - datetime.timedelta(days=1)\n\n    def _parse_ts(ts):\n        if not isinstance(ts, str):\n            return None\n        try:\n            if ts.endswith(\"Z\"):\n                ts = ts[:-1]\n            return datetime.datetime.fromisoformat(ts)\n        except Exception:\n            return None\n\n    recent_1m = 0\n    recent_24h = 0\n    for e in usage:\n        if not isinstance(e, dict):\n            continue\n        ts = _parse_ts(e.get(\"timestamp\"))\n        if ts is None:\n            continue\n        if ts >= minute_ago:\n            recent_1m += 1\n        if ts >= day_ago:\n            recent_24h += 1\n\n    # Enforce before finalizing response; even rejected requests are recorded, but limits must block service\n    if error_obj is None:\n        if isinstance(rate_per_min, int) and rate_per_min >= 0 and recent_1m >= rate_per_min:\n            status = \"error\"\n            error_obj = _err(\"RATE_LIMIT\", \"Rate limit exceeded. Please retry later.\", limit_per_minute=rate_per_min)\n        elif isinstance(quota_per_day, int) and quota_per_day >= 0 and recent_24h >= quota_per_day:\n            status = \"error\"\n            error_obj = _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded. Please retry later.\", quota_per_day=quota_per_day)\n\n    # --- Build response envelope ---\n    if error_obj is not None:\n        response_obj = error_obj\n    else:\n        # Return product details; never fabricate fields, return stored row\n        response_obj = {\n            \"product\": product_row,\n            \"meta\": {\n                \"asin\": asin_s,\n                \"source_collection\": product_source,\n            },\n        }\n\n    # --- Record request to usage log and advance counters (always, even errors) ---\n    latency_ms = int((time.time() - t0) * 1000)\n    req_row = {\n        \"id\": _gen_id(\"req\"),\n        \"endpoint\": endpoint,\n        \"timestamp\": _now(),\n        \"status\": \"error\" if \"error\" in response_obj else \"ok\",\n        \"latency_ms\": latency_ms,\n        \"asin\": asin if isinstance(asin, str) else None,\n    }\n    usage.append(req_row)\n\n    # Advance counters\n    counters[\"total_requests\"] = int(counters.get(\"total_requests\", 0) or 0) + 1\n    if \"error\" in response_obj:\n        counters[\"total_errors\"] = int(counters.get(\"total_errors\", 0) or 0) + 1\n        code = response_obj[\"error\"].get(\"code\")\n        if code:\n            per_code = counters.get(\"errors_by_code\", {})\n            if not isinstance(per_code, dict):\n                per_code = {}\n            per_code[code] = int(per_code.get(code, 0) or 0) + 1\n            counters[\"errors_by_code\"] = per_code\n    else:\n        counters[\"total_success\"] = int(counters.get(\"total_success\", 0) or 0) + 1\n\n    counters[\"last_request_timestamp\"] = req_row[\"timestamp\"]\n    counters[\"last_request_latency_ms\"] = latency_ms\n    counters[\"last_endpoint\"] = endpoint\n\n    _save(usage_file, usage)\n    _save(counters_file, counters)\n\n    return response_obj\n",
+          "df[df['asin'": "asin",
+          "description_restored": true,
+          "implementation_repaired": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0559000",
+    "index": 559,
+    "name": "Pinnacle ASIN Insight Service",
+    "description": "Retrieves comprehensive product details for a given Amazon ASIN via a simple API endpoint.",
+    "taxonomy": {
+      "L1_id": "L1-01",
+      "L1_name": "Search & Information Retrieval",
+      "L1_name_zh": "搜索与信息获取",
+      "L2_id": "L2-01",
+      "L2_name": "General Web Search",
+      "L2_name_zh": "通用网页搜索",
+      "L3_name": "Product & Commerce Lookup",
+      "L3_name_zh": "商品与电商信息查询"
+    },
+    "database_dir": "./environment_mix/0559000",
+    "mount_path": "/app/database",
+    "n_tools": 1,
+    "n_collections": 0,
+    "n_records": 0,
+    "n_questions": 0,
+    "execution_audit": {
+      "tools": 1,
+      "loaded": 1,
+      "reads_returning_data": 0,
+      "read_operations": 1,
+      "mutations_persisted": 0,
+      "mutations_attempted": 0
+    },
+    "tools_loadable_from_database_dir": 1,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_product_by_asin",
+      "returned_chars": 124
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

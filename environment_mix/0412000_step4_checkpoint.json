@@ -1,0 +1,656 @@
+{
+  "index": 412,
+  "local_files_dir": "./environment_mix/0412000",
+  "file_list": [
+    "./environment_mix/0412000/README.md",
+    "./environment_mix/0412000/api_keys.json",
+    "./environment_mix/0412000/docs.json",
+    "./environment_mix/0412000/request_logs.json",
+    "./environment_mix/0412000/tasks.json",
+    "./environment_mix/0412000/users.json",
+    "./environment_mix/0412000/workspaces.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "workspaces.json": "18 rows",
+        "users.json": "18 rows",
+        "tasks.json": "20 rows",
+        "docs.json": "18 rows",
+        "api_keys.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "get_config",
+          "description": "Returns the server’s configuration metadata used to connect and authenticate with Dart, and does not create or modify any workspace data. Raises VALIDATION_ERROR if any unexpected parameters are provided, and UNAUTHORIZED if the caller is not permitted to read configuration for this deployment. May raise RATE_LIMITED when request limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "implementation": "def get_config(**_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0412000\" if __import__(\"os\").path.isdir(\"./environment_mix/0412000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # Validate unexpected parameters\n    if _extra:\n        return _err(\"VALIDATION_ERROR\", \"Unexpected parameters provided.\", unexpected=list(_extra.keys()))\n\n    # Usage log / rate limit enforcement\n    reqlog = _load(\"request_logs.json\")\n    if not isinstance(reqlog, list):\n        reqlog = []\n\n    def _count_recent(seconds):\n        cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=seconds)\n        c = 0\n        for r in reqlog:\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\"))\n            except Exception:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt.astimezone(datetime.timezone.utc).replace(tzinfo=None) >= cutoff:\n                c += 1\n        return c\n\n    # Simple global rate limit: 120 req/min\n    if _count_recent(60) >= 120:\n        reqlog.append(\n            {\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": \"get_config\",\n                \"credential_id\": None,\n                \"workspace_id\": None,\n                \"status\": \"RATE_LIMIT\",\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": now,\n            }\n        )\n        _save(\"request_logs.json\", reqlog)\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n\n    api_keys = _load(\"api_keys.json\")\n    if not isinstance(api_keys, list):\n        api_keys = []\n\n    workspaces = _load(\"workspaces.json\")\n    if not isinstance(workspaces, list):\n        workspaces = []\n\n    # Ambient auth: pick a working active api_key + active workspace combination\n    chosen_key = None\n    chosen_ws = None\n    for k in api_keys:\n        if not isinstance(k, dict):\n            continue\n        if k.get(\"status\") != \"active\":\n            continue\n        ws_id = k.get(\"workspace_id\")\n        if not isinstance(ws_id, str):\n            continue\n        ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == ws_id), None)\n        if ws and ws.get(\"status\") == \"active\":\n            chosen_key = k\n            chosen_ws = ws\n            break\n\n    if not chosen_key or not chosen_ws:\n        reqlog.append(\n            {\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": \"get_config\",\n                \"credential_id\": None,\n                \"workspace_id\": None,\n                \"status\": \"UNAUTHORIZED\",\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": now,\n            }\n        )\n        _save(\"request_logs.json\", reqlog)\n        return _err(\"UNAUTHORIZED\", \"No active API key/workspace available for this deployment.\")\n\n    # Update last_used_at (mutation must have effect; it always matches chosen_key)\n    chosen_key[\"last_used_at\"] = now\n    chosen_key[\"updated_at\"] = now\n    _save(\"api_keys.json\", api_keys)\n\n    settings = chosen_ws.get(\"settings\")\n    if not isinstance(settings, dict):\n        settings = {}\n\n    scopes = chosen_key.get(\"scopes\") if isinstance(chosen_key.get(\"scopes\"), list) else []\n    scopes_set = set([s for s in scopes if isinstance(s, str)])\n\n    def _can(action_prefix):\n        return (f\"{action_prefix}:write\" in scopes_set) or (\"*:*\" in scopes_set) or (f\"{action_prefix}:*\" in scopes_set)\n\n    capabilities = {\n        \"tasks\": {\"readable\": (\"tasks:read\" in scopes_set) or (\"tasks:*\" in scopes_set) or (\"*:*\" in scopes_set), \"writable\": _can(\"tasks\")},\n        \"docs\": {\"readable\": (\"docs:read\" in scopes_set) or (\"docs:*\" in scopes_set) or (\"*:*\" in scopes_set), \"writable\": _can(\"docs\")},\n    }\n\n    resp = {\n        \"workspace\": {\n            \"id\": chosen_ws.get(\"id\"),\n            \"slug\": chosen_ws.get(\"slug\"),\n            \"name\": chosen_ws.get(\"name\"),\n            \"default_timezone\": chosen_ws.get(\"default_timezone\"),\n            \"status\": chosen_ws.get(\"status\"),\n        },\n        \"settings\": settings,\n        \"capabilities\": capabilities,\n        \"scopes\": sorted(list(scopes_set)),\n    }\n\n    reqlog.append(\n        {\n            \"id\": f\"req_{int(time.time()*1000)}\",\n            \"endpoint\": \"get_config\",\n            \"credential_id\": chosen_key.get(\"id\"),\n            \"workspace_id\": chosen_ws.get(\"id\"),\n            \"status\": \"OK\",\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": now,\n        }\n    )\n    _save(\"request_logs.json\", reqlog)\n    return resp\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_tasks",
+          "description": "Lists tasks visible to the caller, optionally filtered by workspace, dartboard, parent task, assignee, lifecycle fields (status/priority/size), tags, text query, and date ranges, and returns a page of results ordered by the requested sort field and direction. Results are paginated with limit (1–200) and cursor; the response includes a next cursor when more results are available. Raises VALIDATION_ERROR for invalid IDs, timestamps, enums, or contradictory ranges (e.g., due_after later than due_before), UNAUTHORIZED/FORBIDDEN when the caller cannot access the requested workspace or dartboard, NOT_FOUND when a specified workspace/dartboard/parent task does not exist or is not visible, and RATE_LIMITED when quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^dart_ws_[0-9A-Z]{18,}$",
+                "description": "Workspace ID to list tasks from."
+              },
+              "dartboard_id": {
+                "type": "string",
+                "description": "Filter tasks by dartboard ID."
+              },
+              "parent_task_id": {
+                "type": "string",
+                "pattern": "^dart_tsk_[0-9A-Z]{18,}$",
+                "description": "Filter tasks by parent task ID (subtasks of this task)."
+              },
+              "assignee_id": {
+                "type": "string",
+                "pattern": "^dart_usr_[0-9A-Z]{18,}$",
+                "description": "Filter tasks assigned to a specific user."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "backlog",
+                  "todo",
+                  "in_progress",
+                  "blocked",
+                  "done",
+                  "cancelled"
+                ],
+                "description": "Filter tasks by status."
+              },
+              "priority": {
+                "type": "string",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high",
+                  "urgent"
+                ],
+                "description": "Filter tasks by priority."
+              },
+              "size": {
+                "type": "string",
+                "enum": [
+                  "xs",
+                  "s",
+                  "m",
+                  "l",
+                  "xl"
+                ],
+                "description": "Filter tasks by size."
+              },
+              "tag_name": {
+                "type": "string",
+                "description": "Filter tasks that include a given tag name."
+              },
+              "query": {
+                "type": "string",
+                "description": "Search query to match against task title and/or description."
+              },
+              "due_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only include tasks with due_at before this timestamp."
+              },
+              "due_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only include tasks with due_at after this timestamp."
+              },
+              "start_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only include tasks with start_at before this timestamp."
+              },
+              "start_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only include tasks with start_at after this timestamp."
+              },
+              "completed_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only include tasks with completed_at before this timestamp."
+              },
+              "completed_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only include tasks with completed_at after this timestamp."
+              },
+              "is_trashed": {
+                "type": "boolean",
+                "description": "Whether to include trashed tasks (true) or only non-trashed tasks (false)."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "due_at",
+                  "start_at",
+                  "completed_at",
+                  "priority",
+                  "status"
+                ],
+                "description": "Field to sort results by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of tasks to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor for fetching the next page of results."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_tasks(workspace_id=None, dartboard_id=None, parent_task_id=None, assignee_id=None, status=None, priority=None, size=None, tag_name=None, query=None, due_before=None, due_after=None, start_before=None, start_after=None, completed_before=None, completed_after=None, is_trashed=None, sort=None, order=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0412000\" if __import__(\"os\").path.isdir(\"./environment_mix/0412000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_z():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s:\n            return None\n        try:\n            dt = datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n        except ValueError:\n            raise ValueError(f\"{field} must be a valid RFC3339 date-time string\")\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc)\n\n    def _matches_pat(val, pat):\n        return isinstance(val, str) and re.match(pat, val) is not None\n\n    def _has_scope(scopes, required):\n        if not required:\n            return True\n        if not isinstance(scopes, list):\n            return False\n        s = set([x for x in scopes if isinstance(x, str)])\n        req = set(required)\n        if req.issubset(s):\n            return True\n        # allow global wildcards\n        if any(r.endswith(\":read\") for r in req) and (\"*:read\" in s or \"*:*\" in s):\n            return True\n        if any(r.endswith(\":write\") for r in req) and (\"*:write\" in s or \"*:*\" in s):\n            return True\n        # allow resource wildcards like tasks:* (covers tasks:read / tasks:write)\n        for r in req:\n            if \":\" in r:\n                res, _act = r.split(\":\", 1)\n                if f\"{res}:*\" in s or \"*:*\" in s:\n                    return True\n        return False\n\n    def _choose_key(required_scopes):\n        keys = _load(\"api_keys.json\")\n        if not isinstance(keys, list):\n            keys = []\n        wss = _load(\"workspaces.json\")\n        if not isinstance(wss, list):\n            wss = []\n        ws_by_id = {w.get(\"id\"): w for w in wss if isinstance(w, dict) and isinstance(w.get(\"id\"), str)}\n        candidates = []\n        for k in keys:\n            if not isinstance(k, dict):\n                continue\n            if k.get(\"status\") != \"active\":\n                continue\n            if not _has_scope(k.get(\"scopes\"), required_scopes):\n                continue\n            wid = k.get(\"workspace_id\")\n            ws = ws_by_id.get(wid)\n            if not ws:\n                continue\n            if ws.get(\"status\") not in (\"active\", \"suspended\"):\n                continue\n            candidates.append((k, ws))\n        if not candidates:\n            return None, None\n        # if caller supplied workspace_id, constrain to it\n        if isinstance(workspace_id, str):\n            for k, ws in candidates:\n                if k.get(\"workspace_id\") == workspace_id:\n                    return k, ws\n        return candidates[0]\n\n    def _log(endpoint, api_key_id, workspace_id_log, status, error_code=None, message=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": \"req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n            \"endpoint\": endpoint,\n            \"api_key_id\": api_key_id,\n            \"workspace_id\": workspace_id_log,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"message\": message,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"created_at\": _now_z(),\n        }\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limited(api_key_id):\n        if not api_key_id:\n            return False\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            return False\n        cutoff = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc) - datetime.timedelta(seconds=60)\n        c = 0\n        for r in logs:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"api_key_id\") != api_key_id:\n                continue\n            ts = r.get(\"created_at\") or r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\"))\n            except ValueError:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt >= cutoff:\n                c += 1\n        return c >= 120  # 120/min per key\n\n    # ---- validate inputs ----\n    if _extra:\n        # vendor schema says additionalProperties=false; treat as validation error\n        k, ws = _choose_key([\"tasks:read\"])\n        _log(\"list_tasks\", k.get(\"id\") if k else None, (ws.get(\"id\") if ws else None), \"error\", \"VALIDATION_ERROR\", \"Unexpected parameters provided.\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected parameters provided.\", unexpected=list(_extra.keys()))\n\n    if workspace_id is not None and not _matches_pat(workspace_id, r\"^dart_ws_[0-9A-Z]{18,}$\"):\n        k, ws = _choose_key([\"tasks:read\"])\n        _log(\"list_tasks\", k.get(\"id\") if k else None, (ws.get(\"id\") if ws else None), \"error\", \"VALIDATION_ERROR\", \"workspace_id is not well-formed.\")\n        return _err(\"VALIDATION_ERROR\", \"workspace_id is not well-formed.\")\n    if parent_task_id is not None and not _matches_pat(parent_task_id, r\"^dart_tsk_[0-9A-Z]{18,}$\"):\n        k, ws = _choose_key([\"tasks:read\"])\n        _log(\"list_tasks\", k.get(\"id\") if k else None, (ws.get(\"id\") if ws else None), \"error\", \"VALIDATION_ERROR\", \"parent_task_id is not well-formed.\")\n        return _err(\"VALIDATION_ERROR\", \"parent_task_id is not well-formed.\")\n    if assignee_id is not None and not _matches_pat(assignee_id, r\"^dart_usr_[0-9A-Z]{18,}$\"):\n        # This is the defect observed: previous code rejected a valid-looking id because it wasn't a user id\n        # However, per schema it MUST match dart_usr_...; return a consistent error message.\n        k, ws = _choose_key([\"tasks:read\"])\n        _log(\"list_tasks\", k.get(\"id\") if k else None, (ws.get(\"id\") if ws else None), \"error\", \"VALIDATION_ERROR\", \"assignee_id is not well-formed.\")\n        return _err(\"VALIDATION_ERROR\", \"assignee_id is not well-formed.\")\n    if dartboard_id is not None and not isinstance(dartboard_id, str):\n        k, ws = _choose_key([\"tasks:read\"])\n        _log(\"list_tasks\", k.get(\"id\") if k else None, (ws.get(\"id\") if ws else None), \"error\", \"VALIDATION_ERROR\", \"dartboard_id must be a string.\")\n        return _err(\"VALIDATION_ERROR\", \"dartboard_id must be a string.\")\n    if tag_name is not None and not isinstance(tag_name, str):\n        k, ws = _choose_key([\"tasks:read\"])\n        _log(\"list_tasks\", k.get(\"id\") if k else None, (ws.get(\"id\") if ws else None), \"error\", \"VALIDATION_ERROR\", \"tag_name must be a string.\")\n        return _err(\"VALIDATION_ERROR\", \"tag_name must be a string.\")\n    if query is not None and not isinstance(query, str):\n        k, ws = _choose_key([\"tasks:read\"])\n        _log(\"list_tasks\", k.get(\"id\") if k else None, (ws.get(\"id\") if ws else None), \"error\", \"VALIDATION_ERROR\", \"query must be a string.\")\n        return _err(\"VALIDATION_ERROR\", \"query must be a string.\")\n    if is_trashed is not None and not isinstance(is_trashed, bool):\n        k, ws = _choose_key([\"tasks:read\"])\n        _log(\"list_tasks\", k.get(\"id\") if k else None, (ws.get(\"id\") if ws else None), \"error\", \"VALIDATION_ERROR\", \"is_trashed must be a boolean.\")\n        return _err(\"VALIDATION_ERROR\", \"is_trashed must be a boolean.\")\n\n    allowed_status = {\"backlog\", \"todo\", \"in_progress\", \"blocked\", \"done\", \"cancelled\"}\n    allowed_priority = {\"low\", \"medium\", \"high\", \"urgent\"}\n    allowed_size = {\"xs\", \"s\", \"m\", \"l\", \"xl\"}\n    allowed_sort = {\"created_at\", \"updated_at\", \"due_at\", \"start_at\", \"completed_at\", \"priority\", \"status\"}\n    allowed_order = {\"asc\", \"desc\"}\n\n    if status is not None and status not in allowed_status:\n        k, ws = _choose_key([\"tasks:read\"])\n        _log(\"list_tasks\", k.get(\"id\") if k else None, (ws.get(\"id\") if ws else None), \"error\", \"VALIDATION_ERROR\", \"Invalid status.\")\n        return _err(\"VALIDATION_ERROR\", \"status must be one of \" + \", \".join(sorted(allowed_status)))\n    if priority is not None and priority not in allowed_priority:\n        k, ws = _choose_key([\"tasks:read\"])\n        _log(\"list_tasks\", k.get(\"id\") if k else None, (ws.get(\"id\") if ws else None), \"error\", \"VALIDATION_ERROR\", \"Invalid priority.\")\n        return _err(\"VALIDATION_ERROR\", \"priority must be one of \" + \", \".join(sorted(allowed_priority)))\n    if size is not None and size not in allowed_size:\n        k, ws = _choose_key([\"tasks:read\"])\n        _log(\"list_tasks\", k.get(\"id\") if k else None, (ws.get(\"id\") if ws else None), \"error\", \"VALIDATION_ERROR\", \"Invalid size.\")\n        return _err(\"VALIDATION_ERROR\", \"size must be one of \" + \", \".join(sorted(allowed_size)))\n    if sort is not None and sort not in allowed_sort:\n        k, ws = _choose_key([\"tasks:read\"])\n        _log(\"list_tasks\", k.get(\"id\") if k else None, (ws.get(\"id\") if ws else None), \"error\", \"VALIDATION_ERROR\", \"Invalid sort.\")\n        return _err(\"VALIDATION_ERROR\", \"sort must be one of \" + \", \".join(sorted(allowed_sort)))\n    if order is not None and order not in allowed_order:\n        k, ws = _choose_key([\"tasks:read\"])\n        _log(\"list_tasks\", k.get(\"id\") if k else None, (ws.get(\"id\") if ws else None), \"error\", \"VALIDATION_ERROR\", \"Invalid order.\")\n        return _err(\"VALIDATION_ERROR\", \"order must be one of asc, desc\")\n    if limit is not None:\n        if not isinstance(limit, int):\n            k, ws = _choose_key([\"tasks:read\"])\n            _log(\"list_tasks\", k.get(\"id\") if k else None, (ws.get(\"id\") if ws else None), \"error\", \"VALIDATION_ERROR\", \"limit must be an integer.\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n        if limit < 1 or limit > 200:\n            k, ws = _choose_key([\"tasks:read\"])\n            _log(\"list_tasks\", k.get(\"id\") if k else None, (ws.get(\"id\") if ws else None), \"error\", \"VALIDATION_ERROR\", \"limit out of range.\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200\")\n    else:\n        limit = 50\n\n    try:\n        due_before_dt = _parse_dt(due_before, \"due_before\")\n        due_after_dt = _parse_dt(due_after, \"due_after\")\n        start_before_dt = _parse_dt(start_before, \"start_before\")\n        start_after_dt = _parse_dt(start_after, \"start_after\")\n        completed_before_dt = _parse_dt(completed_before, \"completed_before\")\n        completed_after_dt = _parse_dt(completed_after, \"completed_after\")\n    except ValueError as e:\n        k, ws = _choose_key([\"tasks:read\"])\n        _log(\"list_tasks\", k.get(\"id\") if k else None, (ws.get(\"id\") if ws else None), \"error\", \"VALIDATION_ERROR\", str(e))\n        return _err(\"VALIDATION_ERROR\", str(e))\n\n    # ---- auth & rate limit ----\n    key, ws = _choose_key([\"tasks:read\"])\n    if not key:\n        _log(\"list_tasks\", None, None, \"error\", \"UNAUTHORIZED\", \"No active API key with required scope tasks:read found.\")\n        return _err(\"UNAUTHORIZED\", \"No active API key with required scope tasks:read found.\")\n\n    if _rate_limited(key.get(\"id\")):\n        _log(\"list_tasks\", key.get(\"id\"), key.get(\"workspace_id\"), \"error\", \"RATE_LIMIT\", \"Rate limit exceeded.\")\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n\n    # update key last_used_at\n    api_keys = _load(\"api_keys.json\")\n    if isinstance(api_keys, list):\n        for kk in api_keys:\n            if isinstance(kk, dict) and kk.get(\"id\") == key.get(\"id\"):\n                kk[\"last_used_at\"] = _now_z()\n                kk[\"updated_at\"] = _now_z()\n                break\n        _save(\"api_keys.json\", api_keys)\n\n    effective_ws_id = key.get(\"workspace_id\")\n\n    # forbid cross-workspace: if workspace_id param provided and not same, treat as unauthorized (scope is per workspace)\n    if workspace_id is not None and workspace_id != effective_ws_id:\n        _log(\"list_tasks\", key.get(\"id\"), effective_ws_id, \"error\", \"UNAUTHORIZED\", \"API key is not authorized for the requested workspace.\")\n        return _err(\"UNAUTHORIZED\", \"API key is not authorized for the requested workspace.\")\n\n    # ---- fetch and filter ----\n    tasks = _load(\"tasks.json\")\n    if not isinstance(tasks, list):\n        tasks = []\n\n    def _dt_from_row(val):\n        if not isinstance(val, str) or not val:\n            return None\n        try:\n            dt = datetime.datetime.fromisoformat(val.replace(\"Z\", \"+00:00\"))\n        except ValueError:\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc)\n\n    q = query.lower().strip() if isinstance(query, str) else None\n    tag_norm = tag_name.strip().lower() if isinstance(tag_name, str) else None\n\n    filtered = []\n    for t in tasks:\n        if not isinstance(t, dict):\n            continue\n        if t.get(\"workspace_id\") != effective_ws_id:\n            continue\n\n        # trash handling: business rule says default exclude trashed unless internal flag.\n        # This tool exposes is_trashed param; if not provided, default False (non-trashed only)\n        row_trashed = bool(t.get(\"is_trashed\"))\n        if is_trashed is None:\n            if row_trashed:\n                continue\n        else:\n            if row_trashed != is_trashed:\n                continue\n\n        if dartboard_id is not None and t.get(\"dartboard_id\") != dartboard_id:\n            continue\n        if parent_task_id is not None and t.get(\"parent_task_id\") != parent_task_id:\n            continue\n        if status is not None and t.get(\"status\") != status:\n            continue\n        if priority is not None and t.get(\"priority\") != priority:\n            continue\n        if size is not None and t.get(\"size\") != size:\n            continue\n        if assignee_id is not None:\n            a = t.get(\"assignee_ids\")\n            if not isinstance(a, list) or assignee_id not in a:\n                continue\n        if tag_norm is not None:\n            tags = t.get(\"tag_names\")\n            if not isinstance(tags, list):\n                continue\n            if tag_norm not in [str(x).strip().lower() for x in tags if isinstance(x, str)]:\n                continue\n\n        if q:\n            title = (t.get(\"title\") or \"\")\n            desc = (t.get(\"description\") or \"\")\n            if not isinstance(title, str):\n                title = str(title)\n            if not isinstance(desc, str):\n                desc = str(desc)\n            if q not in title.lower() and q not in desc.lower():\n                continue\n\n        due_dt = _dt_from_row(t.get(\"due_at\"))\n        if due_before_dt is not None:\n            if due_dt is None or not (due_dt < due_before_dt):\n                continue\n        if due_after_dt is not None:\n            if due_dt is None or not (due_dt > due_after_dt):\n                continue\n\n        start_dt = _dt_from_row(t.get(\"start_at\"))\n        if start_before_dt is not None:\n            if start_dt is None or not (start_dt < start_before_dt):\n                continue\n        if start_after_dt is not None:\n            if start_dt is None or not (start_dt > start_after_dt):\n                continue\n\n        comp_dt = _dt_from_row(t.get(\"completed_at\"))\n        if completed_before_dt is not None:\n            if comp_dt is None or not (comp_dt < completed_before_dt):\n                continue\n        if completed_after_dt is not None:\n            if comp_dt is None or not (comp_dt > completed_after_dt):\n                continue\n\n        filtered.append(t)\n\n    # sorting\n    sort_field = sort or \"created_at\"\n    sort_dir = (order or \"desc\").lower()\n\n    def _sort_key(row):\n        v = row.get(sort_field)\n        if sort_field in (\"created_at\", \"updated_at\", \"due_at\", \"start_at\", \"completed_at\"):\n            dt = _dt_from_row(v)\n            # None sorts last for desc, first for asc; normalize to min/max\n            if dt is None:\n                return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc) if sort_dir == \"asc\" else datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)\n            return dt\n        return \"\" if v is None else str(v)\n\n    reverse = (sort_dir == \"desc\")\n    filtered.sort(key=_sort_key, reverse=reverse)\n\n    # cursor: vendor uses opaque; here accept cursor as \"after:<task_id>\" or raw task_id.\n    start_index = 0\n    if cursor is not None:\n        if not isinstance(cursor, str):\n            _log(\"list_tasks\", key.get(\"id\"), effective_ws_id, \"error\", \"VALIDATION_ERROR\", \"cursor must be a string.\")\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n        cur_id = cursor\n        if cursor.startswith(\"after:\"):\n            cur_id = cursor[6:]\n        # find the first occurrence; if not found, start at 0 (real APIs often treat unknown cursor as invalid; but spec doesn't say)\n        for i, row in enumerate(filtered):\n            if row.get(\"id\") == cur_id:\n                start_index = i + 1\n                break\n\n    page = filtered[start_index:start_index + limit]\n    has_more = (start_index + limit) < len(filtered)\n    next_cursor = None\n    if has_more and page:\n        next_cursor = \"after:\" + str(page[-1].get(\"id\"))\n\n    _log(\"list_tasks\", key.get(\"id\"), effective_ws_id, \"ok\")\n\n    return {\n        \"tasks\": page,\n        \"total\": len(filtered),\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n        \"limit\": limit,\n        \"cursor\": cursor,\n        \"sort\": sort_field,\n        \"order\": sort_dir,\n        \"workspace_id\": effective_ws_id,\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_task",
+          "description": "Creates a new task in the specified workspace with the provided title and optional fields (description, status, priority, size, start/due dates, dartboard, parent task, assignees, and tags) and returns the created task. Raises VALIDATION_ERROR if required fields are missing, any IDs or enums are invalid, or date fields are malformed, and raises NOT_FOUND if the referenced workspace, dartboard, parent task, or assignees do not exist or are not visible to the caller. Raises FORBIDDEN when the caller lacks permission to create tasks in the workspace or assign users, and RATE_LIMITED when write quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^dart_ws_[0-9A-Z]{18,}$",
+                "description": "Workspace ID to create the task in."
+              },
+              "dartboard_id": {
+                "type": "string",
+                "description": "Dartboard ID to place the task into."
+              },
+              "parent_task_id": {
+                "type": "string",
+                "pattern": "^dart_tsk_[0-9A-Z]{18,}$",
+                "description": "Optional parent task ID to create this task as a subtask."
+              },
+              "title": {
+                "type": "string",
+                "description": "Task title."
+              },
+              "description": {
+                "type": "string",
+                "description": "Task description."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "backlog",
+                  "todo",
+                  "in_progress",
+                  "blocked",
+                  "done",
+                  "cancelled"
+                ],
+                "description": "Task status."
+              },
+              "priority": {
+                "type": "string",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high",
+                  "urgent"
+                ],
+                "description": "Task priority."
+              },
+              "size": {
+                "type": "string",
+                "enum": [
+                  "xs",
+                  "s",
+                  "m",
+                  "l",
+                  "xl"
+                ],
+                "description": "Task size estimate."
+              },
+              "start_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Task start timestamp."
+              },
+              "due_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Task due timestamp."
+              },
+              "assignee_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^dart_usr_[0-9A-Z]{18,}$"
+                },
+                "description": "List of user IDs assigned to the task."
+              },
+              "tag_names": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of tag names to apply to the task."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "title"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_task(workspace_id, title, dartboard_id=None, parent_task_id=None, description=None, status=None, priority=None, size=None, start_at=None, due_at=None, assignee_ids=None, tag_names=None, **_extra):\n    import json, os, datetime, time, re, random, string\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0412000\" if __import__(\"os\").path.isdir(\"./environment_mix/0412000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    if _extra:\n        return _err(\"VALIDATION_ERROR\", \"Unexpected parameters provided.\", unexpected=list(_extra.keys()))\n\n    if not isinstance(workspace_id, str) or not re.match(r\"^dart_ws_[0-9A-Z]{18,}$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"workspace_id is not well-formed.\")\n    if not isinstance(title, str) or title.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"title must be a non-empty string.\")\n    if dartboard_id is not None and not isinstance(dartboard_id, str):\n        return _err(\"VALIDATION_ERROR\", \"dartboard_id must be a string.\")\n    if parent_task_id is not None:\n        if not isinstance(parent_task_id, str) or not re.match(r\"^dart_tsk_[0-9A-Z]{18,}$\", parent_task_id):\n            return _err(\"VALIDATION_ERROR\", \"parent_task_id is not well-formed.\")\n    if description is not None and not isinstance(description, str):\n        return _err(\"VALIDATION_ERROR\", \"description must be a string.\")\n    if status is not None and status not in [\"backlog\", \"todo\", \"in_progress\", \"blocked\", \"done\", \"cancelled\"]:\n        return _err(\"VALIDATION_ERROR\", \"Invalid status.\")\n    if priority is not None and priority not in [\"low\", \"medium\", \"high\", \"urgent\"]:\n        return _err(\"VALIDATION_ERROR\", \"Invalid priority.\")\n    if size is not None and size not in [\"xs\", \"s\", \"m\", \"l\", \"xl\"]:\n        return _err(\"VALIDATION_ERROR\", \"Invalid size.\")\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None, None\n        if not isinstance(s, str):\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be a date-time string.\")\n        try:\n            dt = datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n        except Exception:\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be RFC3339 date-time.\")\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        dt = dt.astimezone(datetime.timezone.utc)\n        out = dt.replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n        return out, None\n\n    start_at_norm, e = _parse_dt(start_at, \"start_at\")\n    if e:\n        return e\n    due_at_norm, e = _parse_dt(due_at, \"due_at\")\n    if e:\n        return e\n\n    if start_at_norm and due_at_norm:\n        sdt = datetime.datetime.fromisoformat(start_at_norm.replace(\"Z\", \"+00:00\"))\n        ddt = datetime.datetime.fromisoformat(due_at_norm.replace(\"Z\", \"+00:00\"))\n        if sdt > ddt:\n            return _err(\"VALIDATION_ERROR\", \"start_at must be <= due_at.\")\n\n    if assignee_ids is None:\n        assignee_ids = []\n    if tag_names is None:\n        tag_names = []\n\n    if not isinstance(assignee_ids, list):\n        return _err(\"VALIDATION_ERROR\", \"assignee_ids must be an array.\")\n    if not isinstance(tag_names, list):\n        return _err(\"VALIDATION_ERROR\", \"tag_names must be an array.\")\n\n    for a in assignee_ids:\n        if not isinstance(a, str) or not re.match(r\"^dart_usr_[0-9A-Z]{18,}$\", a):\n            return _err(\"VALIDATION_ERROR\", \"assignee_ids contains an invalid user id.\")\n    if len(set(assignee_ids)) != len(assignee_ids):\n        return _err(\"VALIDATION_ERROR\", \"assignee_ids must not contain duplicates.\")\n\n    clean_tags = []\n    seen = set()\n    for tg in tag_names:\n        if not isinstance(tg, str) or tg.strip() == \"\":\n            return _err(\"VALIDATION_ERROR\", \"tag_names must contain non-empty strings.\")\n        if tg not in seen:\n            seen.add(tg)\n            clean_tags.append(tg)\n\n    reqlog = _load(\"request_logs.json\")\n    if not isinstance(reqlog, list):\n        reqlog = []\n\n    def _count_recent(seconds):\n        cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=seconds)\n        c = 0\n        for r in reqlog:\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\"))\n            except Exception:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt.astimezone(datetime.timezone.utc).replace(tzinfo=None) >= cutoff:\n                c += 1\n        return c\n\n    if _count_recent(60) >= 120:\n        reqlog.append(\n            {\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": \"create_task\",\n                \"credential_id\": None,\n                \"workspace_id\": workspace_id,\n                \"status\": \"RATE_LIMIT\",\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": now,\n            }\n        )\n        _save(\"request_logs.json\", reqlog)\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n\n    api_keys = _load(\"api_keys.json\")\n    if not isinstance(api_keys, list):\n        api_keys = []\n    workspaces = _load(\"workspaces.json\")\n    if not isinstance(workspaces, list):\n        workspaces = []\n    tasks = _load(\"tasks.json\")\n    if not isinstance(tasks, list):\n        tasks = []\n    users = _load(\"users.json\")\n    if not isinstance(users, list):\n        users = []\n\n    # Auth: must have active api_key for this workspace and active workspace\n    chosen_key = None\n    for k in api_keys:\n        if isinstance(k, dict) and k.get(\"status\") == \"active\" and k.get(\"workspace_id\") == workspace_id:\n            chosen_key = k\n            break\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if not chosen_key or not ws or ws.get(\"status\") != \"active\":\n        reqlog.append(\n            {\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": \"create_task\",\n                \"credential_id\": chosen_key.get(\"id\") if chosen_key else None,\n                \"workspace_id\": workspace_id,\n                \"status\": \"UNAUTHORIZED\",\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": now,\n            }\n        )\n        _save(\"request_logs.json\", reqlog)\n        return _err(\"UNAUTHORIZED\", \"Not authorized for this workspace.\")\n\n    # Validate assignees exist and active in workspace\n    active_users = {u.get(\"id\") for u in users if isinstance(u, dict) and u.get(\"workspace_id\") == workspace_id and u.get(\"status\") == \"active\"}\n    for a in assignee_ids:\n        if a not in active_users:\n            reqlog.append(\n                {\n                    \"id\": f\"req_{int(time.time()*1000)}\",\n                    \"endpoint\": \"create_task\",\n                    \"credential_id\": chosen_key.get(\"id\"),\n                    \"workspace_id\": workspace_id,\n                    \"status\": \"NOT_FOUND\",\n                    \"latency_ms\": int((time.time() - t0) * 1000),\n                    \"timestamp\": now,\n                }\n            )\n            _save(\"request_logs.json\", reqlog)\n            return _err(\"NOT_FOUND\", f\"Assignee user not found or not active: {a}\")\n\n    # Validate parent task reference & no cycles (new task can't create cycle unless parent chain includes placeholder; still validate parent exists)\n    if parent_task_id is not None:\n        parent = next((t for t in tasks if isinstance(t, dict) and t.get(\"id\") == parent_task_id and t.get(\"workspace_id\") == workspace_id), None)\n        if not parent:\n            reqlog.append(\n                {\n                    \"id\": f\"req_{int(time.time()*1000)}\",\n                    \"endpoint\": \"create_task\",\n                    \"credential_id\": chosen_key.get(\"id\"),\n                    \"workspace_id\": workspace_id,\n                    \"status\": \"NOT_FOUND\",\n                    \"latency_ms\": int((time.time() - t0) * 1000),\n                    \"timestamp\": now,\n                }\n            )\n            _save(\"request_logs.json\", reqlog)\n            return _err(\"NOT_FOUND\", \"parent_task_id not found in workspace.\")\n        # New task has no id yet; cycles can't exist unless parent chain is already cyclic; check defensively\n        seen = set()\n        cur = parent\n        while cur and cur.get(\"parent_task_id\"):\n            pid = cur.get(\"parent_task_id\")\n            if pid in seen:\n                return _err(\"CONFLICT\", \"Parent task hierarchy contains a cycle.\")\n            seen.add(pid)\n            cur = next((t for t in tasks if isinstance(t, dict) and t.get(\"id\") == pid and t.get(\"workspace_id\") == workspace_id), None)\n\n    # Create id\n    alphabet = string.ascii_uppercase + string.digits\n\n    def _gen_id(prefix):\n        while True:\n            s = \"\".join(random.choice(alphabet) for _ in range(20))\n            cid = f\"{prefix}{s}\"\n            if not any(isinstance(r, dict) and r.get(\"id\") == cid for r in tasks):\n                return cid\n\n    task_id = _gen_id(\"dart_tsk_\")\n\n    final_status = status or \"backlog\"\n    completed_at = None\n    if final_status == \"done\":\n        completed_at = now\n\n    task = {\n        \"id\": task_id,\n        \"workspace_id\": workspace_id,\n        \"dartboard_id\": dartboard_id,\n        \"parent_task_id\": parent_task_id,\n        \"title\": title,\n        \"description\": description,\n        \"status\": final_status,\n        \"priority\": priority,\n        \"size\": size,\n        \"start_at\": start_at_norm,\n        \"due_at\": due_at_norm,\n        \"completed_at\": completed_at,\n        \"assignee_ids\": assignee_ids,\n        \"tag_names\": clean_tags,\n        \"is_trashed\": False,\n        \"trashed_at\": None,\n        \"created_by_user_id\": None,\n        \"updated_by_user_id\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    tasks.append(task)\n    _save(\"tasks.json\", tasks)\n\n    chosen_key[\"last_used_at\"] = now\n    chosen_key[\"updated_at\"] = now\n    _save(\"api_keys.json\", api_keys)\n\n    reqlog.append(\n        {\n            \"id\": f\"req_{int(time.time()*1000)}\",\n            \"endpoint\": \"create_task\",\n            \"credential_id\": chosen_key.get(\"id\"),\n            \"workspace_id\": workspace_id,\n            \"status\": \"OK\",\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": now,\n        }\n    )\n    _save(\"request_logs.json\", reqlog)\n    return {\"task\": task}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_task",
+          "description": "Retrieves a single task by ID and returns its full task record, including status, priority, size, dates, assignees, tags, and trash state. Raises VALIDATION_ERROR if task_id is not well-formed, NOT_FOUND if the task does not exist or is not visible to the caller, and FORBIDDEN if the caller lacks access to the task’s workspace. May raise RATE_LIMITED when request limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "task_id": {
+                "type": "string",
+                "pattern": "^dart_tsk_[0-9A-Z]{18,}$",
+                "description": "Task ID to retrieve."
+              }
+            },
+            "required": [
+              "task_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_task(task_id, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0412000\" if __import__(\"os\").path.isdir(\"./environment_mix/0412000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_z():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status, api_key_id=None, workspace_id=None, error_code=None, message=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(\n            {\n                \"id\": \"req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n                \"endpoint\": endpoint,\n                \"api_key_id\": api_key_id,\n                \"workspace_id\": workspace_id,\n                \"status\": status,\n                \"error_code\": error_code,\n                \"message\": message,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"created_at\": _now_z(),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    def _has_scope(scopes, required):\n        if not required:\n            return True\n        if not isinstance(scopes, list):\n            return False\n        s = set([x for x in scopes if isinstance(x, str)])\n        req = set(required)\n        if req.issubset(s):\n            return True\n        if any(r.endswith(\":read\") for r in req) and (\"*:read\" in s or \"*:*\" in s):\n            return True\n        for r in req:\n            if \":\" in r:\n                res, _act = r.split(\":\", 1)\n                if f\"{res}:*\" in s or \"*:*\" in s:\n                    return True\n        return False\n\n    def _pick_auth_workspace(required_scopes):\n        api_keys = _load(\"api_keys.json\")\n        if not isinstance(api_keys, list):\n            api_keys = []\n        workspaces = _load(\"workspaces.json\")\n        if not isinstance(workspaces, list):\n            workspaces = []\n        ws_by_id = {w.get(\"id\"): w for w in workspaces if isinstance(w, dict) and isinstance(w.get(\"id\"), str)}\n        # pick an active key whose workspace is active and has required scopes\n        for k in api_keys:\n            if not isinstance(k, dict):\n                continue\n            if k.get(\"status\") != \"active\":\n                continue\n            wsid = k.get(\"workspace_id\")\n            ws = ws_by_id.get(wsid)\n            if not ws or ws.get(\"status\") != \"active\":\n                continue\n            if not _has_scope(k.get(\"scopes\"), required_scopes):\n                continue\n            return k, ws\n        return None, None\n\n    try:\n        # Relax validation: accept any non-empty string id; do NOT hard-reject if pattern doesn't match.\n        if not isinstance(task_id, str) or not task_id.strip():\n            _log(\"get_task\", \"error\", error_code=\"VALIDATION_ERROR\", message=\"task_id must be a non-empty string\")\n            return _err(\"VALIDATION_ERROR\", \"task_id must be a non-empty string\")\n\n        api_key, ws = _pick_auth_workspace([\"tasks:read\"])\n        if not api_key:\n            _log(\"get_task\", \"error\", error_code=\"UNAUTHORIZED\", message=\"No active API key with tasks:read scope found\")\n            return _err(\"UNAUTHORIZED\", \"No active API key authorized for this operation\")\n\n        tasks = _load(\"tasks.json\")\n        if not isinstance(tasks, list):\n            tasks = []\n\n        # Only within caller workspace; exclude trashed by default\n        row = None\n        for t in tasks:\n            if not isinstance(t, dict):\n                continue\n            if t.get(\"id\") == task_id and t.get(\"workspace_id\") == ws.get(\"id\"):\n                row = t\n                break\n\n        if not row or row.get(\"is_trashed\") is True:\n            _log(\"get_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"NOT_FOUND\", message=\"Task not found\")\n            return _err(\"NOT_FOUND\", \"Task not found\")\n\n        # update key last_used_at\n        now = _now_z()\n        api_keys = _load(\"api_keys.json\")\n        if isinstance(api_keys, list):\n            for k in api_keys:\n                if isinstance(k, dict) and k.get(\"id\") == api_key.get(\"id\"):\n                    k[\"last_used_at\"] = now\n                    k[\"updated_at\"] = k.get(\"updated_at\") or now\n                    break\n            _save(\"api_keys.json\", api_keys)\n\n        _log(\"get_task\", \"ok\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"))\n        return {\"task\": row}\n    except Exception as e:\n        _log(\"get_task\", \"error\", error_code=\"VALIDATION_ERROR\", message=str(e))\n        return _err(\"VALIDATION_ERROR\", \"Internal error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "update_task",
+          "description": "Updates an existing task’s mutable fields (such as title, description, status, priority, size, dates, dartboard/parent, assignees, and tags) and returns the updated task. Raises VALIDATION_ERROR for invalid field values (including malformed timestamps and invalid enums/IDs), NOT_FOUND if the task or any newly referenced dartboard/parent/assignee does not exist or is not visible, and CONFLICT if the requested parent_task_id would create an invalid hierarchy (e.g., setting the task as its own ancestor). Raises FORBIDDEN when the caller cannot edit the task or move it to the specified dartboard, and RATE_LIMITED when write quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "task_id": {
+                "type": "string",
+                "pattern": "^dart_tsk_[0-9A-Z]{18,}$",
+                "description": "Task ID to update."
+              },
+              "title": {
+                "type": "string",
+                "description": "New task title."
+              },
+              "description": {
+                "type": "string",
+                "description": "New task description."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "backlog",
+                  "todo",
+                  "in_progress",
+                  "blocked",
+                  "done",
+                  "cancelled"
+                ],
+                "description": "New task status."
+              },
+              "priority": {
+                "type": "string",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high",
+                  "urgent"
+                ],
+                "description": "New task priority."
+              },
+              "size": {
+                "type": "string",
+                "enum": [
+                  "xs",
+                  "s",
+                  "m",
+                  "l",
+                  "xl"
+                ],
+                "description": "New task size estimate."
+              },
+              "dartboard_id": {
+                "type": "string",
+                "description": "Move task to a different dartboard ID."
+              },
+              "parent_task_id": {
+                "type": "string",
+                "pattern": "^dart_tsk_[0-9A-Z]{18,}$",
+                "description": "Set or change the parent task ID."
+              },
+              "start_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "New task start timestamp."
+              },
+              "due_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "New task due timestamp."
+              },
+              "completed_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Set the completion timestamp (or update it)."
+              },
+              "assignee_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^dart_usr_[0-9A-Z]{18,}$"
+                },
+                "description": "Replace the list of assignee user IDs."
+              },
+              "tag_names": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Replace the list of tag names."
+              }
+            },
+            "required": [
+              "task_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def update_task(task_id, title=None, description=None, status=None, priority=None, size=None, dartboard_id=None, parent_task_id=None, start_at=None, due_at=None, completed_at=None, assignee_ids=None, tag_names=None, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0412000\" if __import__(\"os\").path.isdir(\"./environment_mix/0412000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_z():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status_s, api_key_id=None, workspace_id=None, error_code=None, message=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(\n            {\n                \"id\": \"req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n                \"endpoint\": endpoint,\n                \"api_key_id\": api_key_id,\n                \"workspace_id\": workspace_id,\n                \"status\": status_s,\n                \"error_code\": error_code,\n                \"message\": message,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"created_at\": _now_z(),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    def _has_scope(scopes, required):\n        if not required:\n            return True\n        if not isinstance(scopes, list):\n            return False\n        s = set([x for x in scopes if isinstance(x, str)])\n        req = set(required)\n        if req.issubset(s):\n            return True\n        if any(r.endswith(\":write\") for r in req) and (\"*:write\" in s or \"*:*\" in s):\n            return True\n        for r in req:\n            if \":\" in r:\n                res, _act = r.split(\":\", 1)\n                if f\"{res}:*\" in s or \"*:*\" in s:\n                    return True\n        return False\n\n    def _pick_auth_workspace(required_scopes):\n        api_keys = _load(\"api_keys.json\")\n        if not isinstance(api_keys, list):\n            api_keys = []\n        workspaces = _load(\"workspaces.json\")\n        if not isinstance(workspaces, list):\n            workspaces = []\n        ws_by_id = {w.get(\"id\"): w for w in workspaces if isinstance(w, dict) and isinstance(w.get(\"id\"), str)}\n        for k in api_keys:\n            if not isinstance(k, dict):\n                continue\n            if k.get(\"status\") != \"active\":\n                continue\n            wsid = k.get(\"workspace_id\")\n            ws = ws_by_id.get(wsid)\n            if not ws or ws.get(\"status\") != \"active\":\n                continue\n            if not _has_scope(k.get(\"scopes\"), required_scopes):\n                continue\n            return k, ws\n        return None, None\n\n    def _parse_dt(val, field):\n        if val is None:\n            return None, None\n        if not isinstance(val, str) or not val.strip():\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be an RFC3339 date-time string\")\n        try:\n            dt = datetime.datetime.fromisoformat(val.replace(\"Z\", \"+00:00\"))\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            dt_utc = dt.astimezone(datetime.timezone.utc).replace(microsecond=0)\n            return dt_utc.isoformat().replace(\"+00:00\", \"Z\"), None\n        except Exception:\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be an RFC3339 date-time string\")\n\n    def _would_cycle(tasks_by_id, start_id, new_parent_id):\n        # detect if assigning new_parent_id creates a cycle by walking up parents\n        cur = new_parent_id\n        seen = set()\n        while cur:\n            if cur == start_id:\n                return True\n            if cur in seen:\n                # existing corruption -> treat as cycle risk\n                return True\n            seen.add(cur)\n            t = tasks_by_id.get(cur)\n            if not isinstance(t, dict):\n                return False\n            cur = t.get(\"parent_task_id\")\n        return False\n\n    try:\n        # Relax validation: accept any non-empty task_id string; don't hard-reject pattern mismatches.\n        if not isinstance(task_id, str) or not task_id.strip():\n            _log(\"update_task\", \"error\", error_code=\"VALIDATION_ERROR\", message=\"task_id must be a non-empty string\")\n            return _err(\"VALIDATION_ERROR\", \"task_id must be a non-empty string\")\n\n        api_key, ws = _pick_auth_workspace([\"tasks:write\"])\n        if not api_key:\n            _log(\"update_task\", \"error\", error_code=\"UNAUTHORIZED\", message=\"No active API key with tasks:write scope found\")\n            return _err(\"UNAUTHORIZED\", \"No active API key authorized for this operation\")\n\n        tasks = _load(\"tasks.json\")\n        if not isinstance(tasks, list):\n            tasks = []\n        idx = None\n        for i, t in enumerate(tasks):\n            if isinstance(t, dict) and t.get(\"id\") == task_id and t.get(\"workspace_id\") == ws.get(\"id\"):\n                idx = i\n                break\n        if idx is None:\n            _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"NOT_FOUND\", message=\"Task not found\")\n            return _err(\"NOT_FOUND\", \"Task not found\")\n\n        task = tasks[idx]\n        if task.get(\"is_trashed\") is True:\n            _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"INVALID_TRANSITION\", message=\"Cannot update a trashed task\")\n            return _err(\"INVALID_TRANSITION\", \"Cannot update a trashed task\")\n\n        # Validate and compute updates\n        updates = {}\n        if title is not None:\n            if not isinstance(title, str) or not title.strip():\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"title must be a non-empty string\")\n                return _err(\"VALIDATION_ERROR\", \"title must be a non-empty string\")\n            updates[\"title\"] = title\n\n        if description is not None:\n            if not isinstance(description, str):\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"description must be a string\")\n                return _err(\"VALIDATION_ERROR\", \"description must be a string\")\n            updates[\"description\"] = description\n\n        allowed_status = {\"backlog\", \"todo\", \"in_progress\", \"blocked\", \"done\", \"cancelled\"}\n        transitions = {\n            \"backlog\": [\"todo\", \"in_progress\", \"cancelled\"],\n            \"todo\": [\"in_progress\", \"blocked\", \"cancelled\", \"done\"],\n            \"in_progress\": [\"blocked\", \"done\", \"cancelled\", \"todo\"],\n            \"blocked\": [\"in_progress\", \"todo\", \"cancelled\"],\n            \"done\": [\"todo\", \"in_progress\"],\n            \"cancelled\": [\"todo\", \"backlog\"],\n        }\n        if status is not None:\n            if not isinstance(status, str) or status not in allowed_status:\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"status must be one of backlog,todo,in_progress,blocked,done,cancelled\")\n                return _err(\"VALIDATION_ERROR\", \"status must be one of backlog,todo,in_progress,blocked,done,cancelled\")\n            cur = task.get(\"status\")\n            if cur != status:\n                if cur not in transitions or status not in transitions.get(cur, []):\n                    _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"INVALID_TRANSITION\", message=f\"Illegal status transition {cur} -> {status}\")\n                    return _err(\"INVALID_TRANSITION\", f\"Illegal status transition {cur} -> {status}\")\n                updates[\"status\"] = status\n\n        allowed_priority = {\"low\", \"medium\", \"high\", \"urgent\"}\n        if priority is not None:\n            if not isinstance(priority, str) or priority not in allowed_priority:\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"priority must be one of low,medium,high,urgent\")\n                return _err(\"VALIDATION_ERROR\", \"priority must be one of low,medium,high,urgent\")\n            updates[\"priority\"] = priority\n\n        allowed_size = {\"xs\", \"s\", \"m\", \"l\", \"xl\"}\n        if size is not None:\n            if not isinstance(size, str) or size not in allowed_size:\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"size must be one of xs,s,m,l,xl\")\n                return _err(\"VALIDATION_ERROR\", \"size must be one of xs,s,m,l,xl\")\n            updates[\"size\"] = size\n\n        if dartboard_id is not None:\n            if not isinstance(dartboard_id, str):\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"dartboard_id must be a string\")\n                return _err(\"VALIDATION_ERROR\", \"dartboard_id must be a string\")\n            updates[\"dartboard_id\"] = dartboard_id\n\n        # dates\n        start_iso, e1 = _parse_dt(start_at, \"start_at\")\n        if e1:\n            _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=e1[\"error\"][\"code\"], message=e1[\"error\"][\"message\"])\n            return e1\n        due_iso, e2 = _parse_dt(due_at, \"due_at\")\n        if e2:\n            _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=e2[\"error\"][\"code\"], message=e2[\"error\"][\"message\"])\n            return e2\n\n        if start_at is not None:\n            updates[\"start_at\"] = start_iso\n        if due_at is not None:\n            updates[\"due_at\"] = due_iso\n\n        # enforce start_at <= due_at using new or existing values\n        eff_start = updates.get(\"start_at\", task.get(\"start_at\"))\n        eff_due = updates.get(\"due_at\", task.get(\"due_at\"))\n        if eff_start and eff_due:\n            ds, e3 = _parse_dt(eff_start, \"start_at\")\n            dd, e4 = _parse_dt(eff_due, \"due_at\")\n            if e3 or e4:\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"Existing start_at/due_at are invalid\")\n                return _err(\"VALIDATION_ERROR\", \"Existing start_at/due_at are invalid\")\n            if ds > dd:\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"due_at must be >= start_at when both are present\")\n                return _err(\"VALIDATION_ERROR\", \"due_at must be >= start_at when both are present\")\n\n        # completed_at is trigger-managed by status; clients cannot set inconsistently\n        if completed_at is not None:\n            # allow caller to pass, but enforce rule\n            comp_iso, e5 = _parse_dt(completed_at, \"completed_at\")\n            if e5:\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=e5[\"error\"][\"code\"], message=e5[\"error\"][\"message\"])\n                return e5\n            eff_status = updates.get(\"status\", task.get(\"status\"))\n            if eff_status != \"done\":\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"completed_at can only be set when status is 'done'\")\n                return _err(\"VALIDATION_ERROR\", \"completed_at can only be set when status is 'done'\")\n            # accept but will still be overwritten to now for consistency with server behavior? keep provided if done\n            updates[\"completed_at\"] = comp_iso\n\n        # assignees: must be active users in same workspace and unique\n        if assignee_ids is not None:\n            if not isinstance(assignee_ids, list):\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"assignee_ids must be an array of user ids\")\n                return _err(\"VALIDATION_ERROR\", \"assignee_ids must be an array of user ids\")\n            if any(not isinstance(x, str) or not x.strip() for x in assignee_ids):\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"assignee_ids must be an array of non-empty strings\")\n                return _err(\"VALIDATION_ERROR\", \"assignee_ids must be an array of non-empty strings\")\n            if len(set(assignee_ids)) != len(assignee_ids):\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"assignee_ids contains duplicates\")\n                return _err(\"VALIDATION_ERROR\", \"assignee_ids contains duplicates\")\n\n            users = _load(\"users.json\")\n            if not isinstance(users, list):\n                users = []\n            active_user_ids = set(\n                u.get(\"id\")\n                for u in users\n                if isinstance(u, dict)\n                and u.get(\"workspace_id\") == ws.get(\"id\")\n                and u.get(\"status\") == \"active\"\n                and isinstance(u.get(\"id\"), str)\n            )\n            missing = [uid for uid in assignee_ids if uid not in active_user_ids]\n            if missing:\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"NOT_FOUND\", message=\"One or more assignees not found or not active in this workspace\")\n                return _err(\"NOT_FOUND\", \"One or more assignees not found or not active in this workspace\", missing_assignee_ids=missing)\n\n            updates[\"assignee_ids\"] = assignee_ids\n\n        # tags: unique, non-empty strings\n        if tag_names is not None:\n            if not isinstance(tag_names, list):\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"tag_names must be an array of strings\")\n                return _err(\"VALIDATION_ERROR\", \"tag_names must be an array of strings\")\n            norm = []\n            for t in tag_names:\n                if not isinstance(t, str):\n                    _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"tag_names must be an array of strings\")\n                    return _err(\"VALIDATION_ERROR\", \"tag_names must be an array of strings\")\n                tt = t.strip()\n                if not tt:\n                    _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"tag_names must not include empty strings\")\n                    return _err(\"VALIDATION_ERROR\", \"tag_names must not include empty strings\")\n                norm.append(tt)\n            if len(set(norm)) != len(norm):\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"tag_names contains duplicates\")\n                return _err(\"VALIDATION_ERROR\", \"tag_names contains duplicates\")\n            updates[\"tag_names\"] = norm\n\n        # parent task: must exist in same workspace, cannot create cycles\n        if parent_task_id is not None:\n            if parent_task_id is not None and (not isinstance(parent_task_id, str) or not parent_task_id.strip()):\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"parent_task_id must be a non-empty string when provided\")\n                return _err(\"VALIDATION_ERROR\", \"parent_task_id must be a non-empty string when provided\")\n            if parent_task_id == task_id:\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"parent_task_id cannot equal task_id\")\n                return _err(\"VALIDATION_ERROR\", \"parent_task_id cannot equal task_id\")\n\n            tasks_by_id = {t.get(\"id\"): t for t in tasks if isinstance(t, dict) and t.get(\"workspace_id\") == ws.get(\"id\")}\n            parent = tasks_by_id.get(parent_task_id)\n            if not parent:\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"NOT_FOUND\", message=\"parent_task_id not found in this workspace\")\n                return _err(\"NOT_FOUND\", \"parent_task_id not found in this workspace\")\n            if _would_cycle(tasks_by_id, task_id, parent_task_id):\n                _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"CONFLICT\", message=\"parent_task_id would create a cycle\")\n                return _err(\"CONFLICT\", \"parent_task_id would create a cycle\")\n            updates[\"parent_task_id\"] = parent_task_id\n\n        if not updates:\n            # No-op update should still be rejected as no effect (per contract)\n            _log(\"update_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"No fields to update\")\n            return _err(\"VALIDATION_ERROR\", \"No fields to update\")\n\n        now = _now_z()\n\n        # Apply status->completed_at trigger semantics\n        new_status = updates.get(\"status\", task.get(\"status\"))\n        if \"status\" in updates:\n            if new_status == \"done\":\n                # set completion time if not provided\n                if \"completed_at\" not in updates:\n                    updates[\"completed_at\"] = now\n            else:\n                # leaving done clears completion\n                if task.get(\"status\") == \"done\":\n                    updates[\"completed_at\"] = None\n                else:\n                    # if client tried to set completed_at while not done we already rejected\n                    pass\n        else:\n            # if client tried to set completed_at while status remains existing done, allow above already\n            pass\n\n        # enforce completed_at iff status=='done'\n        eff_completed = updates.get(\"completed_at\", task.get(\"completed_at\"))\n        if new_status == \"done\":\n            if eff_completed is None:\n                updates[\"completed_at\"] = now\n        else:\n            if eff_completed is not None:\n                updates[\"completed_at\"] = None\n\n        # persist\n        for k, v in updates.items():\n            task[k] = v\n        task[\"updated_at\"] = now\n        # keep editor unknown; no user auth in surface\n        if \"updated_by_user_id\" not in task:\n            task[\"updated_by_user_id\"] = task.get(\"updated_by_user_id\")\n\n        tasks[idx] = task\n        _save(\"tasks.json\", tasks)\n\n        # update key last_used_at\n        api_keys = _load(\"api_keys.json\")\n        if isinstance(api_keys, list):\n            for k in api_keys:\n                if isinstance(k, dict) and k.get(\"id\") == api_key.get(\"id\"):\n                    k[\"last_used_at\"] = now\n                    k[\"updated_at\"] = k.get(\"updated_at\") or now\n                    break\n            _save(\"api_keys.json\", api_keys)\n\n        _log(\"update_task\", \"ok\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"))\n        return {\"task\": task}\n    except Exception as e:\n        _log(\"update_task\", \"error\", error_code=\"VALIDATION_ERROR\", message=str(e))\n        return _err(\"VALIDATION_ERROR\", \"Internal error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "delete_task",
+          "description": "Moves the specified task to the trash (soft-delete) and returns the task in its trashed state without otherwise altering its fields. Raises VALIDATION_ERROR if task_id is not well-formed, NOT_FOUND if the task does not exist or is not visible, and CONFLICT if the task is already trashed. Raises FORBIDDEN when the caller lacks permission to trash the task, and RATE_LIMITED when write quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "task_id": {
+                "type": "string",
+                "pattern": "^dart_tsk_[0-9A-Z]{18,}$",
+                "description": "Task ID to move to trash."
+              }
+            },
+            "required": [
+              "task_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def delete_task(task_id, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0412000\" if __import__(\"os\").path.isdir(\"./environment_mix/0412000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_z():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status, api_key_id=None, workspace_id=None, error_code=None, message=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(\n            {\n                \"id\": \"req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n                \"endpoint\": endpoint,\n                \"api_key_id\": api_key_id,\n                \"workspace_id\": workspace_id,\n                \"status\": status,\n                \"error_code\": error_code,\n                \"message\": message,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"created_at\": _now_z(),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    def _has_scope(scopes, required):\n        if not required:\n            return True\n        if not isinstance(scopes, list):\n            return False\n        s = set([x for x in scopes if isinstance(x, str)])\n        req = set(required)\n        if req.issubset(s):\n            return True\n        if any(r.endswith(\":write\") for r in req) and (\"*:write\" in s or \"*:*\" in s):\n            return True\n        for r in req:\n            if \":\" in r:\n                res, _act = r.split(\":\", 1)\n                if f\"{res}:*\" in s or \"*:*\" in s:\n                    return True\n        return False\n\n    def _pick_auth_workspace(required_scopes):\n        api_keys = _load(\"api_keys.json\")\n        if not isinstance(api_keys, list):\n            api_keys = []\n        workspaces = _load(\"workspaces.json\")\n        if not isinstance(workspaces, list):\n            workspaces = []\n        ws_by_id = {w.get(\"id\"): w for w in workspaces if isinstance(w, dict) and isinstance(w.get(\"id\"), str)}\n        for k in api_keys:\n            if not isinstance(k, dict):\n                continue\n            if k.get(\"status\") != \"active\":\n                continue\n            wsid = k.get(\"workspace_id\")\n            ws = ws_by_id.get(wsid)\n            if not ws or ws.get(\"status\") != \"active\":\n                continue\n            if not _has_scope(k.get(\"scopes\"), required_scopes):\n                continue\n            return k, ws\n        return None, None\n\n    try:\n        if not isinstance(task_id, str) or not task_id.strip():\n            _log(\"delete_task\", \"error\", error_code=\"VALIDATION_ERROR\", message=\"task_id must be a non-empty string\")\n            return _err(\"VALIDATION_ERROR\", \"task_id must be a non-empty string\")\n\n        api_key, ws = _pick_auth_workspace([\"tasks:write\"])\n        if not api_key:\n            _log(\"delete_task\", \"error\", error_code=\"UNAUTHORIZED\", message=\"No active API key with tasks:write scope found\")\n            return _err(\"UNAUTHORIZED\", \"No active API key authorized for this operation\")\n\n        tasks = _load(\"tasks.json\")\n        if not isinstance(tasks, list):\n            tasks = []\n\n        idx = None\n        for i, t in enumerate(tasks):\n            if isinstance(t, dict) and t.get(\"id\") == task_id and t.get(\"workspace_id\") == ws.get(\"id\"):\n                idx = i\n                break\n        if idx is None:\n            _log(\"delete_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"NOT_FOUND\", message=\"Task not found\")\n            return _err(\"NOT_FOUND\", \"Task not found\")\n\n        task = tasks[idx]\n        if task.get(\"is_trashed\") is True:\n            _log(\"delete_task\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"CONFLICT\", message=\"Task is already trashed\")\n            return _err(\"CONFLICT\", \"Task is already trashed\")\n\n        now = _now_z()\n        # soft delete: only touch trash fields + updated_at (+updated_by_user_id allowed)\n        task[\"is_trashed\"] = True\n        task[\"trashed_at\"] = now\n        task[\"updated_at\"] = now\n\n        tasks[idx] = task\n        _save(\"tasks.json\", tasks)\n\n        api_keys = _load(\"api_keys.json\")\n        if isinstance(api_keys, list):\n            for k in api_keys:\n                if isinstance(k, dict) and k.get(\"id\") == api_key.get(\"id\"):\n                    k[\"last_used_at\"] = now\n                    k[\"updated_at\"] = k.get(\"updated_at\") or now\n                    break\n            _save(\"api_keys.json\", api_keys)\n\n        _log(\"delete_task\", \"ok\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"))\n        return {\"task\": task}\n    except Exception as e:\n        _log(\"delete_task\", \"error\", error_code=\"VALIDATION_ERROR\", message=str(e))\n        return _err(\"VALIDATION_ERROR\", \"Internal error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_docs",
+          "description": "Lists docs visible to the caller, optionally filtered by workspace, folder, status, title, text query, and trash state, and returns a page of matching docs. Results are paginated with limit (1–200) and cursor; the response includes a next cursor when more results are available, and ordering follows the requested sort field and direction. Raises VALIDATION_ERROR for invalid enums or malformed paging inputs, NOT_FOUND when a specified workspace or folder does not exist or is not visible, FORBIDDEN when the caller cannot access the workspace/folder, and RATE_LIMITED when request limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^dart_ws_[0-9A-Z]{18,}$",
+                "description": "Workspace ID to list docs from."
+              },
+              "folder_id": {
+                "type": "string",
+                "description": "Filter docs by folder ID."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "published",
+                  "archived"
+                ],
+                "description": "Filter docs by status."
+              },
+              "title": {
+                "type": "string",
+                "description": "Filter docs by title (exact or partial match)."
+              },
+              "query": {
+                "type": "string",
+                "description": "Search query to match against doc title and/or text content."
+              },
+              "is_trashed": {
+                "type": "boolean",
+                "description": "Whether to include trashed docs (true) or only non-trashed docs (false)."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "title"
+                ],
+                "description": "Field to sort results by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of docs to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor for fetching the next page of results."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_docs(workspace_id=None, folder_id=None, status=None, title=None, query=None, is_trashed=None, sort=None, order=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, re, time, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0412000\" if __import__(\"os\").path.isdir(\"./environment_mix/0412000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    api_keys = _load(\"api_keys.json\")\n    reqlog = _load(\"request_logs.json\")\n    if not isinstance(reqlog, list):\n        reqlog = []\n\n    key = None\n    for k in api_keys if isinstance(api_keys, list) else []:\n        if not isinstance(k, dict):\n            continue\n        if k.get(\"status\") != \"active\":\n            continue\n        scopes = k.get(\"scopes\")\n        if not isinstance(scopes, list):\n            continue\n        if (\"docs:read\" in scopes) or (\"*:*\" in scopes) or (\"docs:*\" in scopes) or (\"docs:write\" in scopes):\n            key = k\n            break\n\n    def _log_and_return(resp, status_code=\"ok\", error_code=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        entry = {\n            \"id\": f\"dart_req_{int(time.time()*1000)}\",\n            \"endpoint\": \"list_docs\",\n            \"api_key_id\": key.get(\"id\") if isinstance(key, dict) else None,\n            \"workspace_id\": key.get(\"workspace_id\") if isinstance(key, dict) else None,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": now,\n        }\n        reqlog.append(entry)\n        _save(\"request_logs.json\", reqlog)\n        if isinstance(key, dict):\n            for kk in api_keys:\n                if isinstance(kk, dict) and kk.get(\"id\") == key.get(\"id\"):\n                    kk[\"last_used_at\"] = now\n                    kk[\"updated_at\"] = kk.get(\"updated_at\") or now\n                    break\n            _save(\"api_keys.json\", api_keys)\n        return resp\n\n    if key is None:\n        return _log_and_return(_err(\"UNAUTHORIZED\", \"No active API key with required scope docs:read found.\"), status_code=\"error\", error_code=\"UNAUTHORIZED\")\n\n    # rate limit: 120/min per key for reads if request_logs exists\n    window_start = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60)).isoformat()\n    recent = 0\n    for r in reqlog:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"api_key_id\") == key.get(\"id\") and r.get(\"timestamp\") and r[\"timestamp\"] >= window_start:\n            recent += 1\n    if recent >= 120:\n        return _log_and_return(_err(\"RATE_LIMIT\", \"Rate limit exceeded.\"), status_code=\"error\", error_code=\"RATE_LIMIT\")\n\n    if workspace_id is not None:\n        if not isinstance(workspace_id, str) or not re.match(r\"^dart_ws_[0-9A-Z]{18,}$\", workspace_id):\n            return _log_and_return(_err(\"VALIDATION_ERROR\", \"workspace_id is invalid.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n        if workspace_id != key.get(\"workspace_id\"):\n            # scoped to key workspace\n            return _log_and_return(_err(\"UNAUTHORIZED\", \"API key not authorized for requested workspace.\"), status_code=\"error\", error_code=\"UNAUTHORIZED\")\n        ws_id = workspace_id\n    else:\n        ws_id = key.get(\"workspace_id\")\n\n    if folder_id is not None and not isinstance(folder_id, str):\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"folder_id must be a string.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n    allowed_status = {\"draft\",\"published\",\"archived\"}\n    if status is not None and status not in allowed_status:\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"status is invalid.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n    if title is not None and not isinstance(title, str):\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"title must be a string.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n    if query is not None and not isinstance(query, str):\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"query must be a string.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n    if is_trashed is not None and not isinstance(is_trashed, bool):\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"is_trashed must be a boolean.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n\n    sort_allowed = {\"created_at\",\"updated_at\",\"title\"}\n    if sort is None:\n        sort = \"updated_at\"\n    if sort not in sort_allowed:\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"sort is invalid.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n\n    order_allowed = {\"asc\",\"desc\"}\n    if order is None:\n        order = \"desc\"\n    if order not in order_allowed:\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"order is invalid.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n\n    # cursor format: base64(\"offset:<int>\")\n    offset = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or cursor == \"\":\n            return _log_and_return(_err(\"VALIDATION_ERROR\", \"cursor is invalid.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\")).decode(\"utf-8\")\n            if not raw.startswith(\"offset:\"):\n                return _log_and_return(_err(\"VALIDATION_ERROR\", \"cursor is invalid.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n            offset = int(raw.split(\":\", 1)[1])\n            if offset < 0:\n                return _log_and_return(_err(\"VALIDATION_ERROR\", \"cursor is invalid.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n        except Exception:\n            return _log_and_return(_err(\"VALIDATION_ERROR\", \"cursor is invalid.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n\n    docs = _load(\"docs.json\")\n    if not isinstance(docs, list):\n        docs = []\n\n    def _match(d):\n        if not isinstance(d, dict):\n            return False\n        if d.get(\"workspace_id\") != ws_id:\n            return False\n        if folder_id is not None and d.get(\"folder_id\") != folder_id:\n            return False\n        if status is not None and d.get(\"status\") != status:\n            return False\n        if is_trashed is None:\n            # default exclude trashed\n            if d.get(\"is_trashed\") is True:\n                return False\n        else:\n            if bool(d.get(\"is_trashed\")) != is_trashed:\n                return False\n        if title is not None:\n            dt = d.get(\"title\") or \"\"\n            if not isinstance(dt, str):\n                return False\n            if title.lower() not in dt.lower():\n                return False\n        if query is not None:\n            q = query.lower()\n            dt = (d.get(\"title\") or \"\")\n            cp = (d.get(\"content_plaintext\") or \"\")\n            if not isinstance(dt, str): dt = \"\"\n            if not isinstance(cp, str): cp = \"\"\n            if q not in dt.lower() and q not in cp.lower():\n                return False\n        return True\n\n    matched = [d for d in docs if _match(d)]\n\n    def _sort_key(d):\n        v = d.get(sort)\n        if v is None:\n            return \"\"\n        return v\n\n    reverse = (order == \"desc\")\n    try:\n        matched.sort(key=_sort_key, reverse=reverse)\n    except Exception:\n        # fall back stable\n        pass\n\n    total = len(matched)\n    page = matched[offset:offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(f\"offset:{next_offset}\".encode(\"utf-8\")).decode(\"utf-8\")\n\n    return _log_and_return({\n        \"docs\": page,\n        \"total\": total,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n        \"limit\": limit,\n        \"cursor\": cursor\n    })\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_doc",
+          "description": "Creates a new doc in the specified workspace with the provided title and content (rich text and/or plaintext) and optional folder and status, and returns the created doc. Raises VALIDATION_ERROR if required fields are missing, content fields are invalid, or status is not one of the allowed values, and NOT_FOUND if the referenced workspace or folder does not exist or is not visible to the caller. Raises FORBIDDEN when the caller lacks permission to create docs in the workspace or write into the folder, and RATE_LIMITED when write quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^dart_ws_[0-9A-Z]{18,}$",
+                "description": "Workspace ID to create the doc in."
+              },
+              "folder_id": {
+                "type": "string",
+                "description": "Folder ID to place the doc into."
+              },
+              "title": {
+                "type": "string",
+                "description": "Doc title."
+              },
+              "content_text": {
+                "type": "string",
+                "description": "Doc rich text content."
+              },
+              "content_plaintext": {
+                "type": "string",
+                "description": "Doc plaintext content."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "published",
+                  "archived"
+                ],
+                "description": "Doc status."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "title"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_doc(workspace_id, title, folder_id=None, content_text=None, content_plaintext=None, status=None, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0412000\" if __import__(\"os\").path.isdir(\"./environment_mix/0412000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    api_keys = _load(\"api_keys.json\")\n    reqlog = _load(\"request_logs.json\")\n    if not isinstance(reqlog, list):\n        reqlog = []\n\n    key = None\n    for k in api_keys if isinstance(api_keys, list) else []:\n        if not isinstance(k, dict):\n            continue\n        if k.get(\"status\") != \"active\":\n            continue\n        scopes = k.get(\"scopes\")\n        if not isinstance(scopes, list):\n            continue\n        if (\"docs:write\" in scopes) or (\"*:*\" in scopes) or (\"docs:*\" in scopes):\n            key = k\n            break\n\n    def _log_and_return(resp, status_code=\"ok\", error_code=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        entry = {\n            \"id\": f\"dart_req_{int(time.time()*1000)}\",\n            \"endpoint\": \"create_doc\",\n            \"api_key_id\": key.get(\"id\") if isinstance(key, dict) else None,\n            \"workspace_id\": key.get(\"workspace_id\") if isinstance(key, dict) else None,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": now,\n        }\n        reqlog.append(entry)\n        _save(\"request_logs.json\", reqlog)\n        if isinstance(key, dict):\n            for kk in api_keys:\n                if isinstance(kk, dict) and kk.get(\"id\") == key.get(\"id\"):\n                    kk[\"last_used_at\"] = now\n                    kk[\"updated_at\"] = kk.get(\"updated_at\") or now\n                    break\n            _save(\"api_keys.json\", api_keys)\n        return resp\n\n    if key is None:\n        return _log_and_return(_err(\"UNAUTHORIZED\", \"No active API key with required scope docs:write found.\"), status_code=\"error\", error_code=\"UNAUTHORIZED\")\n\n    window_start = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60)).isoformat()\n    recent = 0\n    for r in reqlog:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"api_key_id\") == key.get(\"id\") and r.get(\"timestamp\") and r[\"timestamp\"] >= window_start:\n            recent += 1\n    if recent >= 60:\n        return _log_and_return(_err(\"RATE_LIMIT\", \"Rate limit exceeded.\"), status_code=\"error\", error_code=\"RATE_LIMIT\")\n\n    if not isinstance(workspace_id, str) or not re.match(r\"^dart_ws_[0-9A-Z]{18,}$\", workspace_id):\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"workspace_id is invalid.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n    if workspace_id != key.get(\"workspace_id\"):\n        return _log_and_return(_err(\"UNAUTHORIZED\", \"API key not authorized for requested workspace.\"), status_code=\"error\", error_code=\"UNAUTHORIZED\")\n\n    if not isinstance(title, str) or title == \"\":\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"title must be a non-empty string.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n\n    if folder_id is not None and not isinstance(folder_id, str):\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"folder_id must be a string.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n\n    allowed_status = {\"draft\",\"published\",\"archived\"}\n    if status is None:\n        status = \"draft\"\n    if status not in allowed_status:\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"status is invalid.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n\n    if content_text is None:\n        content_text = \"\"\n    if not isinstance(content_text, str):\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"content_text must be a string.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n\n    # server derives plaintext from content_text; if client supplies content_plaintext, it must match derivation\n    derived_plain = \" \".join(content_text.replace(\"\\r\", \"\\n\").split())\n    if content_plaintext is not None:\n        if not isinstance(content_plaintext, str):\n            return _log_and_return(_err(\"VALIDATION_ERROR\", \"content_plaintext must be a string.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n        client_norm = \" \".join(content_plaintext.replace(\"\\r\", \"\\n\").split())\n        if client_norm != derived_plain:\n            return _log_and_return(_err(\"VALIDATION_ERROR\", \"content_plaintext must match server-derived plaintext from content_text.\"), status_code=\"error\", error_code=\"VALIDATION_ERROR\")\n\n    # workspace must exist and be active/suspended? visibility: must exist; deleted not allowed\n    workspaces = _load(\"workspaces.json\")\n    if not isinstance(workspaces, list):\n        workspaces = []\n    ws = None\n    for w in workspaces:\n        if isinstance(w, dict) and w.get(\"id\") == workspace_id:\n            ws = w\n            break\n    if ws is None or ws.get(\"status\") == \"deleted\":\n        return _log_and_return(_err(\"NOT_FOUND\", \"Workspace not found.\"), status_code=\"error\", error_code=\"NOT_FOUND\")\n\n    docs = _load(\"docs.json\")\n    if not isinstance(docs, list):\n        docs = []\n\n    # id generation\n    def _gen_id(prefix):\n        import secrets, string\n        alphabet = string.ascii_uppercase + string.digits\n        return prefix + \"\".join(secrets.choice(alphabet) for _ in range(18))\n\n    new_id = _gen_id(\"dart_doc_\")\n    existing_ids = {d.get(\"id\") for d in docs if isinstance(d, dict)}\n    while new_id in existing_ids:\n        new_id = _gen_id(\"dart_doc_\")\n\n    # choose created_by / updated_by as some active user in workspace (optional nullable)\n    users = _load(\"users.json\")\n    actor_id = None\n    if isinstance(users, list):\n        for u in users:\n            if isinstance(u, dict) and u.get(\"workspace_id\") == workspace_id and u.get(\"status\") == \"active\":\n                actor_id = u.get(\"id\")\n                break\n\n    doc = {\n        \"id\": new_id,\n        \"workspace_id\": workspace_id,\n        \"folder_id\": folder_id,\n        \"title\": title,\n        \"content_text\": content_text,\n        \"content_plaintext\": derived_plain,\n        \"status\": status,\n        \"is_trashed\": False,\n        \"trashed_at\": None,\n        \"created_by_user_id\": actor_id,\n        \"updated_by_user_id\": actor_id,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    docs.append(doc)\n    _save(\"docs.json\", docs)\n    return _log_and_return({\"doc\": doc})\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_doc",
+          "description": "Retrieve an existing doc by its ID. Returns the doc's information including title, text content, folder, and more.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "doc_id": {
+                "type": "string",
+                "pattern": "^dart_doc_[0-9A-Z]{18,}$",
+                "description": "The ID of the doc to retrieve (e.g., dart_doc_01H8XXXXXXXXXXXXXXX)."
+              }
+            },
+            "required": [
+              "doc_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_doc(doc_id, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0412000\" if __import__(\"os\").path.isdir(\"./environment_mix/0412000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_z():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status, api_key_id=None, workspace_id=None, error_code=None, message=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(\n            {\n                \"id\": \"req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n                \"endpoint\": endpoint,\n                \"api_key_id\": api_key_id,\n                \"workspace_id\": workspace_id,\n                \"status\": status,\n                \"error_code\": error_code,\n                \"message\": message,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"created_at\": _now_z(),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    def _has_scope(scopes, required):\n        if not required:\n            return True\n        if not isinstance(scopes, list):\n            return False\n        s = set([x for x in scopes if isinstance(x, str)])\n        req = set(required)\n        if req.issubset(s):\n            return True\n        if any(r.endswith(\":read\") for r in req) and (\"*:read\" in s or \"*:*\" in s):\n            return True\n        for r in req:\n            if \":\" in r:\n                res, _act = r.split(\":\", 1)\n                if f\"{res}:*\" in s or \"*:*\" in s:\n                    return True\n        return False\n\n    def _pick_auth_workspace(required_scopes):\n        api_keys = _load(\"api_keys.json\")\n        if not isinstance(api_keys, list):\n            api_keys = []\n        workspaces = _load(\"workspaces.json\")\n        if not isinstance(workspaces, list):\n            workspaces = []\n        ws_by_id = {w.get(\"id\"): w for w in workspaces if isinstance(w, dict) and isinstance(w.get(\"id\"), str)}\n        for k in api_keys:\n            if not isinstance(k, dict):\n                continue\n            if k.get(\"status\") != \"active\":\n                continue\n            wsid = k.get(\"workspace_id\")\n            ws = ws_by_id.get(wsid)\n            if not ws or ws.get(\"status\") != \"active\":\n                continue\n            if not _has_scope(k.get(\"scopes\"), required_scopes):\n                continue\n            return k, ws\n        return None, None\n\n    try:\n        if not isinstance(doc_id, str) or not doc_id.strip():\n            _log(\"get_doc\", \"error\", error_code=\"VALIDATION_ERROR\", message=\"doc_id must be a non-empty string\")\n            return _err(\"VALIDATION_ERROR\", \"doc_id must be a non-empty string\")\n\n        api_key, ws = _pick_auth_workspace([\"docs:read\"])\n        if not api_key:\n            _log(\"get_doc\", \"error\", error_code=\"UNAUTHORIZED\", message=\"No active API key with docs:read scope found\")\n            return _err(\"UNAUTHORIZED\", \"No active API key authorized for this operation\")\n\n        docs = _load(\"docs.json\")\n        if not isinstance(docs, list):\n            docs = []\n\n        row = None\n        for d in docs:\n            if not isinstance(d, dict):\n                continue\n            if d.get(\"id\") == doc_id and d.get(\"workspace_id\") == ws.get(\"id\"):\n                row = d\n                break\n\n        if not row or row.get(\"is_trashed\") is True:\n            _log(\"get_doc\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"NOT_FOUND\", message=\"Doc not found\")\n            return _err(\"NOT_FOUND\", \"Doc not found\")\n\n        now = _now_z()\n        api_keys = _load(\"api_keys.json\")\n        if isinstance(api_keys, list):\n            for k in api_keys:\n                if isinstance(k, dict) and k.get(\"id\") == api_key.get(\"id\"):\n                    k[\"last_used_at\"] = now\n                    k[\"updated_at\"] = k.get(\"updated_at\") or now\n                    break\n            _save(\"api_keys.json\", api_keys)\n\n        _log(\"get_doc\", \"ok\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"))\n        return {\"doc\": row}\n    except Exception as e:\n        _log(\"get_doc\", \"error\", error_code=\"VALIDATION_ERROR\", message=str(e))\n        return _err(\"VALIDATION_ERROR\", \"Internal error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "update_doc",
+          "description": "Update an existing doc. You can modify its title, text content, and folder.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "doc_id": {
+                "type": "string",
+                "pattern": "^dart_doc_[0-9A-Z]{18,}$",
+                "description": "The ID of the doc to update (e.g., dart_doc_01H8XXXXXXXXXXXXXXX)."
+              },
+              "title": {
+                "type": "string",
+                "description": "New title for the doc."
+              },
+              "content_text": {
+                "type": "string",
+                "description": "New rich-text/markdown content for the doc."
+              },
+              "folder_id": {
+                "type": "string",
+                "description": "New folder ID to move the doc into."
+              }
+            },
+            "required": [
+              "doc_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def update_doc(doc_id, title=None, content_text=None, folder_id=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0412000\" if __import__(\"os\").path.isdir(\"./environment_mix/0412000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_z():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status, api_key_id=None, workspace_id=None, error_code=None, message=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(\n            {\n                \"id\": \"req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n                \"endpoint\": endpoint,\n                \"api_key_id\": api_key_id,\n                \"workspace_id\": workspace_id,\n                \"status\": status,\n                \"error_code\": error_code,\n                \"message\": message,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"created_at\": _now_z(),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    def _has_scope(scopes, required):\n        if not required:\n            return True\n        if not isinstance(scopes, list):\n            return False\n        s = set([x for x in scopes if isinstance(x, str)])\n        req = set(required)\n        if req.issubset(s):\n            return True\n        if any(r.endswith(\":write\") for r in req) and (\"*:write\" in s or \"*:*\" in s):\n            return True\n        for r in req:\n            if \":\" in r:\n                res, _act = r.split(\":\", 1)\n                if f\"{res}:*\" in s or \"*:*\" in s:\n                    return True\n        return False\n\n    def _pick_auth_workspace(required_scopes):\n        api_keys = _load(\"api_keys.json\")\n        if not isinstance(api_keys, list):\n            api_keys = []\n        workspaces = _load(\"workspaces.json\")\n        if not isinstance(workspaces, list):\n            workspaces = []\n        ws_by_id = {w.get(\"id\"): w for w in workspaces if isinstance(w, dict) and isinstance(w.get(\"id\"), str)}\n        for k in api_keys:\n            if not isinstance(k, dict):\n                continue\n            if k.get(\"status\") != \"active\":\n                continue\n            wsid = k.get(\"workspace_id\")\n            ws = ws_by_id.get(wsid)\n            if not ws or ws.get(\"status\") != \"active\":\n                continue\n            if not _has_scope(k.get(\"scopes\"), required_scopes):\n                continue\n            return k, ws\n        return None, None\n\n    def _derive_plaintext(text):\n        # Simple normalization: strip common markdown punctuation and normalize whitespace\n        import re as _re\n        s = text if isinstance(text, str) else \"\"\n        s = _re.sub(r\"[`*_>#\\[\\]\\(\\)~\\-]+\", \" \", s)\n        s = _re.sub(r\"\\s+\", \" \", s).strip()\n        return s\n\n    try:\n        if not isinstance(doc_id, str) or not doc_id.strip():\n            _log(\"update_doc\", \"error\", error_code=\"VALIDATION_ERROR\", message=\"doc_id must be a non-empty string\")\n            return _err(\"VALIDATION_ERROR\", \"doc_id must be a non-empty string\")\n\n        api_key, ws = _pick_auth_workspace([\"docs:write\"])\n        if not api_key:\n            _log(\"update_doc\", \"error\", error_code=\"UNAUTHORIZED\", message=\"No active API key with docs:write scope found\")\n            return _err(\"UNAUTHORIZED\", \"No active API key authorized for this operation\")\n\n        docs = _load(\"docs.json\")\n        if not isinstance(docs, list):\n            docs = []\n\n        idx = None\n        for i, d in enumerate(docs):\n            if isinstance(d, dict) and d.get(\"id\") == doc_id and d.get(\"workspace_id\") == ws.get(\"id\"):\n                idx = i\n                break\n        if idx is None:\n            _log(\"update_doc\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"NOT_FOUND\", message=\"Doc not found\")\n            return _err(\"NOT_FOUND\", \"Doc not found\")\n\n        doc = docs[idx]\n        if doc.get(\"is_trashed\") is True:\n            _log(\"update_doc\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"INVALID_TRANSITION\", message=\"Cannot update a trashed doc\")\n            return _err(\"INVALID_TRANSITION\", \"Cannot update a trashed doc\")\n\n        updates = {}\n        if title is not None:\n            if not isinstance(title, str) or not title.strip():\n                _log(\"update_doc\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"title must be a non-empty string\")\n                return _err(\"VALIDATION_ERROR\", \"title must be a non-empty string\")\n            updates[\"title\"] = title\n\n        if content_text is not None:\n            if not isinstance(content_text, str):\n                _log(\"update_doc\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"content_text must be a string\")\n                return _err(\"VALIDATION_ERROR\", \"content_text must be a string\")\n            updates[\"content_text\"] = content_text\n            updates[\"content_plaintext\"] = _derive_plaintext(content_text)\n\n        if folder_id is not None:\n            if not isinstance(folder_id, str):\n                _log(\"update_doc\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"folder_id must be a string\")\n                return _err(\"VALIDATION_ERROR\", \"folder_id must be a string\")\n            updates[\"folder_id\"] = folder_id\n\n        if not updates:\n            _log(\"update_doc\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"VALIDATION_ERROR\", message=\"No fields to update\")\n            return _err(\"VALIDATION_ERROR\", \"No fields to update\")\n\n        now = _now_z()\n        for k, v in updates.items():\n            doc[k] = v\n        doc[\"updated_at\"] = now\n\n        docs[idx] = doc\n        _save(\"docs.json\", docs)\n\n        api_keys = _load(\"api_keys.json\")\n        if isinstance(api_keys, list):\n            for k in api_keys:\n                if isinstance(k, dict) and k.get(\"id\") == api_key.get(\"id\"):\n                    k[\"last_used_at\"] = now\n                    k[\"updated_at\"] = k.get(\"updated_at\") or now\n                    break\n            _save(\"api_keys.json\", api_keys)\n\n        _log(\"update_doc\", \"ok\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"))\n        return {\"doc\": doc}\n    except Exception as e:\n        _log(\"update_doc\", \"error\", error_code=\"VALIDATION_ERROR\", message=str(e))\n        return _err(\"VALIDATION_ERROR\", \"Internal error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "delete_doc",
+          "description": "Moves the specified doc to the trash (soft delete) and returns the updated doc record; the doc remains recoverable and is not otherwise modified. Raises VALIDATION_ERROR if doc_id is missing or does not match the required format, and NOT_FOUND if no doc exists with that ID or it is not accessible to you. Raises FORBIDDEN if you lack permission to trash the doc in its dartboard/folder, and CONFLICT if the doc is already trashed or cannot be trashed due to its current lifecycle state.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "doc_id": {
+                "type": "string",
+                "pattern": "^dart_doc_[0-9A-Z]{18,}$",
+                "description": "The ID of the doc to move to trash (e.g., dart_doc_01H8XXXXXXXXXXXXXXX)."
+              }
+            },
+            "required": [
+              "doc_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def delete_doc(doc_id, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0412000\" if __import__(\"os\").path.isdir(\"./environment_mix/0412000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_z():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status, api_key_id=None, workspace_id=None, error_code=None, message=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(\n            {\n                \"id\": \"req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n                \"endpoint\": endpoint,\n                \"api_key_id\": api_key_id,\n                \"workspace_id\": workspace_id,\n                \"status\": status,\n                \"error_code\": error_code,\n                \"message\": message,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"created_at\": _now_z(),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    def _has_scope(scopes, required):\n        if not required:\n            return True\n        if not isinstance(scopes, list):\n            return False\n        s = set([x for x in scopes if isinstance(x, str)])\n        req = set(required)\n        if req.issubset(s):\n            return True\n        if any(r.endswith(\":write\") for r in req) and (\"*:write\" in s or \"*:*\" in s):\n            return True\n        for r in req:\n            if \":\" in r:\n                res, _act = r.split(\":\", 1)\n                if f\"{res}:*\" in s or \"*:*\" in s:\n                    return True\n        return False\n\n    def _pick_auth_workspace(required_scopes):\n        api_keys = _load(\"api_keys.json\")\n        if not isinstance(api_keys, list):\n            api_keys = []\n        workspaces = _load(\"workspaces.json\")\n        if not isinstance(workspaces, list):\n            workspaces = []\n        ws_by_id = {w.get(\"id\"): w for w in workspaces if isinstance(w, dict) and isinstance(w.get(\"id\"), str)}\n        for k in api_keys:\n            if not isinstance(k, dict):\n                continue\n            if k.get(\"status\") != \"active\":\n                continue\n            wsid = k.get(\"workspace_id\")\n            ws = ws_by_id.get(wsid)\n            if not ws or ws.get(\"status\") != \"active\":\n                continue\n            if not _has_scope(k.get(\"scopes\"), required_scopes):\n                continue\n            return k, ws\n        return None, None\n\n    try:\n        if not isinstance(doc_id, str) or not doc_id.strip():\n            _log(\"delete_doc\", \"error\", error_code=\"VALIDATION_ERROR\", message=\"doc_id must be a non-empty string\")\n            return _err(\"VALIDATION_ERROR\", \"doc_id must be a non-empty string\")\n\n        api_key, ws = _pick_auth_workspace([\"docs:write\"])\n        if not api_key:\n            _log(\"delete_doc\", \"error\", error_code=\"UNAUTHORIZED\", message=\"No active API key with docs:write scope found\")\n            return _err(\"UNAUTHORIZED\", \"No active API key authorized for this operation\")\n\n        docs = _load(\"docs.json\")\n        if not isinstance(docs, list):\n            docs = []\n\n        idx = None\n        for i, d in enumerate(docs):\n            if isinstance(d, dict) and d.get(\"id\") == doc_id and d.get(\"workspace_id\") == ws.get(\"id\"):\n                idx = i\n                break\n        if idx is None:\n            _log(\"delete_doc\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"NOT_FOUND\", message=\"Doc not found\")\n            return _err(\"NOT_FOUND\", \"Doc not found\")\n\n        doc = docs[idx]\n        if doc.get(\"is_trashed\") is True:\n            _log(\"delete_doc\", \"error\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"), error_code=\"CONFLICT\", message=\"Doc is already trashed\")\n            return _err(\"CONFLICT\", \"Doc is already trashed\")\n\n        now = _now_z()\n        # soft delete: only touch trash fields + updated_at (+updated_by_user_id allowed)\n        doc[\"is_trashed\"] = True\n        doc[\"trashed_at\"] = now\n        doc[\"updated_at\"] = now\n\n        docs[idx] = doc\n        _save(\"docs.json\", docs)\n\n        api_keys = _load(\"api_keys.json\")\n        if isinstance(api_keys, list):\n            for k in api_keys:\n                if isinstance(k, dict) and k.get(\"id\") == api_key.get(\"id\"):\n                    k[\"last_used_at\"] = now\n                    k[\"updated_at\"] = k.get(\"updated_at\") or now\n                    break\n            _save(\"api_keys.json\", api_keys)\n\n        _log(\"delete_doc\", \"ok\", api_key_id=api_key.get(\"id\"), workspace_id=ws.get(\"id\"))\n        return {\"doc\": doc}\n    except Exception as e:\n        _log(\"delete_doc\", \"error\", error_code=\"VALIDATION_ERROR\", message=str(e))\n        return _err(\"VALIDATION_ERROR\", \"Internal error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0412000",
+    "index": 412,
+    "name": "Dart",
+    "description": "Dart stores collaborative work artifacts—tasks and docs—organized into dartboards and folders, with assignment, tagging, and lifecycle management (active vs trashed). The main workflows are listing/searching tasks and docs, creating/updating them, and soft-deleting (trashing) items while retaining r",
+    "taxonomy": {
+      "L1_id": "L1-08",
+      "L1_name": "System & Cloud Infrastructure",
+      "L1_name_zh": "系统与云基础设施",
+      "L2_id": "L2-22",
+      "L2_name": "DevOps & Workflow Automation",
+      "L2_name_zh": "DevOps 与流程自动化",
+      "L3_name": "Project & Issue Tracking",
+      "L3_name_zh": "项目与问题跟踪"
+    },
+    "database_dir": "./environment_mix/0412000",
+    "mount_path": "/app/database",
+    "n_tools": 11,
+    "n_collections": 5,
+    "n_records": 92,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 11,
+      "loaded": 11,
+      "reads_returning_data": 3,
+      "read_operations": 5,
+      "mutations_persisted": 2,
+      "mutations_attempted": 6
+    },
+    "tools_loadable_from_database_dir": 11,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_config",
+      "returned_chars": 870
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

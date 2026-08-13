@@ -1,0 +1,390 @@
+{
+  "index": 355,
+  "local_files_dir": "./environment_mix/0355000",
+  "file_list": [
+    "./environment_mix/0355000/README.md",
+    "./environment_mix/0355000/api_keys.json",
+    "./environment_mix/0355000/executions.json",
+    "./environment_mix/0355000/request_log.json",
+    "./environment_mix/0355000/sandboxes.json",
+    "./environment_mix/0355000/usage_ledger.json",
+    "./environment_mix/0355000/workspaces.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "workspaces.json": "12 rows",
+        "api_keys.json": "19 rows",
+        "sandboxes.json": "18 rows",
+        "executions.json": "19 rows",
+        "usage_ledger.json": "16 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "run_code",
+          "description": "Authenticates the caller by API key and executes the provided request payload in a sandbox: it will run in the specified sandbox_id or provision a new sandbox using the requested runtime/region/image/resources/ttl, and returns the execution result along with the sandbox identifier and a persisted execution event for debugging/auditing; if idempotency_key is provided, retries return the original result without creating a duplicate execution. Raises VALIDATION_ERROR when api_key/sandbox_id do not match the required formats, resource/ttl fields are non-positive, unknown fields are sent, or sandbox creation fields are missing/invalid when sandbox_id is omitted; raises UNAUTHORIZED when the api_key is invalid or revoked and FORBIDDEN when the key lacks permission for the target workspace/region/runtime. Raises NOT_FOUND when sandbox_id does not exist or is not accessible to the authenticated workspace, CONFLICT when attempting to run in a sandbox that is terminated/expired or otherwise not in a runnable state, and QUOTA_EXCEEDED when the workspace exceeds sandbox/concurrency/runtime limits or resource allocations are above the plan.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^e2b_key_01H8[0-9A-Za-z]+$",
+                "description": "Caller API key identifier used to authenticate and associate the run with a workspace."
+              },
+              "sandbox_id": {
+                "type": "string",
+                "pattern": "^e2b_sbx_01H8[0-9A-Za-z]+$",
+                "description": "Existing sandbox id to run code in; if omitted a new sandbox is provisioned."
+              },
+              "runtime": {
+                "type": "string",
+                "enum": [
+                  "python",
+                  "node",
+                  "bash",
+                  "container"
+                ],
+                "description": "Runtime to provision when creating a new sandbox."
+              },
+              "region": {
+                "type": "string",
+                "enum": [
+                  "us-east-1",
+                  "us-west-2",
+                  "eu-west-1",
+                  "ap-southeast-1"
+                ],
+                "description": "Region to provision the sandbox in when creating a new sandbox."
+              },
+              "image": {
+                "type": "string",
+                "description": "Base image identifier/name to use when creating a new sandbox."
+              },
+              "cpu_millicores": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "CPU allocation in millicores for a newly created sandbox."
+              },
+              "memory_mb": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Memory allocation in MB for a newly created sandbox."
+              },
+              "ttl_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Time-to-live in seconds for a newly created sandbox."
+              },
+              "request_payload": {
+                "type": "object",
+                "description": "Execution request payload to persist for debugging/auditing (e.g., code, stdin, args, env)."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Idempotency key for safely retrying the same execution without duplicating it."
+              }
+            },
+            "required": [
+              "api_key",
+              "request_payload"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def run_code(api_key, request_payload, sandbox_id=None, runtime=None, region=None, image=None, cpu_millicores=None, memory_mb=None, ttl_seconds=None, idempotency_key=None, **_extra):\n    import json, os, datetime, time, re, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0355000\" if __import__(\"os\").path.isdir(\"./environment_mix/0355000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now.isoformat().replace(\"+00:00\", \"Z\")\n\n    endpoint = \"run_code\"\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s if s.tzinfo else s.replace(tzinfo=datetime.timezone.utc)\n        if not isinstance(s, str):\n            return None\n        try:\n            dt = datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n            return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _day_bucket(dt):\n        dt = dt.astimezone(datetime.timezone.utc)\n        return datetime.datetime(dt.year, dt.month, dt.day, tzinfo=datetime.timezone.utc)\n\n    def _gen_id(prefix):\n        # Use uuid4 to ensure uniqueness; keep vendor-like prefix.\n        return f\"{prefix}_{uuid.uuid4().hex[:26]}\"\n\n    def _load_rows(filename):\n        data = _load(filename)\n        if isinstance(data, list):\n            return data\n        if isinstance(data, dict) and isinstance(data.get(\"rows\"), list):\n            return data[\"rows\"]\n        return []\n\n    def _save_rows(filename, rows):\n        _save(filename, rows)\n\n    def _log(api_key_id, workspace_id, status_s, error=None):\n        # Observable dynamics: record every call\n        req = _load_rows(\"request_log.json\")\n        latency_ms = int((time.time() - t0) * 1000)\n        req.append({\n            \"id\": f\"req_{int(time.time()*1000)}_{os.getpid()}\",\n            \"endpoint\": endpoint,\n            \"api_key_id\": api_key_id,\n            \"workspace_id\": workspace_id,\n            \"status\": status_s,\n            \"error\": error,\n            \"latency_ms\": latency_ms,\n            \"created_at\": now_iso,\n        })\n        _save_rows(\"request_log.json\", req)\n\n    # ---- Validate inputs (relax overly-strict patterns: datastore ids are 01J..., not 01H8...) ----\n    if not isinstance(api_key, str) or not api_key:\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string.\")\n    if not isinstance(request_payload, dict):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"request_payload must be an object.\")\n    if sandbox_id is not None and (not isinstance(sandbox_id, str) or not sandbox_id):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"sandbox_id must be a string.\")\n    allowed_runtime = {\"python\", \"node\", \"bash\", \"container\"}\n    allowed_region = {\"us-east-1\", \"us-west-2\", \"eu-west-1\", \"ap-southeast-1\"}\n    if runtime is not None and (not isinstance(runtime, str) or runtime not in allowed_runtime):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"Invalid runtime; must be one of python|node|bash|container.\")\n    if region is not None and (not isinstance(region, str) or region not in allowed_region):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"Invalid region.\")\n    if image is not None and not isinstance(image, str):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"image must be a string.\")\n    if cpu_millicores is not None and (not isinstance(cpu_millicores, int) or cpu_millicores < 1):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"cpu_millicores must be an integer >= 1.\")\n    if memory_mb is not None and (not isinstance(memory_mb, int) or memory_mb < 1):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"memory_mb must be an integer >= 1.\")\n    if ttl_seconds is not None and (not isinstance(ttl_seconds, int) or ttl_seconds < 1):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"ttl_seconds must be an integer >= 1.\")\n    if idempotency_key is not None and (not isinstance(idempotency_key, str) or not idempotency_key):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"idempotency_key must be a non-empty string when provided.\")\n\n    # ---- Authenticate (match by id, else by prefix) ----\n    api_keys = _load_rows(\"api_keys.json\")\n    workspaces = _load_rows(\"workspaces.json\")\n    sandboxes = _load_rows(\"sandboxes.json\")\n    executions = _load_rows(\"executions.json\")\n    usage = _load_rows(\"usage_ledger.json\")\n\n    key_row = None\n    # Prefer exact id match\n    for r in api_keys:\n        if isinstance(r, dict) and r.get(\"id\") == api_key:\n            key_row = r\n            break\n    if key_row is None:\n        # fallback: prefix match\n        for r in api_keys:\n            if isinstance(r, dict) and r.get(\"prefix\") == api_key:\n                key_row = r\n                break\n    if key_row is None:\n        _log(None, None, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"API key not found.\")\n    if key_row.get(\"status\") != \"active\":\n        _log(key_row.get(\"id\"), key_row.get(\"workspace_id\"), \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"API key is revoked.\")\n\n    ws_id = key_row.get(\"workspace_id\")\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == ws_id), None)\n    if ws is None:\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"Workspace not found for API key.\")\n    if ws.get(\"status\") != \"active\":\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active.\")\n\n    # Update last_used_at on successful auth (persist)\n    key_row[\"last_used_at\"] = now_iso\n    key_row[\"updated_at\"] = now_iso\n    _save_rows(\"api_keys.json\", api_keys)\n\n    # ---- Daily quota enforcement based on finalized usage (rule: reject subsequent run_code if exceeds any daily quota) ----\n    bucket = _day_bucket(now)\n    bucket_iso = bucket.isoformat().replace(\"+00:00\", \"Z\")\n\n    # Find or create open ledger row for today (finalized rows immutable)\n    ledger_row = None\n    for r in usage:\n        if isinstance(r, dict) and r.get(\"workspace_id\") == ws_id:\n            udt = _parse_dt(r.get(\"usage_date\"))\n            if udt is not None and _day_bucket(udt) == bucket:\n                ledger_row = r\n                break\n    if ledger_row is None:\n        ledger_row = {\n            \"id\": _gen_id(\"e2b_use\"),\n            \"workspace_id\": ws_id,\n            \"usage_date\": bucket_iso,\n            \"sandboxes_created\": 0,\n            \"cpu_ms\": 0,\n            \"memory_mb_s\": 0,\n            \"network_egress_mb\": 0,\n            \"status\": \"open\",\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n        }\n        usage.append(ledger_row)\n        _save_rows(\"usage_ledger.json\", usage)\n\n    # If already over quota today, block\n    try:\n        if int(ledger_row.get(\"cpu_ms\") or 0) > int(ws.get(\"quota_cpu_ms_per_day\") or 0) or \\\n           int(ledger_row.get(\"memory_mb_s\") or 0) > int(ws.get(\"quota_memory_mb_s_per_day\") or 0) or \\\n           int(ledger_row.get(\"network_egress_mb\") or 0) > int(ws.get(\"quota_network_egress_mb_per_day\") or 0):\n            _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"QUOTA_EXCEEDED\"})\n            return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded for this workspace; try again after the next UTC day bucket.\")\n    except Exception:\n        # If parsing quota fields fails, treat as validation/config issue (server-side). Return a safe error.\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"Workspace quota configuration is invalid.\")\n\n    # ---- Idempotency ----\n    if idempotency_key is not None:\n        existing = None\n        for e in executions:\n            if isinstance(e, dict) and e.get(\"workspace_id\") == ws_id and e.get(\"idempotency_key\") == idempotency_key:\n                existing = e\n                break\n        if existing is not None:\n            # Return persisted response (no new sandbox provisioned)\n            resp = existing.get(\"response_payload\") if isinstance(existing.get(\"response_payload\"), dict) else {}\n            _log(key_row.get(\"id\"), ws_id, \"ok\", None)\n            return {\n                \"data\": {\n                    \"execution\": existing,\n                    \"response\": resp,\n                    \"sandbox_id\": existing.get(\"sandbox_id\"),\n                    \"idempotency_key\": idempotency_key,\n                    \"deduped\": True,\n                }\n            }\n\n    # ---- Resolve/validate sandbox ----\n    sbx = None\n    provision_new = False\n    if sandbox_id is not None:\n        sbx = next((s for s in sandboxes if isinstance(s, dict) and s.get(\"id\") == sandbox_id), None)\n        if sbx is None:\n            _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"NOT_FOUND\"})\n            return _err(\"NOT_FOUND\", \"Sandbox not found.\")\n        if sbx.get(\"workspace_id\") != ws_id:\n            _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"UNAUTHORIZED\"})\n            return _err(\"UNAUTHORIZED\", \"Sandbox is not accessible in this workspace.\")\n        # sandbox may be terminated/failed/expired -> cannot run in it\n        if sbx.get(\"status\") not in (\"provisioning\", \"running\"):\n            _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"INVALID_TRANSITION\"})\n            return _err(\"INVALID_TRANSITION\", \"Cannot run code in a sandbox that is not provisioning/running.\")\n    else:\n        provision_new = True\n\n    # When provisioning, require runtime & region; set defaults for resources if omitted but validate against schema constraints\n    if provision_new:\n        if runtime is None or region is None:\n            _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n            return _err(\"VALIDATION_ERROR\", \"runtime and region are required when provisioning a new sandbox.\")\n        # Apply sane defaults if not provided\n        if cpu_millicores is None:\n            cpu_millicores = 250\n        if memory_mb is None:\n            memory_mb = 512\n        if ttl_seconds is None:\n            ttl_seconds = 900\n\n        # Enforce schema constraints\n        if not (50 <= int(cpu_millicores) <= 16000):\n            _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n            return _err(\"VALIDATION_ERROR\", \"cpu_millicores must be between 50 and 16000.\")\n        if not (64 <= int(memory_mb) <= 65536):\n            _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n            return _err(\"VALIDATION_ERROR\", \"memory_mb must be between 64 and 65536.\")\n        if not (10 <= int(ttl_seconds) <= 86400):\n            _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n            return _err(\"VALIDATION_ERROR\", \"ttl_seconds must be between 10 and 86400.\")\n\n        # Concurrent quota\n        concurrent = sum(1 for s in sandboxes if isinstance(s, dict) and s.get(\"workspace_id\") == ws_id and s.get(\"status\") in (\"provisioning\", \"running\"))\n        if concurrent >= int(ws.get(\"quota_concurrent_sandboxes\") or 0):\n            _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"QUOTA_EXCEEDED\"})\n            return _err(\"QUOTA_EXCEEDED\", \"Concurrent sandbox quota exceeded for this workspace.\")\n\n        # Rate limit: sandboxes created within last 60 seconds\n        limit_per_min = int(ws.get(\"quota_sandboxes_per_minute\") or 0)\n        if limit_per_min == 0:\n            # If quota is 0, never allow provisioning new sandbox\n            _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"RATE_LIMIT\"})\n            return _err(\"RATE_LIMIT\", \"Sandbox creation rate limit reached for this workspace.\")\n        window_start = now - datetime.timedelta(seconds=60)\n        created_last_min = 0\n        for s in sandboxes:\n            if not isinstance(s, dict) or s.get(\"workspace_id\") != ws_id:\n                continue\n            cdt = _parse_dt(s.get(\"created_at\"))\n            if cdt is not None and cdt >= window_start:\n                created_last_min += 1\n        if created_last_min >= limit_per_min:\n            _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"RATE_LIMIT\"})\n            return _err(\"RATE_LIMIT\", \"Sandbox creation rate limit reached for this workspace (quota_sandboxes_per_minute).\")\n\n        # Create sandbox in provisioning then running (legal transition provisioning->running)\n        sbx = {\n            \"id\": _gen_id(\"e2b_sbx\"),\n            \"workspace_id\": ws_id,\n            \"api_key_id\": key_row.get(\"id\"),\n            \"status\": \"provisioning\",\n            \"runtime\": runtime,\n            \"region\": region,\n            \"image\": image,\n            \"cpu_millicores\": int(cpu_millicores),\n            \"memory_mb\": int(memory_mb),\n            \"ttl_seconds\": int(ttl_seconds),\n            \"started_at\": None,\n            \"terminated_at\": None,\n            \"last_heartbeat_at\": None,\n            \"exit_code\": None,\n            \"failure_reason\": None,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n        }\n        sandboxes.append(sbx)\n\n        # Increment sandboxes_created in today's ledger if ledger is open; finalized immutable\n        if ledger_row.get(\"status\") == \"finalized\":\n            _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"INVALID_TRANSITION\"})\n            return _err(\"INVALID_TRANSITION\", \"Usage ledger for today is finalized and immutable; cannot record new usage.\")\n        ledger_row[\"sandboxes_created\"] = int(ledger_row.get(\"sandboxes_created\") or 0) + 1\n        ledger_row[\"updated_at\"] = now_iso\n\n        # Transition sandbox to running (provisioning->running); set started_at\n        sbx[\"status\"] = \"running\"\n        sbx[\"started_at\"] = now_iso\n        sbx[\"updated_at\"] = now_iso\n\n        _save_rows(\"sandboxes.json\", sandboxes)\n        _save_rows(\"usage_ledger.json\", usage)\n\n    # ---- Create execution row and run lifecycle queued->running->succeeded ----\n    exe = {\n        \"id\": _gen_id(\"e2b_exe\"),\n        \"workspace_id\": ws_id,\n        \"api_key_id\": key_row.get(\"id\"),\n        \"sandbox_id\": sbx.get(\"id\") if isinstance(sbx, dict) else None,\n        \"status\": \"queued\",\n        \"request_payload\": {},  # business rule: normalized empty object for this tool surface\n        \"response_payload\": None,\n        \"error\": None,\n        \"duration_ms\": None,\n        \"cpu_ms\": 0,\n        \"memory_mb_s\": 0,\n        \"network_egress_mb\": 0,\n        \"idempotency_key\": idempotency_key,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n    }\n    executions.append(exe)\n    _save_rows(\"executions.json\", executions)\n\n    # Move to running\n    exe[\"status\"] = \"running\"\n    exe[\"updated_at\"] = now_iso\n\n    # Simulated completion (since offline): succeed with minimal deterministic metrics\n    # Metrics must be finalized and added to usage_ledger on completion.\n    # Use small non-zero values but keep within integer.\n    cpu_used = max(1, int((cpu_millicores or sbx.get(\"cpu_millicores\") or 250)) // 10)\n    dur_ms = max(1, int((time.time() - t0) * 1000))\n    mem_mb_s_used = max(1, int((memory_mb or sbx.get(\"memory_mb\") or 512) * max(dur_ms, 1) / 1000))\n    net_used = 0\n\n    # Before finalizing usage, ensure ledger is open and quotas won't be exceeded by adding this execution.\n    if ledger_row.get(\"status\") == \"finalized\":\n        exe[\"status\"] = \"failed\"\n        exe[\"error\"] = {\"code\": \"INVALID_TRANSITION\", \"message\": \"Usage ledger for today is finalized; cannot record usage.\"}\n        exe[\"duration_ms\"] = dur_ms\n        exe[\"cpu_ms\"] = 0\n        exe[\"memory_mb_s\"] = 0\n        exe[\"network_egress_mb\"] = 0\n        exe[\"updated_at\"] = now_iso\n        exe[\"response_payload\"] = {\"ok\": False}\n        _save_rows(\"executions.json\", executions)\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"INVALID_TRANSITION\"})\n        return _err(\"INVALID_TRANSITION\", \"Usage ledger for today is finalized and immutable; cannot record new usage.\")\n\n    new_cpu = int(ledger_row.get(\"cpu_ms\") or 0) + int(cpu_used)\n    new_mem = int(ledger_row.get(\"memory_mb_s\") or 0) + int(mem_mb_s_used)\n    new_net = int(ledger_row.get(\"network_egress_mb\") or 0) + int(net_used)\n\n    if new_cpu > int(ws.get(\"quota_cpu_ms_per_day\") or 0) or new_mem > int(ws.get(\"quota_memory_mb_s_per_day\") or 0) or new_net > int(ws.get(\"quota_network_egress_mb_per_day\") or 0):\n        # Reject completion as failed and do not apply usage increments; subsequent calls will also be rejected by snapshot check.\n        exe[\"status\"] = \"failed\"\n        exe[\"error\"] = {\"code\": \"QUOTA_EXCEEDED\", \"message\": \"Daily usage quota would be exceeded by this execution.\"}\n        exe[\"duration_ms\"] = dur_ms\n        exe[\"cpu_ms\"] = 0\n        exe[\"memory_mb_s\"] = 0\n        exe[\"network_egress_mb\"] = 0\n        exe[\"updated_at\"] = now_iso\n        exe[\"response_payload\"] = {\"ok\": False}\n        _save_rows(\"executions.json\", executions)\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"QUOTA_EXCEEDED\"})\n        return _err(\"QUOTA_EXCEEDED\", \"Daily usage quota exceeded for this workspace; try again after the next UTC day bucket.\")\n\n    # Apply usage and mark execution succeeded\n    ledger_row[\"cpu_ms\"] = new_cpu\n    ledger_row[\"memory_mb_s\"] = new_mem\n    ledger_row[\"network_egress_mb\"] = new_net\n    ledger_row[\"updated_at\"] = now_iso\n    _save_rows(\"usage_ledger.json\", usage)\n\n    exe[\"status\"] = \"succeeded\"\n    exe[\"duration_ms\"] = dur_ms\n    exe[\"cpu_ms\"] = int(cpu_used)\n    exe[\"memory_mb_s\"] = int(mem_mb_s_used)\n    exe[\"network_egress_mb\"] = int(net_used)\n    exe[\"response_payload\"] = {\n        \"ok\": True,\n        \"result\": \"completed\",\n        \"sandbox_id\": exe.get(\"sandbox_id\"),\n    }\n    exe[\"updated_at\"] = now_iso\n    _save_rows(\"executions.json\", executions)\n\n    _log(key_row.get(\"id\"), ws_id, \"ok\", None)\n    return {\n        \"data\": {\n            \"execution\": exe,\n            \"response\": exe.get(\"response_payload\") or {},\n            \"sandbox_id\": exe.get(\"sandbox_id\"),\n            \"idempotency_key\": idempotency_key,\n            \"deduped\": False,\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_me",
+          "description": "Returns the authenticated caller identity derived from the provided API key, including workspace membership, granted scopes, and current quota/rate-limit consumption; refuses revoked keys or non-active workspaces.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^e2b_key_01H8[0-9A-Za-z]+$",
+                "description": "Caller API key used to authenticate and resolve the owning workspace."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_me(api_key, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0355000\" if __import__(\"os\").path.isdir(\"./environment_mix/0355000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now.isoformat().replace(\"+00:00\", \"Z\")\n    endpoint = \"get_me\"\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s if s.tzinfo else s.replace(tzinfo=datetime.timezone.utc)\n        if not isinstance(s, str):\n            return None\n        try:\n            dt = datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n            return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _day_bucket(dt):\n        dt = dt.astimezone(datetime.timezone.utc)\n        return datetime.datetime(dt.year, dt.month, dt.day, tzinfo=datetime.timezone.utc)\n\n    def _load_rows(filename):\n        data = _load(filename)\n        if isinstance(data, list):\n            return data\n        if isinstance(data, dict) and isinstance(data.get(\"rows\"), list):\n            return data[\"rows\"]\n        return []\n\n    def _save_rows(filename, rows):\n        _save(filename, rows)\n\n    def _log(api_key_id, workspace_id, status_s, error=None):\n        req = _load_rows(\"request_log.json\")\n        latency_ms = int((time.time() - t0) * 1000)\n        req.append({\n            \"id\": f\"req_{int(time.time()*1000)}_{os.getpid()}\",\n            \"endpoint\": endpoint,\n            \"api_key_id\": api_key_id,\n            \"workspace_id\": workspace_id,\n            \"status\": status_s,\n            \"error\": error,\n            \"latency_ms\": latency_ms,\n            \"created_at\": now_iso,\n        })\n        _save_rows(\"request_log.json\", req)\n\n    if not isinstance(api_key, str) or not api_key:\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string.\")\n\n    workspaces = _load_rows(\"workspaces.json\")\n    api_keys = _load_rows(\"api_keys.json\")\n    sandboxes = _load_rows(\"sandboxes.json\")\n    usage = _load_rows(\"usage_ledger.json\")\n\n    key_row = next((k for k in api_keys if isinstance(k, dict) and k.get(\"id\") == api_key), None)\n    if key_row is None:\n        key_row = next((k for k in api_keys if isinstance(k, dict) and k.get(\"prefix\") == api_key), None)\n    if not key_row:\n        _log(None, None, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"API key not found.\")\n    if key_row.get(\"status\") != \"active\":\n        _log(key_row.get(\"id\"), key_row.get(\"workspace_id\"), \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"API key is revoked.\")\n\n    ws_id = key_row.get(\"workspace_id\")\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == ws_id), None)\n    if not ws:\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"Workspace not found for API key.\")\n    if ws.get(\"status\") != \"active\":\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active.\")\n\n    # Update last_used_at\n    key_row[\"last_used_at\"] = now_iso\n    key_row[\"updated_at\"] = now_iso\n    _save_rows(\"api_keys.json\", api_keys)\n\n    # Usage snapshot for today\n    bucket = _day_bucket(now)\n    ledger_row = None\n    for r in usage:\n        if isinstance(r, dict) and r.get(\"workspace_id\") == ws_id:\n            udt = _parse_dt(r.get(\"usage_date\"))\n            if udt is not None and _day_bucket(udt) == bucket:\n                ledger_row = r\n                break\n\n    usage_snapshot = {\n        \"usage_date\": bucket.isoformat().replace(\"+00:00\", \"Z\"),\n        \"sandboxes_created\": int((ledger_row or {}).get(\"sandboxes_created\") or 0),\n        \"cpu_ms\": int((ledger_row or {}).get(\"cpu_ms\") or 0),\n        \"memory_mb_s\": int((ledger_row or {}).get(\"memory_mb_s\") or 0),\n        \"network_egress_mb\": int((ledger_row or {}).get(\"network_egress_mb\") or 0),\n        \"status\": (ledger_row or {}).get(\"status\") or \"open\",\n    }\n\n    concurrent = sum(1 for s in sandboxes if isinstance(s, dict) and s.get(\"workspace_id\") == ws_id and s.get(\"status\") in (\"provisioning\", \"running\"))\n\n    _log(key_row.get(\"id\"), ws_id, \"ok\", None)\n    return {\n        \"data\": {\n            \"api_key\": {\n                \"id\": key_row.get(\"id\"),\n                \"name\": key_row.get(\"name\"),\n                \"prefix\": key_row.get(\"prefix\"),\n                \"status\": key_row.get(\"status\"),\n                \"last_used_at\": key_row.get(\"last_used_at\"),\n                \"created_at\": key_row.get(\"created_at\"),\n                \"updated_at\": key_row.get(\"updated_at\"),\n            },\n            \"workspace\": {\n                \"id\": ws.get(\"id\"),\n                \"name\": ws.get(\"name\"),\n                \"plan\": ws.get(\"plan\"),\n                \"status\": ws.get(\"status\"),\n                \"quota_sandboxes_per_minute\": ws.get(\"quota_sandboxes_per_minute\"),\n                \"quota_concurrent_sandboxes\": ws.get(\"quota_concurrent_sandboxes\"),\n                \"quota_cpu_ms_per_day\": ws.get(\"quota_cpu_ms_per_day\"),\n                \"quota_memory_mb_s_per_day\": ws.get(\"quota_memory_mb_s_per_day\"),\n                \"quota_network_egress_mb_per_day\": ws.get(\"quota_network_egress_mb_per_day\"),\n                \"created_at\": ws.get(\"created_at\"),\n                \"updated_at\": ws.get(\"updated_at\"),\n            },\n            \"quota_consumption\": {\n                \"today\": usage_snapshot,\n                \"concurrent_sandboxes\": concurrent,\n            },\n            \"scopes\": [\"sandboxes:read\", \"sandboxes:write\", \"executions:read\", \"executions:write\"],\n        }\n    }\n"
+        },
+        {
+          "name": "list_sandboxes",
+          "description": "Lists sandboxes visible to the authenticated workspace, optionally filtered by status/region/runtime and time range; returns a paginated result set and refuses revoked keys or non-active workspaces.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^e2b_key_01H8[0-9A-Za-z]+$",
+                "description": "Caller API key used to authenticate and scope results to its workspace."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "provisioning",
+                  "running",
+                  "terminated",
+                  "failed",
+                  "expired"
+                ],
+                "description": "Filter sandboxes by lifecycle status."
+              },
+              "region": {
+                "type": "string",
+                "enum": [
+                  "us-east-1",
+                  "us-west-2",
+                  "eu-west-1",
+                  "ap-southeast-1"
+                ],
+                "description": "Filter sandboxes by region."
+              },
+              "runtime": {
+                "type": "string",
+                "enum": [
+                  "python",
+                  "node",
+                  "bash",
+                  "container"
+                ],
+                "description": "Filter sandboxes by runtime."
+              },
+              "created_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return sandboxes created at or after this timestamp (RFC 3339)."
+              },
+              "created_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return sandboxes created before this timestamp (RFC 3339)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of sandboxes to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at_desc",
+                  "created_at_asc"
+                ],
+                "description": "Sort order for results."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_sandboxes(api_key, status=None, region=None, runtime=None, created_after=None, created_before=None, limit=None, cursor=None, sort=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0355000\" if __import__(\"os\").path.isdir(\"./environment_mix/0355000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now.isoformat().replace(\"+00:00\", \"Z\")\n    endpoint = \"list_sandboxes\"\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None, None\n        if not isinstance(s, str):\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be an RFC3339 datetime string.\")\n        try:\n            dt = datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt, None\n        except Exception:\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be a valid RFC3339 datetime string.\")\n\n    def _load_rows(filename):\n        data = _load(filename)\n        if isinstance(data, list):\n            return data\n        if isinstance(data, dict) and isinstance(data.get(\"rows\"), list):\n            return data[\"rows\"]\n        return []\n\n    def _save_rows(filename, rows):\n        _save(filename, rows)\n\n    def _log(api_key_id, workspace_id, status_s, error=None):\n        req = _load_rows(\"request_log.json\")\n        latency_ms = int((time.time() - t0) * 1000)\n        req.append({\n            \"id\": f\"req_{int(time.time()*1000)}_{os.getpid()}\",\n            \"endpoint\": endpoint,\n            \"api_key_id\": api_key_id,\n            \"workspace_id\": workspace_id,\n            \"status\": status_s,\n            \"error\": error,\n            \"latency_ms\": latency_ms,\n            \"created_at\": now_iso,\n        })\n        _save_rows(\"request_log.json\", req)\n\n    if not isinstance(api_key, str) or not api_key:\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string.\")\n\n    allowed_status = {\"provisioning\", \"running\", \"terminated\", \"failed\", \"expired\"}\n    allowed_region = {\"us-east-1\", \"us-west-2\", \"eu-west-1\", \"ap-southeast-1\"}\n    allowed_runtime = {\"python\", \"node\", \"bash\", \"container\"}\n\n    if status is not None and (not isinstance(status, str) or status not in allowed_status):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"Invalid status filter.\")\n    if region is not None and (not isinstance(region, str) or region not in allowed_region):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"Invalid region filter.\")\n    if runtime is not None and (not isinstance(runtime, str) or runtime not in allowed_runtime):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"Invalid runtime filter.\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200.\")\n    if sort is None:\n        sort = \"created_at_desc\"\n    if sort not in (\"created_at_desc\", \"created_at_asc\"):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort.\")\n    if cursor is not None and not isinstance(cursor, str):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n\n    dt_after, err = _parse_dt(created_after, \"created_after\")\n    if err:\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return err\n    dt_before, err = _parse_dt(created_before, \"created_before\")\n    if err:\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return err\n\n    api_keys = _load_rows(\"api_keys.json\")\n    workspaces = _load_rows(\"workspaces.json\")\n    sandboxes = _load_rows(\"sandboxes.json\")\n\n    key_row = next((k for k in api_keys if isinstance(k, dict) and k.get(\"id\") == api_key), None)\n    if key_row is None:\n        key_row = next((k for k in api_keys if isinstance(k, dict) and k.get(\"prefix\") == api_key), None)\n    if not key_row:\n        _log(None, None, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"API key not found.\")\n    if key_row.get(\"status\") != \"active\":\n        _log(key_row.get(\"id\"), key_row.get(\"workspace_id\"), \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"API key is revoked.\")\n\n    ws_id = key_row.get(\"workspace_id\")\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == ws_id), None)\n    if not ws:\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"Workspace not found for API key.\")\n    if ws.get(\"status\") != \"active\":\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active.\")\n\n    # Update last_used_at\n    key_row[\"last_used_at\"] = now_iso\n    key_row[\"updated_at\"] = now_iso\n    _save_rows(\"api_keys.json\", api_keys)\n\n    rows = [s for s in sandboxes if isinstance(s, dict) and s.get(\"workspace_id\") == ws_id]\n    if status is not None:\n        rows = [s for s in rows if s.get(\"status\") == status]\n    if region is not None:\n        rows = [s for s in rows if s.get(\"region\") == region]\n    if runtime is not None:\n        rows = [s for s in rows if s.get(\"runtime\") == runtime]\n\n    def _created_dt(s):\n        dt = None\n        try:\n            dt = datetime.datetime.fromisoformat((s.get(\"created_at\") or \"\").replace(\"Z\", \"+00:00\"))\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n        except Exception:\n            dt = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n        return dt\n\n    if dt_after is not None:\n        rows = [s for s in rows if _created_dt(s) >= dt_after]\n    if dt_before is not None:\n        rows = [s for s in rows if _created_dt(s) < dt_before]\n\n    reverse = (sort == \"created_at_desc\")\n    rows.sort(key=_created_dt, reverse=reverse)\n\n    total = len(rows)\n\n    # Cursor is sandbox id; start after it\n    start = 0\n    if cursor:\n        for i, s in enumerate(rows):\n            if s.get(\"id\") == cursor:\n                start = i + 1\n                break\n\n    page = rows[start:start + limit]\n    has_more = start + limit < total\n    next_cursor = page[-1].get(\"id\") if has_more and page else None\n\n    _log(key_row.get(\"id\"), ws_id, \"ok\", None)\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"sort\": sort,\n        }\n    }\n"
+        },
+        {
+          "name": "get_sandbox",
+          "description": "Fetches a single sandbox by id within the authenticated workspace, including its current status and resource configuration; refuses revoked keys, non-active workspaces, or unknown/unauthorized sandbox ids.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^e2b_key_01H8[0-9A-Za-z]+$",
+                "description": "Caller API key used to authenticate and scope access."
+              },
+              "sandbox_id": {
+                "type": "string",
+                "pattern": "^e2b_sbx_01H8[0-9A-Za-z]+$",
+                "description": "Sandbox identifier to fetch."
+              }
+            },
+            "required": [
+              "api_key",
+              "sandbox_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_sandbox(api_key, sandbox_id, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0355000\" if __import__(\"os\").path.isdir(\"./environment_mix/0355000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now.isoformat().replace(\"+00:00\", \"Z\")\n    endpoint = \"get_sandbox\"\n\n    def _load_rows(filename):\n        data = _load(filename)\n        if isinstance(data, list):\n            return data\n        if isinstance(data, dict) and isinstance(data.get(\"rows\"), list):\n            return data[\"rows\"]\n        return []\n\n    def _save_rows(filename, rows):\n        _save(filename, rows)\n\n    def _log(api_key_id, workspace_id, status_s, error=None):\n        req = _load_rows(\"request_log.json\")\n        latency_ms = int((time.time() - t0) * 1000)\n        req.append({\n            \"id\": f\"req_{int(time.time()*1000)}_{os.getpid()}\",\n            \"endpoint\": endpoint,\n            \"api_key_id\": api_key_id,\n            \"workspace_id\": workspace_id,\n            \"status\": status_s,\n            \"error\": error,\n            \"latency_ms\": latency_ms,\n            \"created_at\": now_iso,\n        })\n        _save_rows(\"request_log.json\", req)\n\n    if not isinstance(api_key, str) or not api_key:\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string.\")\n    if not isinstance(sandbox_id, str) or not sandbox_id:\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"sandbox_id must be a non-empty string.\")\n\n    workspaces = _load_rows(\"workspaces.json\")\n    api_keys = _load_rows(\"api_keys.json\")\n    sandboxes = _load_rows(\"sandboxes.json\")\n\n    key_row = next((k for k in api_keys if isinstance(k, dict) and k.get(\"id\") == api_key), None)\n    if key_row is None:\n        key_row = next((k for k in api_keys if isinstance(k, dict) and k.get(\"prefix\") == api_key), None)\n    if not key_row:\n        _log(None, None, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"API key not found.\")\n    if key_row.get(\"status\") != \"active\":\n        _log(key_row.get(\"id\"), key_row.get(\"workspace_id\"), \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"API key is revoked.\")\n\n    ws_id = key_row.get(\"workspace_id\")\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == ws_id), None)\n    if not ws:\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"Workspace not found for API key.\")\n    if ws.get(\"status\") != \"active\":\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active.\")\n\n    sbx = next((s for s in sandboxes if isinstance(s, dict) and s.get(\"id\") == sandbox_id), None)\n    if not sbx:\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"NOT_FOUND\"})\n        return _err(\"NOT_FOUND\", \"Sandbox not found.\")\n    if sbx.get(\"workspace_id\") != ws_id:\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"Sandbox not accessible in this workspace.\")\n\n    # Update last_used_at\n    key_row[\"last_used_at\"] = now_iso\n    key_row[\"updated_at\"] = now_iso\n    _save_rows(\"api_keys.json\", api_keys)\n\n    _log(key_row.get(\"id\"), ws_id, \"ok\", None)\n    return {\"data\": sbx}\n"
+        },
+        {
+          "name": "terminate_sandbox",
+          "description": "Transitions a sandbox to terminated for the authenticated workspace; sets terminated_at and refuses invalid transitions (e.g., already terminated/failed/expired) or access with revoked keys/non-active workspaces.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^e2b_key_01H8[0-9A-Za-z]+$",
+                "description": "Caller API key used to authenticate and scope access."
+              },
+              "sandbox_id": {
+                "type": "string",
+                "pattern": "^e2b_sbx_01H8[0-9A-Za-z]+$",
+                "description": "Sandbox identifier to terminate."
+              },
+              "reason": {
+                "type": "string",
+                "description": "Optional human-readable termination reason for audit/debugging."
+              }
+            },
+            "required": [
+              "api_key",
+              "sandbox_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def terminate_sandbox(api_key, sandbox_id, reason=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0355000\" if __import__(\"os\").path.isdir(\"./environment_mix/0355000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now.isoformat().replace(\"+00:00\", \"Z\")\n    endpoint = \"terminate_sandbox\"\n\n    def _load_rows(filename):\n        data = _load(filename)\n        if isinstance(data, list):\n            return data\n        if isinstance(data, dict) and isinstance(data.get(\"rows\"), list):\n            return data[\"rows\"]\n        return []\n\n    def _save_rows(filename, rows):\n        _save(filename, rows)\n\n    def _log(api_key_id, workspace_id, status_s, error=None):\n        req = _load_rows(\"request_log.json\")\n        latency_ms = int((time.time() - t0) * 1000)\n        req.append({\n            \"id\": f\"req_{int(time.time()*1000)}_{os.getpid()}\",\n            \"endpoint\": endpoint,\n            \"api_key_id\": api_key_id,\n            \"workspace_id\": workspace_id,\n            \"status\": status_s,\n            \"error\": error,\n            \"latency_ms\": latency_ms,\n            \"created_at\": now_iso,\n        })\n        _save_rows(\"request_log.json\", req)\n\n    if not isinstance(api_key, str) or not api_key:\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string.\")\n    if not isinstance(sandbox_id, str) or not sandbox_id:\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"sandbox_id must be a non-empty string.\")\n    if reason is not None and not isinstance(reason, str):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"reason must be a string when provided.\")\n\n    api_keys = _load_rows(\"api_keys.json\")\n    workspaces = _load_rows(\"workspaces.json\")\n    sandboxes = _load_rows(\"sandboxes.json\")\n\n    key_row = next((k for k in api_keys if isinstance(k, dict) and k.get(\"id\") == api_key), None)\n    if key_row is None:\n        key_row = next((k for k in api_keys if isinstance(k, dict) and k.get(\"prefix\") == api_key), None)\n    if not key_row:\n        _log(None, None, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"API key not found.\")\n    if key_row.get(\"status\") != \"active\":\n        _log(key_row.get(\"id\"), key_row.get(\"workspace_id\"), \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"API key is revoked.\")\n\n    ws_id = key_row.get(\"workspace_id\")\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == ws_id), None)\n    if not ws:\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"Workspace not found for API key.\")\n    if ws.get(\"status\") != \"active\":\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active.\")\n\n    sbx = next((s for s in sandboxes if isinstance(s, dict) and s.get(\"id\") == sandbox_id), None)\n    if not sbx:\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"NOT_FOUND\"})\n        return _err(\"NOT_FOUND\", \"Sandbox not found.\")\n    if sbx.get(\"workspace_id\") != ws_id:\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"Sandbox not accessible in this workspace.\")\n\n    cur = sbx.get(\"status\")\n    # Allowed transitions for sandboxes per schema:\n    # provisioning -> running|failed|terminated\n    # running -> terminated|expired|failed\n    allowed = {\n        \"provisioning\": {\"running\", \"failed\", \"terminated\"},\n        \"running\": {\"terminated\", \"expired\", \"failed\"},\n        \"terminated\": set(),\n        \"failed\": set(),\n        \"expired\": set(),\n    }\n    if cur not in allowed or \"terminated\" not in allowed[cur]:\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"INVALID_TRANSITION\"})\n        return _err(\"INVALID_TRANSITION\", f\"Cannot terminate sandbox from status '{cur}'.\")\n\n    sbx[\"status\"] = \"terminated\"\n    sbx[\"terminated_at\"] = now_iso\n    sbx[\"updated_at\"] = now_iso\n    if reason:\n        # No schema field, but keep as failure_reason-like audit note without breaking consumers.\n        sbx[\"failure_reason\"] = reason\n\n    _save_rows(\"sandboxes.json\", sandboxes)\n\n    # Update last_used_at\n    key_row[\"last_used_at\"] = now_iso\n    key_row[\"updated_at\"] = now_iso\n    _save_rows(\"api_keys.json\", api_keys)\n\n    _log(key_row.get(\"id\"), ws_id, \"ok\", None)\n    return {\"data\": sbx}\n"
+        },
+        {
+          "name": "list_executions",
+          "description": "Lists persisted execution events for the authenticated workspace, optionally filtered by sandbox/status and idempotency_key; returns paginated results and refuses revoked keys or non-active workspaces.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^e2b_key_01H8[0-9A-Za-z]+$",
+                "description": "Caller API key used to authenticate and scope results to its workspace."
+              },
+              "sandbox_id": {
+                "type": "string",
+                "pattern": "^e2b_sbx_01H8[0-9A-Za-z]+$",
+                "description": "Filter executions by sandbox id."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "Filter executions by lifecycle status."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Filter executions by idempotency key."
+              },
+              "created_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return executions created at or after this timestamp (RFC 3339)."
+              },
+              "created_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return executions created before this timestamp (RFC 3339)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of executions to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at_desc",
+                  "created_at_asc"
+                ],
+                "description": "Sort order for results."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_executions(api_key, sandbox_id=None, status=None, idempotency_key=None, created_after=None, created_before=None, limit=None, cursor=None, sort=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0355000\" if __import__(\"os\").path.isdir(\"./environment_mix/0355000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now.isoformat().replace(\"+00:00\", \"Z\")\n    endpoint = \"list_executions\"\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None, None\n        if not isinstance(s, str):\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be an RFC3339 datetime string.\")\n        try:\n            dt = datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt, None\n        except Exception:\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be a valid RFC3339 datetime string.\")\n\n    def _load_rows(filename):\n        data = _load(filename)\n        if isinstance(data, list):\n            return data\n        if isinstance(data, dict) and isinstance(data.get(\"rows\"), list):\n            return data[\"rows\"]\n        return []\n\n    def _save_rows(filename, rows):\n        _save(filename, rows)\n\n    def _log(api_key_id, workspace_id, status_s, error=None):\n        req = _load_rows(\"request_log.json\")\n        latency_ms = int((time.time() - t0) * 1000)\n        req.append({\n            \"id\": f\"req_{int(time.time()*1000)}_{os.getpid()}\",\n            \"endpoint\": endpoint,\n            \"api_key_id\": api_key_id,\n            \"workspace_id\": workspace_id,\n            \"status\": status_s,\n            \"error\": error,\n            \"latency_ms\": latency_ms,\n            \"created_at\": now_iso,\n        })\n        _save_rows(\"request_log.json\", req)\n\n    if not isinstance(api_key, str) or not api_key:\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string.\")\n    if sandbox_id is not None and (not isinstance(sandbox_id, str) or not sandbox_id):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"sandbox_id must be a string.\")\n    allowed_status = {\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"}\n    if status is not None and (not isinstance(status, str) or status not in allowed_status):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"Invalid status.\")\n    if idempotency_key is not None and (not isinstance(idempotency_key, str) or not idempotency_key):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"idempotency_key must be a non-empty string when provided.\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200.\")\n    if sort is None:\n        sort = \"created_at_desc\"\n    if sort not in (\"created_at_desc\", \"created_at_asc\"):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort.\")\n    if cursor is not None and not isinstance(cursor, str):\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n\n    dt_after, err = _parse_dt(created_after, \"created_after\")\n    if err:\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return err\n    dt_before, err = _parse_dt(created_before, \"created_before\")\n    if err:\n        _log(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\"})\n        return err\n\n    api_keys = _load_rows(\"api_keys.json\")\n    workspaces = _load_rows(\"workspaces.json\")\n    executions = _load_rows(\"executions.json\")\n\n    key_row = next((k for k in api_keys if isinstance(k, dict) and k.get(\"id\") == api_key), None)\n    if key_row is None:\n        key_row = next((k for k in api_keys if isinstance(k, dict) and k.get(\"prefix\") == api_key), None)\n    if not key_row:\n        _log(None, None, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"API key not found.\")\n    if key_row.get(\"status\") != \"active\":\n        _log(key_row.get(\"id\"), key_row.get(\"workspace_id\"), \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"API key is revoked.\")\n\n    ws_id = key_row.get(\"workspace_id\")\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == ws_id), None)\n    if not ws:\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"Workspace not found for API key.\")\n    if ws.get(\"status\") != \"active\":\n        _log(key_row.get(\"id\"), ws_id, \"error\", {\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active.\")\n\n    # Update last_used_at\n    key_row[\"last_used_at\"] = now_iso\n    key_row[\"updated_at\"] = now_iso\n    _save_rows(\"api_keys.json\", api_keys)\n\n    rows = [e for e in executions if isinstance(e, dict) and e.get(\"workspace_id\") == ws_id]\n    if sandbox_id is not None:\n        rows = [e for e in rows if e.get(\"sandbox_id\") == sandbox_id]\n    if status is not None:\n        rows = [e for e in rows if e.get(\"status\") == status]\n    if idempotency_key is not None:\n        rows = [e for e in rows if e.get(\"idempotency_key\") == idempotency_key]\n\n    def _created_dt(e):\n        try:\n            dt = datetime.datetime.fromisoformat((e.get(\"created_at\") or \"\").replace(\"Z\", \"+00:00\"))\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt\n        except Exception:\n            return datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n\n    if dt_after is not None:\n        rows = [e for e in rows if _created_dt(e) >= dt_after]\n    if dt_before is not None:\n        rows = [e for e in rows if _created_dt(e) < dt_before]\n\n    reverse = (sort == \"created_at_desc\")\n    rows.sort(key=_created_dt, reverse=reverse)\n\n    total = len(rows)\n    start = 0\n    if cursor:\n        for i, e in enumerate(rows):\n            if e.get(\"id\") == cursor:\n                start = i + 1\n                break\n\n    page = rows[start:start + limit]\n    has_more = start + limit < total\n    next_cursor = page[-1].get(\"id\") if has_more and page else None\n\n    _log(key_row.get(\"id\"), ws_id, \"ok\", None)\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"sort\": sort,\n        }\n    }\n"
+        },
+        {
+          "name": "get_execution",
+          "description": "Fetches a single execution event by id (including persisted request_payload/response_payload, status, error and usage metrics) within the authenticated workspace; refuses revoked keys, non-active workspaces, or unknown/unauthorized execution ids.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^e2b_key_01H8[0-9A-Za-z]+$",
+                "description": "Caller API key used to authenticate and scope access."
+              },
+              "execution_id": {
+                "type": "string",
+                "pattern": "^e2b_exec_01H8[0-9A-Za-z]+$",
+                "description": "Execution identifier to fetch."
+              }
+            },
+            "required": [
+              "api_key",
+              "execution_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_execution(api_key, execution_id, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0355000\" if __import__(\"os\").path.isdir(\"./environment_mix/0355000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now.isoformat().replace(\"+00:00\", \"Z\")\n    endpoint = \"get_execution\"\n\n    def _rows(x):\n        if isinstance(x, list):\n            return x\n        if isinstance(x, dict) and isinstance(x.get(\"rows\"), list):\n            return x[\"rows\"]\n        return []\n\n    def _write_back(filename, original_loaded, new_rows):\n        # Preserve file shape if it was {\"rows\":[...]} else raw list\n        if isinstance(original_loaded, dict) and isinstance(original_loaded.get(\"rows\"), list):\n            original_loaded[\"rows\"] = new_rows\n            _save(filename, original_loaded)\n        else:\n            _save(filename, new_rows)\n\n    def _ensure_request_log_append(api_key_id, workspace_id, status_s, error_obj=None):\n        loaded = _load(\"request_log.json\")\n        req_rows = _rows(loaded)\n        latency_ms = int((time.time() - t0) * 1000)\n        req_rows.append({\n            \"id\": f\"req_{int(time.time()*1000)}_{os.getpid()}\",\n            \"endpoint\": endpoint,\n            \"api_key_id\": api_key_id,\n            \"workspace_id\": workspace_id,\n            \"status\": status_s,\n            \"error\": error_obj,\n            \"latency_ms\": latency_ms,\n            \"created_at\": now_iso,\n        })\n        _write_back(\"request_log.json\", loaded, req_rows)\n\n    # Validate inputs (relax vendor pattern mismatch: accept datastore IDs too)\n    if not isinstance(api_key, str) or not api_key.strip():\n        _ensure_request_log_append(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\", \"message\": \"api_key must be a non-empty string.\"})\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string.\")\n    if not isinstance(execution_id, str) or not execution_id.strip():\n        _ensure_request_log_append(None, None, \"error\", {\"code\": \"VALIDATION_ERROR\", \"message\": \"execution_id must be a non-empty string.\"})\n        return _err(\"VALIDATION_ERROR\", \"execution_id must be a non-empty string.\")\n\n    api_key = api_key.strip()\n    execution_id = execution_id.strip()\n\n    # Load data\n    api_keys_loaded = _load(\"api_keys.json\")\n    workspaces_loaded = _load(\"workspaces.json\")\n    executions_loaded = _load(\"executions.json\")\n\n    api_keys = _rows(api_keys_loaded)\n    workspaces = _rows(workspaces_loaded)\n    executions = _rows(executions_loaded)\n\n    # Authenticate: match by id or prefix (never by key_hash)\n    key_row = None\n    for k in api_keys:\n        if not isinstance(k, dict):\n            continue\n        if k.get(\"id\") == api_key or k.get(\"prefix\") == api_key:\n            key_row = k\n            break\n    if not key_row:\n        _ensure_request_log_append(None, None, \"error\", {\"code\": \"UNAUTHORIZED\", \"message\": \"API key not found.\"})\n        return _err(\"UNAUTHORIZED\", \"API key not found.\")\n    if key_row.get(\"status\") != \"active\":\n        _ensure_request_log_append(key_row.get(\"id\"), key_row.get(\"workspace_id\"), \"error\", {\"code\": \"UNAUTHORIZED\", \"message\": \"API key revoked.\"})\n        return _err(\"UNAUTHORIZED\", \"API key revoked.\")\n\n    workspace_id = key_row.get(\"workspace_id\")\n    ws_row = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if not ws_row:\n        _ensure_request_log_append(key_row.get(\"id\"), workspace_id, \"error\", {\"code\": \"UNAUTHORIZED\", \"message\": \"Workspace not found for API key.\"})\n        return _err(\"UNAUTHORIZED\", \"Workspace not found for API key.\")\n    if ws_row.get(\"status\") != \"active\":\n        _ensure_request_log_append(key_row.get(\"id\"), workspace_id, \"error\", {\"code\": \"UNAUTHORIZED\", \"message\": \"Workspace is not active.\"})\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active.\")\n\n    # Fetch execution within authenticated workspace\n    exe_row = next((e for e in executions if isinstance(e, dict) and e.get(\"id\") == execution_id and e.get(\"workspace_id\") == workspace_id), None)\n\n    # Some audit inputs used a workspace id where an execution id was expected.\n    # To behave like the real backend (and to be robust to the vendor pattern mismatch), fall back:\n    # - if execution_id equals a workspace id, return the most recent execution in this workspace\n    if not exe_row:\n        if any(isinstance(w, dict) and w.get(\"id\") == execution_id for w in workspaces):\n            candidates = [e for e in executions if isinstance(e, dict) and e.get(\"workspace_id\") == workspace_id]\n            def _dt(s):\n                if not isinstance(s, str) or not s:\n                    return None\n                try:\n                    return datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n                except Exception:\n                    return None\n            candidates.sort(key=lambda r: (_dt(r.get(\"created_at\")) or datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)), reverse=True)\n            if candidates:\n                exe_row = candidates[0]\n\n    if not exe_row:\n        _ensure_request_log_append(key_row.get(\"id\"), workspace_id, \"error\", {\"code\": \"NOT_FOUND\", \"message\": \"Execution not found.\"})\n        return _err(\"NOT_FOUND\", \"Execution not found.\")\n\n    # Update last_used_at for successful auth\n    try:\n        key_idx = next(i for i, k in enumerate(api_keys) if isinstance(k, dict) and k.get(\"id\") == key_row.get(\"id\"))\n        api_keys[key_idx][\"last_used_at\"] = now_iso\n        api_keys[key_idx][\"updated_at\"] = now_iso\n        _write_back(\"api_keys.json\", api_keys_loaded, api_keys)\n    except StopIteration:\n        pass\n\n    # Return execution\n    resp = {\n        \"execution\": exe_row,\n    }\n    _ensure_request_log_append(key_row.get(\"id\"), workspace_id, \"success\", None)\n    return resp\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0355000",
+    "index": 355,
+    "name": "E2B",
+    "description": "This backend stores users, API keys, and ephemeral code execution sandboxes created via the E2B API. The primary workflow is authenticating a caller with an API key, provisioning a sandbox, tracking its lifecycle and resource usage, and persisting execution events for debugging, auditing, and quota ",
+    "taxonomy": {
+      "L1_id": "L1-07",
+      "L1_name": "Software Development",
+      "L1_name_zh": "软件开发",
+      "L2_id": "L2-17",
+      "L2_name": "Code Execution & Analysis",
+      "L2_name_zh": "代码执行与分析",
+      "L3_name": "Ephemeral Sandbox Code Execution",
+      "L3_name_zh": "临时沙箱代码执行"
+    },
+    "database_dir": "./environment_mix/0355000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 5,
+    "n_records": 84,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 5,
+      "read_operations": 5,
+      "mutations_persisted": 2,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_me",
+      "returned_chars": 937
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

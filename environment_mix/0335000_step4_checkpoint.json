@@ -1,0 +1,469 @@
+{
+  "index": 335,
+  "local_files_dir": "./environment_mix/0335000",
+  "file_list": [
+    "./environment_mix/0335000/README.md",
+    "./environment_mix/0335000/api_credentials.json",
+    "./environment_mix/0335000/gif_requests.json",
+    "./environment_mix/0335000/gif_responses.json",
+    "./environment_mix/0335000/usage_counters.json",
+    "./environment_mix/0335000/workspaces.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "workspaces.json": "12 rows",
+        "api_credentials.json": "12 rows",
+        "gif_requests.json": "17 rows",
+        "gif_responses.json": "22 rows",
+        "usage_counters.json": "12 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "search_gifs",
+          "description": "Searches Giphy for GIFs matching q for the given workspace, using the workspace’s default credential unless credential_id is provided, and returns up to limit results starting at offset (offset-based pagination), optionally serving a fresh cached response when use_cache is true and persisting the request/response for audit and analytics. Raises VALIDATION_ERROR if workspace_id/credential_id formats are invalid, q is empty, limit is not 1–50, offset is negative, or cache_ttl_seconds is provided but < 1; raises NOT_FOUND if the workspace does not exist or the specified credential_id does not exist. Raises FORBIDDEN if the credential does not belong to the workspace, UNAUTHORIZED if no usable credential is available for the workspace, and RATE_LIMITED when workspace/credential usage quotas are exceeded (including when forwarding a request to Giphy).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^gph_ws_[A-Za-z0-9]+$",
+                "description": "Workspace id used to resolve configuration, caching, and usage tracking."
+              },
+              "credential_id": {
+                "type": "string",
+                "pattern": "^gph_cred_[A-Za-z0-9]+$",
+                "description": "API credential id to use for the Giphy request (must belong to the workspace)."
+              },
+              "q": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Search query term(s)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Maximum number of GIFs to return."
+              },
+              "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Result offset for pagination."
+              },
+              "lang": {
+                "type": "string",
+                "description": "Language for regional content; defaults from workspace configuration when omitted."
+              },
+              "rating": {
+                "type": "string",
+                "description": "Content rating filter to apply to results."
+              },
+              "bundle": {
+                "type": "string",
+                "description": "Giphy result bundle to request (provider-specific)."
+              },
+              "use_cache": {
+                "type": "boolean",
+                "description": "Whether to serve a cached response when available."
+              },
+              "cache_ttl_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Seconds a newly stored response should be considered fresh for caching."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "q"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def search_gifs(workspace_id, q, credential_id=None, limit=None, offset=None, lang=None, rating=None, bundle=None, use_cache=None, cache_ttl_seconds=None, **_extra):\n    import json, os, datetime, hashlib, time, re, random\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0335000\" if __import__(\"os\").path.isdir(\"./environment_mix/0335000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            return datetime.datetime.fromisoformat(s)\n        except ValueError:\n            return None\n\n    def _new_id(prefix):\n        # preserve vendor-like prefixes in schema examples\n        h = hashlib.sha256((str(time.time_ns()) + os.urandom(8).hex()).encode(\"utf-8\")).hexdigest()[:16]\n        return f\"{prefix}{h}\"\n\n    def _normalize_bool(v, default=False):\n        if v is None:\n            return default\n        if isinstance(v, bool):\n            return v\n        return None\n\n    def _window_start(now, window_seconds):\n        if window_seconds == 60:\n            return now.replace(second=0, microsecond=0)\n        if window_seconds == 300:\n            m = (now.minute // 5) * 5\n            return now.replace(minute=m, second=0, microsecond=0)\n        if window_seconds == 3600:\n            return now.replace(minute=0, second=0, microsecond=0)\n        if window_seconds == 86400:\n            return now.replace(hour=0, minute=0, second=0, microsecond=0)\n        return now.replace(second=0, microsecond=0)\n\n    def _get_or_create_usage_row(usage_rows, workspace_id_, tool_name_, window_seconds_, ws_iso):\n        for r in usage_rows:\n            if (isinstance(r, dict)\n                and r.get(\"workspace_id\") == workspace_id_\n                and r.get(\"tool_name\") == tool_name_\n                and r.get(\"window_seconds\") == window_seconds_\n                and r.get(\"window_start\") == ws_iso):\n                return r\n        row = {\n            \"id\": _new_id(\"gph_use_\"),\n            \"workspace_id\": workspace_id_,\n            \"tool_name\": tool_name_,\n            \"window_start\": ws_iso,\n            \"window_seconds\": window_seconds_,\n            \"request_count\": 0,\n            \"success_count\": 0,\n            \"error_count\": 0,\n            \"created_at\": _now(),\n            \"updated_at\": _now(),\n        }\n        usage_rows.append(row)\n        return row\n\n    def _reserve_quota(usage_rows, workspace_id_, tool_name_):\n        # Configured limits are not present in schema; enforce a safe default per-minute cap.\n        # Business rule says: if increment would exceed configured limits, fail with quota_exceeded.\n        limit_per_minute = 60\n        now = datetime.datetime.utcnow()\n        window_seconds = 60\n        ws = _window_start(now, window_seconds).isoformat() + \"Z\"\n        row = _get_or_create_usage_row(usage_rows, workspace_id_, tool_name_, window_seconds, ws)\n        cur = int(row.get(\"request_count\") or 0)\n        if cur + 1 > limit_per_minute:\n            return False, row\n        row[\"request_count\"] = cur + 1\n        # keep invariant request_count = success_count + error_count by not changing success/error yet\n        row[\"updated_at\"] = _now()\n        return True, row\n\n    def _finalize_usage(row, succeeded):\n        if not isinstance(row, dict):\n            return\n        sc = int(row.get(\"success_count\") or 0)\n        ec = int(row.get(\"error_count\") or 0)\n        if succeeded:\n            sc += 1\n        else:\n            ec += 1\n        row[\"success_count\"] = sc\n        row[\"error_count\"] = ec\n        row[\"request_count\"] = sc + ec\n        row[\"updated_at\"] = _now()\n\n    def _cache_key(ws_id, tool, params):\n        norm = json.dumps(params, sort_keys=True, separators=(\",\", \":\"))\n        return hashlib.sha256((ws_id + \"|\" + tool + \"|\" + norm).encode(\"utf-8\")).hexdigest()\n\n    # Validate inputs\n    if not isinstance(workspace_id, str) or not re.match(r\"^gph_ws_[A-Za-z0-9]+$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id format.\", workspace_id=workspace_id)\n    if not isinstance(q, str) or len(q) < 1:\n        return _err(\"VALIDATION_ERROR\", \"q must be a non-empty string.\", q=q)\n    if credential_id is not None:\n        if not isinstance(credential_id, str) or not re.match(r\"^gph_cred_[A-Za-z0-9]+$\", credential_id):\n            return _err(\"VALIDATION_ERROR\", \"Invalid credential_id format.\", credential_id=credential_id)\n    if limit is not None:\n        if not isinstance(limit, int) or limit < 1 or limit > 50:\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 50.\", limit=limit)\n    if offset is not None:\n        if not isinstance(offset, int) or offset < 0:\n            return _err(\"VALIDATION_ERROR\", \"offset must be an integer >= 0.\", offset=offset)\n    if cache_ttl_seconds is not None:\n        if not isinstance(cache_ttl_seconds, int) or cache_ttl_seconds < 1:\n            return _err(\"VALIDATION_ERROR\", \"cache_ttl_seconds must be an integer >= 1.\", cache_ttl_seconds=cache_ttl_seconds)\n    ub = _normalize_bool(use_cache, default=False)\n    if ub is None:\n        return _err(\"VALIDATION_ERROR\", \"use_cache must be boolean when provided.\", use_cache=use_cache)\n\n    limit_v = limit if limit is not None else 25\n    offset_v = offset if offset is not None else 0\n\n    # Load store\n    workspaces = _load(\"workspaces.json\")\n    creds = _load(\"api_credentials.json\")\n    reqs = _load(\"gif_requests.json\")\n    resps = _load(\"gif_responses.json\")\n    usage = _load(\"usage_counters.json\")\n\n    # Resolve workspace (must exist and not be deleted)\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if not ws:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n    if ws.get(\"status\") == \"deleted\":\n        return _err(\"INVALID_TRANSITION\", \"Workspaces in status 'deleted' must reject new gif_requests inserts.\", workspace_id=workspace_id)\n\n    # Resolve language default\n    lang_v = lang if isinstance(lang, str) and lang else (ws.get(\"default_language\") if isinstance(ws.get(\"default_language\"), str) else None)\n\n    # Resolve credential: if provided, authenticate by id; else pick any active giphy credential in workspace.\n    cred = None\n    if credential_id is not None:\n        cred = next((c for c in creds if isinstance(c, dict) and c.get(\"id\") == credential_id), None)\n        if not cred:\n            return _err(\"NOT_FOUND\", \"Credential not found.\", credential_id=credential_id)\n        if cred.get(\"workspace_id\") != workspace_id:\n            return _err(\"UNAUTHORIZED\", \"Credential must belong to the workspace (business rule).\", workspace_id=workspace_id, credential_id=credential_id)\n        if cred.get(\"status\") != \"active\":\n            return _err(\"UNAUTHORIZED\", \"Credential must be active to be used (business rule).\", credential_id=credential_id, status=cred.get(\"status\"))\n        if cred.get(\"provider\") != \"giphy\":\n            return _err(\"VALIDATION_ERROR\", \"credential_id provider must be 'giphy'.\", credential_id=credential_id)\n    else:\n        cred = next((c for c in creds\n                     if isinstance(c, dict)\n                     and c.get(\"workspace_id\") == workspace_id\n                     and c.get(\"provider\") == \"giphy\"\n                     and c.get(\"status\") == \"active\"), None)\n        if cred is None:\n            # Ambient auth: search for a working combination; none exists.\n            return _err(\"UNAUTHORIZED\", \"No active Giphy credential available for this workspace.\", workspace_id=workspace_id)\n\n    # Compute cache key if caching enabled\n    cache_key = None\n    if ub:\n        ck_params = {\n            \"q\": q,\n            \"limit\": limit_v,\n            \"offset\": offset_v,\n            \"lang\": lang_v,\n            \"rating\": rating,\n            \"bundle\": bundle,\n        }\n        cache_key = _cache_key(workspace_id, \"search_gifs\", ck_params)\n\n    # Create gif_request row (exactly one per call)\n    req_id = _new_id(\"gph_req_\")\n    now_iso = _now()\n    req_row = {\n        \"id\": req_id,\n        \"workspace_id\": workspace_id,\n        \"credential_id\": cred.get(\"id\"),\n        \"tool_name\": \"search_gifs\",\n        \"input\": {},  # current tool surface stores empty object\n        \"cache_key\": cache_key,\n        \"status\": \"queued\",\n        \"http_status\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"duration_ms\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n        \"completed_at\": None,\n    }\n    reqs.append(req_row)\n\n    # Check cache before reserving quota/upstream\n    served_from_cache = False\n    cached_payload = None\n    if ub and cache_key:\n        now_dt = datetime.datetime.utcnow()\n        # find a prior request with same workspace/cache_key with a non-expired response\n        for r in reversed(reqs[:-1]):  # prior only\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"workspace_id\") != workspace_id or r.get(\"cache_key\") != cache_key:\n                continue\n            # response must exist\n            resp = next((x for x in resps if isinstance(x, dict) and x.get(\"request_id\") == r.get(\"id\") and x.get(\"workspace_id\") == workspace_id), None)\n            if not resp:\n                continue\n            exp = _parse_dt(resp.get(\"expires_at\"))\n            if exp is not None and exp <= now_dt:\n                continue\n            cached_payload = resp\n            break\n\n    # Transition queued -> running\n    req_row[\"status\"] = \"running\"\n    req_row[\"updated_at\"] = _now()\n\n    # Serve from cache if available\n    if cached_payload is not None:\n        served_from_cache = True\n        # Complete request as succeeded without consuming quota/upstream\n        req_row[\"status\"] = \"succeeded\"\n        req_row[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n        req_row[\"updated_at\"] = _now()\n        req_row[\"completed_at\"] = _now()\n        # Create a response row for this request (unique request_id), marked from_cache=true\n        ttl = cache_ttl_seconds if isinstance(cache_ttl_seconds, int) else 60\n        expires_at = (datetime.datetime.utcnow() + datetime.timedelta(seconds=ttl)).replace(microsecond=0).isoformat() + \"Z\"\n        resp_row = {\n            \"id\": _new_id(\"gph_resp_\"),\n            \"request_id\": req_id,\n            \"workspace_id\": workspace_id,\n            \"from_cache\": True,\n            \"expires_at\": expires_at,\n            \"raw_json\": cached_payload.get(\"raw_json\") if isinstance(cached_payload.get(\"raw_json\"), dict) else {},\n            \"gif_items\": cached_payload.get(\"gif_items\") if isinstance(cached_payload.get(\"gif_items\"), list) else [],\n            \"result_count\": int(cached_payload.get(\"result_count\") or 0),\n            \"created_at\": _now(),\n            \"updated_at\": _now(),\n        }\n        # Ensure constraint result_count=array_length\n        resp_row[\"result_count\"] = len(resp_row[\"gif_items\"])\n        resps.append(resp_row)\n        # last_used_at on credential for successful use\n        cred[\"last_used_at\"] = _now()\n        cred[\"updated_at\"] = _now()\n        _save(\"gif_requests.json\", reqs)\n        _save(\"gif_responses.json\", resps)\n        _save(\"api_credentials.json\", creds)\n        _save(\"usage_counters.json\", usage)\n        return {\n            \"data\": {\n                \"request\": req_row,\n                \"response\": resp_row,\n                \"meta\": {\"limit\": limit_v, \"offset\": offset_v, \"from_cache\": True}\n            }\n        }\n\n    # Reserve quota before \"upstream\"\n    ok, usage_row = _reserve_quota(usage, workspace_id, \"search_gifs\")\n    if not ok:\n        # Fail request with quota_exceeded; do not call upstream\n        req_row[\"status\"] = \"failed\"\n        req_row[\"error_code\"] = \"quota_exceeded\"\n        req_row[\"error_message\"] = \"Workspace quota exceeded for search_gifs in current window\"\n        req_row[\"http_status\"] = None\n        req_row[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n        req_row[\"updated_at\"] = _now()\n        req_row[\"completed_at\"] = _now()\n        _finalize_usage(usage_row, succeeded=False)\n        _save(\"gif_requests.json\", reqs)\n        _save(\"usage_counters.json\", usage)\n        return _err(\"QUOTA_EXCEEDED\", \"Workspace quota exceeded for search_gifs in current window.\", workspace_id=workspace_id, tool_name=\"search_gifs\")\n\n    # Simulated upstream call (offline). Record http_status since it \"reached upstream\".\n    # Produce deterministic-ish fake results from query and pagination.\n    random_seed = int(hashlib.sha256((workspace_id + \"|\" + q).encode(\"utf-8\")).hexdigest()[:8], 16)\n    rnd = random.Random(random_seed)\n    total_available = 200\n    start = min(offset_v, total_available)\n    end = min(start + limit_v, total_available)\n    items = []\n    for i in range(start, end):\n        gid = hashlib.sha1(f\"{q}|{i}|{workspace_id}\".encode(\"utf-8\")).hexdigest()[:10]\n        items.append({\n            \"giphy_id\": gid,\n            \"title\": f\"{q} #{i}\",\n            \"rating\": rating,\n            \"username\": \"\",\n            \"url\": f\"https://giphy.com/gifs/{gid}\",\n            \"images\": {\n                \"original\": {\"url\": f\"https://media.giphy.com/media/{gid}/giphy.gif\"},\n                \"preview\": {\"url\": f\"https://media.giphy.com/media/{gid}/giphy-preview.gif\"},\n            }\n        })\n        # minor randomness in username/title\n        if rnd.random() < 0.1:\n            items[-1][\"username\"] = \"giphy\"\n    raw_json = {\n        \"data\": items,\n        \"pagination\": {\"total_count\": total_available, \"count\": len(items), \"offset\": offset_v},\n        \"meta\": {\"status\": 200, \"msg\": \"OK\", \"response_id\": hashlib.md5(req_id.encode(\"utf-8\")).hexdigest()},\n        \"request\": {\"q\": q, \"limit\": limit_v, \"offset\": offset_v, \"lang\": lang_v, \"rating\": rating, \"bundle\": bundle},\n    }\n\n    # Succeed\n    req_row[\"http_status\"] = 200\n    req_row[\"status\"] = \"succeeded\"\n    req_row[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n    req_row[\"updated_at\"] = _now()\n    req_row[\"completed_at\"] = _now()\n\n    ttl = cache_ttl_seconds if isinstance(cache_ttl_seconds, int) else 60\n    expires_at = (datetime.datetime.utcnow() + datetime.timedelta(seconds=ttl)).replace(microsecond=0).isoformat() + \"Z\" if cache_key else None\n    resp_row = {\n        \"id\": _new_id(\"gph_resp_\"),\n        \"request_id\": req_id,\n        \"workspace_id\": workspace_id,\n        \"from_cache\": False,\n        \"expires_at\": expires_at,\n        \"raw_json\": raw_json,\n        \"gif_items\": items,\n        \"result_count\": len(items),\n        \"created_at\": _now(),\n        \"updated_at\": _now(),\n    }\n    resps.append(resp_row)\n\n    _finalize_usage(usage_row, succeeded=True)\n    cred[\"last_used_at\"] = _now()\n    cred[\"updated_at\"] = _now()\n\n    _save(\"gif_requests.json\", reqs)\n    _save(\"gif_responses.json\", resps)\n    _save(\"api_credentials.json\", creds)\n    _save(\"usage_counters.json\", usage)\n\n    return {\n        \"data\": {\n            \"request\": req_row,\n            \"response\": resp_row,\n            \"meta\": {\"limit\": limit_v, \"offset\": offset_v, \"from_cache\": False}\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_random_gif",
+          "description": "Fetches a single random GIF from Giphy for the given workspace, optionally filtered by tag and further constrained by rating/lang (defaulting lang from workspace configuration when omitted), optionally serving a fresh cached response when use_cache is true and persisting the request/response for audit and analytics. Raises VALIDATION_ERROR if workspace_id/credential_id formats are invalid or cache_ttl_seconds is provided but < 1; raises NOT_FOUND if the workspace does not exist or the specified credential_id does not exist. Raises FORBIDDEN if the credential does not belong to the workspace, UNAUTHORIZED if no usable credential is available for the workspace, and RATE_LIMITED when workspace/credential usage quotas are exceeded (including when forwarding a request to Giphy).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^gph_ws_[A-Za-z0-9]+$",
+                "description": "Workspace id used to resolve configuration, caching, and usage tracking."
+              },
+              "credential_id": {
+                "type": "string",
+                "pattern": "^gph_cred_[A-Za-z0-9]+$",
+                "description": "API credential id to use for the Giphy request (must belong to the workspace)."
+              },
+              "tag": {
+                "type": "string",
+                "description": "Optional tag to filter the random GIF selection."
+              },
+              "rating": {
+                "type": "string",
+                "description": "Content rating filter to apply to the random GIF selection."
+              },
+              "lang": {
+                "type": "string",
+                "description": "Language for regional content; defaults from workspace configuration when omitted."
+              },
+              "use_cache": {
+                "type": "boolean",
+                "description": "Whether to serve a cached response when available."
+              },
+              "cache_ttl_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Seconds a newly stored response should be considered fresh for caching."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_random_gif(workspace_id, credential_id=None, tag=None, rating=None, lang=None, use_cache=None, cache_ttl_seconds=None, **_extra):\n    import json, os, datetime, hashlib, time, re, random\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0335000\" if __import__(\"os\").path.isdir(\"./environment_mix/0335000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            return datetime.datetime.fromisoformat(s)\n        except ValueError:\n            return None\n\n    def _new_id(prefix):\n        h = hashlib.sha256((str(time.time_ns()) + os.urandom(8).hex()).encode(\"utf-8\")).hexdigest()[:16]\n        return f\"{prefix}{h}\"\n\n    def _normalize_bool(v, default=False):\n        if v is None:\n            return default\n        if isinstance(v, bool):\n            return v\n        return None\n\n    def _window_start(now, window_seconds):\n        return now.replace(second=0, microsecond=0)\n\n    def _get_or_create_usage_row(usage_rows, workspace_id_, tool_name_, window_seconds_, ws_iso):\n        for r in usage_rows:\n            if (isinstance(r, dict)\n                and r.get(\"workspace_id\") == workspace_id_\n                and r.get(\"tool_name\") == tool_name_\n                and r.get(\"window_seconds\") == window_seconds_\n                and r.get(\"window_start\") == ws_iso):\n                return r\n        row = {\n            \"id\": _new_id(\"gph_use_\"),\n            \"workspace_id\": workspace_id_,\n            \"tool_name\": tool_name_,\n            \"window_start\": ws_iso,\n            \"window_seconds\": window_seconds_,\n            \"request_count\": 0,\n            \"success_count\": 0,\n            \"error_count\": 0,\n            \"created_at\": _now(),\n            \"updated_at\": _now(),\n        }\n        usage_rows.append(row)\n        return row\n\n    def _reserve_quota(usage_rows, workspace_id_, tool_name_):\n        limit_per_minute = 60\n        now = datetime.datetime.utcnow()\n        window_seconds = 60\n        ws = _window_start(now, window_seconds).isoformat() + \"Z\"\n        row = _get_or_create_usage_row(usage_rows, workspace_id_, tool_name_, window_seconds, ws)\n        cur = int(row.get(\"request_count\") or 0)\n        if cur + 1 > limit_per_minute:\n            return False, row\n        row[\"request_count\"] = cur + 1\n        row[\"updated_at\"] = _now()\n        return True, row\n\n    def _finalize_usage(row, succeeded):\n        if not isinstance(row, dict):\n            return\n        sc = int(row.get(\"success_count\") or 0)\n        ec = int(row.get(\"error_count\") or 0)\n        if succeeded:\n            sc += 1\n        else:\n            ec += 1\n        row[\"success_count\"] = sc\n        row[\"error_count\"] = ec\n        row[\"request_count\"] = sc + ec\n        row[\"updated_at\"] = _now()\n\n    def _cache_key(ws_id, tool, params):\n        norm = json.dumps(params, sort_keys=True, separators=(\",\", \":\"))\n        return hashlib.sha256((ws_id + \"|\" + tool + \"|\" + norm).encode(\"utf-8\")).hexdigest()\n\n    # Validate\n    if not isinstance(workspace_id, str) or not re.match(r\"^gph_ws_[A-Za-z0-9]+$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id format.\", workspace_id=workspace_id)\n    if credential_id is not None:\n        if not isinstance(credential_id, str) or not re.match(r\"^gph_cred_[A-Za-z0-9]+$\", credential_id):\n            return _err(\"VALIDATION_ERROR\", \"Invalid credential_id format.\", credential_id=credential_id)\n    if cache_ttl_seconds is not None:\n        if not isinstance(cache_ttl_seconds, int) or cache_ttl_seconds < 1:\n            return _err(\"VALIDATION_ERROR\", \"cache_ttl_seconds must be an integer >= 1.\", cache_ttl_seconds=cache_ttl_seconds)\n    ub = _normalize_bool(use_cache, default=False)\n    if ub is None:\n        return _err(\"VALIDATION_ERROR\", \"use_cache must be boolean when provided.\", use_cache=use_cache)\n\n    # Load\n    workspaces = _load(\"workspaces.json\")\n    creds = _load(\"api_credentials.json\")\n    reqs = _load(\"gif_requests.json\")\n    resps = _load(\"gif_responses.json\")\n    usage = _load(\"usage_counters.json\")\n\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if not ws:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n    if ws.get(\"status\") == \"deleted\":\n        return _err(\"INVALID_TRANSITION\", \"Workspaces in status 'deleted' must reject new gif_requests inserts.\", workspace_id=workspace_id)\n\n    lang_v = lang if isinstance(lang, str) and lang else (ws.get(\"default_language\") if isinstance(ws.get(\"default_language\"), str) else None)\n\n    cred = None\n    if credential_id is not None:\n        cred = next((c for c in creds if isinstance(c, dict) and c.get(\"id\") == credential_id), None)\n        if not cred:\n            return _err(\"NOT_FOUND\", \"Credential not found.\", credential_id=credential_id)\n        if cred.get(\"workspace_id\") != workspace_id:\n            return _err(\"UNAUTHORIZED\", \"Credential must belong to the workspace (business rule).\", workspace_id=workspace_id, credential_id=credential_id)\n        if cred.get(\"status\") != \"active\":\n            return _err(\"UNAUTHORIZED\", \"Credential must be active to be used (business rule).\", credential_id=credential_id, status=cred.get(\"status\"))\n        if cred.get(\"provider\") != \"giphy\":\n            return _err(\"VALIDATION_ERROR\", \"credential_id provider must be 'giphy'.\", credential_id=credential_id)\n    else:\n        cred = next((c for c in creds\n                     if isinstance(c, dict)\n                     and c.get(\"workspace_id\") == workspace_id\n                     and c.get(\"provider\") == \"giphy\"\n                     and c.get(\"status\") == \"active\"), None)\n        if cred is None:\n            return _err(\"UNAUTHORIZED\", \"No active Giphy credential available for this workspace.\", workspace_id=workspace_id)\n\n    cache_key = None\n    if ub:\n        ck_params = {\"tag\": tag, \"lang\": lang_v, \"rating\": rating}\n        cache_key = _cache_key(workspace_id, \"get_random_gif\", ck_params)\n\n    # Create request row\n    req_id = _new_id(\"gph_req_\")\n    now_iso = _now()\n    req_row = {\n        \"id\": req_id,\n        \"workspace_id\": workspace_id,\n        \"credential_id\": cred.get(\"id\"),\n        \"tool_name\": \"get_random_gif\",\n        \"input\": {},\n        \"cache_key\": cache_key,\n        \"status\": \"queued\",\n        \"http_status\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"duration_ms\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n        \"completed_at\": None,\n    }\n    reqs.append(req_row)\n\n    # Cache check\n    cached_payload = None\n    if ub and cache_key:\n        now_dt = datetime.datetime.utcnow()\n        for r in reversed(reqs[:-1]):\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"workspace_id\") != workspace_id or r.get(\"cache_key\") != cache_key:\n                continue\n            resp = next((x for x in resps if isinstance(x, dict) and x.get(\"request_id\") == r.get(\"id\") and x.get(\"workspace_id\") == workspace_id), None)\n            if not resp:\n                continue\n            exp = _parse_dt(resp.get(\"expires_at\"))\n            if exp is not None and exp <= now_dt:\n                continue\n            cached_payload = resp\n            break\n\n    req_row[\"status\"] = \"running\"\n    req_row[\"updated_at\"] = _now()\n\n    if cached_payload is not None:\n        req_row[\"status\"] = \"succeeded\"\n        req_row[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n        req_row[\"updated_at\"] = _now()\n        req_row[\"completed_at\"] = _now()\n        ttl = cache_ttl_seconds if isinstance(cache_ttl_seconds, int) else 60\n        expires_at = (datetime.datetime.utcnow() + datetime.timedelta(seconds=ttl)).replace(microsecond=0).isoformat() + \"Z\"\n        resp_row = {\n            \"id\": _new_id(\"gph_resp_\"),\n            \"request_id\": req_id,\n            \"workspace_id\": workspace_id,\n            \"from_cache\": True,\n            \"expires_at\": expires_at,\n            \"raw_json\": cached_payload.get(\"raw_json\") if isinstance(cached_payload.get(\"raw_json\"), dict) else {},\n            \"gif_items\": cached_payload.get(\"gif_items\") if isinstance(cached_payload.get(\"gif_items\"), list) else [],\n            \"result_count\": 0,\n            \"created_at\": _now(),\n            \"updated_at\": _now(),\n        }\n        resp_row[\"result_count\"] = len(resp_row[\"gif_items\"])\n        resps.append(resp_row)\n        cred[\"last_used_at\"] = _now()\n        cred[\"updated_at\"] = _now()\n        _save(\"gif_requests.json\", reqs)\n        _save(\"gif_responses.json\", resps)\n        _save(\"api_credentials.json\", creds)\n        _save(\"usage_counters.json\", usage)\n        return {\"data\": {\"request\": req_row, \"response\": resp_row, \"meta\": {\"from_cache\": True}}}\n\n    ok, usage_row = _reserve_quota(usage, workspace_id, \"get_random_gif\")\n    if not ok:\n        req_row[\"status\"] = \"failed\"\n        req_row[\"error_code\"] = \"quota_exceeded\"\n        req_row[\"error_message\"] = \"Workspace quota exceeded for get_random_gif in current window\"\n        req_row[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n        req_row[\"updated_at\"] = _now()\n        req_row[\"completed_at\"] = _now()\n        _finalize_usage(usage_row, succeeded=False)\n        _save(\"gif_requests.json\", reqs)\n        _save(\"usage_counters.json\", usage)\n        return _err(\"QUOTA_EXCEEDED\", \"Workspace quota exceeded for get_random_gif in current window.\", workspace_id=workspace_id, tool_name=\"get_random_gif\")\n\n    # Simulated upstream (offline) with http_status recorded\n    seed = int(hashlib.sha256((workspace_id + \"|\" + (tag or \"\") + \"|\" + (rating or \"\")).encode(\"utf-8\")).hexdigest()[:8], 16)\n    rnd = random.Random(seed)\n    gid = hashlib.sha1(f\"random|{workspace_id}|{tag}|{seed}\".encode(\"utf-8\")).hexdigest()[:10]\n    item = {\n        \"giphy_id\": gid,\n        \"title\": f\"Random {tag or 'gif'}\",\n        \"rating\": rating,\n        \"username\": \"giphy\" if rnd.random() < 0.5 else \"\",\n        \"url\": f\"https://giphy.com/gifs/{gid}\",\n        \"images\": {\"original\": {\"url\": f\"https://media.giphy.com/media/{gid}/giphy.gif\"}},\n    }\n    raw_json = {\n        \"data\": item,\n        \"meta\": {\"status\": 200, \"msg\": \"OK\", \"response_id\": hashlib.md5(req_id.encode(\"utf-8\")).hexdigest()},\n        \"request\": {\"tag\": tag, \"lang\": lang_v, \"rating\": rating},\n    }\n\n    req_row[\"http_status\"] = 200\n    req_row[\"status\"] = \"succeeded\"\n    req_row[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n    req_row[\"updated_at\"] = _now()\n    req_row[\"completed_at\"] = _now()\n\n    ttl = cache_ttl_seconds if isinstance(cache_ttl_seconds, int) else 60\n    expires_at = (datetime.datetime.utcnow() + datetime.timedelta(seconds=ttl)).replace(microsecond=0).isoformat() + \"Z\" if cache_key else None\n    resp_row = {\n        \"id\": _new_id(\"gph_resp_\"),\n        \"request_id\": req_id,\n        \"workspace_id\": workspace_id,\n        \"from_cache\": False,\n        \"expires_at\": expires_at,\n        \"raw_json\": raw_json,\n        \"gif_items\": [item],\n        \"result_count\": 1,\n        \"created_at\": _now(),\n        \"updated_at\": _now(),\n    }\n    resps.append(resp_row)\n\n    _finalize_usage(usage_row, succeeded=True)\n    cred[\"last_used_at\"] = _now()\n    cred[\"updated_at\"] = _now()\n\n    _save(\"gif_requests.json\", reqs)\n    _save(\"gif_responses.json\", resps)\n    _save(\"api_credentials.json\", creds)\n    _save(\"usage_counters.json\", usage)\n\n    return {\"data\": {\"request\": req_row, \"response\": resp_row, \"meta\": {\"from_cache\": False}}}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_trending_gifs",
+          "description": "Retrieves currently trending GIFs from Giphy for the given workspace and returns up to limit results starting at offset (offset-based pagination), optionally applying rating/bundle and serving a fresh cached response when use_cache is true while persisting the request/response for audit and analytics. Raises VALIDATION_ERROR if workspace_id/credential_id formats are invalid, limit is not 1–50, offset is negative, or cache_ttl_seconds is provided but < 1; raises NOT_FOUND if the workspace does not exist or the specified credential_id does not exist. Raises FORBIDDEN if the credential does not belong to the workspace, UNAUTHORIZED if no usable credential is available for the workspace, and RATE_LIMITED when workspace/credential usage quotas are exceeded (including when forwarding a request to Giphy).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^gph_ws_[A-Za-z0-9]+$",
+                "description": "Workspace id used to resolve configuration, caching, and usage tracking."
+              },
+              "credential_id": {
+                "type": "string",
+                "pattern": "^gph_cred_[A-Za-z0-9]+$",
+                "description": "API credential id to use for the Giphy request (must belong to the workspace)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Maximum number of trending GIFs to return."
+              },
+              "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Result offset for pagination."
+              },
+              "rating": {
+                "type": "string",
+                "description": "Content rating filter to apply to trending results."
+              },
+              "bundle": {
+                "type": "string",
+                "description": "Giphy result bundle to request (provider-specific)."
+              },
+              "use_cache": {
+                "type": "boolean",
+                "description": "Whether to serve a cached response when available."
+              },
+              "cache_ttl_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Seconds a newly stored response should be considered fresh for caching."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_trending_gifs(workspace_id, credential_id=None, limit=None, offset=None, rating=None, bundle=None, use_cache=None, cache_ttl_seconds=None, **_extra):\n    import json, os, datetime, hashlib, time, re, random\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0335000\" if __import__(\"os\").path.isdir(\"./environment_mix/0335000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            return datetime.datetime.fromisoformat(s)\n        except ValueError:\n            return None\n\n    def _new_id(prefix):\n        h = hashlib.sha256((str(time.time_ns()) + os.urandom(8).hex()).encode(\"utf-8\")).hexdigest()[:16]\n        return f\"{prefix}{h}\"\n\n    def _normalize_bool(v, default=False):\n        if v is None:\n            return default\n        if isinstance(v, bool):\n            return v\n        return None\n\n    def _window_start(now, window_seconds):\n        return now.replace(second=0, microsecond=0)\n\n    def _get_or_create_usage_row(usage_rows, workspace_id_, tool_name_, window_seconds_, ws_iso):\n        for r in usage_rows:\n            if (isinstance(r, dict)\n                and r.get(\"workspace_id\") == workspace_id_\n                and r.get(\"tool_name\") == tool_name_\n                and r.get(\"window_seconds\") == window_seconds_\n                and r.get(\"window_start\") == ws_iso):\n                return r\n        row = {\n            \"id\": _new_id(\"gph_use_\"),\n            \"workspace_id\": workspace_id_,\n            \"tool_name\": tool_name_,\n            \"window_start\": ws_iso,\n            \"window_seconds\": window_seconds_,\n            \"request_count\": 0,\n            \"success_count\": 0,\n            \"error_count\": 0,\n            \"created_at\": _now(),\n            \"updated_at\": _now(),\n        }\n        usage_rows.append(row)\n        return row\n\n    def _reserve_quota(usage_rows, workspace_id_, tool_name_):\n        limit_per_minute = 60\n        now = datetime.datetime.utcnow()\n        window_seconds = 60\n        ws = _window_start(now, window_seconds).isoformat() + \"Z\"\n        row = _get_or_create_usage_row(usage_rows, workspace_id_, tool_name_, window_seconds, ws)\n        cur = int(row.get(\"request_count\") or 0)\n        if cur + 1 > limit_per_minute:\n            return False, row\n        row[\"request_count\"] = cur + 1\n        row[\"updated_at\"] = _now()\n        return True, row\n\n    def _finalize_usage(row, succeeded):\n        if not isinstance(row, dict):\n            return\n        sc = int(row.get(\"success_count\") or 0)\n        ec = int(row.get(\"error_count\") or 0)\n        if succeeded:\n            sc += 1\n        else:\n            ec += 1\n        row[\"success_count\"] = sc\n        row[\"error_count\"] = ec\n        row[\"request_count\"] = sc + ec\n        row[\"updated_at\"] = _now()\n\n    def _cache_key(ws_id, tool, params):\n        norm = json.dumps(params, sort_keys=True, separators=(\",\", \":\"))\n        return hashlib.sha256((ws_id + \"|\" + tool + \"|\" + norm).encode(\"utf-8\")).hexdigest()\n\n    # Validate\n    if not isinstance(workspace_id, str) or not re.match(r\"^gph_ws_[A-Za-z0-9]+$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id format.\", workspace_id=workspace_id)\n    if credential_id is not None:\n        if not isinstance(credential_id, str) or not re.match(r\"^gph_cred_[A-Za-z0-9]+$\", credential_id):\n            return _err(\"VALIDATION_ERROR\", \"Invalid credential_id format.\", credential_id=credential_id)\n    if limit is not None:\n        if not isinstance(limit, int) or limit < 1 or limit > 50:\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 50.\", limit=limit)\n    if offset is not None:\n        if not isinstance(offset, int) or offset < 0:\n            return _err(\"VALIDATION_ERROR\", \"offset must be an integer >= 0.\", offset=offset)\n    if cache_ttl_seconds is not None:\n        if not isinstance(cache_ttl_seconds, int) or cache_ttl_seconds < 1:\n            return _err(\"VALIDATION_ERROR\", \"cache_ttl_seconds must be an integer >= 1.\", cache_ttl_seconds=cache_ttl_seconds)\n    ub = _normalize_bool(use_cache, default=False)\n    if ub is None:\n        return _err(\"VALIDATION_ERROR\", \"use_cache must be boolean when provided.\", use_cache=use_cache)\n\n    limit_v = limit if limit is not None else 25\n    offset_v = offset if offset is not None else 0\n\n    workspaces = _load(\"workspaces.json\")\n    creds = _load(\"api_credentials.json\")\n    reqs = _load(\"gif_requests.json\")\n    resps = _load(\"gif_responses.json\")\n    usage = _load(\"usage_counters.json\")\n\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if not ws:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n    if ws.get(\"status\") == \"deleted\":\n        return _err(\"INVALID_TRANSITION\", \"Workspaces in status 'deleted' must reject new gif_requests inserts.\", workspace_id=workspace_id)\n\n    cred = None\n    if credential_id is not None:\n        cred = next((c for c in creds if isinstance(c, dict) and c.get(\"id\") == credential_id), None)\n        if not cred:\n            return _err(\"NOT_FOUND\", \"Credential not found.\", credential_id=credential_id)\n        if cred.get(\"workspace_id\") != workspace_id:\n            return _err(\"UNAUTHORIZED\", \"Credential must belong to the workspace (business rule).\", workspace_id=workspace_id, credential_id=credential_id)\n        if cred.get(\"status\") != \"active\":\n            return _err(\"UNAUTHORIZED\", \"Credential must be active to be used (business rule).\", credential_id=credential_id, status=cred.get(\"status\"))\n        if cred.get(\"provider\") != \"giphy\":\n            return _err(\"VALIDATION_ERROR\", \"credential_id provider must be 'giphy'.\", credential_id=credential_id)\n    else:\n        cred = next((c for c in creds\n                     if isinstance(c, dict)\n                     and c.get(\"workspace_id\") == workspace_id\n                     and c.get(\"provider\") == \"giphy\"\n                     and c.get(\"status\") == \"active\"), None)\n        if cred is None:\n            return _err(\"UNAUTHORIZED\", \"No active Giphy credential available for this workspace.\", workspace_id=workspace_id)\n\n    cache_key = None\n    if ub:\n        ck_params = {\"limit\": limit_v, \"offset\": offset_v, \"rating\": rating, \"bundle\": bundle}\n        cache_key = _cache_key(workspace_id, \"get_trending_gifs\", ck_params)\n\n    # Create request\n    req_id = _new_id(\"gph_req_\")\n    now_iso = _now()\n    req_row = {\n        \"id\": req_id,\n        \"workspace_id\": workspace_id,\n        \"credential_id\": cred.get(\"id\"),\n        \"tool_name\": \"get_trending_gifs\",\n        \"input\": {},\n        \"cache_key\": cache_key,\n        \"status\": \"queued\",\n        \"http_status\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"duration_ms\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n        \"completed_at\": None,\n    }\n    reqs.append(req_row)\n\n    # Cache check\n    cached_payload = None\n    if ub and cache_key:\n        now_dt = datetime.datetime.utcnow()\n        for r in reversed(reqs[:-1]):\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"workspace_id\") != workspace_id or r.get(\"cache_key\") != cache_key:\n                continue\n            resp = next((x for x in resps if isinstance(x, dict) and x.get(\"request_id\") == r.get(\"id\") and x.get(\"workspace_id\") == workspace_id), None)\n            if not resp:\n                continue\n            exp = _parse_dt(resp.get(\"expires_at\"))\n            if exp is not None and exp <= now_dt:\n                continue\n            cached_payload = resp\n            break\n\n    req_row[\"status\"] = \"running\"\n    req_row[\"updated_at\"] = _now()\n\n    if cached_payload is not None:\n        req_row[\"status\"] = \"succeeded\"\n        req_row[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n        req_row[\"updated_at\"] = _now()\n        req_row[\"completed_at\"] = _now()\n        ttl = cache_ttl_seconds if isinstance(cache_ttl_seconds, int) else 60\n        expires_at = (datetime.datetime.utcnow() + datetime.timedelta(seconds=ttl)).replace(microsecond=0).isoformat() + \"Z\"\n        resp_row = {\n            \"id\": _new_id(\"gph_resp_\"),\n            \"request_id\": req_id,\n            \"workspace_id\": workspace_id,\n            \"from_cache\": True,\n            \"expires_at\": expires_at,\n            \"raw_json\": cached_payload.get(\"raw_json\") if isinstance(cached_payload.get(\"raw_json\"), dict) else {},\n            \"gif_items\": cached_payload.get(\"gif_items\") if isinstance(cached_payload.get(\"gif_items\"), list) else [],\n            \"result_count\": 0,\n            \"created_at\": _now(),\n            \"updated_at\": _now(),\n        }\n        resp_row[\"result_count\"] = len(resp_row[\"gif_items\"])\n        resps.append(resp_row)\n        cred[\"last_used_at\"] = _now()\n        cred[\"updated_at\"] = _now()\n        _save(\"gif_requests.json\", reqs)\n        _save(\"gif_responses.json\", resps)\n        _save(\"api_credentials.json\", creds)\n        _save(\"usage_counters.json\", usage)\n        return {\"data\": {\"request\": req_row, \"response\": resp_row, \"meta\": {\"limit\": limit_v, \"offset\": offset_v, \"from_cache\": True}}}\n\n    ok, usage_row = _reserve_quota(usage, workspace_id, \"get_trending_gifs\")\n    if not ok:\n        req_row[\"status\"] = \"failed\"\n        req_row[\"error_code\"] = \"quota_exceeded\"\n        req_row[\"error_message\"] = \"Workspace quota exceeded for get_trending_gifs in current window\"\n        req_row[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n        req_row[\"updated_at\"] = _now()\n        req_row[\"completed_at\"] = _now()\n        _finalize_usage(usage_row, succeeded=False)\n        _save(\"gif_requests.json\", reqs)\n        _save(\"usage_counters.json\", usage)\n        return _err(\"QUOTA_EXCEEDED\", \"Workspace quota exceeded for get_trending_gifs in current window.\", workspace_id=workspace_id, tool_name=\"get_trending_gifs\")\n\n    # Simulated upstream response\n    total_available = 200\n    start = min(offset_v, total_available)\n    end = min(start + limit_v, total_available)\n    seed = int(hashlib.sha256((workspace_id + \"|trending\").encode(\"utf-8\")).hexdigest()[:8], 16)\n    rnd = random.Random(seed)\n    items = []\n    for i in range(start, end):\n        gid = hashlib.sha1(f\"trending|{i}|{workspace_id}\".encode(\"utf-8\")).hexdigest()[:10]\n        items.append({\n            \"giphy_id\": gid,\n            \"title\": f\"Trending #{i}\",\n            \"rating\": rating,\n            \"username\": \"giphy\" if rnd.random() < 0.2 else \"\",\n            \"url\": f\"https://giphy.com/gifs/{gid}\",\n            \"images\": {\"original\": {\"url\": f\"https://media.giphy.com/media/{gid}/giphy.gif\"}},\n        })\n    raw_json = {\n        \"data\": items,\n        \"pagination\": {\"total_count\": total_available, \"count\": len(items), \"offset\": offset_v},\n        \"meta\": {\"status\": 200, \"msg\": \"OK\", \"response_id\": hashlib.md5(req_id.encode(\"utf-8\")).hexdigest()},\n        \"request\": {\"limit\": limit_v, \"offset\": offset_v, \"rating\": rating, \"bundle\": bundle},\n    }\n\n    req_row[\"http_status\"] = 200\n    req_row[\"status\"] = \"succeeded\"\n    req_row[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n    req_row[\"updated_at\"] = _now()\n    req_row[\"completed_at\"] = _now()\n\n    ttl = cache_ttl_seconds if isinstance(cache_ttl_seconds, int) else 60\n    expires_at = (datetime.datetime.utcnow() + datetime.timedelta(seconds=ttl)).replace(microsecond=0).isoformat() + \"Z\" if cache_key else None\n    resp_row = {\n        \"id\": _new_id(\"gph_resp_\"),\n        \"request_id\": req_id,\n        \"workspace_id\": workspace_id,\n        \"from_cache\": False,\n        \"expires_at\": expires_at,\n        \"raw_json\": raw_json,\n        \"gif_items\": items,\n        \"result_count\": len(items),\n        \"created_at\": _now(),\n        \"updated_at\": _now(),\n    }\n    resps.append(resp_row)\n\n    _finalize_usage(usage_row, succeeded=True)\n    cred[\"last_used_at\"] = _now()\n    cred[\"updated_at\"] = _now()\n\n    _save(\"gif_requests.json\", reqs)\n    _save(\"gif_responses.json\", resps)\n    _save(\"api_credentials.json\", creds)\n    _save(\"usage_counters.json\", usage)\n\n    return {\"data\": {\"request\": req_row, \"response\": resp_row, \"meta\": {\"limit\": limit_v, \"offset\": offset_v, \"from_cache\": False}}}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_workspace",
+          "description": "Creates a new workspace used to scope credentials, caching, and usage tracking, and returns the created workspace record. Refuses invalid fields and does not allow creating a workspace in status \"deleted\".",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "Human-friendly workspace name."
+              },
+              "default_language": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 10,
+                "description": "Default language code (used when lang is omitted on GIF tools)."
+              },
+              "default_region": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 10,
+                "description": "Default region code (used for regional content defaults)."
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_workspace(name, default_language=None, default_region=None, **_extra):\n    import json, os, datetime, secrets, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0335000\" if __import__(\"os\").path.isdir(\"./environment_mix/0335000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _new_id(existing):\n        # Observed ids look like gph_ws_<base62-ish>. Keep it simple and collision-checked.\n        alphabet = \"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz\"\n        for _ in range(200):\n            suffix = \"\".join(secrets.choice(alphabet) for _ in range(26))\n            _id = \"gph_ws_\" + suffix\n            if _id not in existing:\n                return _id\n        # very unlikely fallback\n        ts = datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\")\n        _id = \"gph_ws_\" + ts\n        if _id in existing:\n            _id = _id + \"X\"\n        return _id\n\n    # Validate inputs\n    if not isinstance(name, str):\n        return _err(\"VALIDATION_ERROR\", \"name must be a string.\", name=name)\n    norm_name = name.strip()\n    if len(norm_name) < 1 or len(norm_name) > 200:\n        return _err(\"VALIDATION_ERROR\", \"name must be 1-200 characters.\", name=name)\n\n    if default_language is not None:\n        if not isinstance(default_language, str):\n            return _err(\"VALIDATION_ERROR\", \"default_language must be a string.\", default_language=default_language)\n        if not (2 <= len(default_language) <= 10):\n            return _err(\"VALIDATION_ERROR\", \"default_language length must be 2-10.\", default_language=default_language)\n\n    if default_region is not None:\n        if not isinstance(default_region, str):\n            return _err(\"VALIDATION_ERROR\", \"default_region must be a string.\", default_region=default_region)\n        if not (2 <= len(default_region) <= 10):\n            return _err(\"VALIDATION_ERROR\", \"default_region length must be 2-10.\", default_region=default_region)\n\n    workspaces = _load(\"workspaces.json\")\n    if not isinstance(workspaces, list):\n        return _err(\"CONFLICT\", \"Datastore corrupted: workspaces.json must contain a JSON array.\")\n\n    # Enforce unique(name) constraint (case-sensitive, as per schema; normalize only whitespace)\n    for w in workspaces:\n        if isinstance(w, dict) and w.get(\"name\") == norm_name:\n            return _err(\n                \"CONFLICT\",\n                \"Workspace name already exists (unique(name) constraint).\",\n                name=norm_name\n            )\n\n    existing_ids = set()\n    for w in workspaces:\n        if isinstance(w, dict) and isinstance(w.get(\"id\"), str):\n            existing_ids.add(w[\"id\"])\n\n    now = _now()\n    ws_id = _new_id(existing_ids)\n\n    row = {\n        \"id\": ws_id,\n        \"name\": norm_name,\n        \"status\": \"active\",\n        \"default_language\": default_language,\n        \"default_region\": default_region,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    workspaces.append(row)\n    _save(\"workspaces.json\", workspaces)\n\n    return {\"workspace\": row}\n"
+        },
+        {
+          "name": "update_workspace",
+          "description": "Updates mutable workspace fields and/or transitions its status. Returns the updated workspace. Refuses transitions not allowed by the lifecycle (active↔suspended, active/suspended→deleted) and refuses updates once status is \"deleted\".",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^gph_ws_[A-Za-z0-9]+$",
+                "description": "Workspace id to update."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "New workspace name."
+              },
+              "default_language": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 10,
+                "description": "New default language code."
+              },
+              "default_region": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 10,
+                "description": "New default region code."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "suspended",
+                  "deleted"
+                ],
+                "description": "New workspace status (must be a valid lifecycle transition)."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_workspace(workspace_id, name=None, default_language=None, default_region=None, status=None, **_extra):\n    import json, os, datetime, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0335000\" if __import__(\"os\").path.isdir(\"./environment_mix/0335000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = datetime.datetime.utcnow()\n\n    # Validate inputs\n    if not isinstance(workspace_id, str) or not re.match(r\"^gph_ws_[A-Za-z0-9]+$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if name is not None:\n        if not isinstance(name, str) or not (1 <= len(name) <= 200):\n            return _err(\"VALIDATION_ERROR\", \"Invalid name.\")\n    if default_language is not None:\n        if not isinstance(default_language, str) or not (2 <= len(default_language) <= 10):\n            return _err(\"VALIDATION_ERROR\", \"Invalid default_language.\")\n    if default_region is not None:\n        if not isinstance(default_region, str) or not (2 <= len(default_region) <= 10):\n            return _err(\"VALIDATION_ERROR\", \"Invalid default_region.\")\n    if status is not None:\n        if status not in (\"active\", \"suspended\", \"deleted\"):\n            return _err(\"VALIDATION_ERROR\", \"Invalid status.\")\n\n    # Load\n    workspaces = _load(\"workspaces.json\")\n\n    ws = None\n    for r in workspaces:\n        if isinstance(r, dict) and r.get(\"id\") == workspace_id:\n            ws = r\n            break\n    if not ws:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n\n    # Refuse any updates once deleted\n    if ws.get(\"status\") == \"deleted\":\n        return _err(\"INVALID_TRANSITION\", \"Workspace is deleted and cannot be updated.\", from_status=\"deleted\")\n\n    # Determine whether there is any change\n    changes = {}\n    if name is not None and name != ws.get(\"name\"):\n        # unique(name)\n        for r in workspaces:\n            if isinstance(r, dict) and r.get(\"id\") != workspace_id and r.get(\"name\") == name:\n                return _err(\"CONFLICT\", \"Workspace name must be unique.\", field=\"name\")\n        changes[\"name\"] = name\n\n    if default_language is not None and default_language != ws.get(\"default_language\"):\n        changes[\"default_language\"] = default_language\n\n    if default_region is not None and default_region != ws.get(\"default_region\"):\n        changes[\"default_region\"] = default_region\n\n    if status is not None and status != ws.get(\"status\"):\n        transitions = {\n            \"active\": [\"suspended\", \"deleted\"],\n            \"suspended\": [\"active\", \"deleted\"],\n            \"deleted\": []\n        }\n        cur = ws.get(\"status\")\n        if cur not in transitions or status not in transitions[cur]:\n            return _err(\"INVALID_TRANSITION\", \"Illegal workspace status transition.\", from_status=cur, to_status=status)\n        changes[\"status\"] = status\n\n    if not changes:\n        # No success without effect\n        return _err(\"CONFLICT\", \"No changes to apply.\")\n\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    for k, v in changes.items():\n        ws[k] = v\n    ws[\"updated_at\"] = now\n\n    _save(\"workspaces.json\", workspaces)\n\n    latency_ms = int((datetime.datetime.utcnow() - t0).total_seconds() * 1000)\n    return {\"workspace\": ws, \"updated_fields\": sorted(list(changes.keys())), \"latency_ms\": latency_ms}\n"
+        },
+        {
+          "name": "create_api_credential",
+          "description": "Stores a Giphy API key for a workspace and returns the created credential metadata (never returns the raw key). Refuses creation when the workspace is deleted and refuses unsupported providers.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^gph_ws_[A-Za-z0-9]+$",
+                "description": "Workspace that will own this credential."
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "giphy"
+                ],
+                "description": "Credential provider (only \"giphy\" is supported)."
+              },
+              "api_key": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Giphy API key to encrypt and store (not returned once stored)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled"
+                ],
+                "description": "Initial credential status; defaults to active when omitted."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "provider",
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_api_credential(workspace_id, provider, api_key, status=None, **_extra):\n    import json, os, datetime, re, hashlib, base64, secrets\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0335000\" if __import__(\"os\").path.isdir(\"./environment_mix/0335000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    # Validate inputs\n    if not isinstance(workspace_id, str) or not re.match(r\"^gph_ws_[A-Za-z0-9]+$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if provider != \"giphy\":\n        return _err(\"VALIDATION_ERROR\", \"Unsupported provider.\", provider=provider)\n    if not isinstance(api_key, str) or len(api_key) < 1:\n        return _err(\"VALIDATION_ERROR\", \"Invalid api_key.\")\n    if status is None:\n        status = \"active\"\n    if status not in (\"active\", \"disabled\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid status.\")\n\n    workspaces = _load(\"workspaces.json\")\n    creds = _load(\"api_credentials.json\")\n\n    ws = None\n    for r in workspaces:\n        if isinstance(r, dict) and r.get(\"id\") == workspace_id:\n            ws = r\n            break\n    if not ws:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n    if ws.get(\"status\") == \"deleted\":\n        return _err(\"INVALID_TRANSITION\", \"Cannot create credentials for a deleted workspace.\", workspace_id=workspace_id)\n\n    # fingerprint (stable)\n    fp = hashlib.sha256(api_key.encode(\"utf-8\")).hexdigest()\n\n    # unique(workspace_id, provider, key_fingerprint)\n    for r in creds:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"workspace_id\") == workspace_id and r.get(\"provider\") == provider and r.get(\"key_fingerprint\") == fp:\n            return _err(\"CONFLICT\", \"Credential with same key already exists for this workspace/provider.\", key_fingerprint=fp)\n\n    # \"Encrypt\" and store (offline simulation): store as base64 with random salt prefix so ciphertext differs per insert\n    salt = secrets.token_bytes(16)\n    ct = base64.b64encode(salt + api_key.encode(\"utf-8\")).decode(\"ascii\")\n\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    new_id = \"gph_cred_\" + secrets.token_urlsafe(12).replace(\"-\", \"\").replace(\"_\", \"\")[:16]\n\n    row = {\n        \"id\": new_id,\n        \"workspace_id\": workspace_id,\n        \"provider\": provider,\n        \"api_key_ciphertext\": ct,\n        \"key_fingerprint\": fp,\n        \"status\": status,\n        \"created_at\": now,\n        \"updated_at\": now,\n        \"last_used_at\": None\n    }\n    creds.append(row)\n    _save(\"api_credentials.json\", creds)\n\n    # Return metadata only (no raw key)\n    return {\n        \"credential\": {\n            \"id\": row[\"id\"],\n            \"workspace_id\": row[\"workspace_id\"],\n            \"provider\": row[\"provider\"],\n            \"key_fingerprint\": row[\"key_fingerprint\"],\n            \"status\": row[\"status\"],\n            \"created_at\": row[\"created_at\"],\n            \"updated_at\": row[\"updated_at\"],\n            \"last_used_at\": row[\"last_used_at\"]\n        }\n    }\n"
+        },
+        {
+          "name": "update_api_credential",
+          "description": "Updates an API credential’s status and/or rotates its key. Returns the updated credential metadata. Refuses lifecycle-invalid transitions (active↔disabled, active/disabled→revoked), refuses updates once revoked, and refuses operations when the credential does not belong to the given workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^gph_ws_[A-Za-z0-9]+$",
+                "description": "Workspace id that must own the credential."
+              },
+              "credential_id": {
+                "type": "string",
+                "pattern": "^gph_cred_[A-Za-z0-9]+$",
+                "description": "Credential id to update."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled",
+                  "revoked"
+                ],
+                "description": "New credential status (must be a valid lifecycle transition)."
+              },
+              "api_key": {
+                "type": "string",
+                "minLength": 1,
+                "description": "New Giphy API key to rotate to (stored encrypted; not returned)."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "credential_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_api_credential(workspace_id, credential_id, status=None, api_key=None, **_extra):\n    import json, os, datetime, re, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0335000\" if __import__(\"os\").path.isdir(\"./environment_mix/0335000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _fingerprint(k):\n        return hashlib.sha256(k.encode(\"utf-8\")).hexdigest()\n\n    def _ciphertext_placeholder(k):\n        # Offline placeholder; must not store plaintext.\n        # Keep stable-ish but non-reversible. Prefix hints it's encrypted material.\n        return \"v1:enc:\" + hashlib.sha256((\"giphy|\" + k).encode(\"utf-8\")).hexdigest()\n\n    # Validate inputs\n    if not isinstance(workspace_id, str) or not re.match(r\"^gph_ws_[A-Za-z0-9]+$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"workspace_id must match ^gph_ws_[A-Za-z0-9]+$.\", workspace_id=workspace_id)\n    if not isinstance(credential_id, str) or not re.match(r\"^gph_cred_[A-Za-z0-9]+$\", credential_id):\n        return _err(\"VALIDATION_ERROR\", \"credential_id must match ^gph_cred_[A-Za-z0-9]+$.\", credential_id=credential_id)\n\n    if status is not None and status not in (\"active\", \"disabled\", \"revoked\"):\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: active, disabled, revoked.\", status=status)\n    if api_key is not None and (not isinstance(api_key, str) or len(api_key) < 1):\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string when provided.\", api_key=api_key)\n\n    if status is None and api_key is None:\n        return _err(\"VALIDATION_ERROR\", \"No fields to update; provide status and/or api_key.\")\n\n    workspaces = _load(\"workspaces.json\")\n    creds = _load(\"api_credentials.json\")\n    if not isinstance(workspaces, list) or not isinstance(creds, list):\n        return _err(\"CONFLICT\", \"Datastore corrupted: expected JSON arrays in workspaces.json and api_credentials.json.\")\n\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if not ws:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n\n    # Locate credential\n    cred_idx = None\n    cred = None\n    for i, c in enumerate(creds):\n        if isinstance(c, dict) and c.get(\"id\") == credential_id:\n            cred_idx = i\n            cred = c\n            break\n    if cred is None:\n        return _err(\"NOT_FOUND\", \"Credential not found.\", credential_id=credential_id)\n\n    # Enforce \"credential must belong to the given workspace\"\n    # IMPORTANT: accept valid updates when it DOES belong; reject only when mismatch.\n    if cred.get(\"workspace_id\") != workspace_id:\n        return _err(\n            \"CONFLICT\",\n            \"Credential does not belong to the given workspace (workspace_id mismatch).\",\n            workspace_id=workspace_id,\n            credential_id=credential_id,\n            credential_workspace_id=cred.get(\"workspace_id\"),\n        )\n\n    # Lifecycle rules\n    current_status = cred.get(\"status\")\n    if current_status not in (\"active\", \"disabled\", \"revoked\"):\n        return _err(\"CONFLICT\", \"Datastore corrupted: credential has invalid status.\", credential_id=credential_id, status=current_status)\n\n    if current_status == \"revoked\":\n        # Once revoked, refuse any updates\n        return _err(\"INVALID_TRANSITION\", \"Credential is revoked and cannot be updated.\", credential_id=credential_id)\n\n    if status is not None:\n        allowed = {\n            \"active\": (\"disabled\", \"revoked\"),\n            \"disabled\": (\"active\", \"revoked\"),\n            \"revoked\": (),\n        }\n        if status == current_status:\n            # idempotent status set is allowed\n            pass\n        else:\n            if status not in allowed.get(current_status, ()):\n                return _err(\n                    \"INVALID_TRANSITION\",\n                    \"Invalid credential status transition.\",\n                    from_status=current_status,\n                    to_status=status,\n                    credential_id=credential_id,\n                )\n\n    # Key rotation rules + uniqueness constraint: unique(workspace_id, provider, key_fingerprint)\n    changed = False\n    now = _now()\n\n    if api_key is not None:\n        new_fp = _fingerprint(api_key)\n        provider = cred.get(\"provider\")\n        if provider != \"giphy\":\n            return _err(\"CONFLICT\", \"Datastore corrupted: credential provider must be 'giphy'.\", credential_id=credential_id, provider=provider)\n\n        # If fingerprint unchanged, treat as idempotent rotate (still update updated_at)\n        if new_fp != cred.get(\"key_fingerprint\"):\n            for c in creds:\n                if not isinstance(c, dict):\n                    continue\n                if c.get(\"id\") == credential_id:\n                    continue\n                if c.get(\"workspace_id\") == workspace_id and c.get(\"provider\") == \"giphy\" and c.get(\"key_fingerprint\") == new_fp:\n                    return _err(\n                        \"CONFLICT\",\n                        \"Duplicate credential for this workspace/provider/key_fingerprint (unique(workspace_id, provider, key_fingerprint)).\",\n                        workspace_id=workspace_id,\n                        provider=\"giphy\",\n                        key_fingerprint=new_fp,\n                    )\n            cred[\"key_fingerprint\"] = new_fp\n            cred[\"api_key_ciphertext\"] = _ciphertext_placeholder(api_key)\n            changed = True\n\n    if status is not None and status != current_status:\n        cred[\"status\"] = status\n        changed = True\n\n    # Even if change is idempotent (same status / same key), updated_at should reflect the update attempt?\n    # Real systems vary; but \"no success without effect\" applies. Ensure at least updated_at moves only if there is\n    # an actual change OR a true idempotent set (status same / key same) should still be considered an effect? We'll\n    # only succeed if something changes or the caller requested a state equal to current (idempotent).\n    requested_idempotent = False\n    if status is not None and status == current_status:\n        requested_idempotent = True\n    if api_key is not None and _fingerprint(api_key) == cred.get(\"key_fingerprint\"):\n        requested_idempotent = True\n\n    if not changed and not requested_idempotent:\n        return _err(\"NOT_FOUND\", \"No update applied.\", credential_id=credential_id)\n\n    cred[\"updated_at\"] = now\n    creds[cred_idx] = cred\n    _save(\"api_credentials.json\", creds)\n\n    # Do not return api_key_ciphertext (key material) - return metadata row as stored (it includes ciphertext in schema,\n    # but description says not returned). So redact it.\n    resp = dict(cred)\n    if \"api_key_ciphertext\" in resp:\n        resp[\"api_key_ciphertext\"] = None\n\n    return {\"credential\": resp}\n"
+        },
+        {
+          "name": "list_gif_requests",
+          "description": "Lists persisted GIF request records for a workspace for auditing/analytics with filtering and offset-based pagination. Returns request rows and does not include raw upstream response bodies.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^gph_ws_[A-Za-z0-9]+$",
+                "description": "Workspace id to list requests for."
+              },
+              "tool_name": {
+                "type": "string",
+                "enum": [
+                  "search_gifs",
+                  "get_random_gif",
+                  "get_trending_gifs"
+                ],
+                "description": "Filter by tool that produced the request."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "Filter by request lifecycle status."
+              },
+              "credential_id": {
+                "type": "string",
+                "pattern": "^gph_cred_[A-Za-z0-9]+$",
+                "description": "Filter by credential id used."
+              },
+              "created_from": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only include requests created at or after this timestamp."
+              },
+              "created_to": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only include requests created before this timestamp."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of rows to return."
+              },
+              "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Result offset for pagination."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at_desc",
+                  "created_at_asc"
+                ],
+                "description": "Sort order for results."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_gif_requests(workspace_id, tool_name=None, status=None, credential_id=None, created_from=None, created_to=None, limit=None, offset=None, sort=None, **_extra):\n    import json, os, datetime, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0335000\" if __import__(\"os\").path.isdir(\"./environment_mix/0335000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    # Validate inputs\n    if not isinstance(workspace_id, str) or not re.match(r\"^gph_ws_[A-Za-z0-9]+$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if tool_name is not None and tool_name not in (\"search_gifs\", \"get_random_gif\", \"get_trending_gifs\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid tool_name.\")\n    if status is not None and status not in (\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid status.\")\n    if credential_id is not None:\n        if not isinstance(credential_id, str) or not re.match(r\"^gph_cred_[A-Za-z0-9]+$\", credential_id):\n            return _err(\"VALIDATION_ERROR\", \"Invalid credential_id.\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"Invalid limit.\")\n    if offset is None:\n        offset = 0\n    if not isinstance(offset, int) or offset < 0:\n        return _err(\"VALIDATION_ERROR\", \"Invalid offset.\")\n    if sort is None:\n        sort = \"created_at_desc\"\n    if sort not in (\"created_at_desc\", \"created_at_asc\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort.\")\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None, None\n        if not isinstance(s, str):\n            return None, _err(\"VALIDATION_ERROR\", f\"Invalid {field}.\")\n        try:\n            # Accept ...Z or offset; normalize Z\n            ss = s[:-1] + \"+00:00\" if s.endswith(\"Z\") else s\n            return datetime.datetime.fromisoformat(ss), None\n        except Exception:\n            return None, _err(\"VALIDATION_ERROR\", f\"Invalid {field}, must be date-time.\")\n    dt_from, e = _parse_dt(created_from, \"created_from\")\n    if e: return e\n    dt_to, e = _parse_dt(created_to, \"created_to\")\n    if e: return e\n    if dt_from and dt_to and dt_from > dt_to:\n        return _err(\"VALIDATION_ERROR\", \"created_from must be <= created_to.\")\n\n    # Load + check workspace exists\n    workspaces = _load(\"workspaces.json\")\n    ws_exists = any(isinstance(r, dict) and r.get(\"id\") == workspace_id for r in workspaces)\n    if not ws_exists:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n\n    reqs = _load(\"gif_requests.json\")\n\n    def _row_dt(row):\n        v = row.get(\"created_at\")\n        if not isinstance(v, str):\n            return None\n        try:\n            vv = v[:-1] + \"+00:00\" if v.endswith(\"Z\") else v\n            return datetime.datetime.fromisoformat(vv)\n        except Exception:\n            return None\n\n    out = []\n    for r in reqs:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"workspace_id\") != workspace_id:\n            continue\n        if tool_name is not None and r.get(\"tool_name\") != tool_name:\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        if credential_id is not None and r.get(\"credential_id\") != credential_id:\n            continue\n        cd = _row_dt(r)\n        if dt_from is not None and cd is not None and cd < dt_from:\n            continue\n        if dt_to is not None and cd is not None and cd >= dt_to:\n            continue\n        # If date parsing fails, include row (do not silently drop audits)\n        if dt_from is not None and cd is None:\n            pass\n        if dt_to is not None and cd is None:\n            pass\n\n        # Return request rows (no raw upstream responses are in this table anyway)\n        out.append(r)\n\n    reverse = (sort == \"created_at_desc\")\n    def _sort_key(r):\n        cd = _row_dt(r)\n        # Put unparsable at end deterministically\n        return (cd is None, cd or datetime.datetime.min)\n    out.sort(key=_sort_key, reverse=reverse)\n\n    total = len(out)\n    page = out[offset: offset + limit]\n    has_more = offset + limit < total\n    next_offset = offset + limit if has_more else None\n\n    return {\n        \"requests\": page,\n        \"pagination\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"offset\": offset,\n            \"has_more\": has_more,\n            \"next_offset\": next_offset\n        }\n    }\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0335000",
+    "index": 335,
+    "name": "Giphy API Integration",
+    "description": "This backend powers an integration layer over the Giphy API, storing tenant/workspace configuration (API keys), executing GIF fetch operations (search/random/trending), and persisting responses for auditing, caching, and analytics. Primary workflows are: configure access credentials, issue a request",
+    "taxonomy": {
+      "L1_id": "L1-03",
+      "L1_name": "Social Media & Community",
+      "L1_name_zh": "社交媒体与社区",
+      "L2_id": "L2-07",
+      "L2_name": "Video & Content Platforms",
+      "L2_name_zh": "视频与内容平台",
+      "L3_name": "GIF Search & Retrieval (Giphy)",
+      "L3_name_zh": "GIF 搜索与获取（Giphy）"
+    },
+    "database_dir": "./environment_mix/0335000",
+    "mount_path": "/app/database",
+    "n_tools": 8,
+    "n_collections": 5,
+    "n_records": 75,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 8,
+      "loaded": 8,
+      "reads_returning_data": 4,
+      "read_operations": 4,
+      "mutations_persisted": 2,
+      "mutations_attempted": 4
+    },
+    "tools_loadable_from_database_dir": 8,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "search_gifs",
+      "returned_chars": 93
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

@@ -1,0 +1,253 @@
+{
+  "index": 499,
+  "local_files_dir": "./environment_mix/0499000",
+  "file_list": [
+    "./environment_mix/0499000/README.md",
+    "./environment_mix/0499000/pdf_candidates.json",
+    "./environment_mix/0499000/pdf_documents.json",
+    "./environment_mix/0499000/pdf_extractions.json",
+    "./environment_mix/0499000/pdf_load_jobs.json",
+    "./environment_mix/0499000/search_queries.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "search_queries.json": "18 rows",
+        "pdf_candidates.json": "18 rows",
+        "pdf_documents.json": "18 rows",
+        "pdf_load_jobs.json": "20 rows",
+        "pdf_extractions.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "pdf_url",
+          "description": "Searches Korean law resources for the provided query string and returns a list of discovered PDF URLs associated with a stored search request. Results may be returned incrementally as new URLs are discovered for the same query; if multiple URLs are available, the response contains the full current set for that request (no pagination parameters are supported). Raises VALIDATION_ERROR if query is missing/blank, UNAUTHORIZED/FORBIDDEN if the caller is not permitted to search, QUOTA_EXCEEDED if search limits are exceeded, and UPSTREAM_ERROR if the remote resource cannot be queried.",
+          "parameters": {
+            "properties": {
+              "query": {
+                "title": "Query",
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "title": "pdf_urlArguments",
+            "type": "object"
+          },
+          "implementation": "def pdf_url(query, **_extra):\n    import json, os, datetime, hashlib, re, time, urllib.parse\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0499000\" if __import__(\"os\").path.isdir(\"./environment_mix/0499000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # No explicit request log/usage collections exist in schema; nothing to record/enforce.\n\n    # Validate\n    if not isinstance(query, str):\n        return _err(\"VALIDATION_ERROR\", \"query must be a string\")\n    raw_query = query\n    if len(raw_query) < 1 or len(raw_query) > 512:\n        return _err(\"VALIDATION_ERROR\", \"query length must be between 1 and 512\")\n\n    def _normalize_query(s: str) -> str:\n        s = s.strip()\n        s = re.sub(r\"\\s+\", \" \", s)\n        # canonicalize common punctuation variants\n        s = s.replace(\"“\", '\"').replace(\"”\", '\"').replace(\"’\", \"'\").replace(\"‘\", \"'\")\n        s = s.replace(\"–\", \"-\").replace(\"—\", \"-\")\n        s = re.sub(r\"\\s*([,;:(){}\\[\\]])\\s*\", r\"\\1\", s)\n        return s\n\n    def _hash_text(s: str) -> str:\n        return hashlib.sha256(s.encode(\"utf-8\")).hexdigest()\n\n    def _canonicalize_url(u: str) -> str:\n        u = (u or \"\").strip()\n        try:\n            p = urllib.parse.urlsplit(u)\n        except Exception:\n            return u\n        scheme = (p.scheme or \"\").lower()\n        netloc = (p.netloc or \"\").strip()\n        path = p.path or \"\"\n        query_s = p.query or \"\"\n        frag = \"\"  # drop fragment\n        # normalize host case; keep userinfo/port if present (rare)\n        if \"@\" in netloc:\n            ui, hostport = netloc.rsplit(\"@\", 1)\n            hostport = hostport.lower()\n            netloc = ui + \"@\" + hostport\n        else:\n            netloc = netloc.lower()\n        # collapse multiple slashes\n        path = re.sub(r\"/{2,}\", \"/\", path)\n        # percent-encode minimally (avoid raising)\n        try:\n            path = urllib.parse.quote(urllib.parse.unquote(path), safe=\"/:@-._~%!$&'()*+,;=\")\n        except Exception:\n            pass\n        # sort query params for stable hashing\n        if query_s:\n            try:\n                q = urllib.parse.parse_qsl(query_s, keep_blank_values=True)\n                q.sort()\n                query_s = urllib.parse.urlencode(q, doseq=True)\n            except Exception:\n                pass\n        return urllib.parse.urlunsplit((scheme, netloc, path, query_s, frag))\n\n    search_queries = _load(\"search_queries.json\")\n    pdf_candidates = _load(\"pdf_candidates.json\")\n\n    normalized = _normalize_query(raw_query)\n    qhash = _hash_text(normalized)\n\n    # Upsert search_queries by unique(query_hash)\n    sq = None\n    for row in search_queries:\n        if isinstance(row, dict) and row.get(\"query_hash\") == qhash:\n            sq = row\n            break\n\n    if sq is None:\n        sq_id = \"sq_\" + hashlib.sha256((qhash + \"|\" + now).encode(\"utf-8\")).hexdigest()[:24]\n        sq = {\n            \"id\": sq_id,\n            \"query_text\": raw_query,\n            \"query_hash\": qhash,\n            \"normalized_query_text\": normalized,\n            \"status\": \"received\",\n            \"result_count\": 0,\n            \"error_message\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        search_queries.append(sq)\n    else:\n        # keep original query_text but refresh updated fields for observability\n        sq[\"query_text\"] = sq.get(\"query_text\") or raw_query\n        sq[\"normalized_query_text\"] = normalized\n        sq[\"updated_at\"] = now\n\n    # Transition received->searching (or remain searching) for this invocation\n    status = sq.get(\"status\")\n    if status in (\"completed\", \"failed\"):\n        # return current set (no new discovery without external search in this offline implementation)\n        sq_id = sq[\"id\"]\n        candidates = [c for c in pdf_candidates if c.get(\"search_query_id\") == sq_id]\n        candidates.sort(key=lambda x: (x.get(\"rank\") or 10**9, x.get(\"created_at\") or \"\"))\n        # Ensure ranks consecutive if present; if data is inconsistent, do not mutate silently\n        urls = [c.get(\"url\") for c in candidates if isinstance(c.get(\"url\"), str)]\n        return {\n            \"search_query\": sq,\n            \"urls\": urls,\n            \"pdf_candidates\": candidates,\n        }\n\n    transitions = {\n        \"received\": {\"searching\", \"failed\"},\n        \"searching\": {\"completed\", \"failed\"},\n        \"completed\": set(),\n        \"failed\": set(),\n    }\n    if status is None:\n        sq[\"status\"] = \"received\"\n        status = \"received\"\n    if \"searching\" not in transitions.get(status, set()) and status != \"searching\":\n        return _err(\"INVALID_TRANSITION\", f\"Cannot transition search_queries.status from {status} to searching\")\n\n    if status != \"searching\":\n        sq[\"status\"] = \"searching\"\n        sq[\"updated_at\"] = now\n\n    # Offline discovery strategy:\n    # If query itself is a URL, treat as the single candidate; otherwise, no external search.\n    discovered_urls = []\n    q_stripped = raw_query.strip()\n    if re.match(r\"^https?://\", q_stripped, re.IGNORECASE):\n        discovered_urls = [q_stripped]\n\n    # Populate candidates enforcing unique(search_query_id, url_hash) and consecutive ranks\n    sq_id = sq[\"id\"]\n    existing = [c for c in pdf_candidates if c.get(\"search_query_id\") == sq_id]\n    existing_by_hash = {}\n    max_rank = 0\n    for c in existing:\n        uh = c.get(\"url_hash\")\n        if isinstance(uh, str):\n            existing_by_hash[uh] = c\n        r = c.get(\"rank\")\n        if isinstance(r, int) and r > max_rank:\n            max_rank = r\n\n    created_any = False\n    for u in discovered_urls:\n        cu = _canonicalize_url(u)\n        uh = _hash_text(cu)\n        if uh in existing_by_hash:\n            # idempotent: refresh url field/canonical changes not stored; just touch updated_at\n            existing_by_hash[uh][\"updated_at\"] = now\n            continue\n        max_rank += 1\n        cand_id = \"pc_\" + hashlib.sha256((sq_id + \"|\" + uh + \"|\" + str(max_rank)).encode(\"utf-8\")).hexdigest()[:24]\n        try:\n            host = urllib.parse.urlsplit(cu).netloc or None\n        except Exception:\n            host = None\n        pdf_candidates.append({\n            \"id\": cand_id,\n            \"search_query_id\": sq_id,\n            \"url\": cu,\n            \"url_hash\": uh,\n            \"source_host\": host,\n            \"title\": None,\n            \"rank\": max_rank,\n            \"status\": \"discovered\",\n            \"http_status_last\": None,\n            \"content_type_last\": None,\n            \"content_length_last_bytes\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        })\n        created_any = True\n\n    # Ensure ranks are consecutive starting at 1 for this query (only validate among current records)\n    candidates_now = [c for c in pdf_candidates if c.get(\"search_query_id\") == sq_id]\n    ranks = sorted([c.get(\"rank\") for c in candidates_now if isinstance(c.get(\"rank\"), int)])\n    if ranks:\n        expected = list(range(1, len(ranks) + 1))\n        if ranks != expected:\n            # Refuse to claim completed if invariant broken; do not \"fix\" silently.\n            sq[\"status\"] = \"failed\" if \"failed\" in transitions.get(\"searching\", set()) else sq.get(\"status\")\n            sq[\"error_message\"] = \"Candidate ranks are not consecutive starting at 1\"\n            sq[\"updated_at\"] = now\n            _save(\"search_queries.json\", search_queries)\n            _save(\"pdf_candidates.json\", pdf_candidates)\n            return _err(\"CONFLICT\", \"Candidate ranks invariant violated for search_query\", search_query_id=sq_id)\n\n    # Complete lifecycle searching->completed (or failed)\n    if \"completed\" not in transitions.get(\"searching\", set()):\n        return _err(\"INVALID_TRANSITION\", \"Cannot transition search_queries.status to completed\")\n\n    sq[\"result_count\"] = len(candidates_now)\n    sq[\"error_message\"] = None\n\n    sq[\"status\"] = \"completed\"\n    sq[\"updated_at\"] = now\n\n    _save(\"search_queries.json\", search_queries)\n    if created_any:\n        _save(\"pdf_candidates.json\", pdf_candidates)\n    else:\n        # still save candidates if we touched updated_at on existing ones\n        _save(\"pdf_candidates.json\", pdf_candidates)\n\n    candidates_now.sort(key=lambda x: (x.get(\"rank\") or 10**9, x.get(\"created_at\") or \"\"))\n    urls = [c.get(\"url\") for c in candidates_now if isinstance(c.get(\"url\"), str)]\n\n    _ = time.time() - t0\n    return {\n        \"search_query\": sq,\n        \"urls\": urls,\n        \"pdf_candidates\": candidates_now,\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "load_pdf",
+          "description": "Creates or reuses a PDF fetch/parse job for the provided query (a PDF URL or a known PDF identifier) and returns the job record and, when available, the extracted text content. If processing is not yet complete, the response indicates the current job state and can be called again to retrieve the completed content (no pagination parameters are supported). Raises VALIDATION_ERROR if query is missing/blank or not a supported PDF reference, NOT_FOUND if the referenced PDF URL was not previously discovered/registered, CONFLICT if the PDF is in a state that cannot transition to processing (e.g., already processing or permanently failed), UNAUTHORIZED/FORBIDDEN if the caller is not permitted to load/process PDFs, and QUOTA_EXCEEDED if processing limits are exceeded.",
+          "parameters": {
+            "properties": {
+              "query": {
+                "title": "Query",
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "title": "load_pdfArguments",
+            "type": "object"
+          },
+          "implementation": "def load_pdf(query, **_extra):\n    import json, os, datetime, hashlib, re, time, urllib.parse\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0499000\" if __import__(\"os\").path.isdir(\"./environment_mix/0499000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    if not isinstance(query, str):\n        return _err(\"VALIDATION_ERROR\", \"query must be a string\")\n    if len(query) < 1 or len(query) > 2048:\n        return _err(\"VALIDATION_ERROR\", \"query length must be between 1 and 2048\")\n\n    def _hash_text(s: str) -> str:\n        return hashlib.sha256(s.encode(\"utf-8\")).hexdigest()\n\n    def _canonicalize_url(u: str) -> str:\n        u = (u or \"\").strip()\n        try:\n            p = urllib.parse.urlsplit(u)\n        except Exception:\n            return u\n        scheme = (p.scheme or \"\").lower()\n        netloc = (p.netloc or \"\").strip()\n        path = p.path or \"\"\n        query_s = p.query or \"\"\n        frag = \"\"\n        if \"@\" in netloc:\n            ui, hostport = netloc.rsplit(\"@\", 1)\n            hostport = hostport.lower()\n            netloc = ui + \"@\" + hostport\n        else:\n            netloc = netloc.lower()\n        path = re.sub(r\"/{2,}\", \"/\", path)\n        try:\n            path = urllib.parse.quote(urllib.parse.unquote(path), safe=\"/:@-._~%!$&'()*+,;=\")\n        except Exception:\n            pass\n        if query_s:\n            try:\n                q = urllib.parse.parse_qsl(query_s, keep_blank_values=True)\n                q.sort()\n                query_s = urllib.parse.urlencode(q, doseq=True)\n            except Exception:\n                pass\n        return urllib.parse.urlunsplit((scheme, netloc, path, query_s, frag))\n\n    search_queries = _load(\"search_queries.json\")\n    pdf_candidates = _load(\"pdf_candidates.json\")\n    pdf_documents = _load(\"pdf_documents.json\")\n    pdf_load_jobs = _load(\"pdf_load_jobs.json\")\n    pdf_extractions = _load(\"pdf_extractions.json\")\n\n    # Create load job (must exist even if resolution fails)\n    job_id = \"lj_\" + hashlib.sha256((query + \"|\" + now).encode(\"utf-8\")).hexdigest()[:24]\n    job = {\n        \"id\": job_id,\n        \"input_query_text\": query,\n        \"search_query_id\": None,\n        \"pdf_candidate_id\": None,\n        \"pdf_document_id\": None,\n        \"resolved_url\": None,\n        \"status\": \"queued\",\n        \"failure_stage\": None,\n        \"error_message\": None,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    pdf_load_jobs.append(job)\n\n    def _set_job_failed(stage: str, msg: str):\n        # queued->failed is allowed; fetching/parsing too, but we only transition forward here.\n        job[\"status\"] = \"failed\"\n        job[\"failure_stage\"] = stage\n        job[\"error_message\"] = msg\n        job[\"finished_at\"] = now\n        job[\"updated_at\"] = now\n\n    # Resolve to URL\n    resolved_url = None\n    candidate_row = None\n\n    q_strip = query.strip()\n    if re.match(r\"^https?://\", q_strip, re.IGNORECASE):\n        resolved_url = _canonicalize_url(q_strip)\n        # Link to candidate if exists (exact or canonical match)\n        canon = resolved_url\n        canon_hash = _hash_text(canon)\n        for c in pdf_candidates:\n            u = c.get(\"url\")\n            if not isinstance(u, str):\n                continue\n            cu = _canonicalize_url(u)\n            if u == q_strip or cu == canon or _hash_text(cu) == canon_hash:\n                candidate_row = c\n                break\n    else:\n        # Not a URL: try to match by exact candidate url equal to query\n        for c in pdf_candidates:\n            u = c.get(\"url\")\n            if isinstance(u, str) and u == q_strip:\n                candidate_row = c\n                resolved_url = _canonicalize_url(u)\n                break\n\n    if candidate_row is not None:\n        job[\"pdf_candidate_id\"] = candidate_row.get(\"id\")\n        job[\"search_query_id\"] = candidate_row.get(\"search_query_id\")\n\n    if resolved_url is None:\n        _set_job_failed(\"resolve\", \"Could not resolve query to a PDF URL\")\n        _save(\"pdf_load_jobs.json\", pdf_load_jobs)\n        return {\n            \"job\": job,\n            \"pdf_document\": None,\n            \"extraction\": None,\n            \"text\": None,\n        }\n\n    job[\"resolved_url\"] = resolved_url\n\n    # Upsert pdf_documents by canonical_url_hash\n    curl = resolved_url\n    curl_hash = _hash_text(curl)\n    doc = None\n    for d in pdf_documents:\n        if isinstance(d, dict) and d.get(\"canonical_url_hash\") == curl_hash:\n            doc = d\n            break\n    if doc is None:\n        doc_id = \"pd_\" + hashlib.sha256((curl_hash + \"|\" + now).encode(\"utf-8\")).hexdigest()[:24]\n        doc = {\n            \"id\": doc_id,\n            \"canonical_url\": curl,\n            \"canonical_url_hash\": curl_hash,\n            \"status\": \"new\",\n            \"etag\": None,\n            \"last_modified\": None,\n            \"sha256_bytes\": None,\n            \"byte_size\": None,\n            \"stored_object_key\": None,\n            \"last_fetch_at\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        pdf_documents.append(doc)\n    else:\n        doc[\"updated_at\"] = now\n\n    job[\"pdf_document_id\"] = doc.get(\"id\")\n\n    # Simulated processing pipeline (offline):\n    # If document already available and extraction ready exists, immediately complete.\n    # Otherwise, move to failed at fetch stage (since we cannot actually fetch offline).\n    def _find_extraction_for_doc(doc_id: str):\n        for e in pdf_extractions:\n            if isinstance(e, dict) and e.get(\"pdf_document_id\") == doc_id:\n                return e\n        return None\n\n    extraction = _find_extraction_for_doc(doc[\"id\"])\n\n    # If there is an existing ready extraction, we can complete the job (parsing implied already done)\n    if extraction is not None and extraction.get(\"status\") == \"ready\":\n        # queued -> fetching -> parsing -> completed (must respect transitions)\n        job[\"status\"] = \"fetching\"\n        job[\"started_at\"] = job[\"started_at\"] or now\n        job[\"updated_at\"] = now\n\n        job[\"status\"] = \"parsing\"\n        job[\"updated_at\"] = now\n\n        job[\"status\"] = \"completed\"\n        job[\"finished_at\"] = now\n        job[\"updated_at\"] = now\n\n        _save(\"pdf_documents.json\", pdf_documents)\n        _save(\"pdf_load_jobs.json\", pdf_load_jobs)\n        _save(\"pdf_extractions.json\", pdf_extractions)\n\n        text = extraction.get(\"text_content\")\n        return {\n            \"job\": job,\n            \"pdf_document\": doc,\n            \"extraction\": extraction,\n            \"text\": text,\n        }\n\n    # Otherwise, we cannot fetch/parse offline. Mark failed at fetch stage.\n    # Also, reflect candidate status transition if linked and appropriate.\n    if candidate_row is not None:\n        # candidate: discovered->fetch_scheduled is allowed; fetch_failed->fetch_scheduled also allowed\n        cstatus = candidate_row.get(\"status\")\n        cand_transitions = {\n            \"discovered\": {\"filtered\", \"fetch_scheduled\"},\n            \"filtered\": set(),\n            \"fetch_scheduled\": {\"fetched\", \"fetch_failed\"},\n            \"fetched\": set(),\n            \"fetch_failed\": {\"fetch_scheduled\"},\n        }\n        if cstatus in cand_transitions and \"fetch_scheduled\" in cand_transitions[cstatus]:\n            candidate_row[\"status\"] = \"fetch_scheduled\"\n            candidate_row[\"updated_at\"] = now\n\n    # Move job queued->fetching then fail fetch\n    job[\"status\"] = \"fetching\"\n    job[\"started_at\"] = job[\"started_at\"] or now\n    job[\"updated_at\"] = now\n\n    _set_job_failed(\"fetch\", \"Offline mode: fetching not available; cannot download PDF bytes\")\n\n    # Ensure failure_stage populated when failed (business rule already met)\n    _save(\"pdf_candidates.json\", pdf_candidates)\n    _save(\"pdf_documents.json\", pdf_documents)\n    _save(\"pdf_load_jobs.json\", pdf_load_jobs)\n\n    _ = time.time() - t0\n    return {\n        \"job\": job,\n        \"pdf_document\": doc,\n        \"extraction\": extraction,\n        \"text\": extraction.get(\"text_content\") if extraction and extraction.get(\"status\") == \"ready\" else None,\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_search_queries",
+          "description": "Lists stored search request records, optionally filtered by status or query_hash, returning the most recent first. Refuses invalid filters and enforces pagination limits.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "received",
+                  "searching",
+                  "completed",
+                  "failed"
+                ],
+                "description": "Filter by search query lifecycle status."
+              },
+              "query_hash": {
+                "type": "string",
+                "description": "Filter by exact query_hash."
+              },
+              "created_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return records created at or after this time (ISO 8601)."
+              },
+              "created_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return records created before this time (ISO 8601)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of records to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_search_queries(status=None, query_hash=None, created_after=None, created_before=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0499000\" if __import__(\"os\").path.isdir(\"./environment_mix/0499000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    # Validate filters\n    allowed_status = {\"received\", \"searching\", \"completed\", \"failed\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            return _err(\"VALIDATION_ERROR\", \"status must be one of received, searching, completed, failed\")\n    if query_hash is not None and not isinstance(query_hash, str):\n        return _err(\"VALIDATION_ERROR\", \"query_hash must be a string\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            raise ValueError(\"datetime must be a string\")\n        ss = s.strip()\n        if ss.endswith(\"Z\"):\n            ss = ss[:-1] + \"+00:00\"\n        return datetime.datetime.fromisoformat(ss)\n\n    try:\n        dt_after = _parse_dt(created_after)\n    except Exception:\n        return _err(\"VALIDATION_ERROR\", \"created_after must be ISO 8601 date-time\")\n    try:\n        dt_before = _parse_dt(created_before)\n    except Exception:\n        return _err(\"VALIDATION_ERROR\", \"created_before must be ISO 8601 date-time\")\n\n    # Decode cursor\n    start_idx = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            payload = json.loads(raw.decode(\"utf-8\"))\n            if not isinstance(payload, dict) or payload.get(\"v\") != 1 or not isinstance(payload.get(\"offset\"), int):\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n            start_idx = payload[\"offset\"]\n            if start_idx < 0:\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n\n    rows = _load(\"search_queries.json\")\n    if not isinstance(rows, list):\n        rows = []\n\n    def _row_dt(row, key):\n        v = row.get(key)\n        if not isinstance(v, str):\n            return None\n        try:\n            return _parse_dt(v)\n        except Exception:\n            return None\n\n    # Filter\n    out = []\n    for r in rows:\n        if not isinstance(r, dict):\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        if query_hash is not None and r.get(\"query_hash\") != query_hash:\n            continue\n        cdt = _row_dt(r, \"created_at\")\n        if dt_after is not None and cdt is not None and cdt < dt_after:\n            continue\n        if dt_before is not None and cdt is not None and cdt >= dt_before:\n            continue\n        if dt_after is not None and cdt is None:\n            continue\n        if dt_before is not None and cdt is None:\n            continue\n        out.append(r)\n\n    # Sort most recent first by created_at then id\n    def _sort_key(r):\n        c = r.get(\"created_at\")\n        return (c if isinstance(c, str) else \"\", r.get(\"id\") if isinstance(r.get(\"id\"), str) else \"\")\n    out.sort(key=_sort_key, reverse=True)\n\n    total = len(out)\n    if start_idx > total:\n        start_idx = total\n    page = out[start_idx:start_idx + limit]\n\n    next_cursor = None\n    has_more = start_idx + limit < total\n    if has_more:\n        payload = json.dumps({\"v\": 1, \"offset\": start_idx + limit}, ensure_ascii=False).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(payload).decode(\"utf-8\").rstrip(\"=\")\n\n    _ = time.time() - t0\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n        }\n    }\n"
+        },
+        {
+          "name": "get_search_query",
+          "description": "Fetches a single stored search request by id. Refuses unknown ids.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Primary key of the search_queries record."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_search_query(id, **_extra):\n    import json, os, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0499000\" if __import__(\"os\").path.isdir(\"./environment_mix/0499000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    if not isinstance(id, str) or not id.strip():\n        return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\")\n\n    rows = _load(\"search_queries.json\")\n    if not isinstance(rows, list):\n        rows = []\n\n    row = None\n    for r in rows:\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            row = r\n            break\n    if row is None:\n        return _err(\"NOT_FOUND\", \"search_query not found\", id=id)\n\n    _ = time.time() - t0\n    return {\"search_query\": row}\n"
+        },
+        {
+          "name": "list_pdf_candidates",
+          "description": "Lists discovered PDF URL candidates for a search query, optionally filtered by status. Refuses invalid search_query_id and enforces pagination limits.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "search_query_id": {
+                "type": "string",
+                "description": "Parent search_queries id to list candidates for."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "discovered",
+                  "filtered",
+                  "fetch_scheduled",
+                  "fetched",
+                  "fetch_failed"
+                ],
+                "description": "Filter by candidate lifecycle status."
+              },
+              "source_host": {
+                "type": "string",
+                "description": "Filter by exact source host (e.g., domain)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500,
+                "default": 100,
+                "description": "Maximum number of records to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              }
+            },
+            "required": [
+              "search_query_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_pdf_candidates(search_query_id, status=None, source_host=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0499000\" if __import__(\"os\").path.isdir(\"./environment_mix/0499000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    endpoint = \"list_pdf_candidates\"\n\n    # Simple service dynamics: per-call request logging + basic rate limit.\n    # Since schema did not declare an audit collection, we maintain a vendor-internal log file.\n    _REQ_FILE = \"_request_log.json\"\n    def _log(status_code, ok, message=None):\n        latency_ms = int((time.time() - _t0) * 1000)\n        ts = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n        logs = _load(_REQ_FILE)\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": f\"req_{len(logs)+1}\",\n            \"endpoint\": endpoint,\n            \"status\": \"ok\" if ok else \"error\",\n            \"status_code\": status_code,\n            \"message\": message,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": ts\n        })\n        _save(_REQ_FILE, logs)\n\n    def _rate_limit_check():\n        logs = _load(_REQ_FILE)\n        if not isinstance(logs, list):\n            return None\n        now = datetime.datetime.utcnow()\n        window_s = 60\n        max_per_window = 120  # conservative local limit\n        cnt = 0\n        for r in reversed(logs[-2000:]):\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                continue\n            if (now - dt).total_seconds() <= window_s:\n                cnt += 1\n        if cnt >= max_per_window:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded. Please retry later.\", window_seconds=window_s, limit=max_per_window)\n        return None\n\n    rl = _rate_limit_check()\n    if rl is not None:\n        _log(429, False, rl[\"error\"][\"message\"])\n        return rl\n\n    # Validate inputs\n    if not isinstance(search_query_id, str) or not search_query_id:\n        e = _err(\"VALIDATION_ERROR\", \"search_query_id must be a non-empty string.\", field=\"search_query_id\")\n        _log(400, False, e[\"error\"][\"message\"])\n        return e\n\n    allowed_status = {\"discovered\", \"filtered\", \"fetch_scheduled\", \"fetched\", \"fetch_failed\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            e = _err(\"VALIDATION_ERROR\", \"Invalid status.\", field=\"status\", allowed=sorted(list(allowed_status)))\n            _log(400, False, e[\"error\"][\"message\"])\n            return e\n\n    if source_host is not None and (not isinstance(source_host, str) or source_host == \"\"):\n        e = _err(\"VALIDATION_ERROR\", \"source_host must be a non-empty string when provided.\", field=\"source_host\")\n        _log(400, False, e[\"error\"][\"message\"])\n        return e\n\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int):\n        e = _err(\"VALIDATION_ERROR\", \"limit must be an integer.\", field=\"limit\")\n        _log(400, False, e[\"error\"][\"message\"])\n        return e\n    if limit < 1 or limit > 500:\n        e = _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 500.\", field=\"limit\")\n        _log(400, False, e[\"error\"][\"message\"])\n        return e\n\n    # Cursor: opaque base10 integer offset encoded as string: \"o:<offset>\"\n    offset = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or not cursor.startswith(\"o:\"):\n            e = _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n            _log(400, False, e[\"error\"][\"message\"])\n            return e\n        try:\n            offset = int(cursor.split(\":\", 1)[1])\n        except Exception:\n            e = _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n            _log(400, False, e[\"error\"][\"message\"])\n            return e\n        if offset < 0:\n            e = _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n            _log(400, False, e[\"error\"][\"message\"])\n            return e\n\n    # Validate search_query exists\n    sqs = _load(\"search_queries.json\")\n    if not isinstance(sqs, list):\n        sqs = []\n    if not any(isinstance(r, dict) and r.get(\"id\") == search_query_id for r in sqs):\n        e = _err(\"NOT_FOUND\", \"search_query_id not found.\", search_query_id=search_query_id)\n        _log(404, False, e[\"error\"][\"message\"])\n        return e\n\n    cands = _load(\"pdf_candidates.json\")\n    if not isinstance(cands, list):\n        cands = []\n\n    rows = []\n    for r in cands:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"search_query_id\") != search_query_id:\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        if source_host is not None and r.get(\"source_host\") != source_host:\n            continue\n        rows.append(r)\n\n    # Sort by rank ascending, then id for stability\n    def _rank_key(x):\n        rk = x.get(\"rank\")\n        try:\n            rk = int(rk)\n        except Exception:\n            rk = 10**12\n        return (rk, str(x.get(\"id\", \"\")))\n    rows.sort(key=_rank_key)\n\n    total = len(rows)\n    page = rows[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = f\"o:{next_offset}\" if has_more else None\n\n    resp = {\n        \"object\": \"list\",\n        \"data\": page,\n        \"search_query_id\": search_query_id,\n        \"total\": total,\n        \"limit\": limit,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor\n    }\n    _log(200, True)\n    return resp\n"
+        },
+        {
+          "name": "get_pdf_document",
+          "description": "Fetches a single PDF document record by id, including its current fetch availability state. Refuses unknown ids.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Primary key of the pdf_documents record."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_pdf_document(id, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0499000\" if __import__(\"os\").path.isdir(\"./environment_mix/0499000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    endpoint = \"get_pdf_document\"\n    _REQ_FILE = \"_request_log.json\"\n\n    def _utcnow_z():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_ts(ts):\n        if not isinstance(ts, str):\n            return None\n        try:\n            return datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n        except Exception:\n            return None\n\n    def _log(status_code, ok, message=None, credential_id=None):\n        latency_ms = int((time.time() - _t0) * 1000)\n        logs = _load(_REQ_FILE)\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(\n            {\n                \"id\": f\"req_{len(logs) + 1}\",\n                \"endpoint\": endpoint,\n                \"status\": \"ok\" if ok else \"error\",\n                \"status_code\": int(status_code),\n                \"message\": message,\n                \"latency_ms\": latency_ms,\n                \"timestamp\": _utcnow_z(),\n                \"credential_id\": credential_id,\n            }\n        )\n        _save(_REQ_FILE, logs)\n\n    def _rate_limit_check():\n        logs = _load(_REQ_FILE)\n        if not isinstance(logs, list):\n            return None\n        now = datetime.datetime.utcnow()\n        window_s = 60\n        max_per_window = 240\n        cnt = 0\n        for r in reversed(logs[-5000:]):\n            dt = _parse_ts(r.get(\"timestamp\"))\n            if dt is None:\n                continue\n            if (now - dt).total_seconds() <= window_s:\n                cnt += 1\n                if cnt > max_per_window:\n                    return _err(\n                        \"RATE_LIMIT\",\n                        \"Rate limit exceeded. Please retry later.\",\n                        window_seconds=window_s,\n                        limit=max_per_window,\n                    )\n            else:\n                break\n        return None\n\n    # Validate inputs\n    if not isinstance(id, str) or not id.strip():\n        rl = _rate_limit_check()\n        if rl is not None:\n            _log(429, False, rl[\"error\"][\"message\"])\n            return rl\n        err = _err(\"VALIDATION_ERROR\", \"id must be a non-empty string.\", id=id)\n        _log(400, False, err[\"error\"][\"message\"])\n        return err\n\n    rl = _rate_limit_check()\n    if rl is not None:\n        _log(429, False, rl[\"error\"][\"message\"])\n        return rl\n\n    # Load documents; accept either a list-of-rows file or {\"rows\": [...]} shape.\n    docs_raw = _load(\"pdf_documents.json\")\n    if isinstance(docs_raw, dict) and isinstance(docs_raw.get(\"rows\"), list):\n        docs = docs_raw.get(\"rows\")\n    elif isinstance(docs_raw, list):\n        docs = docs_raw\n    else:\n        docs = []\n\n    row = None\n    for r in docs:\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            row = r\n            break\n\n    if row is None:\n        err = _err(\"NOT_FOUND\", \"pdf_document not found.\", id=id)\n        _log(404, False, err[\"error\"][\"message\"])\n        return err\n\n    resp = {\"pdf_document\": row}\n    _log(200, True)\n    return resp\n"
+        },
+        {
+          "name": "get_pdf_load_job",
+          "description": "Fetches a single PDF load job by id. Returns current status and any linked document/extraction identifiers; refuses unknown ids.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Primary key of the pdf_load_jobs record."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_pdf_load_job(id, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0499000\" if __import__(\"os\").path.isdir(\"./environment_mix/0499000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    endpoint = \"get_pdf_load_job\"\n    _REQ_FILE = \"_request_log.json\"\n\n    def _utcnow_z():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_ts(ts):\n        if not isinstance(ts, str):\n            return None\n        try:\n            return datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n        except Exception:\n            return None\n\n    def _log(status_code, ok, message=None, credential_id=None):\n        latency_ms = int((time.time() - _t0) * 1000)\n        logs = _load(_REQ_FILE)\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(\n            {\n                \"id\": f\"req_{len(logs) + 1}\",\n                \"endpoint\": endpoint,\n                \"status\": \"ok\" if ok else \"error\",\n                \"status_code\": int(status_code),\n                \"message\": message,\n                \"latency_ms\": latency_ms,\n                \"timestamp\": _utcnow_z(),\n                \"credential_id\": credential_id,\n            }\n        )\n        _save(_REQ_FILE, logs)\n\n    def _rate_limit_check():\n        logs = _load(_REQ_FILE)\n        if not isinstance(logs, list):\n            return None\n        now = datetime.datetime.utcnow()\n        window_s = 60\n        max_per_window = 240\n        cnt = 0\n        for r in reversed(logs[-5000:]):\n            dt = _parse_ts(r.get(\"timestamp\"))\n            if dt is None:\n                continue\n            if (now - dt).total_seconds() <= window_s:\n                cnt += 1\n                if cnt > max_per_window:\n                    return _err(\n                        \"RATE_LIMIT\",\n                        \"Rate limit exceeded. Please retry later.\",\n                        window_seconds=window_s,\n                        limit=max_per_window,\n                    )\n            else:\n                break\n        return None\n\n    # Validate inputs\n    if not isinstance(id, str) or not id.strip():\n        rl = _rate_limit_check()\n        if rl is not None:\n            _log(429, False, rl[\"error\"][\"message\"])\n            return rl\n        err = _err(\"VALIDATION_ERROR\", \"id must be a non-empty string.\", id=id)\n        _log(400, False, err[\"error\"][\"message\"])\n        return err\n\n    rl = _rate_limit_check()\n    if rl is not None:\n        _log(429, False, rl[\"error\"][\"message\"])\n        return rl\n\n    jobs_raw = _load(\"pdf_load_jobs.json\")\n    if isinstance(jobs_raw, dict) and isinstance(jobs_raw.get(\"rows\"), list):\n        jobs = jobs_raw.get(\"rows\")\n    elif isinstance(jobs_raw, list):\n        jobs = jobs_raw\n    else:\n        jobs = []\n\n    job = None\n    for r in jobs:\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            job = r\n            break\n\n    if job is None:\n        err = _err(\"NOT_FOUND\", \"pdf_load_job not found.\", id=id)\n        _log(404, False, err[\"error\"][\"message\"])\n        return err\n\n    resp = {\"pdf_load_job\": job}\n    _log(200, True)\n    return resp\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0499000",
+    "index": 499,
+    "name": "Law Tool KOR",
+    "description": "This backend supports searching Korean law resources for PDF documents and loading/processing those PDFs. It stores search requests, discovered PDF URLs, PDF fetch/parse jobs, and the extracted text content for downstream use. Repository: https://github.com/drepion43/law_tool_KOR Homepage: https://s",
+    "taxonomy": {
+      "L1_id": "L1-01",
+      "L1_name": "Search & Information Retrieval",
+      "L1_name_zh": "搜索与信息获取",
+      "L2_id": "L2-02",
+      "L2_name": "Web Content Extraction",
+      "L2_name_zh": "网页内容抓取",
+      "L3_name": "Legal/PDF Resource Retrieval & Parsing",
+      "L3_name_zh": "法律/PDF资源检索与解析"
+    },
+    "database_dir": "./environment_mix/0499000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 5,
+    "n_records": 92,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 3,
+      "read_operations": 5,
+      "mutations_persisted": 2,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_search_queries",
+      "returned_chars": 87
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

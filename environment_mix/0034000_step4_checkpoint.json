@@ -1,0 +1,158 @@
+{
+  "index": 34,
+  "local_files_dir": "./environment_mix/0034000",
+  "file_list": [
+    "./environment_mix/0034000/README.md",
+    "./environment_mix/0034000/integrations.json",
+    "./environment_mix/0034000/notifications.json",
+    "./environment_mix/0034000/teams.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "integrations.json": "Array of integrations (integration_id, name, type, enabled, webhook).",
+        "notifications.json": "Array of notifications (notification_id, integration_id, channel, level).",
+        "teams.json": "Array of teams (team_id, name, members).",
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "config_list_integrations",
+          "description": "Lists configured integrations and returns the matching integration records, optionally filtered by integration type and/or enabled state. Requests are refused when the provided type is not a supported integration type or when enabled is not a boolean value. If filters are provided, only integrations that satisfy all filters are returned.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "description": "Optional integration type filter."
+              },
+              "enabled": {
+                "type": "boolean",
+                "description": "Optional enabled filter."
+              }
+            }
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0034000\" if __import__(\"os\").path.isdir(\"./environment_mix/0034000\") else \"/app/database\")\ndef config_list_integrations(type=None, enabled=None):\n    import json\n    with open(__import__(\"os\").path.join(_DB, 'integrations.json')) as f:\n        items = json.load(f)\n    if type:\n        items = [i for i in items if i.get('type') == type]\n    if enabled is not None:\n        items = [i for i in items if i.get('enabled') == enabled]\n    return items",
+          "description_restored": true
+        },
+        {
+          "name": "config_get_integration",
+          "description": "Retrieves and returns the integration record for the given integration_id. The request is refused when integration_id is missing or empty. If no integration exists with that id, the response indicates it was not found rather than returning an integration.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "integration_id": {
+                "type": "string",
+                "description": "Integration id."
+              }
+            },
+            "required": [
+              "integration_id"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0034000\" if __import__(\"os\").path.isdir(\"./environment_mix/0034000\") else \"/app/database\")\ndef config_get_integration(integration_id):\n    import json\n    with open(__import__(\"os\").path.join(_DB, 'integrations.json')) as f:\n        items = json.load(f)\n    for i in items:\n        if i.get('integration_id') == integration_id:\n            return i\n    return {'found': False, 'integration_id': integration_id}",
+          "description_restored": true
+        },
+        {
+          "name": "config_update_integration",
+          "description": "Updates an existing integration’s configuration by changing its enabled flag and/or webhook URL, and returns the updated integration record. The request is refused when integration_id is missing, when no updatable fields are provided, when the integration does not exist, or when the webhook value is not a valid URL string. Updates are also refused if the integration is in a state that does not allow modification.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "integration_id": {
+                "type": "string",
+                "description": "Integration id."
+              },
+              "enabled": {
+                "type": "boolean",
+                "description": "New enabled flag (optional)."
+              },
+              "webhook": {
+                "type": "string",
+                "description": "New webhook URL (optional)."
+              }
+            },
+            "required": [
+              "integration_id"
+            ]
+          },
+          "implementation": "def config_update_integration(integration_id, enabled=None, webhook=None, **_extra):\n    import json, os, datetime, time, re, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0034000\" if __import__(\"os\").path.isdir(\"./environment_mix/0034000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = time.time()\n    audit_file = \"audit_log.json\"\n\n    def _append_audit(endpoint, status, credential_used=None, details=None):\n        now = datetime.datetime.utcnow().isoformat() + \"Z\"\n        row = {\n            \"id\": \"audit_\" + uuid.uuid4().hex,\n            \"ts\": now,\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"latency_ms\": int(max(0, (time.time() - start) * 1000)),\n            \"credential_used\": credential_used,\n        }\n        if details is not None:\n            row[\"details\"] = details\n        logs = _load(audit_file)\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(row)\n        _save(audit_file, logs)\n\n    def _rate_limit_check():\n        # Lightweight per-endpoint rate limiter based on audit_log.json (if present).\n        # 120 requests per rolling 60s per endpoint.\n        logs = _load(audit_file)\n        if not isinstance(logs, list):\n            return None\n        now = datetime.datetime.utcnow()\n        window_s = 60\n        limit = 120\n        count = 0\n        for r in reversed(logs[-2000:]):\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"endpoint\") != \"config_update_integration\":\n                continue\n            ts = r.get(\"ts\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                t = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                continue\n            if (now - t).total_seconds() <= window_s:\n                count += 1\n                if count >= limit:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n            else:\n                break\n        return None\n\n    rl = _rate_limit_check()\n    if rl is not None:\n        _append_audit(\"config_update_integration\", \"error\", details=rl)\n        return rl\n\n    # Validate inputs\n    if not isinstance(integration_id, str) or not integration_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"integration_id is required and must be a non-empty string\")\n        _append_audit(\"config_update_integration\", \"error\", details=e)\n        return e\n\n    if enabled is None and webhook is None:\n        e = _err(\"VALIDATION_ERROR\", \"At least one updatable field (enabled, webhook) must be provided\")\n        _append_audit(\"config_update_integration\", \"error\", details=e)\n        return e\n\n    if enabled is not None and not isinstance(enabled, bool):\n        e = _err(\"VALIDATION_ERROR\", \"enabled must be a boolean\")\n        _append_audit(\"config_update_integration\", \"error\", details=e)\n        return e\n\n    if webhook is not None:\n        if not isinstance(webhook, str) or not webhook.strip():\n            e = _err(\"VALIDATION_ERROR\", \"webhook must be a non-empty string URL\")\n            _append_audit(\"config_update_integration\", \"error\", details=e)\n            return e\n        # Simple URL validation: http(s) scheme + host\n        w = webhook.strip()\n        if not re.match(r\"^https?://[A-Za-z0-9.-]+(?::\\d+)?(?:/.*)?$\", w):\n            e = _err(\"VALIDATION_ERROR\", \"webhook must be a valid http(s) URL\")\n            _append_audit(\"config_update_integration\", \"error\", details=e)\n            return e\n\n    integrations = _load(\"integrations.json\")\n    if not isinstance(integrations, list):\n        integrations = []\n\n    idx = None\n    for i, row in enumerate(integrations):\n        if isinstance(row, dict) and row.get(\"integration_id\") == integration_id:\n            idx = i\n            break\n\n    if idx is None:\n        e = _err(\"NOT_FOUND\", \"Integration not found\", integration_id=integration_id)\n        _append_audit(\"config_update_integration\", \"error\", details=e)\n        return e\n\n    before = integrations[idx]\n    if not isinstance(before, dict):\n        e = _err(\"CONFLICT\", \"Integration record is corrupted\", integration_id=integration_id)\n        _append_audit(\"config_update_integration\", \"error\", details=e)\n        return e\n\n    updated = dict(before)\n    changed = False\n\n    if enabled is not None and updated.get(\"enabled\") is not enabled:\n        updated[\"enabled\"] = enabled\n        changed = True\n\n    if webhook is not None and updated.get(\"webhook\") != webhook.strip():\n        updated[\"webhook\"] = webhook.strip()\n        changed = True\n\n    if not changed:\n        # Idempotent: return current record; still record traffic.\n        resp = {\"integration\": before, \"updated\": False}\n        _append_audit(\"config_update_integration\", \"ok\", details={\"updated\": False, \"integration_id\": integration_id})\n        return resp\n\n    # Add audit timestamps to the record (non-schema fields are allowed in this datastore model)\n    now = datetime.datetime.utcnow().isoformat() + \"Z\"\n    if \"created_at\" not in updated:\n        updated[\"created_at\"] = before.get(\"created_at\", now)\n    updated[\"updated_at\"] = now\n\n    integrations[idx] = updated\n    try:\n        _save(\"integrations.json\", integrations)\n    except Exception as ex:\n        e = _err(\"CONFLICT\", \"Failed to persist integration update\", reason=str(ex))\n        _append_audit(\"config_update_integration\", \"error\", details=e)\n        return e\n\n    resp = {\"integration\": updated, \"updated\": True}\n    _append_audit(\"config_update_integration\", \"ok\", details={\"updated\": True, \"integration_id\": integration_id})\n    return resp\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "config_send_notification",
+          "description": "Routes and sends a notification using the specified integration and returns a delivery attempt result for that notification. The request is refused when integration_id or message is missing/empty, when level is provided but is not one of the supported values, when the integration does not exist, or when the integration is disabled. Requests are also refused when the integration lacks the required routing configuration (for example, no webhook is set) to deliver the notification.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "integration_id": {
+                "type": "string",
+                "description": "Integration id."
+              },
+              "message": {
+                "type": "string",
+                "description": "Notification message."
+              },
+              "level": {
+                "type": "string",
+                "enum": [
+                  "info",
+                  "warning",
+                  "critical"
+                ],
+                "description": "Severity level."
+              }
+            },
+            "required": [
+              "integration_id",
+              "message"
+            ]
+          },
+          "implementation": "def config_send_notification(integration_id, message, level='info', **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0034000\" if __import__(\"os\").path.isdir(\"./environment_mix/0034000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = time.time()\n    audit_file = \"audit_log.json\"\n\n    def _append_audit(endpoint, status, credential_used=None, details=None):\n        now = datetime.datetime.utcnow().isoformat() + \"Z\"\n        row = {\n            \"id\": \"audit_\" + uuid.uuid4().hex,\n            \"ts\": now,\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"latency_ms\": int(max(0, (time.time() - start) * 1000)),\n            \"credential_used\": credential_used,\n        }\n        if details is not None:\n            row[\"details\"] = details\n        logs = _load(audit_file)\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(row)\n        _save(audit_file, logs)\n\n    def _rate_limit_check():\n        # 300 notifications per rolling 60s per endpoint.\n        logs = _load(audit_file)\n        if not isinstance(logs, list):\n            return None\n        now = datetime.datetime.utcnow()\n        window_s = 60\n        limit = 300\n        count = 0\n        for r in reversed(logs[-5000:]):\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"endpoint\") != \"config_send_notification\":\n                continue\n            ts = r.get(\"ts\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                t = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                continue\n            if (now - t).total_seconds() <= window_s:\n                count += 1\n                if count >= limit:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n            else:\n                break\n        return None\n\n    rl = _rate_limit_check()\n    if rl is not None:\n        _append_audit(\"config_send_notification\", \"error\", details=rl)\n        return rl\n\n    # Validate inputs\n    if not isinstance(integration_id, str) or not integration_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"integration_id is required and must be a non-empty string\")\n        _append_audit(\"config_send_notification\", \"error\", details=e)\n        return e\n\n    if not isinstance(message, str) or not message.strip():\n        e = _err(\"VALIDATION_ERROR\", \"message is required and must be a non-empty string\")\n        _append_audit(\"config_send_notification\", \"error\", details=e)\n        return e\n\n    if level is None:\n        level = \"info\"\n    if not isinstance(level, str):\n        e = _err(\"VALIDATION_ERROR\", \"level must be a string\")\n        _append_audit(\"config_send_notification\", \"error\", details=e)\n        return e\n    level = level.strip()\n    if level not in (\"info\", \"warning\", \"critical\"):\n        e = _err(\"VALIDATION_ERROR\", \"Unsupported level\", supported=[\"info\", \"warning\", \"critical\"])\n        _append_audit(\"config_send_notification\", \"error\", details=e)\n        return e\n\n    integrations = _load(\"integrations.json\")\n    if not isinstance(integrations, list):\n        integrations = []\n\n    integration = None\n    for row in integrations:\n        if isinstance(row, dict) and row.get(\"integration_id\") == integration_id:\n            integration = row\n            break\n\n    if integration is None:\n        e = _err(\"NOT_FOUND\", \"Integration not found\", integration_id=integration_id)\n        _append_audit(\"config_send_notification\", \"error\", details=e)\n        return e\n\n    if integration.get(\"enabled\") is not True:\n        e = _err(\"INVALID_TRANSITION\", \"Integration is disabled\", integration_id=integration_id)\n        _append_audit(\"config_send_notification\", \"error\", details=e)\n        return e\n\n    webhook = integration.get(\"webhook\")\n    if not isinstance(webhook, str) or not webhook.strip():\n        e = _err(\"CONFLICT\", \"Integration lacks required webhook configuration\", integration_id=integration_id)\n        _append_audit(\"config_send_notification\", \"error\", details=e)\n        return e\n\n    # Persist notification \"delivery attempt\" as a row in notifications.json\n    notifications = _load(\"notifications.json\")\n    if not isinstance(notifications, list):\n        notifications = []\n\n    now = datetime.datetime.utcnow().isoformat() + \"Z\"\n    notification_id = \"notif_\" + uuid.uuid4().hex\n    # Schema doesn't include message/timestamps, but we keep them for observability without breaking reads.\n    notif_row = {\n        \"notification_id\": notification_id,\n        \"integration_id\": integration_id,\n        \"channel\": integration.get(\"type\", \"unknown\"),\n        \"level\": level,\n        \"message\": message,\n        \"sent_at\": now,\n        \"delivery\": {\n            \"status\": \"sent\",\n            \"target\": webhook.strip(),\n        },\n    }\n    notifications.append(notif_row)\n    try:\n        _save(\"notifications.json\", notifications)\n    except Exception as ex:\n        e = _err(\"CONFLICT\", \"Failed to persist notification\", reason=str(ex))\n        _append_audit(\"config_send_notification\", \"error\", details=e)\n        return e\n\n    resp = {\n        \"delivery\": {\n            \"status\": \"sent\",\n            \"notification_id\": notification_id,\n            \"integration_id\": integration_id,\n            \"level\": level,\n            \"sent_at\": now,\n        }\n    }\n    _append_audit(\"config_send_notification\", \"ok\", details={\"integration_id\": integration_id, \"notification_id\": notification_id, \"level\": level})\n    return resp\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0034000",
+    "index": 34,
+    "name": "HarborLink Integration Router",
+    "description": "Centralizes configuration of external integrations and routes operational notifications to the right endpoints for each team.",
+    "taxonomy": {
+      "L1_id": "L1-20",
+      "L1_name": "Communication & General Utilities",
+      "L1_name_zh": "通信与通用工具",
+      "L2_id": "L2-48",
+      "L2_name": "Messaging & Notification",
+      "L2_name_zh": "即时通信与通知",
+      "L3_name": "Integration Routing & Operational Notifications",
+      "L3_name_zh": "集成路由与运维通知"
+    },
+    "database_dir": "./environment_mix/0034000",
+    "mount_path": "/app/database",
+    "n_tools": 4,
+    "n_collections": 3,
+    "n_records": 75,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 4,
+      "loaded": 4,
+      "reads_returning_data": 2,
+      "read_operations": 2,
+      "mutations_persisted": 2,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 4,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "config_list_integrations",
+      "returned_chars": 385
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

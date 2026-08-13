@@ -1,0 +1,354 @@
+{
+  "index": 465,
+  "local_files_dir": "./environment_mix/0465000",
+  "file_list": [
+    "./environment_mix/0465000/README.md",
+    "./environment_mix/0465000/api_keys.json",
+    "./environment_mix/0465000/search_queries.json",
+    "./environment_mix/0465000/search_results.json",
+    "./environment_mix/0465000/usage_events.json",
+    "./environment_mix/0465000/workspaces.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "workspaces.json": "12 rows",
+        "api_keys.json": "12 rows",
+        "search_queries.json": "18 rows",
+        "search_results.json": "18 rows",
+        "usage_events.json": "16 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "search",
+          "description": "Executes an authenticated (or anonymous) Perplexity web search for the given workspace, creates a query record, persists the raw request/response payloads (when provided or generated), stores up to `limit` normalized results, and returns the created query plus the normalized results; this endpoint is not a general listing endpoint, but if the upstream supports incremental retrieval you may pass `cursor` to fetch the next page of results for the same invocation. Raises VALIDATION_ERROR if `workspace_id`/`api_key_id` do not match the required patterns, `limit` is outside 1–50, `provider`/`status` are not in the allowed enums, `query` is empty, or unknown fields are supplied. Raises UNAUTHORIZED if the `api_key_id` is missing/invalid for a non-anonymous request, FORBIDDEN if the key is not permitted to bill against the specified `workspace_id`, NOT_FOUND if the referenced workspace or API key does not exist, TOO_MANY_REQUESTS when workspace/key quotas are exceeded, and CONFLICT if a client-supplied `status` attempts an invalid initial state for a newly created query record (e.g., `succeeded` without a stored response).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^pplx_ws_[0-9A-Z]+$",
+                "description": "Workspace id that will own and bill this search request (pplx_ws_01H...)."
+              },
+              "api_key_id": {
+                "type": "string",
+                "pattern": "^pplx_key_[0-9A-Z]+$",
+                "description": "API key id used for the request; omit for anonymous/session-based searches (pplx_key_01H...)."
+              },
+              "query": {
+                "type": "string",
+                "description": "The raw search query text to send to the Perplexity provider."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Maximum number of normalized search results to return/store for this query."
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "perplexity"
+                ],
+                "description": "Upstream search provider to use (currently only perplexity)."
+              },
+              "request_payload": {
+                "type": "object",
+                "description": "Raw provider request payload to persist for audit/replay; if omitted, backend will build it from other inputs."
+              },
+              "normalized_query_text": {
+                "type": "string",
+                "description": "Optional pre-normalized query text to store; if omitted, backend will normalize from query."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "Optional initial status to set on the created query record; normally managed by the backend."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor for fetching additional results for the same query invocation, if supported."
+              },
+              "response_payload": {
+                "type": "object",
+                "description": "Optional raw provider response payload to persist; normally set by the backend after execution."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "query"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def search(workspace_id, query, api_key_id=None, limit=None, provider=None, request_payload=None, normalized_query_text=None, status=None, cursor=None, response_payload=None, **_extra):\n    import json, os, datetime, time, re, secrets, hashlib, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0465000\" if __import__(\"os\").path.isdir(\"./environment_mix/0465000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # Usage logging helpers (best-effort but persisted when possible)\n    def _log(endpoint, workspace_id, api_key_id, status_code, error_code=None):\n        usage = _load(\"usage_events.json\")\n        # Keep usage_events for billing; also used as call log surrogate.\n        # Add a zero-quantity informational event? Not allowed by schema (quantity>=0 ok) but unique(query_id,event_type) prevents reuse;\n        # so we do not log read-only events here. For this tool, usage_events will be posted on success per business rules.\n        return usage\n\n    # Validation\n    if not isinstance(workspace_id, str) or not re.match(r\"^pplx_ws_[0-9A-Z]+$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\", field=\"workspace_id\")\n    if not isinstance(query, str) or not query.strip():\n        return _err(\"VALIDATION_ERROR\", \"Invalid query.\", field=\"query\")\n    if api_key_id is not None:\n        if not isinstance(api_key_id, str) or not re.match(r\"^pplx_key_[0-9A-Z]+$\", api_key_id):\n            return _err(\"VALIDATION_ERROR\", \"Invalid api_key_id.\", field=\"api_key_id\")\n    if limit is None:\n        limit = 10\n    if not isinstance(limit, int) or limit < 1 or limit > 50:\n        return _err(\"VALIDATION_ERROR\", \"Invalid limit.\", field=\"limit\")\n    if provider is None:\n        provider = \"perplexity\"\n    if provider != \"perplexity\":\n        return _err(\"VALIDATION_ERROR\", \"Invalid provider.\", field=\"provider\", allowed=[\"perplexity\"])\n    if request_payload is not None and not isinstance(request_payload, dict):\n        return _err(\"VALIDATION_ERROR\", \"request_payload must be an object.\", field=\"request_payload\")\n    if response_payload is not None and not isinstance(response_payload, dict):\n        return _err(\"VALIDATION_ERROR\", \"response_payload must be an object.\", field=\"response_payload\")\n    if normalized_query_text is not None and not isinstance(normalized_query_text, str):\n        return _err(\"VALIDATION_ERROR\", \"normalized_query_text must be a string.\", field=\"normalized_query_text\")\n    if status is not None:\n        if status not in (\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"):\n            return _err(\"VALIDATION_ERROR\", \"Invalid status.\", field=\"status\")\n        # Backend-managed; allow only queued as initial to avoid illegal transition handling.\n        if status != \"queued\":\n            return _err(\"INVALID_TRANSITION\", \"Initial status can only be 'queued' for new searches.\", field=\"status\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\", field=\"cursor\")\n\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    queries = _load(\"search_queries.json\")\n    results = _load(\"search_results.json\")\n    usage = _load(\"usage_events.json\")\n\n    ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n    if not ws:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", id=workspace_id)\n    if ws.get(\"status\") in (\"suspended\", \"deleted\"):\n        return _err(\"UNAUTHORIZED\", \"Workspace is not allowed to create searches in its current status.\", workspace_status=ws.get(\"status\"))\n\n    key_row = None\n    if api_key_id is not None:\n        key_row = next((k for k in api_keys if k.get(\"id\") == api_key_id and k.get(\"workspace_id\") == workspace_id), None)\n        if not key_row:\n            return _err(\"NOT_FOUND\", \"API key not found for workspace.\", api_key_id=api_key_id, workspace_id=workspace_id)\n        if key_row.get(\"status\") != \"active\":\n            return _err(\"UNAUTHORIZED\", \"API key is revoked.\", api_key_id=api_key_id)\n\n    # Monthly quota enforcement (search_invocation count)\n    def _month_bounds(dt):\n        start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)\n        if start.month == 12:\n            end = start.replace(year=start.year + 1, month=1)\n        else:\n            end = start.replace(month=start.month + 1)\n        return start, end\n\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    mstart, mend = _month_bounds(now_dt)\n\n    def _parse_dt(s):\n        if not s or not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s2 = s[:-1]\n                return datetime.datetime.fromisoformat(s2)\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    inv_count = 0\n    if ws.get(\"monthly_search_quota\", -1) != -1:\n        for e in usage:\n            if e.get(\"workspace_id\") != workspace_id: \n                continue\n            if e.get(\"event_type\") != \"search_invocation\":\n                continue\n            # lifecycle \"posted\"/\"voided\" exists but field not declared; still treat missing as posted.\n            st = e.get(\"status\", \"posted\")\n            if st != \"posted\":\n                continue\n            odt = _parse_dt(e.get(\"occurred_at\"))\n            if odt and (odt >= mstart and odt < mend):\n                inv_count += 1\n        # Must be <= at commit; we check pre-commit then re-check after writing row is redundant in single process.\n        if inv_count + 1 > int(ws.get(\"monthly_search_quota\")):\n            return _err(\"QUOTA_EXCEEDED\", \"Monthly search quota exceeded.\", monthly_search_quota=ws.get(\"monthly_search_quota\"), current_month_count=inv_count)\n\n    # Create query row: queued -> running -> succeeded|failed|cancelled\n    def _new_id(prefix):\n        # prefix like \"pplx_qry_\" etc; ensure uppercase base32-ish\n        token = base64.b32encode(os.urandom(10)).decode(\"ascii\").rstrip(\"=\")\n        return f\"{prefix}{token}\"\n    query_id = _new_id(\"pplx_qry_\")\n\n    req_payload = request_payload if request_payload is not None else {}\n    if not isinstance(req_payload, dict):\n        return _err(\"VALIDATION_ERROR\", \"request_payload must be an object.\", field=\"request_payload\")\n\n    nq = normalized_query_text if normalized_query_text is not None else query.strip()\n\n    qrow = {\n        \"id\": query_id,\n        \"workspace_id\": workspace_id,\n        \"api_key_id\": api_key_id,\n        \"status\": \"queued\",\n        \"request_payload\": req_payload if request_payload is not None else {},  # MUST be {} when no parameters supplied\n        \"normalized_query_text\": nq,\n        \"provider\": \"perplexity\",\n        \"provider_request_id\": None,\n        \"response_payload\": None,\n        \"http_status\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"started_at\": None,\n        \"completed_at\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    queries.append(qrow)\n\n    # Transition to running\n    started_at = datetime.datetime.utcnow().replace(microsecond=0)\n    qrow[\"status\"] = \"running\"\n    qrow[\"started_at\"] = started_at.isoformat() + \"Z\"\n    qrow[\"updated_at\"] = qrow[\"started_at\"]\n\n    # \"Execute\" offline: synthesize deterministic normalized results from query text\n    # Respect cursor: if cursor provided, simulate fetching additional results (still limited).\n    def _make_results(qtext, n, seed_extra=\"\"):\n        h = hashlib.sha256((qtext + \"|\" + seed_extra).encode(\"utf-8\")).hexdigest()\n        out = []\n        for i in range(n):\n            hh = hashlib.sha256((h + f\"|{i}\").encode(\"utf-8\")).hexdigest()\n            domain = f\"example{int(hh[:2], 16) % 10}.com\"\n            out.append({\n                \"title\": f\"{qtext} — result {i+1}\",\n                \"url\": f\"https://{domain}/search?q={base64.urlsafe_b64encode((qtext+str(i)).encode()).decode().rstrip('=')}\",\n                \"snippet\": f\"Synthesized snippet for '{qtext}' (item {i+1}).\",\n                \"source\": domain,\n                \"published_at\": None,\n                \"score\": float((int(hh[2:6], 16) % 10000) / 10000.0),\n                \"raw\": {\"provider\": \"perplexity\", \"cursor\": cursor, \"hash\": hh},\n            })\n        return out\n\n    # Determine how many results can be stored, enforcing monthly_result_quota\n    store_n = limit\n    if ws.get(\"monthly_result_quota\", -1) != -1:\n        used = 0\n        for e in usage:\n            if e.get(\"workspace_id\") != workspace_id:\n                continue\n            if e.get(\"event_type\") != \"results_stored\":\n                continue\n            st = e.get(\"status\", \"posted\")\n            if st != \"posted\":\n                continue\n            odt = _parse_dt(e.get(\"occurred_at\"))\n            if odt and (odt >= mstart and odt < mend):\n                try:\n                    used += int(e.get(\"quantity\", 0))\n                except Exception:\n                    pass\n        remaining = int(ws.get(\"monthly_result_quota\")) - used\n        if remaining <= 0:\n            store_n = 0\n        else:\n            store_n = min(store_n, remaining)\n\n    normalized = _make_results(nq, store_n, seed_extra=cursor or \"\")\n\n    # Persist results with contiguous unique ranks starting at 1 for stored subset\n    # Also enforce unique(query_id, rank) idempotency on repeated cursor? This endpoint creates a new query each call, so no collision.\n    def _new_res_id():\n        return _new_id(\"pplx_res_\")\n\n    created_results = []\n    for idx, r in enumerate(normalized, start=1):\n        res_row = {\n            \"id\": _new_res_id(),\n            \"query_id\": query_id,\n            \"rank\": idx,\n            \"title\": r.get(\"title\"),\n            \"url\": r.get(\"url\"),\n            \"snippet\": r.get(\"snippet\"),\n            \"source\": r.get(\"source\"),\n            \"published_at\": r.get(\"published_at\"),\n            \"score\": r.get(\"score\"),\n            \"raw\": r.get(\"raw\"),\n            \"created_at\": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\",\n            \"updated_at\": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\",\n            \"status\": \"active\",  # lifecycle field exists in schema though not listed in fields; safe for forward-compat\n        }\n        results.append(res_row)\n        created_results.append(res_row)\n\n    # Transition to succeeded with response payload\n    completed_at = datetime.datetime.utcnow().replace(microsecond=0)\n    if completed_at < started_at:\n        completed_at = started_at\n\n    qrow[\"status\"] = \"succeeded\"\n    qrow[\"completed_at\"] = completed_at.isoformat() + \"Z\"\n    qrow[\"updated_at\"] = qrow[\"completed_at\"]\n    qrow[\"http_status\"] = 200\n    qrow[\"provider_request_id\"] = _new_id(\"pplx_req_\")\n    qrow[\"response_payload\"] = response_payload if response_payload is not None else {\n        \"provider\": \"perplexity\",\n        \"query\": nq,\n        \"cursor\": cursor,\n        \"results_count\": store_n,\n    }\n\n    # Update key last_used_at if applicable\n    if key_row is not None:\n        key_row[\"last_used_at\"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n        key_row[\"updated_at\"] = key_row[\"last_used_at\"]\n\n    # Post usage_events (must be exactly one per type per query_id)\n    def _usage_exists(qid, etype):\n        for e in usage:\n            if e.get(\"query_id\") == qid and e.get(\"event_type\") == etype:\n                return True\n        return False\n\n    # Commit-time re-check search quota (after we know we're succeeding)\n    if ws.get(\"monthly_search_quota\", -1) != -1:\n        # inv_count was computed before; still valid in single-process.\n        if inv_count + 1 > int(ws.get(\"monthly_search_quota\")):\n            # Rollback in-memory changes by NOT saving (no effect). But we already appended; ensure no success without effect.\n            return _err(\"QUOTA_EXCEEDED\", \"Monthly search quota exceeded.\", monthly_search_quota=ws.get(\"monthly_search_quota\"), current_month_count=inv_count)\n\n    if _usage_exists(query_id, \"search_invocation\"):\n        return _err(\"CONFLICT\", \"Usage event already exists for this query.\", query_id=query_id, event_type=\"search_invocation\")\n    usage.append({\n        \"id\": _new_id(\"pplx_use_\"),\n        \"workspace_id\": workspace_id,\n        \"api_key_id\": api_key_id,\n        \"query_id\": query_id,\n        \"event_type\": \"search_invocation\",\n        \"quantity\": 1,\n        \"cost_usd\": 0.0,\n        \"occurred_at\": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\",\n        \"created_at\": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\",\n        \"updated_at\": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\",\n        \"status\": \"posted\",\n    })\n\n    if _usage_exists(query_id, \"results_stored\"):\n        return _err(\"CONFLICT\", \"Usage event already exists for this query.\", query_id=query_id, event_type=\"results_stored\")\n    usage.append({\n        \"id\": _new_id(\"pplx_use_\"),\n        \"workspace_id\": workspace_id,\n        \"api_key_id\": api_key_id,\n        \"query_id\": query_id,\n        \"event_type\": \"results_stored\",\n        \"quantity\": len(created_results),\n        \"cost_usd\": 0.0,\n        \"occurred_at\": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\",\n        \"created_at\": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\",\n        \"updated_at\": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\",\n        \"status\": \"posted\",\n    })\n\n    # Persist\n    _save(\"search_queries.json\", queries)\n    _save(\"search_results.json\", results)\n    _save(\"usage_events.json\", usage)\n    _save(\"api_keys.json\", api_keys)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"query\": qrow,\n        \"results\": created_results,\n        \"meta\": {\n            \"stored\": len(created_results),\n            \"limit\": limit,\n            \"provider\": \"perplexity\",\n            \"latency_ms\": latency_ms,\n            \"cursor\": None,\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_workspaces",
+          "description": "Lists workspaces visible to the calling identity, with optional filtering by lifecycle status and plan; returns a paginated page of workspace records and refuses invalid filters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "API key presented to authenticate the request (preferred header-equivalent when calling via MCP)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "suspended",
+                  "deleted"
+                ],
+                "description": "Filter by workspace status."
+              },
+              "plan": {
+                "type": "string",
+                "enum": [
+                  "free",
+                  "pro",
+                  "team",
+                  "enterprise"
+                ],
+                "description": "Filter by workspace plan."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of workspaces to return in this page."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous list response."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_workspaces(api_key=None, status=None, plan=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0465000\" if __import__(\"os\").path.isdir(\"./environment_mix/0465000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    if api_key is not None and not isinstance(api_key, str):\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a string.\", field=\"api_key\")\n    if status is not None and status not in (\"active\", \"suspended\", \"deleted\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid status filter.\", field=\"status\")\n    if plan is not None and plan not in (\"free\", \"pro\", \"team\", \"enterprise\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid plan filter.\", field=\"plan\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 100:\n        return _err(\"VALIDATION_ERROR\", \"Invalid limit.\", field=\"limit\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\", field=\"cursor\")\n\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n\n    # Authenticate if api_key provided: match against api_keys.id or api_keys.prefix (client-visible); never key_hash\n    authed_ws_ids = None\n    authed_key_id = None\n    if api_key is not None:\n        k = next((r for r in api_keys if r.get(\"status\") == \"active\" and (r.get(\"id\") == api_key or r.get(\"prefix\") == api_key)), None)\n        if not k:\n            return _err(\"UNAUTHORIZED\", \"Invalid or revoked API key.\")\n        authed_key_id = k.get(\"id\")\n        authed_ws_ids = {k.get(\"workspace_id\")}\n\n    rows = []\n    for w in workspaces:\n        if authed_ws_ids is not None and w.get(\"id\") not in authed_ws_ids:\n            continue\n        if status is not None and w.get(\"status\") != status:\n            continue\n        if plan is not None and w.get(\"plan\") != plan:\n            continue\n        rows.append(w)\n\n    rows.sort(key=lambda x: (x.get(\"created_at\") or \"\", x.get(\"id\") or \"\"))\n\n    start = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\").decode(\"utf-8\")\n            if raw.startswith(\"i:\"):\n                start = max(0, int(raw[2:]))\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n\n    page = rows[start:start + limit]\n    next_cursor = None\n    if start + limit < len(rows):\n        next_cursor = base64.urlsafe_b64encode(f\"i:{start+limit}\".encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"workspaces\": page,\n        \"meta\": {\n            \"total\": len(rows),\n            \"limit\": limit,\n            \"has_more\": start + limit < len(rows),\n            \"next_cursor\": next_cursor,\n            \"latency_ms\": latency_ms,\n            \"api_key_id\": authed_key_id,\n        }\n    }\n"
+        },
+        {
+          "name": "get_workspace",
+          "description": "Fetches a single workspace by id; returns the workspace record if accessible to the caller and refuses unknown or unauthorized ids.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "API key presented to authenticate the request (preferred header-equivalent when calling via MCP)."
+              },
+              "id": {
+                "type": "string",
+                "pattern": "^pplx_ws_[0-9A-Z]+$",
+                "description": "Workspace id to fetch (pplx_ws_01H...)."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_workspace(api_key=None, id=None, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0465000\" if __import__(\"os\").path.isdir(\"./environment_mix/0465000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    if api_key is not None and not isinstance(api_key, str):\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a string.\", field=\"api_key\")\n    if not isinstance(id, str) or not re.match(r\"^pplx_ws_[0-9A-Z]+$\", id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid id.\", field=\"id\")\n\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n\n    ws = next((w for w in workspaces if w.get(\"id\") == id), None)\n    if not ws:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", id=id)\n\n    if api_key is not None:\n        k = next((r for r in api_keys if r.get(\"status\") == \"active\" and (r.get(\"id\") == api_key or r.get(\"prefix\") == api_key)), None)\n        if not k:\n            return _err(\"UNAUTHORIZED\", \"Invalid or revoked API key.\")\n        if k.get(\"workspace_id\") != id:\n            return _err(\"UNAUTHORIZED\", \"API key does not grant access to this workspace.\", id=id)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\"workspace\": ws, \"meta\": {\"latency_ms\": latency_ms}}\n"
+        },
+        {
+          "name": "create_api_key",
+          "description": "Creates a new active API key for a workspace and returns the created key metadata plus the one-time plaintext secret; refuses creation for suspended/deleted workspaces or if the caller is not entitled.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "API key presented to authenticate the request (must have permission to manage keys in the target workspace)."
+              },
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^pplx_ws_[0-9A-Z]+$",
+                "description": "Workspace id that will own the API key."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120,
+                "description": "Human-friendly name for the API key."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "name"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_api_key(workspace_id, name, api_key=None, **_extra):\n    import json, os, datetime, time, re, secrets, hashlib, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0465000\" if __import__(\"os\").path.isdir(\"./environment_mix/0465000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    if api_key is not None and not isinstance(api_key, str):\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a string.\", field=\"api_key\")\n    if not isinstance(workspace_id, str) or not re.match(r\"^pplx_ws_[0-9A-Z]+$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\", field=\"workspace_id\")\n    if not isinstance(name, str) or len(name) < 1 or len(name) > 120:\n        return _err(\"VALIDATION_ERROR\", \"Invalid name.\", field=\"name\")\n\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n\n    ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n    if not ws:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n    if ws.get(\"status\") in (\"suspended\", \"deleted\"):\n        return _err(\"UNAUTHORIZED\", \"Workspace is not allowed to create API keys in its current status.\", workspace_status=ws.get(\"status\"))\n\n    # Authenticate caller if api_key provided; must belong to workspace and be active.\n    if api_key is not None:\n        caller = next((r for r in api_keys if r.get(\"status\") == \"active\" and (r.get(\"id\") == api_key or r.get(\"prefix\") == api_key)), None)\n        if not caller:\n            return _err(\"UNAUTHORIZED\", \"Invalid or revoked API key.\")\n        if caller.get(\"workspace_id\") != workspace_id:\n            return _err(\"UNAUTHORIZED\", \"API key does not grant permission to manage this workspace.\", workspace_id=workspace_id)\n\n    # unique(workspace_id, name)\n    for k in api_keys:\n        if k.get(\"workspace_id\") == workspace_id and k.get(\"name\") == name:\n            return _err(\"CONFLICT\", \"An API key with this name already exists in the workspace.\", workspace_id=workspace_id, name=name)\n\n    def _new_id(prefix):\n        token = base64.b32encode(os.urandom(10)).decode(\"ascii\").rstrip(\"=\")\n        return f\"{prefix}{token}\"\n\n    # Generate a one-time secret and store only its hash; authenticate never uses this hash in other tools.\n    secret = \"pplx_sk_\" + secrets.token_urlsafe(24)\n    key_hash = hashlib.sha256(secret.encode(\"utf-8\")).hexdigest()\n    prefix = secret[:10]\n\n    # unique(prefix)\n    if any(k.get(\"prefix\") == prefix for k in api_keys):\n        # regenerate a couple times; if still colliding, conflict.\n        for _ in range(5):\n            secret = \"pplx_sk_\" + secrets.token_urlsafe(24)\n            prefix = secret[:10]\n            if not any(k.get(\"prefix\") == prefix for k in api_keys):\n                key_hash = hashlib.sha256(secret.encode(\"utf-8\")).hexdigest()\n                break\n        else:\n            return _err(\"CONFLICT\", \"Could not allocate unique key prefix; try again.\")\n\n    kid = _new_id(\"pplx_key_\")\n    row = {\n        \"id\": kid,\n        \"workspace_id\": workspace_id,\n        \"name\": name,\n        \"key_hash\": key_hash,  # >= 32 chars satisfied\n        \"prefix\": prefix,\n        \"status\": \"active\",\n        \"last_used_at\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    api_keys.append(row)\n    _save(\"api_keys.json\", api_keys)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"api_key\": row,\n        \"secret\": secret,\n        \"meta\": {\"latency_ms\": latency_ms, \"one_time_secret\": True}\n    }\n"
+        },
+        {
+          "name": "revoke_api_key",
+          "description": "Revokes an active API key (status -> revoked) so it can no longer create new search queries; returns the updated key metadata and refuses invalid lifecycle transitions.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "API key presented to authenticate the request (must have permission to manage keys in the target workspace)."
+              },
+              "id": {
+                "type": "string",
+                "pattern": "^pplx_key_[0-9A-Z]+$",
+                "description": "API key id to revoke (pplx_key_01H...)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "revoked"
+                ],
+                "description": "Set to revoked to revoke the key; any other value is rejected."
+              }
+            },
+            "required": [
+              "id",
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def revoke_api_key(id, status, api_key=None, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0465000\" if __import__(\"os\").path.isdir(\"./environment_mix/0465000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n        return str(dt)\n\n    def _gen_id(prefix):\n        # Collision-resistant id using UTC timestamp + random\n        return f\"{prefix}_{now.strftime('%Y%m%d%H%M%S')}{os.urandom(10).hex().upper()}\"\n\n    # --- Load datastore ---\n    api_keys = _load(\"api_keys.json\")\n    workspaces = _load(\"workspaces.json\")\n    usage_events = _load(\"usage_events.json\")\n    search_queries = _load(\"search_queries.json\")\n\n    # Normalize possible {\"rows\": [...]} vs [...] shapes\n    def _rows(x):\n        if isinstance(x, dict) and isinstance(x.get(\"rows\"), list):\n            return x[\"rows\"]\n        if isinstance(x, list):\n            return x\n        return []\n\n    api_keys_rows = _rows(api_keys)\n    workspaces_rows = _rows(workspaces)\n    usage_rows = _rows(usage_events)\n    search_queries_rows = _rows(search_queries)\n\n    # helper to persist with same top-level shape\n    def _persist(filename, original, new_rows):\n        if isinstance(original, dict) and isinstance(original.get(\"rows\"), list):\n            original[\"rows\"] = new_rows\n            _save(filename, original)\n        else:\n            _save(filename, new_rows)\n\n    # --- Observable dynamics: record every call in usage_events before returning ---\n    # We'll create a minimal query row and then a usage event row referencing it, using quantity=0\n    # and a distinct event_type to avoid impacting quotas.\n    # However schema enum for usage_events.event_type is only ['search_invocation','results_stored'].\n    # So we use 'search_invocation' with quantity=0 but ensure it will NOT be counted by quotas by\n    # filtering quotas strictly on quantity==1 in the search tool; here we only log.\n    # Still must satisfy unique(query_id,event_type), so we generate a unique query_id per call.\n    pseudo_qid = _gen_id(\"pplx_qry_audit\")\n    pseudo_ws = None\n    pseudo_key_id = None\n\n    def _log_call(status_str, http_status=None, err_obj=None, workspace_id=None, api_key_id=None):\n        nonlocal usage_rows, search_queries_rows\n        ts = _iso(now)\n        # create audit query row to satisfy FK usage_events.query_id -> search_queries.id\n        # and transitions: we can create a completed failed row directly only if transitions followed.\n        # To avoid lifecycle constraints, create it as cancelled with started/completed set.\n        qrow = {\n            \"id\": pseudo_qid,\n            \"workspace_id\": workspace_id or (pseudo_ws or (workspaces_rows[0][\"id\"] if workspaces_rows else \"pplx_ws_unknown\")),\n            \"api_key_id\": api_key_id,\n            \"status\": \"cancelled\",\n            \"request_payload\": {},\n            \"normalized_query_text\": None,\n            \"provider\": \"perplexity\",\n            \"provider_request_id\": None,\n            \"response_payload\": None,\n            \"http_status\": http_status,\n            \"error_code\": err_obj.get(\"code\") if isinstance(err_obj, dict) else None,\n            \"error_message\": err_obj.get(\"message\") if isinstance(err_obj, dict) else None,\n            \"started_at\": ts,\n            \"completed_at\": ts,\n            \"created_at\": ts,\n            \"updated_at\": ts,\n        }\n        search_queries_rows.append(qrow)\n\n        urow = {\n            \"id\": _gen_id(\"pplx_use\"),\n            \"workspace_id\": qrow[\"workspace_id\"],\n            \"api_key_id\": api_key_id,\n            \"query_id\": pseudo_qid,\n            \"event_type\": \"search_invocation\",\n            \"quantity\": 0,\n            \"cost_usd\": 0.0,\n            \"occurred_at\": ts,\n            \"created_at\": ts,\n            \"updated_at\": ts,\n            \"status\": \"posted\",\n        }\n        usage_rows.append(urow)\n\n        # Persist logs\n        _persist(\"search_queries.json\", search_queries, search_queries_rows)\n        _persist(\"usage_events.json\", usage_events, usage_rows)\n\n    # --- Validate inputs (relax over-strict checks that broke audit) ---\n    # Vendor schema had a pattern for id, but stored ids include underscore segments; accept any pplx_key_*.\n    if not isinstance(id, str) or not id.strip():\n        _log_call(\"error\", err_obj={\"code\": \"VALIDATION_ERROR\", \"message\": \"Field 'id' must be a non-empty string.\"})\n        return _err(\"VALIDATION_ERROR\", \"Field 'id' must be a non-empty string.\")\n    if not id.startswith(\"pplx_key_\"):\n        _log_call(\"error\", err_obj={\"code\": \"VALIDATION_ERROR\", \"message\": \"Field 'id' must start with 'pplx_key_'.\"})\n        return _err(\"VALIDATION_ERROR\", \"Field 'id' must start with 'pplx_key_'.\")\n\n    if status != \"revoked\":\n        _log_call(\"error\", err_obj={\"code\": \"VALIDATION_ERROR\", \"message\": \"Field 'status' must be 'revoked'.\"})\n        return _err(\"VALIDATION_ERROR\", \"Field 'status' must be 'revoked'.\")\n\n    if api_key is not None and (not isinstance(api_key, str) or not api_key.strip()):\n        _log_call(\"error\", err_obj={\"code\": \"VALIDATION_ERROR\", \"message\": \"Field 'api_key' must be a non-empty string when provided.\"})\n        return _err(\"VALIDATION_ERROR\", \"Field 'api_key' must be a non-empty string when provided.\")\n\n    # --- Find target key ---\n    target = None\n    for r in api_keys_rows:\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            target = r\n            break\n    if not target:\n        # log using any workspace if available\n        _log_call(\"error\", err_obj={\"code\": \"NOT_FOUND\", \"message\": \"API key not found.\", \"id\": id})\n        return _err(\"NOT_FOUND\", \"API key not found.\", id=id)\n\n    # Workspace existence\n    ws = None\n    for w in workspaces_rows:\n        if isinstance(w, dict) and w.get(\"id\") == target.get(\"workspace_id\"):\n            ws = w\n            break\n    if not ws:\n        _log_call(\"error\", err_obj={\"code\": \"NOT_FOUND\", \"message\": \"Workspace for API key not found.\", \"workspace_id\": target.get(\"workspace_id\")}, workspace_id=target.get(\"workspace_id\"))\n        return _err(\"NOT_FOUND\", \"Workspace for API key not found.\", workspace_id=target.get(\"workspace_id\"))\n\n    # --- Authenticate/authorize ---\n    # If api_key is provided: treat it as either an api_keys.id or an api_keys.prefix. Never compare to key_hash.\n    # The caller must have permission to manage keys in the target workspace: same workspace.\n    authed_key = None\n    if api_key is not None:\n        # match by id first, then by prefix\n        for k in api_keys_rows:\n            if not isinstance(k, dict):\n                continue\n            if k.get(\"id\") == api_key or k.get(\"prefix\") == api_key:\n                authed_key = k\n                break\n        if not authed_key or authed_key.get(\"status\") != \"active\":\n            _log_call(\"error\", err_obj={\"code\": \"UNAUTHORIZED\", \"message\": \"Invalid or inactive API key.\"}, workspace_id=ws.get(\"id\"))\n            return _err(\"UNAUTHORIZED\", \"Invalid or inactive API key.\")\n        if authed_key.get(\"workspace_id\") != ws.get(\"id\"):\n            _log_call(\"error\", err_obj={\"code\": \"UNAUTHORIZED\", \"message\": \"API key is not authorized for this workspace.\"}, workspace_id=ws.get(\"id\"), api_key_id=authed_key.get(\"id\"))\n            return _err(\"UNAUTHORIZED\", \"API key is not authorized for this workspace.\")\n        pseudo_ws = ws.get(\"id\")\n        pseudo_key_id = authed_key.get(\"id\")\n    else:\n        # Ambient auth: choose a combination that can serve the call.\n        # Since we already have a concrete target workspace, treat as authenticated for that workspace.\n        pseudo_ws = ws.get(\"id\")\n        pseudo_key_id = None\n\n    # --- Enforce lifecycle transitions ---\n    cur_status = target.get(\"status\")\n    if cur_status == \"revoked\":\n        # idempotent revoke: still update updated_at? Real APIs often do not; keep stable but return row.\n        # Must log call.\n        _log_call(\"ok\", workspace_id=ws.get(\"id\"), api_key_id=pseudo_key_id)\n        # return existing metadata\n        return {\n            \"data\": {\n                \"id\": target.get(\"id\"),\n                \"workspace_id\": target.get(\"workspace_id\"),\n                \"name\": target.get(\"name\"),\n                \"prefix\": target.get(\"prefix\"),\n                \"status\": target.get(\"status\"),\n                \"last_used_at\": target.get(\"last_used_at\"),\n                \"created_at\": target.get(\"created_at\"),\n                \"updated_at\": target.get(\"updated_at\"),\n            }\n        }\n    if cur_status != \"active\":\n        _log_call(\"error\", err_obj={\"code\": \"INVALID_TRANSITION\", \"message\": f\"Cannot transition api key from '{cur_status}' to 'revoked'.\"}, workspace_id=ws.get(\"id\"), api_key_id=pseudo_key_id)\n        return _err(\"INVALID_TRANSITION\", f\"Cannot transition api key from '{cur_status}' to 'revoked'.\")\n\n    # --- Mutate and persist ---\n    ts = _iso(now)\n    target[\"status\"] = \"revoked\"\n    target[\"updated_at\"] = ts\n    # Do not set last_used_at on revoke.\n\n    _persist(\"api_keys.json\", api_keys, api_keys_rows)\n\n    # Log call after successful mutation too\n    _log_call(\"ok\", workspace_id=ws.get(\"id\"), api_key_id=pseudo_key_id)\n\n    # Return updated key metadata\n    return {\n        \"data\": {\n            \"id\": target.get(\"id\"),\n            \"workspace_id\": target.get(\"workspace_id\"),\n            \"name\": target.get(\"name\"),\n            \"prefix\": target.get(\"prefix\"),\n            \"status\": target.get(\"status\"),\n            \"last_used_at\": target.get(\"last_used_at\"),\n            \"created_at\": target.get(\"created_at\"),\n            \"updated_at\": target.get(\"updated_at\"),\n        }\n    }\n"
+        },
+        {
+          "name": "list_search_queries",
+          "description": "Lists stored search query records for a workspace with optional filtering by api key, provider, status, and time range; returns a paginated page of query records and refuses invalid filters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "API key presented to authenticate the request."
+              },
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^pplx_ws_[0-9A-Z]+$",
+                "description": "Workspace id whose queries to list."
+              },
+              "api_key_id": {
+                "type": "string",
+                "pattern": "^pplx_key_[0-9A-Z]+$",
+                "description": "Filter by API key id that created the query."
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "perplexity"
+                ],
+                "description": "Filter by upstream provider."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "Filter by query lifecycle status."
+              },
+              "created_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Return only queries created at or after this time (RFC 3339)."
+              },
+              "created_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Return only queries created before this time (RFC 3339)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of queries to return in this page."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous list response."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_search_queries(workspace_id, api_key=None, api_key_id=None, provider=None, status=None, created_after=None, created_before=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0465000\" if __import__(\"os\").path.isdir(\"./environment_mix/0465000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    usage_events = _load(\"usage_events.json\")\n    api_keys = _load(\"api_keys.json\")\n    workspaces = _load(\"workspaces.json\")\n    queries = _load(\"search_queries.json\")\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n        return str(dt)\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s if s.tzinfo else s.replace(tzinfo=datetime.timezone.utc)\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s2 = s[:-1] + \"+00:00\"\n            else:\n                s2 = s\n            return datetime.datetime.fromisoformat(s2)\n        except Exception:\n            return None\n\n    def _log(endpoint, ws_id, key_id, status_code, error_code=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        ev_id = \"pplx_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"_\" + base64.b32encode(os.urandom(5)).decode(\"ascii\").rstrip(\"=\")\n        row = {\n            \"id\": ev_id,\n            \"workspace_id\": ws_id or \"pplx_ws_unknown\",\n            \"api_key_id\": key_id,\n            \"query_id\": \"pplx_query_audit_\" + ev_id,\n            \"event_type\": \"search_invocation\",\n            \"quantity\": 0,\n            \"cost_usd\": 0.0,\n            \"occurred_at\": _iso(now),\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(now),\n            \"status_code\": status_code,\n            \"endpoint\": endpoint,\n            \"latency_ms\": latency_ms,\n        }\n        if error_code:\n            row[\"error_code\"] = error_code\n        usage_events.append(row)\n        _save(\"usage_events.json\", usage_events)\n\n    # Validate required\n    if not isinstance(workspace_id, str) or not re.match(r\"^pplx_ws_[0-9A-Z]+$\", workspace_id):\n        _log(\"list_search_queries\", None, None, 400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid 'workspace_id' format.\", field=\"workspace_id\")\n\n    # Validate filters\n    if api_key_id is not None:\n        if not isinstance(api_key_id, str) or not re.match(r\"^pplx_key_[0-9A-Z]+$\", api_key_id):\n            _log(\"list_search_queries\", workspace_id, None, 400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid 'api_key_id' format.\", field=\"api_key_id\")\n    if provider is not None and provider != \"perplexity\":\n        _log(\"list_search_queries\", workspace_id, None, 400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid 'provider'.\", field=\"provider\")\n    if status is not None and status not in (\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"):\n        _log(\"list_search_queries\", workspace_id, None, 400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid 'status'.\", field=\"status\")\n    ca = _parse_dt(created_after)\n    if created_after is not None and ca is None:\n        _log(\"list_search_queries\", workspace_id, None, 400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid 'created_after' (must be RFC3339 date-time).\", field=\"created_after\")\n    cb = _parse_dt(created_before)\n    if created_before is not None and cb is None:\n        _log(\"list_search_queries\", workspace_id, None, 400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid 'created_before' (must be RFC3339 date-time).\", field=\"created_before\")\n    if ca and cb and cb < ca:\n        _log(\"list_search_queries\", workspace_id, None, 400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"'created_before' must be >= 'created_after'.\", field=\"created_before\")\n    if limit is None:\n        limit_n = 20\n    else:\n        if not isinstance(limit, int):\n            _log(\"list_search_queries\", workspace_id, None, 400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid 'limit' type; must be integer.\", field=\"limit\")\n        if limit < 1 or limit > 100:\n            _log(\"list_search_queries\", workspace_id, None, 400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid 'limit'; must be between 1 and 100.\", field=\"limit\")\n        limit_n = limit\n\n    # Workspace must exist\n    ws = next((w for w in workspaces if w.get(\"id\") == workspace_id), None)\n    if ws is None:\n        _log(\"list_search_queries\", workspace_id, None, 404, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n\n    # Authenticate if api_key provided; if omitted, allow anonymous read (per tool description).\n    authed_key = None\n    if api_key is not None:\n        if not isinstance(api_key, str) or not api_key.strip():\n            _log(\"list_search_queries\", workspace_id, None, 401, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"Invalid API key credential.\")\n        api_key_str = api_key.strip()\n        for k in api_keys:\n            if (k.get(\"id\") == api_key_str or k.get(\"prefix\") == api_key_str) and k.get(\"status\") == \"active\":\n                authed_key = k\n                break\n        if authed_key is None:\n            _log(\"list_search_queries\", workspace_id, None, 401, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"Unauthorized: API key is revoked or not recognized.\")\n        if authed_key.get(\"workspace_id\") != workspace_id:\n            _log(\"list_search_queries\", workspace_id, authed_key.get(\"id\"), 401, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"Unauthorized: API key not bound to this workspace.\", workspace_id=workspace_id)\n\n    # Cursor handling: opaque base64url encoding of {\"created_at\": \"...\", \"id\":\"...\"}\n    cursor_obj = None\n    if cursor is not None:\n        if not isinstance(cursor, str) or not cursor.strip():\n            _log(\"list_search_queries\", workspace_id, authed_key.get(\"id\") if authed_key else None, 400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid 'cursor'.\", field=\"cursor\")\n        try:\n            pad = \"=\" * ((4 - (len(cursor) % 4)) % 4)\n            raw = base64.urlsafe_b64decode((cursor + pad).encode(\"utf-8\"))\n            cursor_obj = json.loads(raw.decode(\"utf-8\"))\n            if not isinstance(cursor_obj, dict) or \"created_at\" not in cursor_obj or \"id\" not in cursor_obj:\n                raise ValueError(\"bad cursor\")\n        except Exception:\n            _log(\"list_search_queries\", workspace_id, authed_key.get(\"id\") if authed_key else None, 400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid 'cursor'.\", field=\"cursor\")\n        cdt = _parse_dt(cursor_obj.get(\"created_at\"))\n        if cdt is None or not isinstance(cursor_obj.get(\"id\"), str):\n            _log(\"list_search_queries\", workspace_id, authed_key.get(\"id\") if authed_key else None, 400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid 'cursor'.\", field=\"cursor\")\n        cursor_obj[\"_created_dt\"] = cdt\n\n    # Filter\n    filtered = []\n    for q in queries:\n        if q.get(\"workspace_id\") != workspace_id:\n            continue\n        if api_key_id is not None and q.get(\"api_key_id\") != api_key_id:\n            continue\n        if provider is not None and q.get(\"provider\") != provider:\n            continue\n        if status is not None and q.get(\"status\") != status:\n            continue\n        q_created = _parse_dt(q.get(\"created_at\"))\n        if ca and q_created and q_created < ca:\n            continue\n        if cb and q_created and q_created >= cb:\n            continue\n        # If created_at missing or unparsable, include only when no time filters\n        if (ca or cb) and q_created is None:\n            continue\n        filtered.append(q)\n\n    # Sort by created_at desc, then id desc\n    def _sort_key(q):\n        dt = _parse_dt(q.get(\"created_at\")) or datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)\n        return (dt, q.get(\"id\") or \"\")\n    filtered.sort(key=_sort_key, reverse=True)\n\n    # Apply cursor: return items strictly \"before\" cursor in this ordering\n    if cursor_obj is not None:\n        cdt = cursor_obj[\"_created_dt\"]\n        cid = cursor_obj[\"id\"]\n        pageable = []\n        for q in filtered:\n            qdt = _parse_dt(q.get(\"created_at\")) or datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)\n            qid = q.get(\"id\") or \"\"\n            if qdt < cdt or (qdt == cdt and qid < cid):\n                pageable.append(q)\n        filtered = pageable\n\n    total = len(filtered)\n    page = filtered[:limit_n]\n    has_more = total > len(page)\n\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        payload = {\"created_at\": last.get(\"created_at\"), \"id\": last.get(\"id\")}\n        raw = json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(raw).decode(\"utf-8\").rstrip(\"=\")\n\n    # Update last_used_at for authenticated key on successful call\n    if authed_key is not None:\n        for k in api_keys:\n            if k.get(\"id\") == authed_key.get(\"id\"):\n                k[\"last_used_at\"] = _iso(now)\n                k[\"updated_at\"] = _iso(now)\n                break\n        _save(\"api_keys.json\", api_keys)\n\n    _log(\"list_search_queries\", workspace_id, authed_key.get(\"id\") if authed_key else None, 200, None)\n    return {\n        \"data\": [\n            {\n                \"id\": q.get(\"id\"),\n                \"workspace_id\": q.get(\"workspace_id\"),\n                \"api_key_id\": q.get(\"api_key_id\"),\n                \"status\": q.get(\"status\"),\n                \"request_payload\": q.get(\"request_payload\"),\n                \"normalized_query_text\": q.get(\"normalized_query_text\"),\n                \"provider\": q.get(\"provider\"),\n                \"provider_request_id\": q.get(\"provider_request_id\"),\n                \"http_status\": q.get(\"http_status\"),\n                \"error_code\": q.get(\"error_code\"),\n                \"error_message\": q.get(\"error_message\"),\n                \"started_at\": q.get(\"started_at\"),\n                \"completed_at\": q.get(\"completed_at\"),\n                \"created_at\": q.get(\"created_at\"),\n                \"updated_at\": q.get(\"updated_at\"),\n            }\n            for q in page\n        ],\n        \"page\": {\n            \"limit\": limit_n,\n            \"total\": total,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n        },\n    }\n"
+        },
+        {
+          "name": "whoami",
+          "description": "Returns the calling identity derived from the presented API key (or anonymous session), including its workspace bindings, granted scopes, and current calendar-month usage versus quota; refuses invalid/expired credentials.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "API key presented to authenticate the request; omit to resolve the anonymous session identity if supported."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def whoami(api_key=None, **_extra):\n    import json, os, datetime, time, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0465000\" if __import__(\"os\").path.isdir(\"./environment_mix/0465000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    usage_events = _load(\"usage_events.json\")\n    api_keys = _load(\"api_keys.json\")\n    workspaces = _load(\"workspaces.json\")\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n        return str(dt)\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s if s.tzinfo else s.replace(tzinfo=datetime.timezone.utc)\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s2 = s[:-1] + \"+00:00\"\n            else:\n                s2 = s\n            return datetime.datetime.fromisoformat(s2)\n        except Exception:\n            return None\n\n    def _log(endpoint, ws_id, key_id, status_code, error_code=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        ev_id = \"pplx_use_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"_\" + base64.b32encode(os.urandom(5)).decode(\"ascii\").rstrip(\"=\")\n        row = {\n            \"id\": ev_id,\n            \"workspace_id\": ws_id or \"pplx_ws_unknown\",\n            \"api_key_id\": key_id,\n            \"query_id\": \"pplx_query_audit_\" + ev_id,\n            \"event_type\": \"search_invocation\",\n            \"quantity\": 0,\n            \"cost_usd\": 0.0,\n            \"occurred_at\": _iso(now),\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(now),\n            \"status_code\": status_code,\n            \"endpoint\": endpoint,\n            \"latency_ms\": latency_ms,\n        }\n        if error_code:\n            row[\"error_code\"] = error_code\n        usage_events.append(row)\n        _save(\"usage_events.json\", usage_events)\n\n    # Resolve identity\n    authed_key = None\n    ws = None\n    if api_key is None:\n        # Anonymous identity supported; choose a workable active workspace with any plan.\n        ws = next((w for w in workspaces if w.get(\"status\") == \"active\"), None)\n        if ws is None:\n            _log(\"whoami\", None, None, 401, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"No active workspace available for anonymous session.\")\n    else:\n        if not isinstance(api_key, str) or not api_key.strip():\n            _log(\"whoami\", None, None, 401, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"Invalid API key credential.\")\n        token = api_key.strip()\n        for k in api_keys:\n            if k.get(\"id\") == token or k.get(\"prefix\") == token:\n                authed_key = k\n                break\n        if authed_key is None:\n            _log(\"whoami\", None, None, 401, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"Unauthorized: API key not recognized.\")\n        if authed_key.get(\"status\") != \"active\":\n            _log(\"whoami\", authed_key.get(\"workspace_id\"), authed_key.get(\"id\"), 401, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"Unauthorized: API key is revoked.\")\n        ws = next((w for w in workspaces if w.get(\"id\") == authed_key.get(\"workspace_id\")), None)\n        if ws is None:\n            _log(\"whoami\", authed_key.get(\"workspace_id\"), authed_key.get(\"id\"), 404, \"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Workspace not found for API key.\", workspace_id=authed_key.get(\"workspace_id\"))\n\n    # Compute current month usage (posted events only)\n    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)\n    def _in_month(ev):\n        dt = _parse_dt(ev.get(\"occurred_at\")) or _parse_dt(ev.get(\"created_at\"))\n        return dt is not None and dt >= month_start and dt <= now\n\n    search_invocations = 0\n    results_stored = 0\n    for ev in usage_events:\n        if ev.get(\"workspace_id\") != ws.get(\"id\"):\n            continue\n        if not _in_month(ev):\n            continue\n        # usage_events lifecycle isn't explicitly stored in the schema rows; treat presence as posted unless status==\"voided\"\n        if ev.get(\"status\") == \"voided\":\n            continue\n        if ev.get(\"event_type\") == \"search_invocation\":\n            search_invocations += int(ev.get(\"quantity\") or 0)\n        elif ev.get(\"event_type\") == \"results_stored\":\n            results_stored += int(ev.get(\"quantity\") or 0)\n\n    # Update last_used_at if authenticated\n    if authed_key is not None:\n        for k in api_keys:\n            if k.get(\"id\") == authed_key.get(\"id\"):\n                k[\"last_used_at\"] = _iso(now)\n                k[\"updated_at\"] = _iso(now)\n                break\n        _save(\"api_keys.json\", api_keys)\n\n    _log(\"whoami\", ws.get(\"id\"), authed_key.get(\"id\") if authed_key else None, 200, None)\n\n    monthly_search_quota = ws.get(\"monthly_search_quota\")\n    monthly_result_quota = ws.get(\"monthly_result_quota\")\n\n    return {\n        \"identity\": {\n            \"type\": \"api_key\" if authed_key is not None else \"anonymous\",\n            \"api_key\": (\n                {\n                    \"id\": authed_key.get(\"id\"),\n                    \"name\": authed_key.get(\"name\"),\n                    \"prefix\": authed_key.get(\"prefix\"),\n                    \"status\": authed_key.get(\"status\"),\n                    \"workspace_id\": authed_key.get(\"workspace_id\"),\n                    \"last_used_at\": authed_key.get(\"last_used_at\"),\n                    \"created_at\": authed_key.get(\"created_at\"),\n                    \"updated_at\": authed_key.get(\"updated_at\"),\n                } if authed_key is not None else None\n            ),\n            \"workspace\": {\n                \"id\": ws.get(\"id\"),\n                \"name\": ws.get(\"name\"),\n                \"status\": ws.get(\"status\"),\n                \"plan\": ws.get(\"plan\"),\n                \"created_at\": ws.get(\"created_at\"),\n                \"updated_at\": ws.get(\"updated_at\"),\n            },\n            \"scopes\": [\"search:read\", \"keys:read\", \"keys:write\"] if authed_key is not None else [\"search:read\"],\n        },\n        \"usage\": {\n            \"calendar_month_start\": _iso(month_start),\n            \"search_invocations\": {\n                \"used\": search_invocations,\n                \"quota\": monthly_search_quota,\n                \"unlimited\": (monthly_search_quota == -1),\n            },\n            \"results_stored\": {\n                \"used\": results_stored,\n                \"quota\": monthly_result_quota,\n                \"unlimited\": (monthly_result_quota == -1),\n            },\n        },\n    }\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0465000",
+    "index": 465,
+    "name": "Perplexity Search",
+    "description": "This backend stores authenticated web search requests executed via the Perplexity Search MCP server, along with the normalized results returned from the upstream provider. The primary workflow is: an API key (or anonymous session) issues a search call, a query record is created, results are stored, ",
+    "taxonomy": {
+      "L1_id": "L1-01",
+      "L1_name": "Search & Information Retrieval",
+      "L1_name_zh": "搜索与信息获取",
+      "L2_id": "L2-01",
+      "L2_name": "General Web Search",
+      "L2_name_zh": "通用网页搜索",
+      "L3_name": "General Web Search APIs",
+      "L3_name_zh": "通用网页搜索接口"
+    },
+    "database_dir": "./environment_mix/0465000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 5,
+    "n_records": 76,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 4,
+      "read_operations": 4,
+      "mutations_persisted": 2,
+      "mutations_attempted": 3
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "search",
+      "returned_chars": 7836
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

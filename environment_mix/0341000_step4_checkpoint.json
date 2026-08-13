@@ -1,0 +1,966 @@
+{
+  "index": 341,
+  "local_files_dir": "./environment_mix/0341000",
+  "file_list": [
+    "./environment_mix/0341000/README.md",
+    "./environment_mix/0341000/catalog_releases.json",
+    "./environment_mix/0341000/component_categories.json",
+    "./environment_mix/0341000/component_category_memberships.json",
+    "./environment_mix/0341000/component_implementations.json",
+    "./environment_mix/0341000/components.json",
+    "./environment_mix/0341000/request_logs.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "catalog_releases.json": "12 rows",
+        "component_categories.json": "12 rows",
+        "components.json": "32 rows",
+        "component_category_memberships.json": "29 rows",
+        "component_implementations.json": "32 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "getUIComponents",
+          "description": "Lists Magic UI components in the catalog and returns a cursor-paginated result set ordered by `sort_by`/`sort_order` with up to `limit` items and an optional `cursor` to fetch the next page; filters apply by `status`, `category_key`, full-text `q`, and (when provided) `release_id` to only include components that have an implementation in that release. Raises VALIDATION_ERROR when any filter, sort, limit, or cursor is invalid or out of range, including an invalid `release_id` format. Raises UNAUTHORIZED when credentials are missing/invalid, FORBIDDEN when you lack access to the catalog, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "deprecated",
+                  "hidden"
+                ],
+                "description": "Filter components by status."
+              },
+              "category_key": {
+                "type": "string",
+                "enum": [
+                  "layout",
+                  "media",
+                  "motion",
+                  "text_reveal",
+                  "text_effects",
+                  "buttons",
+                  "effects",
+                  "widgets",
+                  "backgrounds",
+                  "devices"
+                ],
+                "description": "Filter components by category key."
+              },
+              "release_id": {
+                "type": "string",
+                "pattern": "^mui_rel_[0-9A-Z]{18,}$",
+                "description": "If provided, only return components that have an implementation in this catalog release."
+              },
+              "q": {
+                "type": "string",
+                "description": "Search query applied to component slug and display name."
+              },
+              "sort_by": {
+                "type": "string",
+                "enum": [
+                  "display_name",
+                  "slug",
+                  "created_at",
+                  "updated_at"
+                ],
+                "description": "Field to sort components by."
+              },
+              "sort_order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of components to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor for fetching the next page of results."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def getUIComponents(status=None, category_key=None, release_id=None, q=None, sort_by=None, sort_order=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, re, time, base64, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0341000\" if __import__(\"os\").path.isdir(\"./environment_mix/0341000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # --- validation ---\n    status_enum = {\"active\", \"deprecated\", \"hidden\"}\n    cat_enum = {\"layout\", \"media\", \"motion\", \"text_reveal\", \"text_effects\", \"buttons\", \"effects\", \"widgets\", \"backgrounds\", \"devices\"}\n    sort_by_enum = {\"display_name\", \"slug\", \"created_at\", \"updated_at\"}\n    sort_order_enum = {\"asc\", \"desc\"}\n\n    if status is not None and (not isinstance(status, str) or status not in status_enum):\n        return _err(\"VALIDATION_ERROR\", \"Invalid `status`.\", allowed=sorted(status_enum))\n    if category_key is not None and (not isinstance(category_key, str) or category_key not in cat_enum):\n        return _err(\"VALIDATION_ERROR\", \"Invalid `category_key`.\", allowed=sorted(cat_enum))\n    if release_id is not None:\n        if not isinstance(release_id, str):\n            return _err(\"VALIDATION_ERROR\", \"Invalid `release_id` type.\")\n        if not re.match(r\"^mui_rel_[0-9A-Z]{18,}$\", release_id):\n            return _err(\"VALIDATION_ERROR\", \"Malformed `release_id`.\")\n    if q is not None and not isinstance(q, str):\n        return _err(\"VALIDATION_ERROR\", \"Invalid `q` type.\")\n    if sort_by is not None and (not isinstance(sort_by, str) or sort_by not in sort_by_enum):\n        return _err(\"VALIDATION_ERROR\", \"Invalid `sort_by`.\", allowed=sorted(sort_by_enum))\n    if sort_order is not None and (not isinstance(sort_order, str) or sort_order not in sort_order_enum):\n        return _err(\"VALIDATION_ERROR\", \"Invalid `sort_order`.\", allowed=sorted(sort_order_enum))\n    if limit is not None:\n        if not isinstance(limit, int):\n            return _err(\"VALIDATION_ERROR\", \"Invalid `limit` type.\")\n        if limit < 1 or limit > 200:\n            return _err(\"VALIDATION_ERROR\", \"`limit` must be between 1 and 200.\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"Invalid `cursor` type.\")\n\n    # defaults\n    if sort_by is None:\n        sort_by = \"display_name\"\n    if sort_order is None:\n        sort_order = \"asc\"\n    if limit is None:\n        limit = 50\n\n    # --- load store ---\n    components = _load(\"components.json\")\n    memberships = _load(\"component_category_memberships.json\")\n    categories = _load(\"component_categories.json\")\n    impls = _load(\"component_implementations.json\")\n    releases = _load(\"catalog_releases.json\")\n    request_logs = _load(\"request_logs.json\")\n\n    # --- cursor decode ---\n    def _decode_cursor(c):\n        # Supports base64url of json {\"v\":1,\"sort\":..., \"order\":..., \"after\":[...]} or raw legacy token \"field:value|id\"\n        if not c:\n            return None\n        try:\n            pad = \"=\" * ((4 - (len(c) % 4)) % 4)\n            raw = base64.urlsafe_b64decode((c + pad).encode(\"utf-8\")).decode(\"utf-8\")\n            obj = json.loads(raw)\n            if isinstance(obj, dict) and obj.get(\"v\") == 1:\n                if obj.get(\"sort\") != sort_by or obj.get(\"order\") != sort_order:\n                    return _err(\"VALIDATION_ERROR\", \"Cursor sort does not match request.\", cursor_sort=obj.get(\"sort\"), cursor_order=obj.get(\"order\"))\n                after = obj.get(\"after\")\n                if not (isinstance(after, list) and len(after) == 2 and isinstance(after[1], str)):\n                    return _err(\"VALIDATION_ERROR\", \"Malformed cursor.\")\n                return (\"ok\", after)\n        except Exception:\n            pass\n        # fallback format\n        if \"|\" in c:\n            try:\n                a, bid = c.split(\"|\", 1)\n                return (\"ok\", [a, bid])\n            except Exception:\n                return _err(\"VALIDATION_ERROR\", \"Malformed cursor.\")\n        return _err(\"VALIDATION_ERROR\", \"Malformed cursor.\")\n\n    after = None\n    dec = _decode_cursor(cursor)\n    if isinstance(dec, dict) and \"error\" in dec:\n        return dec\n    if isinstance(dec, tuple):\n        after = dec[1]\n\n    # --- filters/join prep ---\n    cat_by_id = {c.get(\"id\"): c for c in categories if isinstance(c, dict)}\n    active_cat_ids_by_key = {}\n    for c in categories:\n        if not isinstance(c, dict):\n            continue\n        if c.get(\"status\") == \"active\" and c.get(\"key\") in cat_enum and isinstance(c.get(\"id\"), str):\n            active_cat_ids_by_key.setdefault(c[\"key\"], set()).add(c[\"id\"])\n\n    mems_by_component = {}\n    for m in memberships:\n        if not isinstance(m, dict):\n            continue\n        cid = m.get(\"component_id\")\n        catid = m.get(\"category_id\")\n        if not isinstance(cid, str) or not isinstance(catid, str):\n            continue\n        # only join active categories\n        cat = cat_by_id.get(catid)\n        if not cat or cat.get(\"status\") != \"active\":\n            continue\n        mems_by_component.setdefault(cid, []).append(m)\n\n    # release filter: components must have at least one impl in that release (any status)\n    component_ids_with_impl_in_release = None\n    if release_id is not None:\n        rel_exists = any(isinstance(r, dict) and r.get(\"id\") == release_id for r in releases)\n        if not rel_exists:\n            # Listing with nonexistent release simply yields empty; but description says \"Raises VALIDATION_ERROR when ... release_id ... is\"\n            # It's \"malformed\" for validation; nonexistent is NOT_FOUND? Real list APIs usually accept and return empty.\n            # We'll treat missing release as NOT_FOUND to avoid silent typo.\n            return _err(\"NOT_FOUND\", \"Release not found.\", release_id=release_id)\n        s = set()\n        for im in impls:\n            if isinstance(im, dict) and im.get(\"release_id\") == release_id and isinstance(im.get(\"component_id\"), str):\n                s.add(im[\"component_id\"])\n        component_ids_with_impl_in_release = s\n\n    q_norm = (q or \"\").strip().lower()\n    def _matches_q(comp):\n        if not q_norm:\n            return True\n        slug = (comp.get(\"slug\") or \"\")\n        dn = (comp.get(\"display_name\") or \"\")\n        return (q_norm in str(slug).lower()) or (q_norm in str(dn).lower())\n\n    # --- apply filters ---\n    filtered = []\n    for c in components:\n        if not isinstance(c, dict):\n            continue\n        if c.get(\"status\") == \"hidden\":\n            # Business rule: never returned by getUIComponents\n            continue\n        if status is not None and c.get(\"status\") != status:\n            continue\n        if not _matches_q(c):\n            continue\n        if category_key is not None:\n            ok_cat_ids = active_cat_ids_by_key.get(category_key, set())\n            cmems = mems_by_component.get(c.get(\"id\"), [])\n            if not any(isinstance(m, dict) and m.get(\"category_id\") in ok_cat_ids for m in cmems):\n                continue\n        if component_ids_with_impl_in_release is not None:\n            cid = c.get(\"id\")\n            if cid not in component_ids_with_impl_in_release:\n                continue\n        filtered.append(c)\n\n    # --- sort + stable tiebreak ---\n    reverse = (sort_order == \"desc\")\n    def _key(c):\n        v = c.get(sort_by)\n        # normalize for consistent ordering\n        if v is None:\n            v = \"\"\n        if sort_by in (\"created_at\", \"updated_at\"):\n            # ISO Z sorts lexicographically if consistent; keep as string\n            v = str(v)\n        else:\n            v = str(v).lower()\n        return (v, str(c.get(\"id\") or \"\"))\n    filtered.sort(key=_key, reverse=reverse)\n\n    # --- pagination ---\n    def _compare_tuple(a, b):\n        return (a > b) - (a < b)\n\n    if after is not None:\n        # after = [sort_value, id]\n        a_sort, a_id = after[0], after[1]\n        # Need to drop items <= after when asc, or >= after when desc, based on same sort key\n        def _is_after(item):\n            item_sort = item.get(sort_by)\n            if item_sort is None:\n                item_sort = \"\"\n            if sort_by in (\"created_at\", \"updated_at\"):\n                item_sort = str(item_sort)\n            else:\n                item_sort = str(item_sort).lower()\n            item_id = str(item.get(\"id\") or \"\")\n            cur = (item_sort, item_id)\n            aft = (str(a_sort).lower() if sort_by not in (\"created_at\", \"updated_at\") else str(a_sort), str(a_id))\n            if not reverse:\n                return cur > aft\n            else:\n                return cur < aft\n        filtered = [c for c in filtered if _is_after(c)]\n\n    page = filtered[:limit]\n    has_more = len(filtered) > limit\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        last_sort = last.get(sort_by)\n        if last_sort is None:\n            last_sort = \"\"\n        if sort_by not in (\"created_at\", \"updated_at\"):\n            last_sort = str(last_sort).lower()\n        payload = {\"v\": 1, \"sort\": sort_by, \"order\": sort_order, \"after\": [last_sort, str(last.get(\"id\") or \"\")]}\n        token = base64.urlsafe_b64encode(json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n        next_cursor = token\n\n    # --- shape response including categories ---\n    def _category_public(cat):\n        return {\n            \"id\": cat.get(\"id\"),\n            \"key\": cat.get(\"key\"),\n            \"display_name\": cat.get(\"display_name\"),\n            \"description\": cat.get(\"description\"),\n            \"sort_order\": cat.get(\"sort_order\"),\n            \"status\": cat.get(\"status\"),\n        }\n\n    items = []\n    for c in page:\n        cid = c.get(\"id\")\n        cmems = mems_by_component.get(cid, [])\n        cats_out = []\n        for m in sorted([m for m in cmems if isinstance(m, dict)], key=lambda x: (x.get(\"sort_order\") if isinstance(x.get(\"sort_order\"), int) else 10**9, str(x.get(\"id\") or \"\"))):\n            cat = cat_by_id.get(m.get(\"category_id\"))\n            if not cat or cat.get(\"status\") != \"active\":\n                continue\n            cats_out.append({\n                \"category\": _category_public(cat),\n                \"is_primary\": bool(m.get(\"is_primary\")),\n                \"sort_order\": m.get(\"sort_order\"),\n            })\n        items.append({\n            \"id\": c.get(\"id\"),\n            \"slug\": c.get(\"slug\"),\n            \"display_name\": c.get(\"display_name\"),\n            \"summary\": c.get(\"summary\"),\n            \"doc_url\": c.get(\"doc_url\"),\n            \"repo_path\": c.get(\"repo_path\"),\n            \"status\": c.get(\"status\"),\n            \"created_at\": c.get(\"created_at\"),\n            \"updated_at\": c.get(\"updated_at\"),\n            \"categories\": cats_out,\n        })\n\n    # --- request log (observable dynamics) ---\n    latency_ms = int((time.time() - start) * 1000)\n    request_logs.append({\n        \"id\": \"req_\" + hashlib.sha256((now + \"|getUIComponents|\" + str(time.time())).encode(\"utf-8\")).hexdigest()[:24],\n        \"endpoint\": \"getUIComponents\",\n        \"status\": \"ok\",\n        \"http_status\": 200,\n        \"latency_ms\": latency_ms,\n        \"timestamp\": now,\n    })\n    _save(\"request_logs.json\", request_logs)\n\n    return {\n        \"object\": \"list\",\n        \"data\": items,\n        \"total\": len(filtered) + (0 if after is None else 0),\n        \"limit\": limit,\n        \"has_more\": bool(has_more),\n        \"next_cursor\": next_cursor,\n        \"sort_by\": sort_by,\n        \"sort_order\": sort_order,\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getLayout",
+          "description": "Returns the curated bundle of versioned implementation payloads for the Layout category (bento-grid, dock, file-tree, grid-pattern, interactive-grid-pattern, dot-pattern) for a specific catalog release selected by `release_id` or `version`, optionally filtered by `framework`, `language`, and implementation `status`. Raises VALIDATION_ERROR when filters are invalid or when `release_id`/`version` is malformed or ambiguous (for example, both provided but not referring to the same release). Raises NOT_FOUND when the referenced release does not exist, UNAUTHORIZED/FORBIDDEN for access control failures, and RATE_LIMITED when quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "release_id": {
+                "type": "string",
+                "pattern": "^mui_rel_[0-9A-Z]{18,}$",
+                "description": "Catalog release id to fetch implementations from."
+              },
+              "version": {
+                "type": "string",
+                "description": "Catalog release version to fetch implementations from (alternative to release_id)."
+              },
+              "framework": {
+                "type": "string",
+                "enum": [
+                  "react",
+                  "nextjs",
+                  "remix",
+                  "vite",
+                  "generic"
+                ],
+                "description": "Filter implementations by framework."
+              },
+              "language": {
+                "type": "string",
+                "enum": [
+                  "tsx",
+                  "ts",
+                  "jsx",
+                  "js",
+                  "mdx",
+                  "css"
+                ],
+                "description": "Filter implementations by primary language."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "superseded",
+                  "removed"
+                ],
+                "description": "Filter implementations by status."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def getLayout(release_id=None, version=None, framework=None, language=None, status=None, **_extra):\n    import json, os, datetime, time, re, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0341000\" if __import__(\"os\").path.isdir(\"./environment_mix/0341000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"getLayout\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _pick_logfile():\n        for fname in (\"request_logs.json\", \"api_requests.json\", \"api_request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fname)):\n                return fname\n        return None\n\n    def _log(status_code, error_code=None):\n        fname = _pick_logfile()\n        if not fname:\n            return\n        rows = _load(fname)\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": \"mui_req_\" + secrets.token_hex(12).upper(),\n            \"endpoint\": endpoint,\n            \"timestamp\": _now_iso(),\n            \"status\": int(status_code),\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(fname, rows)\n\n    try:\n        # Validation (relaxed: allow both release_id and version but ignore them; reads always use active published release)\n        if release_id is not None:\n            if not isinstance(release_id, str):\n                _log(400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"release_id must be a string\", field=\"release_id\")\n            # pattern per tool schema\n            if not re.match(r\"^mui_rel_[0-9A-Z]{18,}$\", release_id):\n                _log(400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"release_id does not match required format\", field=\"release_id\")\n        if version is not None and not isinstance(version, str):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"version must be a string\", field=\"version\")\n\n        allowed_framework = {\"react\", \"nextjs\", \"remix\", \"vite\", \"generic\"}\n        allowed_language = {\"tsx\", \"ts\", \"jsx\", \"js\", \"mdx\", \"css\"}\n        allowed_status = {\"active\", \"superseded\", \"removed\"}\n        if framework is not None and (not isinstance(framework, str) or framework not in allowed_framework):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid framework\", field=\"framework\", allowed=sorted(allowed_framework))\n        if language is not None and (not isinstance(language, str) or language not in allowed_language):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid language\", field=\"language\", allowed=sorted(allowed_language))\n        if status is not None and (not isinstance(status, str) or status not in allowed_status):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid status\", field=\"status\", allowed=sorted(allowed_status))\n\n        releases = _load(\"catalog_releases.json\")\n        categories = _load(\"component_categories.json\")\n        components = _load(\"components.json\")\n        memberships = _load(\"component_category_memberships.json\")\n        impls = _load(\"component_implementations.json\")\n\n        # Select the single active published release (business rule)\n        active_release = None\n        for r in releases if isinstance(releases, list) else []:\n            if isinstance(r, dict) and r.get(\"is_active\") is True and r.get(\"status\") == \"published\":\n                active_release = r\n                break\n        if not active_release:\n            _log(401, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"No active published catalog release available\")\n\n        # Find category by key=layout and status=active\n        cat = None\n        for c in categories if isinstance(categories, list) else []:\n            if isinstance(c, dict) and c.get(\"key\") == \"layout\" and c.get(\"status\") == \"active\":\n                cat = c\n                break\n        if not cat:\n            body = {\"release\": active_release, \"category\": {\"key\": \"layout\"}, \"items\": [], \"count\": 0}\n            _log(200, None)\n            return body\n\n        cat_id = cat.get(\"id\")\n\n        # component ids in category memberships\n        member_component_ids = set()\n        for m in memberships if isinstance(memberships, list) else []:\n            if isinstance(m, dict) and m.get(\"category_id\") == cat_id:\n                member_component_ids.add(m.get(\"component_id\"))\n\n        # components map; exclude hidden\n        comp_by_id = {}\n        for comp in components if isinstance(components, list) else []:\n            if not isinstance(comp, dict):\n                continue\n            if comp.get(\"id\") in member_component_ids and comp.get(\"status\") != \"hidden\":\n                comp_by_id[comp.get(\"id\")] = comp\n\n        # choose at most one implementation per (component_id, framework, language) from active release, status active\n        chosen = {}\n        for imp in impls if isinstance(impls, list) else []:\n            if not isinstance(imp, dict):\n                continue\n            if imp.get(\"release_id\") != active_release.get(\"id\"):\n                continue\n            cid = imp.get(\"component_id\")\n            if cid not in comp_by_id:\n                continue\n            if imp.get(\"status\") != \"active\":\n                continue\n            if framework is not None and imp.get(\"framework\") != framework:\n                continue\n            if language is not None and imp.get(\"language\") != language:\n                continue\n            if status is not None and imp.get(\"status\") != status:\n                continue\n\n            key = (cid, imp.get(\"framework\"), imp.get(\"language\"))\n            # deterministic pick: prefer most recently updated, then created, else first\n            prev = chosen.get(key)\n            if prev is None:\n                chosen[key] = imp\n            else:\n                pu = prev.get(\"updated_at\") or prev.get(\"created_at\") or \"\"\n                nu = imp.get(\"updated_at\") or imp.get(\"created_at\") or \"\"\n                if isinstance(nu, str) and isinstance(pu, str) and nu > pu:\n                    chosen[key] = imp\n\n        # Build response items: include component + implementation\n        items = []\n        for (cid, fw, lang), imp in chosen.items():\n            comp = comp_by_id.get(cid)\n            if not comp:\n                continue\n            items.append({\n                \"component\": comp,\n                \"implementation\": imp,\n            })\n\n        # stable ordering: by component.slug then framework/language\n        def _sort_key(it):\n            comp = it.get(\"component\") or {}\n            imp = it.get(\"implementation\") or {}\n            return (comp.get(\"slug\") or \"\", imp.get(\"framework\") or \"\", imp.get(\"language\") or \"\")\n        items.sort(key=_sort_key)\n\n        body = {\n            \"release\": active_release,\n            \"category\": cat,\n            \"items\": items,\n            \"count\": len(items),\n        }\n        _log(200, None)\n        return body\n    except Exception as e:\n        _log(500, \"INTERNAL_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected server error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getMedia",
+          "description": "Returns the curated bundle of versioned implementation payloads for the Media category (hero-video-dialog, terminal, marquee, script-copy-btn, code-comparison) for a specific catalog release selected by `release_id` or `version`, optionally filtered by `framework`, `language`, and implementation `status`. Raises VALIDATION_ERROR when any filter is invalid or when `release_id`/`version` is malformed or inconsistent (including providing both with a mismatch). Raises NOT_FOUND when the release cannot be found, UNAUTHORIZED/FORBIDDEN when you don’t have access, and RATE_LIMITED when you exceed request quotas.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "release_id": {
+                "type": "string",
+                "pattern": "^mui_rel_[0-9A-Z]{18,}$",
+                "description": "Catalog release id to fetch implementations from."
+              },
+              "version": {
+                "type": "string",
+                "description": "Catalog release version to fetch implementations from (alternative to release_id)."
+              },
+              "framework": {
+                "type": "string",
+                "enum": [
+                  "react",
+                  "nextjs",
+                  "remix",
+                  "vite",
+                  "generic"
+                ],
+                "description": "Filter implementations by framework."
+              },
+              "language": {
+                "type": "string",
+                "enum": [
+                  "tsx",
+                  "ts",
+                  "jsx",
+                  "js",
+                  "mdx",
+                  "css"
+                ],
+                "description": "Filter implementations by primary language."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "superseded",
+                  "removed"
+                ],
+                "description": "Filter implementations by status."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def getMedia(release_id=None, version=None, framework=None, language=None, status=None, **_extra):\n    import json, os, datetime, time, re, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0341000\" if __import__(\"os\").path.isdir(\"./environment_mix/0341000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"getMedia\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _pick_logfile():\n        for fname in (\"request_logs.json\", \"api_requests.json\", \"api_request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fname)):\n                return fname\n        return None\n\n    def _log(status_code, error_code=None):\n        fname = _pick_logfile()\n        if not fname:\n            return\n        rows = _load(fname)\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": \"mui_req_\" + secrets.token_hex(12).upper(),\n            \"endpoint\": endpoint,\n            \"timestamp\": _now_iso(),\n            \"status\": int(status_code),\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(fname, rows)\n\n    try:\n        if release_id is not None:\n            if not isinstance(release_id, str):\n                _log(400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"release_id must be a string\", field=\"release_id\")\n            if not re.match(r\"^mui_rel_[0-9A-Z]{18,}$\", release_id):\n                _log(400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"release_id does not match required format\", field=\"release_id\")\n        if version is not None and not isinstance(version, str):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"version must be a string\", field=\"version\")\n\n        allowed_framework = {\"react\", \"nextjs\", \"remix\", \"vite\", \"generic\"}\n        allowed_language = {\"tsx\", \"ts\", \"jsx\", \"js\", \"mdx\", \"css\"}\n        allowed_status = {\"active\", \"superseded\", \"removed\"}\n        if framework is not None and (not isinstance(framework, str) or framework not in allowed_framework):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid framework\", field=\"framework\", allowed=sorted(allowed_framework))\n        if language is not None and (not isinstance(language, str) or language not in allowed_language):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid language\", field=\"language\", allowed=sorted(allowed_language))\n        if status is not None and (not isinstance(status, str) or status not in allowed_status):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid status\", field=\"status\", allowed=sorted(allowed_status))\n\n        releases = _load(\"catalog_releases.json\")\n        categories = _load(\"component_categories.json\")\n        components = _load(\"components.json\")\n        memberships = _load(\"component_category_memberships.json\")\n        impls = _load(\"component_implementations.json\")\n\n        active_release = None\n        for r in releases if isinstance(releases, list) else []:\n            if isinstance(r, dict) and r.get(\"is_active\") is True and r.get(\"status\") == \"published\":\n                active_release = r\n                break\n        if not active_release:\n            _log(401, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"No active published catalog release available\")\n\n        cat = None\n        for c in categories if isinstance(categories, list) else []:\n            if isinstance(c, dict) and c.get(\"key\") == \"media\" and c.get(\"status\") == \"active\":\n                cat = c\n                break\n        if not cat:\n            body = {\"release\": active_release, \"category\": {\"key\": \"media\"}, \"items\": [], \"count\": 0}\n            _log(200, None)\n            return body\n\n        cat_id = cat.get(\"id\")\n\n        member_component_ids = set()\n        for m in memberships if isinstance(memberships, list) else []:\n            if isinstance(m, dict) and m.get(\"category_id\") == cat_id:\n                member_component_ids.add(m.get(\"component_id\"))\n\n        comp_by_id = {}\n        for comp in components if isinstance(components, list) else []:\n            if not isinstance(comp, dict):\n                continue\n            if comp.get(\"id\") in member_component_ids and comp.get(\"status\") != \"hidden\":\n                comp_by_id[comp.get(\"id\")] = comp\n\n        chosen = {}\n        for imp in impls if isinstance(impls, list) else []:\n            if not isinstance(imp, dict):\n                continue\n            if imp.get(\"release_id\") != active_release.get(\"id\"):\n                continue\n            cid = imp.get(\"component_id\")\n            if cid not in comp_by_id:\n                continue\n            if imp.get(\"status\") != \"active\":\n                continue\n            if framework is not None and imp.get(\"framework\") != framework:\n                continue\n            if language is not None and imp.get(\"language\") != language:\n                continue\n            if status is not None and imp.get(\"status\") != status:\n                continue\n\n            key = (cid, imp.get(\"framework\"), imp.get(\"language\"))\n            prev = chosen.get(key)\n            if prev is None:\n                chosen[key] = imp\n            else:\n                pu = prev.get(\"updated_at\") or prev.get(\"created_at\") or \"\"\n                nu = imp.get(\"updated_at\") or imp.get(\"created_at\") or \"\"\n                if isinstance(nu, str) and isinstance(pu, str) and nu > pu:\n                    chosen[key] = imp\n\n        items = []\n        for (cid, fw, lang), imp in chosen.items():\n            comp = comp_by_id.get(cid)\n            if not comp:\n                continue\n            items.append({\"component\": comp, \"implementation\": imp})\n\n        items.sort(key=lambda it: ((it.get(\"component\") or {}).get(\"slug\") or \"\", (it.get(\"implementation\") or {}).get(\"framework\") or \"\", (it.get(\"implementation\") or {}).get(\"language\") or \"\"))\n\n        body = {\"release\": active_release, \"category\": cat, \"items\": items, \"count\": len(items)}\n        _log(200, None)\n        return body\n    except Exception as e:\n        _log(500, \"INTERNAL_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected server error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getMotion",
+          "description": "Returns the curated bundle of versioned implementation payloads for the Motion category (blur-fade, scroll-progress, scroll-based-velocity, orbiting-circles, animated-circular-progress-bar) for a specific catalog release selected by `release_id` or `version`, optionally filtered by `framework`, `language`, and implementation `status`. Raises VALIDATION_ERROR for invalid filter values or malformed/contradictory `release_id`/`version` inputs. Raises NOT_FOUND if the requested release does not exist, plus UNAUTHORIZED/FORBIDDEN for authorization failures and RATE_LIMITED for quota enforcement.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "release_id": {
+                "type": "string",
+                "pattern": "^mui_rel_[0-9A-Z]{18,}$",
+                "description": "Catalog release id to fetch implementations from."
+              },
+              "version": {
+                "type": "string",
+                "description": "Catalog release version to fetch implementations from (alternative to release_id)."
+              },
+              "framework": {
+                "type": "string",
+                "enum": [
+                  "react",
+                  "nextjs",
+                  "remix",
+                  "vite",
+                  "generic"
+                ],
+                "description": "Filter implementations by framework."
+              },
+              "language": {
+                "type": "string",
+                "enum": [
+                  "tsx",
+                  "ts",
+                  "jsx",
+                  "js",
+                  "mdx",
+                  "css"
+                ],
+                "description": "Filter implementations by primary language."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "superseded",
+                  "removed"
+                ],
+                "description": "Filter implementations by status."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def getMotion(release_id=None, version=None, framework=None, language=None, status=None, **_extra):\n    import json, os, datetime, time, re, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0341000\" if __import__(\"os\").path.isdir(\"./environment_mix/0341000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"getMotion\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _pick_logfile():\n        for fname in (\"request_logs.json\", \"api_requests.json\", \"api_request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fname)):\n                return fname\n        return None\n\n    def _log(status_code, error_code=None):\n        fname = _pick_logfile()\n        if not fname:\n            return\n        rows = _load(fname)\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": \"mui_req_\" + secrets.token_hex(12).upper(),\n            \"endpoint\": endpoint,\n            \"timestamp\": _now_iso(),\n            \"status\": int(status_code),\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(fname, rows)\n\n    try:\n        if release_id is not None:\n            if not isinstance(release_id, str):\n                _log(400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"release_id must be a string\", field=\"release_id\")\n            if not re.match(r\"^mui_rel_[0-9A-Z]{18,}$\", release_id):\n                _log(400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"release_id does not match required format\", field=\"release_id\")\n        if version is not None and not isinstance(version, str):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"version must be a string\", field=\"version\")\n\n        allowed_framework = {\"react\", \"nextjs\", \"remix\", \"vite\", \"generic\"}\n        allowed_language = {\"tsx\", \"ts\", \"jsx\", \"js\", \"mdx\", \"css\"}\n        allowed_status = {\"active\", \"superseded\", \"removed\"}\n        if framework is not None and (not isinstance(framework, str) or framework not in allowed_framework):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid framework\", field=\"framework\", allowed=sorted(allowed_framework))\n        if language is not None and (not isinstance(language, str) or language not in allowed_language):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid language\", field=\"language\", allowed=sorted(allowed_language))\n        if status is not None and (not isinstance(status, str) or status not in allowed_status):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid status\", field=\"status\", allowed=sorted(allowed_status))\n\n        releases = _load(\"catalog_releases.json\")\n        categories = _load(\"component_categories.json\")\n        components = _load(\"components.json\")\n        memberships = _load(\"component_category_memberships.json\")\n        impls = _load(\"component_implementations.json\")\n\n        active_release = None\n        for r in releases if isinstance(releases, list) else []:\n            if isinstance(r, dict) and r.get(\"is_active\") is True and r.get(\"status\") == \"published\":\n                active_release = r\n                break\n        if not active_release:\n            _log(401, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"No active published catalog release available\")\n\n        cat = None\n        for c in categories if isinstance(categories, list) else []:\n            if isinstance(c, dict) and c.get(\"key\") == \"motion\" and c.get(\"status\") == \"active\":\n                cat = c\n                break\n        if not cat:\n            body = {\"release\": active_release, \"category\": {\"key\": \"motion\"}, \"items\": [], \"count\": 0}\n            _log(200, None)\n            return body\n\n        cat_id = cat.get(\"id\")\n\n        member_component_ids = set()\n        for m in memberships if isinstance(memberships, list) else []:\n            if isinstance(m, dict) and m.get(\"category_id\") == cat_id:\n                member_component_ids.add(m.get(\"component_id\"))\n\n        comp_by_id = {}\n        for comp in components if isinstance(components, list) else []:\n            if not isinstance(comp, dict):\n                continue\n            if comp.get(\"id\") in member_component_ids and comp.get(\"status\") != \"hidden\":\n                comp_by_id[comp.get(\"id\")] = comp\n\n        chosen = {}\n        for imp in impls if isinstance(impls, list) else []:\n            if not isinstance(imp, dict):\n                continue\n            if imp.get(\"release_id\") != active_release.get(\"id\"):\n                continue\n            cid = imp.get(\"component_id\")\n            if cid not in comp_by_id:\n                continue\n            if imp.get(\"status\") != \"active\":\n                continue\n            if framework is not None and imp.get(\"framework\") != framework:\n                continue\n            if language is not None and imp.get(\"language\") != language:\n                continue\n            if status is not None and imp.get(\"status\") != status:\n                continue\n            key = (cid, imp.get(\"framework\"), imp.get(\"language\"))\n            prev = chosen.get(key)\n            if prev is None:\n                chosen[key] = imp\n            else:\n                pu = prev.get(\"updated_at\") or prev.get(\"created_at\") or \"\"\n                nu = imp.get(\"updated_at\") or imp.get(\"created_at\") or \"\"\n                if isinstance(nu, str) and isinstance(pu, str) and nu > pu:\n                    chosen[key] = imp\n\n        items = [{\"component\": comp_by_id[cid], \"implementation\": imp} for (cid, fw, lang), imp in chosen.items() if cid in comp_by_id]\n        items.sort(key=lambda it: ((it.get(\"component\") or {}).get(\"slug\") or \"\", (it.get(\"implementation\") or {}).get(\"framework\") or \"\", (it.get(\"implementation\") or {}).get(\"language\") or \"\"))\n\n        body = {\"release\": active_release, \"category\": cat, \"items\": items, \"count\": len(items)}\n        _log(200, None)\n        return body\n    except Exception as e:\n        _log(500, \"INTERNAL_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected server error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getTextReveal",
+          "description": "Returns the curated bundle of versioned implementation payloads for the Text Reveal category (text-animate, line-shadow-text, aurora-text, animated-shiny-text, animated-gradient-text, text-reveal, typing-animation, box-reveal, number-ticker) for a specific catalog release selected by `release_id` or `version`, optionally filtered by `framework`, `language`, and implementation `status`. Raises VALIDATION_ERROR when filters are invalid or when `release_id`/`version` is malformed or inconsistent (including mismatched values when both are provided). Raises NOT_FOUND when the referenced release cannot be located, and also UNAUTHORIZED/FORBIDDEN and RATE_LIMITED when access or quota checks fail.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "release_id": {
+                "type": "string",
+                "pattern": "^mui_rel_[0-9A-Z]{18,}$",
+                "description": "Catalog release id to fetch implementations from."
+              },
+              "version": {
+                "type": "string",
+                "description": "Catalog release version to fetch implementations from (alternative to release_id)."
+              },
+              "framework": {
+                "type": "string",
+                "enum": [
+                  "react",
+                  "nextjs",
+                  "remix",
+                  "vite",
+                  "generic"
+                ],
+                "description": "Filter implementations by framework."
+              },
+              "language": {
+                "type": "string",
+                "enum": [
+                  "tsx",
+                  "ts",
+                  "jsx",
+                  "js",
+                  "mdx",
+                  "css"
+                ],
+                "description": "Filter implementations by primary language."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "superseded",
+                  "removed"
+                ],
+                "description": "Filter implementations by status."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def getTextReveal(release_id=None, version=None, framework=None, language=None, status=None, **_extra):\n    import json, os, datetime, time, re, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0341000\" if __import__(\"os\").path.isdir(\"./environment_mix/0341000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"getTextReveal\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _pick_logfile():\n        for fname in (\"request_logs.json\", \"api_requests.json\", \"api_request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fname)):\n                return fname\n        return None\n\n    def _log(status_code, error_code=None):\n        fname = _pick_logfile()\n        if not fname:\n            return\n        rows = _load(fname)\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": \"mui_req_\" + secrets.token_hex(12).upper(),\n            \"endpoint\": endpoint,\n            \"timestamp\": _now_iso(),\n            \"status\": int(status_code),\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(fname, rows)\n\n    try:\n        if release_id is not None:\n            if not isinstance(release_id, str):\n                _log(400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"release_id must be a string\", field=\"release_id\")\n            if not re.match(r\"^mui_rel_[0-9A-Z]{18,}$\", release_id):\n                _log(400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"release_id does not match required format\", field=\"release_id\")\n        if version is not None and not isinstance(version, str):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"version must be a string\", field=\"version\")\n\n        allowed_framework = {\"react\", \"nextjs\", \"remix\", \"vite\", \"generic\"}\n        allowed_language = {\"tsx\", \"ts\", \"jsx\", \"js\", \"mdx\", \"css\"}\n        allowed_status = {\"active\", \"superseded\", \"removed\"}\n        if framework is not None and (not isinstance(framework, str) or framework not in allowed_framework):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid framework\", field=\"framework\", allowed=sorted(allowed_framework))\n        if language is not None and (not isinstance(language, str) or language not in allowed_language):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid language\", field=\"language\", allowed=sorted(allowed_language))\n        if status is not None and (not isinstance(status, str) or status not in allowed_status):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid status\", field=\"status\", allowed=sorted(allowed_status))\n\n        releases = _load(\"catalog_releases.json\")\n        categories = _load(\"component_categories.json\")\n        components = _load(\"components.json\")\n        memberships = _load(\"component_category_memberships.json\")\n        impls = _load(\"component_implementations.json\")\n\n        active_release = None\n        for r in releases if isinstance(releases, list) else []:\n            if isinstance(r, dict) and r.get(\"is_active\") is True and r.get(\"status\") == \"published\":\n                active_release = r\n                break\n        if not active_release:\n            _log(401, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"No active published catalog release available\")\n\n        cat = None\n        for c in categories if isinstance(categories, list) else []:\n            if isinstance(c, dict) and c.get(\"key\") == \"text_reveal\" and c.get(\"status\") == \"active\":\n                cat = c\n                break\n        if not cat:\n            body = {\"release\": active_release, \"category\": {\"key\": \"text_reveal\"}, \"items\": [], \"count\": 0}\n            _log(200, None)\n            return body\n\n        cat_id = cat.get(\"id\")\n\n        member_component_ids = set()\n        for m in memberships if isinstance(memberships, list) else []:\n            if isinstance(m, dict) and m.get(\"category_id\") == cat_id:\n                member_component_ids.add(m.get(\"component_id\"))\n\n        comp_by_id = {}\n        for comp in components if isinstance(components, list) else []:\n            if not isinstance(comp, dict):\n                continue\n            if comp.get(\"id\") in member_component_ids and comp.get(\"status\") != \"hidden\":\n                comp_by_id[comp.get(\"id\")] = comp\n\n        chosen = {}\n        for imp in impls if isinstance(impls, list) else []:\n            if not isinstance(imp, dict):\n                continue\n            if imp.get(\"release_id\") != active_release.get(\"id\"):\n                continue\n            cid = imp.get(\"component_id\")\n            if cid not in comp_by_id:\n                continue\n            if imp.get(\"status\") != \"active\":\n                continue\n            if framework is not None and imp.get(\"framework\") != framework:\n                continue\n            if language is not None and imp.get(\"language\") != language:\n                continue\n            if status is not None and imp.get(\"status\") != status:\n                continue\n            key = (cid, imp.get(\"framework\"), imp.get(\"language\"))\n            prev = chosen.get(key)\n            if prev is None:\n                chosen[key] = imp\n            else:\n                pu = prev.get(\"updated_at\") or prev.get(\"created_at\") or \"\"\n                nu = imp.get(\"updated_at\") or imp.get(\"created_at\") or \"\"\n                if isinstance(nu, str) and isinstance(pu, str) and nu > pu:\n                    chosen[key] = imp\n\n        items = [{\"component\": comp_by_id[cid], \"implementation\": imp} for (cid, fw, lang), imp in chosen.items() if cid in comp_by_id]\n        items.sort(key=lambda it: ((it.get(\"component\") or {}).get(\"slug\") or \"\", (it.get(\"implementation\") or {}).get(\"framework\") or \"\", (it.get(\"implementation\") or {}).get(\"language\") or \"\"))\n\n        body = {\"release\": active_release, \"category\": cat, \"items\": items, \"count\": len(items)}\n        _log(200, None)\n        return body\n    except Exception as e:\n        _log(500, \"INTERNAL_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected server error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getTextEffects",
+          "description": "Returns the curated bundle of versioned implementation payloads for the Text Effects category (word-rotate, flip-text, hyper-text, morphing-text, spinning-text, sparkles-text) for a specific catalog release selected by `release_id` or `version`, optionally filtered by `framework`, `language`, and implementation `status`. Raises VALIDATION_ERROR on invalid filters or malformed/contradictory release selectors. Raises NOT_FOUND when the target release does not exist, and UNAUTHORIZED/FORBIDDEN or RATE_LIMITED when authentication/authorization or quota rules block the request.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "release_id": {
+                "type": "string",
+                "pattern": "^mui_rel_[0-9A-Z]{18,}$",
+                "description": "Catalog release id to fetch implementations from."
+              },
+              "version": {
+                "type": "string",
+                "description": "Catalog release version to fetch implementations from (alternative to release_id)."
+              },
+              "framework": {
+                "type": "string",
+                "enum": [
+                  "react",
+                  "nextjs",
+                  "remix",
+                  "vite",
+                  "generic"
+                ],
+                "description": "Filter implementations by framework."
+              },
+              "language": {
+                "type": "string",
+                "enum": [
+                  "tsx",
+                  "ts",
+                  "jsx",
+                  "js",
+                  "mdx",
+                  "css"
+                ],
+                "description": "Filter implementations by primary language."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "superseded",
+                  "removed"
+                ],
+                "description": "Filter implementations by status."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def getTextEffects(release_id=None, version=None, framework=None, language=None, status=None, **_extra):\n    import json, os, datetime, time, re, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0341000\" if __import__(\"os\").path.isdir(\"./environment_mix/0341000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"getTextEffects\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _pick_logfile():\n        for fname in (\"request_logs.json\", \"api_requests.json\", \"api_request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fname)):\n                return fname\n        return None\n\n    def _log(status_code, error_code=None):\n        fname = _pick_logfile()\n        if not fname:\n            return\n        rows = _load(fname)\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": \"mui_req_\" + secrets.token_hex(12).upper(),\n            \"endpoint\": endpoint,\n            \"timestamp\": _now_iso(),\n            \"status\": int(status_code),\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(fname, rows)\n\n    try:\n        if release_id is not None:\n            if not isinstance(release_id, str):\n                _log(400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"release_id must be a string\", field=\"release_id\")\n            if not re.match(r\"^mui_rel_[0-9A-Z]{18,}$\", release_id):\n                _log(400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"release_id does not match required format\", field=\"release_id\")\n        if version is not None and not isinstance(version, str):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"version must be a string\", field=\"version\")\n\n        allowed_framework = {\"react\", \"nextjs\", \"remix\", \"vite\", \"generic\"}\n        allowed_language = {\"tsx\", \"ts\", \"jsx\", \"js\", \"mdx\", \"css\"}\n        allowed_status = {\"active\", \"superseded\", \"removed\"}\n        if framework is not None and (not isinstance(framework, str) or framework not in allowed_framework):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid framework\", field=\"framework\", allowed=sorted(allowed_framework))\n        if language is not None and (not isinstance(language, str) or language not in allowed_language):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid language\", field=\"language\", allowed=sorted(allowed_language))\n        if status is not None and (not isinstance(status, str) or status not in allowed_status):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid status\", field=\"status\", allowed=sorted(allowed_status))\n\n        releases = _load(\"catalog_releases.json\")\n        categories = _load(\"component_categories.json\")\n        components = _load(\"components.json\")\n        memberships = _load(\"component_category_memberships.json\")\n        impls = _load(\"component_implementations.json\")\n\n        active_release = None\n        for r in releases if isinstance(releases, list) else []:\n            if isinstance(r, dict) and r.get(\"is_active\") is True and r.get(\"status\") == \"published\":\n                active_release = r\n                break\n        if not active_release:\n            _log(401, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"No active published catalog release available\")\n\n        cat = None\n        for c in categories if isinstance(categories, list) else []:\n            if isinstance(c, dict) and c.get(\"key\") == \"text_effects\" and c.get(\"status\") == \"active\":\n                cat = c\n                break\n        if not cat:\n            body = {\"release\": active_release, \"category\": {\"key\": \"text_effects\"}, \"items\": [], \"count\": 0}\n            _log(200, None)\n            return body\n\n        cat_id = cat.get(\"id\")\n\n        member_component_ids = set()\n        for m in memberships if isinstance(memberships, list) else []:\n            if isinstance(m, dict) and m.get(\"category_id\") == cat_id:\n                member_component_ids.add(m.get(\"component_id\"))\n\n        comp_by_id = {}\n        for comp in components if isinstance(components, list) else []:\n            if not isinstance(comp, dict):\n                continue\n            if comp.get(\"id\") in member_component_ids and comp.get(\"status\") != \"hidden\":\n                comp_by_id[comp.get(\"id\")] = comp\n\n        chosen = {}\n        for imp in impls if isinstance(impls, list) else []:\n            if not isinstance(imp, dict):\n                continue\n            if imp.get(\"release_id\") != active_release.get(\"id\"):\n                continue\n            cid = imp.get(\"component_id\")\n            if cid not in comp_by_id:\n                continue\n            if imp.get(\"status\") != \"active\":\n                continue\n            if framework is not None and imp.get(\"framework\") != framework:\n                continue\n            if language is not None and imp.get(\"language\") != language:\n                continue\n            if status is not None and imp.get(\"status\") != status:\n                continue\n            key = (cid, imp.get(\"framework\"), imp.get(\"language\"))\n            prev = chosen.get(key)\n            if prev is None:\n                chosen[key] = imp\n            else:\n                pu = prev.get(\"updated_at\") or prev.get(\"created_at\") or \"\"\n                nu = imp.get(\"updated_at\") or imp.get(\"created_at\") or \"\"\n                if isinstance(nu, str) and isinstance(pu, str) and nu > pu:\n                    chosen[key] = imp\n\n        items = [{\"component\": comp_by_id[cid], \"implementation\": imp} for (cid, fw, lang), imp in chosen.items() if cid in comp_by_id]\n        items.sort(key=lambda it: ((it.get(\"component\") or {}).get(\"slug\") or \"\", (it.get(\"implementation\") or {}).get(\"framework\") or \"\", (it.get(\"implementation\") or {}).get(\"language\") or \"\"))\n\n        body = {\"release\": active_release, \"category\": cat, \"items\": items, \"count\": len(items)}\n        _log(200, None)\n        return body\n    except Exception as e:\n        _log(500, \"INTERNAL_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected server error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getButtons",
+          "description": "Returns the curated bundle of versioned implementation payloads for the Buttons category (rainbow-button, shimmer-button, shiny-button, interactive-hover-button, animated-subscribe-button, pulsating-button, ripple-button) for a specific catalog release selected by `release_id` or `version`, optionally filtered by `framework`, `language`, and implementation `status`. Raises VALIDATION_ERROR for invalid filter values or malformed/inconsistent `release_id`/`version`. Raises NOT_FOUND if the selected release cannot be found, along with UNAUTHORIZED/FORBIDDEN for access control failures and RATE_LIMITED when quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "release_id": {
+                "type": "string",
+                "pattern": "^mui_rel_[0-9A-Z]{18,}$",
+                "description": "Catalog release id to fetch implementations from."
+              },
+              "version": {
+                "type": "string",
+                "description": "Catalog release version to fetch implementations from (alternative to release_id)."
+              },
+              "framework": {
+                "type": "string",
+                "enum": [
+                  "react",
+                  "nextjs",
+                  "remix",
+                  "vite",
+                  "generic"
+                ],
+                "description": "Filter implementations by framework."
+              },
+              "language": {
+                "type": "string",
+                "enum": [
+                  "tsx",
+                  "ts",
+                  "jsx",
+                  "js",
+                  "mdx",
+                  "css"
+                ],
+                "description": "Filter implementations by primary language."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "superseded",
+                  "removed"
+                ],
+                "description": "Filter implementations by status."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def getButtons(release_id=None, version=None, framework=None, language=None, status=None, **_extra):\n    import json, os, datetime, time, re, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0341000\" if __import__(\"os\").path.isdir(\"./environment_mix/0341000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"getButtons\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _pick_logfile():\n        for fname in (\"request_logs.json\", \"api_requests.json\", \"api_request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fname)):\n                return fname\n        return None\n\n    def _log(status_code, error_code=None):\n        fname = _pick_logfile()\n        if not fname:\n            return\n        rows = _load(fname)\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": \"mui_req_\" + secrets.token_hex(12).upper(),\n            \"endpoint\": endpoint,\n            \"timestamp\": _now_iso(),\n            \"status\": int(status_code),\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(fname, rows)\n\n    try:\n        # Validation relaxed re: both release_id+version (ignored); but still validate formats if provided.\n        if release_id is not None:\n            if not isinstance(release_id, str):\n                _log(400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"release_id must be a string\", field=\"release_id\")\n            if not re.match(r\"^mui_rel_[0-9A-Z]{18,}$\", release_id):\n                _log(400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"release_id does not match required format\", field=\"release_id\")\n        if version is not None and not isinstance(version, str):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"version must be a string\", field=\"version\")\n\n        allowed_framework = {\"react\", \"nextjs\", \"remix\", \"vite\", \"generic\"}\n        allowed_language = {\"tsx\", \"ts\", \"jsx\", \"js\", \"mdx\", \"css\"}\n        allowed_status = {\"active\", \"superseded\", \"removed\"}\n        if framework is not None and (not isinstance(framework, str) or framework not in allowed_framework):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid framework\", field=\"framework\", allowed=sorted(allowed_framework))\n        if language is not None and (not isinstance(language, str) or language not in allowed_language):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid language\", field=\"language\", allowed=sorted(allowed_language))\n        if status is not None and (not isinstance(status, str) or status not in allowed_status):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid status\", field=\"status\", allowed=sorted(allowed_status))\n\n        releases = _load(\"catalog_releases.json\")\n        categories = _load(\"component_categories.json\")\n        components = _load(\"components.json\")\n        memberships = _load(\"component_category_memberships.json\")\n        impls = _load(\"component_implementations.json\")\n\n        active_release = None\n        for r in releases if isinstance(releases, list) else []:\n            if isinstance(r, dict) and r.get(\"is_active\") is True and r.get(\"status\") == \"published\":\n                active_release = r\n                break\n        if not active_release:\n            _log(401, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"No active published catalog release available\")\n\n        cat = None\n        for c in categories if isinstance(categories, list) else []:\n            if isinstance(c, dict) and c.get(\"key\") == \"buttons\" and c.get(\"status\") == \"active\":\n                cat = c\n                break\n        if not cat:\n            body = {\"release\": active_release, \"category\": {\"key\": \"buttons\"}, \"items\": [], \"count\": 0}\n            _log(200, None)\n            return body\n\n        cat_id = cat.get(\"id\")\n\n        member_component_ids = set()\n        for m in memberships if isinstance(memberships, list) else []:\n            if isinstance(m, dict) and m.get(\"category_id\") == cat_id:\n                member_component_ids.add(m.get(\"component_id\"))\n\n        comp_by_id = {}\n        for comp in components if isinstance(components, list) else []:\n            if not isinstance(comp, dict):\n                continue\n            if comp.get(\"id\") in member_component_ids and comp.get(\"status\") != \"hidden\":\n                comp_by_id[comp.get(\"id\")] = comp\n\n        chosen = {}\n        for imp in impls if isinstance(impls, list) else []:\n            if not isinstance(imp, dict):\n                continue\n            if imp.get(\"release_id\") != active_release.get(\"id\"):\n                continue\n            cid = imp.get(\"component_id\")\n            if cid not in comp_by_id:\n                continue\n            if imp.get(\"status\") != \"active\":\n                continue\n            if framework is not None and imp.get(\"framework\") != framework:\n                continue\n            if language is not None and imp.get(\"language\") != language:\n                continue\n            if status is not None and imp.get(\"status\") != status:\n                continue\n            key = (cid, imp.get(\"framework\"), imp.get(\"language\"))\n            prev = chosen.get(key)\n            if prev is None:\n                chosen[key] = imp\n            else:\n                pu = prev.get(\"updated_at\") or prev.get(\"created_at\") or \"\"\n                nu = imp.get(\"updated_at\") or imp.get(\"created_at\") or \"\"\n                if isinstance(nu, str) and isinstance(pu, str) and nu > pu:\n                    chosen[key] = imp\n\n        items = [{\"component\": comp_by_id[cid], \"implementation\": imp} for (cid, fw, lang), imp in chosen.items() if cid in comp_by_id]\n        items.sort(key=lambda it: ((it.get(\"component\") or {}).get(\"slug\") or \"\", (it.get(\"implementation\") or {}).get(\"framework\") or \"\", (it.get(\"implementation\") or {}).get(\"language\") or \"\"))\n\n        body = {\"release\": active_release, \"category\": cat, \"items\": items, \"count\": len(items)}\n        _log(200, None)\n        return body\n    except Exception as e:\n        _log(500, \"INTERNAL_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected server error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getEffects",
+          "description": "Returns the curated bundle of versioned implementation payloads for the Effects category (animated-beam, border-beam, shine-border, magic-card, meteors, neon-gradient-card, confetti, particles, cool-mode, scratch-to-reveal) for a specific catalog release selected by `release_id` or `version`, optionally filtered by `framework`, `language`, and implementation `status`. Raises VALIDATION_ERROR when any filter is invalid or when the release selector is malformed or inconsistent (including a mismatch when both `release_id` and `version` are provided). Raises NOT_FOUND when the requested release doesn’t exist, and UNAUTHORIZED/FORBIDDEN and RATE_LIMITED when the request is blocked by access rules or quotas.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "release_id": {
+                "type": "string",
+                "pattern": "^mui_rel_[0-9A-Z]{18,}$",
+                "description": "Catalog release id to fetch implementations from."
+              },
+              "version": {
+                "type": "string",
+                "description": "Catalog release version to fetch implementations from (alternative to release_id)."
+              },
+              "framework": {
+                "type": "string",
+                "enum": [
+                  "react",
+                  "nextjs",
+                  "remix",
+                  "vite",
+                  "generic"
+                ],
+                "description": "Filter implementations by framework."
+              },
+              "language": {
+                "type": "string",
+                "enum": [
+                  "tsx",
+                  "ts",
+                  "jsx",
+                  "js",
+                  "mdx",
+                  "css"
+                ],
+                "description": "Filter implementations by primary language."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "superseded",
+                  "removed"
+                ],
+                "description": "Filter implementations by status."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def getEffects(release_id=None, version=None, framework=None, language=None, status=None, **_extra):\n    import json, os, datetime, time, re, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0341000\" if __import__(\"os\").path.isdir(\"./environment_mix/0341000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"getEffects\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _pick_logfile():\n        for fname in (\"request_logs.json\", \"api_requests.json\", \"api_request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fname)):\n                return fname\n        return None\n\n    def _log(status_code, error_code=None):\n        fname = _pick_logfile()\n        if not fname:\n            return\n        rows = _load(fname)\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": \"mui_req_\" + secrets.token_hex(12).upper(),\n            \"endpoint\": endpoint,\n            \"timestamp\": _now_iso(),\n            \"status\": int(status_code),\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(fname, rows)\n\n    try:\n        if release_id is not None:\n            if not isinstance(release_id, str):\n                _log(400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"release_id must be a string\", field=\"release_id\")\n            if not re.match(r\"^mui_rel_[0-9A-Z]{18,}$\", release_id):\n                _log(400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"release_id does not match required format\", field=\"release_id\")\n        if version is not None and not isinstance(version, str):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"version must be a string\", field=\"version\")\n\n        allowed_framework = {\"react\", \"nextjs\", \"remix\", \"vite\", \"generic\"}\n        allowed_language = {\"tsx\", \"ts\", \"jsx\", \"js\", \"mdx\", \"css\"}\n        allowed_status = {\"active\", \"superseded\", \"removed\"}\n        if framework is not None and (not isinstance(framework, str) or framework not in allowed_framework):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid framework\", field=\"framework\", allowed=sorted(allowed_framework))\n        if language is not None and (not isinstance(language, str) or language not in allowed_language):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid language\", field=\"language\", allowed=sorted(allowed_language))\n        if status is not None and (not isinstance(status, str) or status not in allowed_status):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid status\", field=\"status\", allowed=sorted(allowed_status))\n\n        releases = _load(\"catalog_releases.json\")\n        categories = _load(\"component_categories.json\")\n        components = _load(\"components.json\")\n        memberships = _load(\"component_category_memberships.json\")\n        impls = _load(\"component_implementations.json\")\n\n        active_release = None\n        for r in releases if isinstance(releases, list) else []:\n            if isinstance(r, dict) and r.get(\"is_active\") is True and r.get(\"status\") == \"published\":\n                active_release = r\n                break\n        if not active_release:\n            _log(401, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"No active published catalog release available\")\n\n        cat = None\n        for c in categories if isinstance(categories, list) else []:\n            if isinstance(c, dict) and c.get(\"key\") == \"effects\" and c.get(\"status\") == \"active\":\n                cat = c\n                break\n        if not cat:\n            body = {\"release\": active_release, \"category\": {\"key\": \"effects\"}, \"items\": [], \"count\": 0}\n            _log(200, None)\n            return body\n\n        cat_id = cat.get(\"id\")\n\n        member_component_ids = set()\n        for m in memberships if isinstance(memberships, list) else []:\n            if isinstance(m, dict) and m.get(\"category_id\") == cat_id:\n                member_component_ids.add(m.get(\"component_id\"))\n\n        comp_by_id = {}\n        for comp in components if isinstance(components, list) else []:\n            if not isinstance(comp, dict):\n                continue\n            if comp.get(\"id\") in member_component_ids and comp.get(\"status\") != \"hidden\":\n                comp_by_id[comp.get(\"id\")] = comp\n\n        chosen = {}\n        for imp in impls if isinstance(impls, list) else []:\n            if not isinstance(imp, dict):\n                continue\n            if imp.get(\"release_id\") != active_release.get(\"id\"):\n                continue\n            cid = imp.get(\"component_id\")\n            if cid not in comp_by_id:\n                continue\n            if imp.get(\"status\") != \"active\":\n                continue\n            if framework is not None and imp.get(\"framework\") != framework:\n                continue\n            if language is not None and imp.get(\"language\") != language:\n                continue\n            if status is not None and imp.get(\"status\") != status:\n                continue\n            key = (cid, imp.get(\"framework\"), imp.get(\"language\"))\n            prev = chosen.get(key)\n            if prev is None:\n                chosen[key] = imp\n            else:\n                pu = prev.get(\"updated_at\") or prev.get(\"created_at\") or \"\"\n                nu = imp.get(\"updated_at\") or imp.get(\"created_at\") or \"\"\n                if isinstance(nu, str) and isinstance(pu, str) and nu > pu:\n                    chosen[key] = imp\n\n        items = [{\"component\": comp_by_id[cid], \"implementation\": imp} for (cid, fw, lang), imp in chosen.items() if cid in comp_by_id]\n        items.sort(key=lambda it: ((it.get(\"component\") or {}).get(\"slug\") or \"\", (it.get(\"implementation\") or {}).get(\"framework\") or \"\", (it.get(\"implementation\") or {}).get(\"language\") or \"\"))\n\n        body = {\"release\": active_release, \"category\": cat, \"items\": items, \"count\": len(items)}\n        _log(200, None)\n        return body\n    except Exception as e:\n        _log(500, \"INTERNAL_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected server error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getWidgets",
+          "description": "Returns the curated bundle of versioned implementation payloads for the Widgets category (animated-list, tweet-card, client-tweet-card, lens, pointer, avatar-circles, icon-cloud, globe) for a specific catalog release selected by `release_id` or `version`, optionally filtered by `framework`, `language`, and implementation `status`. Raises VALIDATION_ERROR when filters are invalid or when `release_id`/`version` is malformed or inconsistent, including failing the `release_id` pattern. Raises NOT_FOUND when the referenced release cannot be found, and UNAUTHORIZED/FORBIDDEN or RATE_LIMITED when authentication/authorization or quota enforcement prevents the request.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "release_id": {
+                "type": "string",
+                "pattern": "^mui_rel_[0-9A-HJKMNP-TV-Z]{17}$",
+                "description": "Catalog release ID to fetch widget implementation payloads from."
+              },
+              "version": {
+                "type": "string",
+                "description": "Catalog release version string to fetch widget implementation payloads from (alternative to release_id)."
+              },
+              "framework": {
+                "type": "string",
+                "enum": [
+                  "react",
+                  "nextjs",
+                  "remix",
+                  "vite",
+                  "generic"
+                ],
+                "description": "Framework variant of implementations to return."
+              },
+              "language": {
+                "type": "string",
+                "enum": [
+                  "tsx",
+                  "ts",
+                  "jsx",
+                  "js",
+                  "mdx",
+                  "css"
+                ],
+                "description": "Source language/extension of implementations to return."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "superseded",
+                  "removed"
+                ],
+                "description": "Implementation status filter."
+              }
+            },
+            "required": [],
+            "additionalProperties": false,
+            "oneOf": [
+              {
+                "required": [
+                  "release_id"
+                ]
+              },
+              {
+                "required": [
+                  "version"
+                ]
+              }
+            ]
+          },
+          "implementation": "def getWidgets(release_id=None, version=None, framework=None, language=None, status=None, **_extra):\n    import json, os, datetime, time, re, secrets\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0341000\" if __import__(\"os\").path.isdir(\"./environment_mix/0341000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"getWidgets\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _pick_logfile():\n        for fname in (\"request_logs.json\", \"api_requests.json\", \"api_request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fname)):\n                return fname\n        return \"request_logs.json\"\n\n    def _log(http_status, error_code=None):\n        fname = _pick_logfile()\n        rows = _load(fname)\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": \"mui_req_\" + secrets.token_hex(12).upper(),\n            \"endpoint\": endpoint,\n            \"timestamp\": _now_iso(),\n            \"status\": int(http_status),\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(fname, rows)\n\n    try:\n        # Validate filters (relaxed release_id pattern to accept existing IDs in store)\n        if release_id is not None and not isinstance(release_id, str):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"release_id must be a string\", field=\"release_id\")\n        if version is not None and not isinstance(version, str):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"version must be a string\", field=\"version\")\n\n        allowed_framework = {\"react\", \"nextjs\", \"remix\", \"vite\", \"generic\"}\n        allowed_language = {\"tsx\", \"ts\", \"jsx\", \"js\", \"mdx\", \"css\"}\n        allowed_status = {\"active\", \"superseded\", \"removed\"}\n\n        if framework is not None and framework not in allowed_framework:\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"framework must be one of react,nextjs,remix,vite,generic\", field=\"framework\")\n        if language is not None and language not in allowed_language:\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"language must be one of tsx,ts,jsx,js,mdx,css\", field=\"language\")\n        if status is not None and status not in allowed_status:\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of active,superseded,removed\", field=\"status\")\n\n        # Business rule: MUST use the single active published release (ignore release_id/version selection inputs)\n        releases = _load(\"catalog_releases.json\")\n        if not isinstance(releases, list):\n            releases = []\n        active_release = None\n        for r in releases:\n            if isinstance(r, dict) and r.get(\"is_active\") is True and r.get(\"status\") == \"published\":\n                active_release = r\n                break\n        if not active_release:\n            _log(401, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"no active published catalog release available\")\n\n        category_key = \"widgets\"\n        categories = _load(\"component_categories.json\")\n        if not isinstance(categories, list):\n            categories = []\n        cat = None\n        for c in categories:\n            if isinstance(c, dict) and c.get(\"key\") == category_key:\n                cat = c\n                break\n        if not cat:\n            _log(200, None)\n            return {\"release\": active_release, \"category\": {\"key\": category_key}, \"items\": [], \"total\": 0}\n\n        memberships = _load(\"component_category_memberships.json\")\n        if not isinstance(memberships, list):\n            memberships = []\n        member_component_ids = []\n        for m in memberships:\n            if isinstance(m, dict) and m.get(\"category_id\") == cat.get(\"id\"):\n                cid = m.get(\"component_id\")\n                if isinstance(cid, str):\n                    member_component_ids.append(cid)\n        member_component_ids = list(dict.fromkeys(member_component_ids))\n\n        components = _load(\"components.json\")\n        if not isinstance(components, list):\n            components = []\n        comp_by_id = {c.get(\"id\"): c for c in components if isinstance(c, dict) and isinstance(c.get(\"id\"), str)}\n\n        implementations = _load(\"component_implementations.json\")\n        if not isinstance(implementations, list):\n            implementations = []\n\n        # Select at most one implementation per (framework, language) for each component from active release where impl.status == 'active'\n        # Also: hidden components must not be returned.\n        results = []\n        for cid in member_component_ids:\n            comp = comp_by_id.get(cid)\n            if not comp or comp.get(\"status\") == \"hidden\":\n                continue\n\n            impls = []\n            for imp in implementations:\n                if not isinstance(imp, dict):\n                    continue\n                if imp.get(\"release_id\") != active_release.get(\"id\"):\n                    continue\n                if imp.get(\"component_id\") != cid:\n                    continue\n                if imp.get(\"status\") != \"active\":\n                    continue\n                if framework is not None and imp.get(\"framework\") != framework:\n                    continue\n                if language is not None and imp.get(\"language\") != language:\n                    continue\n                if status is not None and imp.get(\"status\") != status:\n                    continue\n                impls.append(imp)\n\n            chosen = {}\n            for imp in impls:\n                key = (imp.get(\"framework\"), imp.get(\"language\"))\n                if key not in chosen:\n                    chosen[key] = imp\n\n            results.append({\n                \"component\": comp,\n                \"implementations\": list(chosen.values())\n            })\n\n        _log(200, None)\n        return {\n            \"release\": active_release,\n            \"category\": {\"id\": cat.get(\"id\"), \"key\": cat.get(\"key\"), \"display_name\": cat.get(\"display_name\")},\n            \"items\": results,\n            \"total\": len(results)\n        }\n    except Exception as e:\n        _log(500, \"INTERNAL_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"unexpected error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getBackgrounds",
+          "description": "Provides implementation details for warp-background, flickering-grid, animated-grid-pattern, retro-grid, ripple components.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "release_id": {
+                "type": "string",
+                "pattern": "^mui_rel_[0-9A-HJKMNP-TV-Z]{17}$",
+                "description": "Catalog release ID to fetch background implementation payloads from."
+              },
+              "version": {
+                "type": "string",
+                "description": "Catalog release version string to fetch background implementation payloads from (alternative to release_id)."
+              },
+              "framework": {
+                "type": "string",
+                "enum": [
+                  "react",
+                  "nextjs",
+                  "remix",
+                  "vite",
+                  "generic"
+                ],
+                "description": "Framework variant of implementations to return."
+              },
+              "language": {
+                "type": "string",
+                "enum": [
+                  "tsx",
+                  "ts",
+                  "jsx",
+                  "js",
+                  "mdx",
+                  "css"
+                ],
+                "description": "Source language/extension of implementations to return."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "superseded",
+                  "removed"
+                ],
+                "description": "Implementation status filter."
+              }
+            },
+            "required": [],
+            "additionalProperties": false,
+            "oneOf": [
+              {
+                "required": [
+                  "release_id"
+                ]
+              },
+              {
+                "required": [
+                  "version"
+                ]
+              }
+            ]
+          },
+          "implementation": "def getBackgrounds(release_id=None, version=None, framework=None, language=None, status=None, **_extra):\n    import json, os, datetime, time, secrets\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0341000\" if __import__(\"os\").path.isdir(\"./environment_mix/0341000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"getBackgrounds\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _pick_logfile():\n        for fname in (\"request_logs.json\", \"api_requests.json\", \"api_request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fname)):\n                return fname\n        return \"request_logs.json\"\n\n    def _log(http_status, error_code=None):\n        fname = _pick_logfile()\n        rows = _load(fname)\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": \"mui_req_\" + secrets.token_hex(12).upper(),\n            \"endpoint\": endpoint,\n            \"timestamp\": _now_iso(),\n            \"status\": int(http_status),\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(fname, rows)\n\n    try:\n        if release_id is not None and not isinstance(release_id, str):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"release_id must be a string\", field=\"release_id\")\n        if version is not None and not isinstance(version, str):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"version must be a string\", field=\"version\")\n\n        allowed_framework = {\"react\", \"nextjs\", \"remix\", \"vite\", \"generic\"}\n        allowed_language = {\"tsx\", \"ts\", \"jsx\", \"js\", \"mdx\", \"css\"}\n        allowed_status = {\"active\", \"superseded\", \"removed\"}\n\n        if framework is not None and framework not in allowed_framework:\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"framework must be one of react,nextjs,remix,vite,generic\", field=\"framework\")\n        if language is not None and language not in allowed_language:\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"language must be one of tsx,ts,jsx,js,mdx,css\", field=\"language\")\n        if status is not None and status not in allowed_status:\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of active,superseded,removed\", field=\"status\")\n\n        releases = _load(\"catalog_releases.json\")\n        if not isinstance(releases, list):\n            releases = []\n        active_release = None\n        for r in releases:\n            if isinstance(r, dict) and r.get(\"is_active\") is True and r.get(\"status\") == \"published\":\n                active_release = r\n                break\n        if not active_release:\n            _log(401, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"no active published catalog release available\")\n\n        category_key = \"backgrounds\"\n        categories = _load(\"component_categories.json\")\n        if not isinstance(categories, list):\n            categories = []\n        cat = None\n        for c in categories:\n            if isinstance(c, dict) and c.get(\"key\") == category_key:\n                cat = c\n                break\n        if not cat:\n            _log(200, None)\n            return {\"release\": active_release, \"category\": {\"key\": category_key}, \"items\": [], \"total\": 0}\n\n        memberships = _load(\"component_category_memberships.json\")\n        if not isinstance(memberships, list):\n            memberships = []\n        member_component_ids = []\n        for m in memberships:\n            if isinstance(m, dict) and m.get(\"category_id\") == cat.get(\"id\"):\n                cid = m.get(\"component_id\")\n                if isinstance(cid, str):\n                    member_component_ids.append(cid)\n        member_component_ids = list(dict.fromkeys(member_component_ids))\n\n        components = _load(\"components.json\")\n        if not isinstance(components, list):\n            components = []\n        comp_by_id = {c.get(\"id\"): c for c in components if isinstance(c, dict) and isinstance(c.get(\"id\"), str)}\n\n        implementations = _load(\"component_implementations.json\")\n        if not isinstance(implementations, list):\n            implementations = []\n\n        results = []\n        for cid in member_component_ids:\n            comp = comp_by_id.get(cid)\n            if not comp or comp.get(\"status\") == \"hidden\":\n                continue\n\n            impls = []\n            for imp in implementations:\n                if not isinstance(imp, dict):\n                    continue\n                if imp.get(\"release_id\") != active_release.get(\"id\"):\n                    continue\n                if imp.get(\"component_id\") != cid:\n                    continue\n                if imp.get(\"status\") != \"active\":\n                    continue\n                if framework is not None and imp.get(\"framework\") != framework:\n                    continue\n                if language is not None and imp.get(\"language\") != language:\n                    continue\n                if status is not None and imp.get(\"status\") != status:\n                    continue\n                impls.append(imp)\n\n            chosen = {}\n            for imp in impls:\n                key = (imp.get(\"framework\"), imp.get(\"language\"))\n                if key not in chosen:\n                    chosen[key] = imp\n\n            results.append({\n                \"component\": comp,\n                \"implementations\": list(chosen.values())\n            })\n\n        _log(200, None)\n        return {\n            \"release\": active_release,\n            \"category\": {\"id\": cat.get(\"id\"), \"key\": cat.get(\"key\"), \"display_name\": cat.get(\"display_name\")},\n            \"items\": results,\n            \"total\": len(results)\n        }\n    except Exception as e:\n        _log(500, \"INTERNAL_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"unexpected error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getDevices",
+          "description": "Returns a curated bundle of device component implementation payloads (including safari, iphone-15-pro, and android) for the specified catalog release, filtered by framework, language, and status; the response is a single bundle (not paged). Raises VALIDATION_ERROR if neither or both of release_id and version are provided, if release_id does not match the required format, or if framework/language/status are not one of the supported values. Raises NOT_FOUND if the referenced release/version does not exist, and FORBIDDEN if you are not authorized to access that release.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "release_id": {
+                "type": "string",
+                "pattern": "^mui_rel_[0-9A-HJKMNP-TV-Z]{17}$",
+                "description": "Catalog release ID to fetch device implementation payloads from."
+              },
+              "version": {
+                "type": "string",
+                "description": "Catalog release version string to fetch device implementation payloads from (alternative to release_id)."
+              },
+              "framework": {
+                "type": "string",
+                "enum": [
+                  "react",
+                  "nextjs",
+                  "remix",
+                  "vite",
+                  "generic"
+                ],
+                "description": "Framework variant of implementations to return."
+              },
+              "language": {
+                "type": "string",
+                "enum": [
+                  "tsx",
+                  "ts",
+                  "jsx",
+                  "js",
+                  "mdx",
+                  "css"
+                ],
+                "description": "Source language/extension of implementations to return."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "superseded",
+                  "removed"
+                ],
+                "description": "Implementation status filter."
+              }
+            },
+            "required": [],
+            "additionalProperties": false,
+            "oneOf": [
+              {
+                "required": [
+                  "release_id"
+                ]
+              },
+              {
+                "required": [
+                  "version"
+                ]
+              }
+            ]
+          },
+          "implementation": "def getDevices(release_id=None, version=None, framework=None, language=None, status=None, **_extra):\n    import json, os, datetime, time, secrets\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0341000\" if __import__(\"os\").path.isdir(\"./environment_mix/0341000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"getDevices\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _pick_logfile():\n        for fname in (\"request_logs.json\", \"api_requests.json\", \"api_request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fname)):\n                return fname\n        return \"request_logs.json\"\n\n    def _log(http_status, error_code=None):\n        fname = _pick_logfile()\n        rows = _load(fname)\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": \"mui_req_\" + secrets.token_hex(12).upper(),\n            \"endpoint\": endpoint,\n            \"timestamp\": _now_iso(),\n            \"status\": int(http_status),\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(fname, rows)\n\n    try:\n        if release_id is not None and not isinstance(release_id, str):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"release_id must be a string\", field=\"release_id\")\n        if version is not None and not isinstance(version, str):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"version must be a string\", field=\"version\")\n\n        allowed_framework = {\"react\", \"nextjs\", \"remix\", \"vite\", \"generic\"}\n        allowed_language = {\"tsx\", \"ts\", \"jsx\", \"js\", \"mdx\", \"css\"}\n        allowed_status = {\"active\", \"superseded\", \"removed\"}\n\n        if framework is not None and framework not in allowed_framework:\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"framework must be one of react,nextjs,remix,vite,generic\", field=\"framework\")\n        if language is not None and language not in allowed_language:\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"language must be one of tsx,ts,jsx,js,mdx,css\", field=\"language\")\n        if status is not None and status not in allowed_status:\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of active,superseded,removed\", field=\"status\")\n\n        releases = _load(\"catalog_releases.json\")\n        if not isinstance(releases, list):\n            releases = []\n        active_release = None\n        for r in releases:\n            if isinstance(r, dict) and r.get(\"is_active\") is True and r.get(\"status\") == \"published\":\n                active_release = r\n                break\n        if not active_release:\n            _log(401, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"no active published catalog release available\")\n\n        category_key = \"devices\"\n        categories = _load(\"component_categories.json\")\n        if not isinstance(categories, list):\n            categories = []\n        cat = None\n        for c in categories:\n            if isinstance(c, dict) and c.get(\"key\") == category_key:\n                cat = c\n                break\n        if not cat:\n            _log(200, None)\n            return {\"release\": active_release, \"category\": {\"key\": category_key}, \"items\": [], \"total\": 0}\n\n        memberships = _load(\"component_category_memberships.json\")\n        if not isinstance(memberships, list):\n            memberships = []\n        member_component_ids = []\n        for m in memberships:\n            if isinstance(m, dict) and m.get(\"category_id\") == cat.get(\"id\"):\n                cid = m.get(\"component_id\")\n                if isinstance(cid, str):\n                    member_component_ids.append(cid)\n        member_component_ids = list(dict.fromkeys(member_component_ids))\n\n        components = _load(\"components.json\")\n        if not isinstance(components, list):\n            components = []\n        comp_by_id = {c.get(\"id\"): c for c in components if isinstance(c, dict) and isinstance(c.get(\"id\"), str)}\n\n        implementations = _load(\"component_implementations.json\")\n        if not isinstance(implementations, list):\n            implementations = []\n\n        results = []\n        for cid in member_component_ids:\n            comp = comp_by_id.get(cid)\n            if not comp or comp.get(\"status\") == \"hidden\":\n                continue\n\n            impls = []\n            for imp in implementations:\n                if not isinstance(imp, dict):\n                    continue\n                if imp.get(\"release_id\") != active_release.get(\"id\"):\n                    continue\n                if imp.get(\"component_id\") != cid:\n                    continue\n                if imp.get(\"status\") != \"active\":\n                    continue\n                if framework is not None and imp.get(\"framework\") != framework:\n                    continue\n                if language is not None and imp.get(\"language\") != language:\n                    continue\n                if status is not None and imp.get(\"status\") != status:\n                    continue\n                impls.append(imp)\n\n            chosen = {}\n            for imp in impls:\n                key = (imp.get(\"framework\"), imp.get(\"language\"))\n                if key not in chosen:\n                    chosen[key] = imp\n\n            results.append({\n                \"component\": comp,\n                \"implementations\": list(chosen.values())\n            })\n\n        _log(200, None)\n        return {\n            \"release\": active_release,\n            \"category\": {\"id\": cat.get(\"id\"), \"key\": cat.get(\"key\"), \"display_name\": cat.get(\"display_name\")},\n            \"items\": results,\n            \"total\": len(results)\n        }\n    except Exception as e:\n        _log(500, \"INTERNAL_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"unexpected error\", detail=str(e))\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getCatalogReleases",
+          "description": "Lists catalog releases ordered by `sort_by`/`sort_order` and returns a cursor-paginated result set; supports filtering by `status`, `is_active`, and `version`. Returns only releases the caller is authorized to view; raises VALIDATION_ERROR for invalid filters/sorts.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "published",
+                  "deprecated"
+                ],
+                "description": "Filter releases by lifecycle status."
+              },
+              "is_active": {
+                "type": "boolean",
+                "description": "Filter releases by active flag."
+              },
+              "version": {
+                "type": "string",
+                "description": "Filter releases by exact version string."
+              },
+              "sort_by": {
+                "type": "string",
+                "enum": [
+                  "version",
+                  "published_at",
+                  "created_at",
+                  "updated_at"
+                ],
+                "description": "Field to sort releases by."
+              },
+              "sort_order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of releases to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor for fetching the next page of results."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def getCatalogReleases(status=None, is_active=None, version=None, sort_by=None, sort_order=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0341000\" if __import__(\"os\").path.isdir(\"./environment_mix/0341000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    allowed_status = {\"draft\", \"published\", \"deprecated\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            return _err(\"VALIDATION_ERROR\", \"Invalid status.\", field=\"status\", allowed=sorted(allowed_status))\n    if is_active is not None and not isinstance(is_active, bool):\n        return _err(\"VALIDATION_ERROR\", \"is_active must be a boolean.\", field=\"is_active\")\n    if version is not None and not isinstance(version, str):\n        return _err(\"VALIDATION_ERROR\", \"version must be a string.\", field=\"version\")\n\n    allowed_sort_by = {\"version\", \"published_at\", \"created_at\", \"updated_at\"}\n    allowed_sort_order = {\"asc\", \"desc\"}\n    if sort_by is None:\n        sort_by = \"published_at\"\n    if sort_order is None:\n        sort_order = \"desc\"\n    if not isinstance(sort_by, str) or sort_by not in allowed_sort_by:\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort_by.\", field=\"sort_by\", allowed=sorted(allowed_sort_by))\n    if not isinstance(sort_order, str) or sort_order not in allowed_sort_order:\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort_order.\", field=\"sort_order\", allowed=sorted(allowed_sort_order))\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer.\", field=\"limit\")\n    if limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit out of range (1-200).\", field=\"limit\")\n\n    # Decode cursor if present\n    start_after = None\n    if cursor is not None:\n        if not isinstance(cursor, str):\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\", field=\"cursor\")\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            payload = json.loads(raw.decode(\"utf-8\"))\n            start_after = payload  # {\"v\": <sort_value>, \"id\": <id>}\n            if not isinstance(start_after, dict) or \"v\" not in start_after or \"id\" not in start_after:\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\", field=\"cursor\")\n\n    releases = _load(\"catalog_releases.json\")\n\n    # Authorization: no auth model/collections provided, so all releases are viewable.\n    rows = []\n    for r in releases:\n        if status is not None and r.get(\"status\") != status:\n            continue\n        if is_active is not None and r.get(\"is_active\") is not is_active:\n            continue\n        if version is not None and r.get(\"version\") != version:\n            continue\n        rows.append(r)\n\n    total = len(rows)\n\n    # Sorting\n    reverse = (sort_order == \"desc\")\n    def sort_key(r):\n        v = r.get(sort_by)\n        # Normalize None to empty for stable ordering\n        if v is None:\n            v = \"\"\n        return (v, r.get(\"id\", \"\"))\n    rows.sort(key=sort_key, reverse=reverse)\n\n    # Apply cursor\n    if start_after is not None:\n        sv = start_after.get(\"v\")\n        sid = start_after.get(\"id\")\n        filtered = []\n        passed = False\n        for r in rows:\n            kv = r.get(sort_by)\n            if kv is None:\n                kv = \"\"\n            kid = r.get(\"id\", \"\")\n            cur_tuple = (kv, kid)\n            cmp_tuple = (sv if sv is not None else \"\", sid if sid is not None else \"\")\n            if not passed:\n                if reverse:\n                    # descending: start after means strictly less than cursor tuple\n                    if cur_tuple < cmp_tuple:\n                        passed = True\n                else:\n                    if cur_tuple > cmp_tuple:\n                        passed = True\n            if passed:\n                filtered.append(r)\n        rows = filtered\n\n    page = rows[:limit]\n    has_more = len(rows) > limit\n\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        payload = {\"v\": (last.get(sort_by) if last.get(sort_by) is not None else \"\"), \"id\": last.get(\"id\", \"\")}\n        next_cursor = base64.urlsafe_b64encode(json.dumps(payload, ensure_ascii=False).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"sort_by\": sort_by,\n            \"sort_order\": sort_order,\n            \"latency_ms\": int((time.time()-t0)*1000)\n        }\n    }\n"
+        },
+        {
+          "name": "createCatalogRelease",
+          "description": "Creates a new catalog release in `draft` status. The created release is not active and cannot be activated until it is published and has at least one active component implementation. Returns the created release; refuses with VALIDATION_ERROR on malformed fields or conflicting version.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "version": {
+                "type": "string",
+                "description": "Semantic or vendor version identifier for this release."
+              },
+              "source_repo_url": {
+                "type": "string",
+                "description": "Source repository URL the release was produced from."
+              },
+              "source_ref": {
+                "type": "string",
+                "description": "Git ref (tag/commit/branch) used to build this release."
+              }
+            },
+            "required": [
+              "version"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def createCatalogRelease(version, source_repo_url=None, source_ref=None, **_extra):\n    import json, os, datetime, time, secrets, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0341000\" if __import__(\"os\").path.isdir(\"./environment_mix/0341000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"createCatalogRelease\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _pick_logfile():\n        for fname in (\"request_logs.json\", \"api_requests.json\", \"api_request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fname)):\n                return fname\n        return \"request_logs.json\"\n\n    def _log(http_status, error_code=None, meta=None):\n        try:\n            fname = _pick_logfile()\n            rows = _load(fname)\n            if not isinstance(rows, list):\n                rows = []\n            row = {\n                \"id\": \"mui_req_\" + secrets.token_hex(12).upper(),\n                \"endpoint\": endpoint,\n                \"timestamp\": _now_iso(),\n                \"status\": int(http_status),\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            }\n            if isinstance(meta, dict):\n                row.update(meta)\n            rows.append(row)\n            _save(fname, rows)\n        except Exception:\n            # never fail the request due to logging\n            pass\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return prefix + \"_\" + \"\".join(alphabet[secrets.randbelow(len(alphabet))] for _ in range(26))\n\n    # Validate inputs\n    if not isinstance(version, str) or not version.strip():\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"version must be a non-empty string\", field=\"version\")\n    version = version.strip()\n\n    if source_repo_url is None:\n        source_repo_url = \"\"\n    if not isinstance(source_repo_url, str):\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"source_repo_url must be a string\", field=\"source_repo_url\")\n    source_repo_url = source_repo_url.strip()\n\n    if source_ref is None:\n        source_ref = \"\"\n    if not isinstance(source_ref, str):\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"source_ref must be a string\", field=\"source_ref\")\n    source_ref = source_ref.strip()\n\n    # Load releases\n    releases = _load(\"catalog_releases.json\")\n    if isinstance(releases, dict) and \"rows\" in releases and isinstance(releases[\"rows\"], list):\n        releases_rows = releases[\"rows\"]\n        container = releases\n    elif isinstance(releases, list):\n        releases_rows = releases\n        container = None\n    else:\n        releases_rows = []\n        container = None\n\n    # Uniqueness constraints: unique(version), unique(source_ref) (if provided)\n    for r in releases_rows:\n        if isinstance(r, dict) and r.get(\"version\") == version:\n            _log(409, \"CONFLICT\")\n            return _err(\"CONFLICT\", \"version must be unique\", field=\"version\", rule=\"unique(version)\")\n    if source_ref:\n        for r in releases_rows:\n            if isinstance(r, dict) and r.get(\"source_ref\") == source_ref:\n                _log(409, \"CONFLICT\")\n                return _err(\"CONFLICT\", \"source_ref must be unique\", field=\"source_ref\", rule=\"unique(source_ref)\")\n\n    now = _now_iso()\n    new_row = {\n        \"id\": _gen_id(\"mui_rel\"),\n        \"version\": version,\n        \"source_repo_url\": source_repo_url,\n        \"source_ref\": source_ref,\n        \"is_active\": False,\n        \"published_at\": None,\n        \"status\": \"draft\",\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    releases_rows.append(new_row)\n    if container is not None:\n        container[\"rows\"] = releases_rows\n        _save(\"catalog_releases.json\", container)\n    else:\n        _save(\"catalog_releases.json\", releases_rows)\n\n    _log(201, None, meta={\"release_id\": new_row[\"id\"]})\n    return {\"release\": new_row}\n"
+        },
+        {
+          "name": "updateCatalogRelease",
+          "description": "Updates a catalog release by id, including lifecycle transitions (`draft`→`published`, `published`→`deprecated`) and activation. Returns the updated release; refuses with NOT_FOUND when id does not exist, VALIDATION_ERROR for invalid transitions, and CONFLICT when attempting to set `is_active=true` while the release is not `published` or has no active implementations.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^mui_rel_[0-9A-Z]{18,}$",
+                "description": "Catalog release id to update."
+              },
+              "version": {
+                "type": "string",
+                "description": "New version string (must be unique)."
+              },
+              "source_repo_url": {
+                "type": "string",
+                "description": "Updated source repository URL."
+              },
+              "source_ref": {
+                "type": "string",
+                "description": "Updated git ref used to build this release."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "published",
+                  "deprecated"
+                ],
+                "description": "Set the release lifecycle status. Only allowed transitions: draft→published, published→deprecated."
+              },
+              "published_at": {
+                "type": "string",
+                "description": "RFC3339 timestamp to record when the release was published (usually set when status becomes published)."
+              },
+              "is_active": {
+                "type": "boolean",
+                "description": "Whether this release is the single active release used by curated category endpoints. Can only be true when status='published' and the release has at least one active implementation."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def updateCatalogRelease(id, version=None, source_repo_url=None, source_ref=None, status=None, published_at=None, is_active=None, **_extra):\n    import json, os, datetime, re, time, secrets\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0341000\" if __import__(\"os\").path.isdir(\"./environment_mix/0341000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"updateCatalogRelease\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _pick_logfile():\n        for fname in (\"request_logs.json\", \"api_requests.json\", \"api_request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fname)):\n                return fname\n        return \"request_logs.json\"\n\n    def _log(http_status, error_code=None, meta=None):\n        fname = _pick_logfile()\n        rows = _load(fname)\n        if not isinstance(rows, list):\n            rows = []\n        row = {\n            \"id\": \"mui_req_\" + secrets.token_hex(12).upper(),\n            \"endpoint\": endpoint,\n            \"timestamp\": _now_iso(),\n            \"status\": int(http_status),\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if isinstance(meta, dict):\n            row.update(meta)\n        rows.append(row)\n        _save(fname, rows)\n\n    def _parse_rfc3339_to_z(s):\n        if s is None:\n            return None, None\n        if not isinstance(s, str) or not s.strip():\n            return None, \"published_at must be an RFC3339 timestamp string\"\n        ss = s.strip()\n        try:\n            if ss.endswith(\"Z\"):\n                dt = datetime.datetime.fromisoformat(ss[:-1] + \"+00:00\")\n            else:\n                dt = datetime.datetime.fromisoformat(ss)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            dt = dt.astimezone(datetime.timezone.utc).replace(microsecond=0)\n            return dt.isoformat().replace(\"+00:00\", \"Z\"), None\n        except ValueError:\n            return None, \"published_at must be an RFC3339 timestamp string\"\n\n    # Validate id\n    if not isinstance(id, str) or not re.match(r\"^mui_rel_[0-9A-Z]{18,}$\", id):\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"id is invalid\", field=\"id\")\n\n    if version is not None and (not isinstance(version, str) or not version.strip()):\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"version must be a non-empty string\", field=\"version\")\n    if isinstance(version, str):\n        version = version.strip()\n\n    if source_repo_url is not None and (not isinstance(source_repo_url, str) or not source_repo_url.strip()):\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"source_repo_url must be a non-empty string when provided\", field=\"source_repo_url\")\n    if isinstance(source_repo_url, str):\n        source_repo_url = source_repo_url.strip()\n\n    if source_ref is not None and (not isinstance(source_ref, str) or not source_ref.strip()):\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"source_ref must be a non-empty string when provided\", field=\"source_ref\")\n    if isinstance(source_ref, str):\n        source_ref = source_ref.strip()\n\n    if status is not None:\n        if not isinstance(status, str):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status must be a string\", field=\"status\")\n        if status not in (\"draft\", \"published\", \"deprecated\"):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: draft, published, deprecated\", field=\"status\")\n\n    if published_at is not None:\n        published_at_norm, perr = _parse_rfc3339_to_z(published_at)\n        if perr:\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", perr, field=\"published_at\")\n    else:\n        published_at_norm = None\n\n    if is_active is not None and not isinstance(is_active, bool):\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"is_active must be a boolean\", field=\"is_active\")\n\n    # Load releases\n    rel_doc = _load(\"catalog_releases.json\")\n    if isinstance(rel_doc, dict) and isinstance(rel_doc.get(\"rows\"), list):\n        releases = rel_doc[\"rows\"]\n        rel_wrap = True\n    elif isinstance(rel_doc, list):\n        releases = rel_doc\n        rel_wrap = False\n    else:\n        releases = []\n        rel_wrap = False\n\n    idx = None\n    for i, r in enumerate(releases):\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            idx = i\n            break\n    if idx is None:\n        _log(404, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"catalog release not found\", id=id)\n\n    row = releases[idx]\n    old_status = row.get(\"status\")\n\n    # Uniqueness checks for version / source_ref when changing\n    if version is not None and version != row.get(\"version\"):\n        for r in releases:\n            if isinstance(r, dict) and r.get(\"id\") != id and r.get(\"version\") == version:\n                _log(409, \"CONFLICT\")\n                return _err(\"CONFLICT\", \"version must be unique\", field=\"version\", rule=\"unique(version)\")\n    if source_ref is not None and source_ref != row.get(\"source_ref\"):\n        for r in releases:\n            if isinstance(r, dict) and r.get(\"id\") != id and r.get(\"source_ref\") == source_ref:\n                _log(409, \"CONFLICT\")\n                return _err(\"CONFLICT\", \"source_ref must be unique\", field=\"source_ref\", rule=\"unique(source_ref)\")\n\n    # Lifecycle transition enforcement (only if changing status)\n    if status is not None and status != old_status:\n        allowed = {\n            \"draft\": {\"published\"},\n            \"published\": {\"deprecated\"},\n            \"deprecated\": set(),\n        }\n        if old_status not in allowed or status not in allowed[old_status]:\n            _log(409, \"INVALID_TRANSITION\")\n            return _err(\"INVALID_TRANSITION\", \"illegal lifecycle transition\", from_status=old_status, to_status=status, rule=\"catalog_releases.lifecycle\")\n        row[\"status\"] = status\n        # If publishing and published_at not provided, set now\n        if status == \"published\" and published_at_norm is None and not row.get(\"published_at\"):\n            row[\"published_at\"] = _now_iso()\n\n    # Update other fields\n    if version is not None:\n        row[\"version\"] = version\n    if source_repo_url is not None:\n        row[\"source_repo_url\"] = source_repo_url\n    if source_ref is not None:\n        row[\"source_ref\"] = source_ref\n    if published_at_norm is not None:\n        row[\"published_at\"] = published_at_norm\n\n    # Activation rules & single-active constraint\n    if is_active is not None:\n        if is_active is True:\n            # Must be published\n            if row.get(\"status\") != \"published\":\n                _log(409, \"CONFLICT\")\n                return _err(\"CONFLICT\", \"cannot set is_active=true unless status='published'\", field=\"is_active\", rule=\"is_active implies status='published'\")\n            # Must have at least one active implementation for this release\n            imp_doc = _load(\"component_implementations.json\")\n            if isinstance(imp_doc, dict) and isinstance(imp_doc.get(\"rows\"), list):\n                imps = imp_doc[\"rows\"]\n            elif isinstance(imp_doc, list):\n                imps = imp_doc\n            else:\n                imps = []\n            has_active_impl = any(isinstance(imp, dict) and imp.get(\"release_id\") == id and imp.get(\"status\") == \"active\" for imp in imps)\n            if not has_active_impl:\n                _log(409, \"CONFLICT\")\n                return _err(\"CONFLICT\", \"cannot set is_active=true: release has no active component implementations\", field=\"is_active\", rule=\"activation_requires_active_implementation\")\n            # Enforce at most one active: deactivate all others\n            for r in releases:\n                if isinstance(r, dict) and r.get(\"id\") != id and r.get(\"is_active\") is True:\n                    r[\"is_active\"] = False\n                    r[\"updated_at\"] = _now_iso()\n            row[\"is_active\"] = True\n            if row.get(\"published_at\") in (None, \"\"):\n                row[\"published_at\"] = _now_iso()\n        else:\n            # Allowed to deactivate regardless of status\n            row[\"is_active\"] = False\n\n    # Enforce constraint: is_active implies published (in case status wasn't changed but is_active already true)\n    if row.get(\"is_active\") is True and row.get(\"status\") != \"published\":\n        _log(409, \"CONFLICT\")\n        return _err(\"CONFLICT\", \"is_active release must have status='published'\", field=\"is_active\", rule=\"is_active implies status='published'\")\n\n    row[\"updated_at\"] = _now_iso()\n    releases[idx] = row\n    _save(\"catalog_releases.json\", {\"rows\": releases} if rel_wrap else releases)\n\n    _log(200, None, meta={\"resource_id\": id})\n    return {\"catalog_release\": row}\n"
+        },
+        {
+          "name": "createUIComponent",
+          "description": "Creates a new Magic UI component in the catalog. Returns the created component; refuses with VALIDATION_ERROR on malformed fields and CONFLICT if `slug` is not globally unique.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "slug": {
+                "type": "string",
+                "description": "Globally unique component slug (immutable once referenced by any implementation)."
+              },
+              "display_name": {
+                "type": "string",
+                "description": "Human-readable name for the component."
+              },
+              "summary": {
+                "type": "string",
+                "description": "Short summary used in listings."
+              },
+              "doc_url": {
+                "type": "string",
+                "description": "Documentation URL for the component."
+              },
+              "repo_path": {
+                "type": "string",
+                "description": "Repository path for the component source."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "deprecated",
+                  "hidden"
+                ],
+                "description": "Initial component status."
+              }
+            },
+            "required": [
+              "slug",
+              "display_name"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def createUIComponent(slug, display_name, summary=None, doc_url=None, repo_path=None, status=None, **_extra):\n    import json, os, datetime, time, re, secrets\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0341000\" if __import__(\"os\").path.isdir(\"./environment_mix/0341000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"createUIComponent\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _pick_logfile():\n        for fname in (\"request_logs.json\", \"api_requests.json\", \"api_request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fname)):\n                return fname\n        return \"request_logs.json\"\n\n    def _log(http_status, error_code=None, meta=None):\n        try:\n            fname = _pick_logfile()\n            rows = _load(fname)\n            if not isinstance(rows, list):\n                rows = []\n            row = {\n                \"id\": \"mui_req_\" + secrets.token_hex(12).upper(),\n                \"endpoint\": endpoint,\n                \"timestamp\": _now_iso(),\n                \"status\": int(http_status),\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            }\n            if isinstance(meta, dict):\n                row.update(meta)\n            rows.append(row)\n            _save(fname, rows)\n        except Exception:\n            pass\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return prefix + \"_\" + \"\".join(alphabet[secrets.randbelow(len(alphabet))] for _ in range(26))\n\n    # Validate required fields\n    if not isinstance(slug, str) or not slug.strip():\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"slug must be a non-empty string\", field=\"slug\")\n    slug = slug.strip()\n    if not re.match(r\"^[a-z0-9]+(?:-[a-z0-9]+)*$\", slug):\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"slug must match ^[a-z0-9]+(?:-[a-z0-9]+)*$\", field=\"slug\", rule=\"slug pattern\")\n\n    if not isinstance(display_name, str) or not display_name.strip():\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"display_name must be a non-empty string\", field=\"display_name\")\n    display_name = display_name.strip()\n\n    # Validate optional fields\n    if summary is not None and not isinstance(summary, str):\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"summary must be a string\", field=\"summary\")\n    if doc_url is not None and not isinstance(doc_url, str):\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"doc_url must be a string\", field=\"doc_url\")\n    if repo_path is not None and not isinstance(repo_path, str):\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"repo_path must be a string\", field=\"repo_path\")\n\n    allowed_status = {\"active\", \"deprecated\", \"hidden\"}\n    if status is None:\n        status = \"active\"\n    if not isinstance(status, str) or status not in allowed_status:\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"status must be one of active, deprecated, hidden\", field=\"status\", allowed=list(sorted(allowed_status)))\n\n    # Load components\n    components = _load(\"components.json\")\n    if isinstance(components, dict) and \"rows\" in components and isinstance(components[\"rows\"], list):\n        comp_rows = components[\"rows\"]\n        container = components\n    elif isinstance(components, list):\n        comp_rows = components\n        container = None\n    else:\n        comp_rows = []\n        container = None\n\n    # Unique(slug)\n    for c in comp_rows:\n        if isinstance(c, dict) and c.get(\"slug\") == slug:\n            _log(409, \"CONFLICT\")\n            return _err(\"CONFLICT\", \"slug must be globally unique\", field=\"slug\", rule=\"unique(slug)\")\n\n    now = _now_iso()\n    new_row = {\n        \"id\": _gen_id(\"mui_cmp\"),\n        \"slug\": slug,\n        \"display_name\": display_name,\n        \"summary\": summary,\n        \"doc_url\": doc_url,\n        \"repo_path\": repo_path,\n        \"status\": status,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    comp_rows.append(new_row)\n    if container is not None:\n        container[\"rows\"] = comp_rows\n        _save(\"components.json\", container)\n    else:\n        _save(\"components.json\", comp_rows)\n\n    _log(201, None, meta={\"component_id\": new_row[\"id\"]})\n    return {\"component\": new_row}\n"
+        },
+        {
+          "name": "updateUIComponent",
+          "description": "Updates a Magic UI component by id, including lifecycle transitions (`active`→`deprecated`/`hidden`, `deprecated`→`hidden`, `hidden`→`active`). Returns the updated component; refuses with NOT_FOUND when id does not exist, VALIDATION_ERROR for invalid transitions, and CONFLICT if attempting to change `slug` after it has been referenced by any implementation.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^mui_cmp_[0-9A-Z]{18,}$",
+                "description": "Component id to update."
+              },
+              "display_name": {
+                "type": "string",
+                "description": "Updated display name."
+              },
+              "summary": {
+                "type": "string",
+                "description": "Updated summary."
+              },
+              "doc_url": {
+                "type": "string",
+                "description": "Updated documentation URL."
+              },
+              "repo_path": {
+                "type": "string",
+                "description": "Updated repository path."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "deprecated",
+                  "hidden"
+                ],
+                "description": "Set component lifecycle status (must follow allowed transitions)."
+              },
+              "slug": {
+                "type": "string",
+                "description": "Component slug. May only be updated if it has never been referenced by any component implementation."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def updateUIComponent(id, display_name=None, summary=None, doc_url=None, repo_path=None, status=None, slug=None, **_extra):\n    import json, os, datetime, re, time, secrets\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0341000\" if __import__(\"os\").path.isdir(\"./environment_mix/0341000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"updateUIComponent\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _pick_logfile():\n        for fname in (\"request_logs.json\", \"api_requests.json\", \"api_request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fname)):\n                return fname\n        return \"request_logs.json\"\n\n    def _log(http_status, error_code=None, meta=None):\n        try:\n            fname = _pick_logfile()\n            rows = _load(fname)\n            if not isinstance(rows, list):\n                rows = []\n            row = {\n                \"id\": \"mui_req_\" + secrets.token_hex(12).upper(),\n                \"endpoint\": endpoint,\n                \"timestamp\": _now_iso(),\n                \"status\": int(http_status),\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            }\n            if isinstance(meta, dict):\n                row.update(meta)\n            rows.append(row)\n            _save(fname, rows)\n        except Exception:\n            pass\n\n    # Validate id\n    if not isinstance(id, str) or not re.match(r\"^mui_cmp_[0-9A-Z]{18,}$\", id):\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"id is invalid\", field=\"id\")\n\n    if display_name is not None and (not isinstance(display_name, str) or not display_name.strip()):\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"display_name must be a non-empty string\", field=\"display_name\")\n    if isinstance(display_name, str):\n        display_name = display_name.strip()\n\n    if summary is not None and not isinstance(summary, str):\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"summary must be a string\", field=\"summary\")\n    if doc_url is not None and not isinstance(doc_url, str):\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"doc_url must be a string\", field=\"doc_url\")\n    if repo_path is not None and not isinstance(repo_path, str):\n        _log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"repo_path must be a string\", field=\"repo_path\")\n\n    allowed_status = {\"active\", \"deprecated\", \"hidden\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of active, deprecated, hidden\", field=\"status\", allowed=list(sorted(allowed_status)))\n\n    if slug is not None:\n        if not isinstance(slug, str) or not slug.strip():\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"slug must be a non-empty string when provided\", field=\"slug\")\n        slug = slug.strip()\n        if not re.match(r\"^[a-z0-9]+(?:-[a-z0-9]+)*$\", slug):\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"slug must match ^[a-z0-9]+(?:-[a-z0-9]+)*$\", field=\"slug\", rule=\"slug pattern\")\n\n    # Load components\n    components = _load(\"components.json\")\n    if isinstance(components, dict) and \"rows\" in components and isinstance(components[\"rows\"], list):\n        comp_rows = components[\"rows\"]\n        container = components\n    elif isinstance(components, list):\n        comp_rows = components\n        container = None\n    else:\n        comp_rows = []\n        container = None\n\n    idx = None\n    for i, c in enumerate(comp_rows):\n        if isinstance(c, dict) and c.get(\"id\") == id:\n            idx = i\n            break\n    if idx is None:\n        _log(404, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"component not found\", field=\"id\", id=id)\n\n    comp = comp_rows[idx]\n    if not isinstance(comp, dict):\n        _log(404, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"component not found\", field=\"id\", id=id)\n\n    changed = False\n    now = _now_iso()\n\n    # Slug change rules:\n    # - unique(slug)\n    # - immutable once referenced by any component_implementations row\n    if slug is not None and slug != comp.get(\"slug\"):\n        impls = _load(\"component_implementations.json\")\n        if isinstance(impls, dict) and \"rows\" in impls and isinstance(impls[\"rows\"], list):\n            impl_rows = impls[\"rows\"]\n        elif isinstance(impls, list):\n            impl_rows = impls\n        else:\n            impl_rows = []\n        referenced = any(isinstance(r, dict) and r.get(\"component_id\") == id for r in impl_rows)\n        if referenced:\n            _log(409, \"CONFLICT\")\n            return _err(\"CONFLICT\", \"cannot change slug after it has been referenced by an implementation\", field=\"slug\", rule=\"slug immutable once referenced\")\n        for c in comp_rows:\n            if isinstance(c, dict) and c.get(\"slug\") == slug and c.get(\"id\") != id:\n                _log(409, \"CONFLICT\")\n                return _err(\"CONFLICT\", \"slug must be globally unique\", field=\"slug\", rule=\"unique(slug)\")\n        comp[\"slug\"] = slug\n        changed = True\n\n    # Lifecycle transitions\n    if status is not None and status != comp.get(\"status\"):\n        transitions = {\n            \"active\": {\"deprecated\", \"hidden\"},\n            \"deprecated\": {\"hidden\"},\n            \"hidden\": {\"active\"},\n        }\n        cur = comp.get(\"status\")\n        if cur not in transitions or status not in transitions[cur]:\n            _log(409, \"INVALID_TRANSITION\")\n            return _err(\"INVALID_TRANSITION\", \"invalid status transition\", field=\"status\", from_status=cur, to_status=status)\n        comp[\"status\"] = status\n        changed = True\n\n    # Simple fields\n    if display_name is not None and display_name != comp.get(\"display_name\"):\n        comp[\"display_name\"] = display_name\n        changed = True\n    if summary is not None and summary != comp.get(\"summary\"):\n        comp[\"summary\"] = summary\n        changed = True\n    if doc_url is not None and doc_url != comp.get(\"doc_url\"):\n        comp[\"doc_url\"] = doc_url\n        changed = True\n    if repo_path is not None and repo_path != comp.get(\"repo_path\"):\n        comp[\"repo_path\"] = repo_path\n        changed = True\n\n    if not changed:\n        # idempotent: return current component (but still \"success\" because target exists)\n        _log(200, None, meta={\"component_id\": id, \"changed\": False})\n        return {\"component\": comp}\n\n    comp[\"updated_at\"] = now\n    comp_rows[idx] = comp\n\n    if container is not None:\n        container[\"rows\"] = comp_rows\n        _save(\"components.json\", container)\n    else:\n        _save(\"components.json\", comp_rows)\n\n    _log(200, None, meta={\"component_id\": id, \"changed\": True})\n    return {\"component\": comp}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0341000",
+    "index": 341,
+    "name": "Magic UI Component Server",
+    "description": "This backend stores a catalog of Magic UI components and the versioned implementation payloads returned by the API tools. The main workflows are: (1) list all available components, and (2) fetch curated bundles of implementation details by category (layout, media, motion, text, buttons, effects, wid",
+    "taxonomy": {
+      "L1_id": "L1-07",
+      "L1_name": "Software Development",
+      "L1_name_zh": "软件开发",
+      "L2_id": "L2-19",
+      "L2_name": "Framework & Component Libraries",
+      "L2_name_zh": "框架与组件库",
+      "L3_name": "UI Component Catalogs & References",
+      "L3_name_zh": "UI组件目录与参考"
+    },
+    "database_dir": "./environment_mix/0341000",
+    "mount_path": "/app/database",
+    "n_tools": 16,
+    "n_collections": 5,
+    "n_records": 117,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 16,
+      "loaded": 16,
+      "reads_returning_data": 12,
+      "read_operations": 12,
+      "mutations_persisted": 1,
+      "mutations_attempted": 4
+    },
+    "tools_loadable_from_database_dir": 16,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "getUIComponents",
+      "returned_chars": 2013
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

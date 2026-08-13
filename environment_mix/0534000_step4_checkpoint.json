@@ -1,0 +1,793 @@
+{
+  "index": 534,
+  "local_files_dir": "./environment_mix/0534000",
+  "file_list": [
+    "./environment_mix/0534000/README.md",
+    "./environment_mix/0534000/metabase_cards.json",
+    "./environment_mix/0534000/metabase_collections.json",
+    "./environment_mix/0534000/metabase_dashboard_cards.json",
+    "./environment_mix/0534000/metabase_dashboards.json",
+    "./environment_mix/0534000/metabase_databases_schema.json",
+    "./environment_mix/0534000/metabase_executions.json",
+    "./environment_mix/0534000/request_logs.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "metabase_collections.json": "31 rows",
+        "metabase_dashboards.json": "27 rows",
+        "metabase_cards.json": "36 rows",
+        "metabase_dashboard_cards.json": "38 rows",
+        "metabase_databases_schema.json": "12 rows",
+        "metabase_executions.json": "36 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "list_dashboards",
+          "description": "Lists dashboards from the Integration Server’s local Metabase representation, optionally filtered by collection, status/archived flag, and sorted; returns up to `limit` items and a `cursor` to fetch the next page when more results remain. Raises VALIDATION_ERROR if any filter/sort/pagination input is invalid (including malformed IDs, out-of-range `limit`, or an unusable `cursor`), and UNAUTHORIZED/FORBIDDEN if you are not permitted to browse dashboards or the requested collection. Raises NOT_FOUND when `collection_id` refers to no known collection in the local representation, and QUOTA_EXCEEDED if request-rate or execution quotas for listing are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "collection_id": {
+                "type": "string",
+                "pattern": "^mbc_[0-9A-Z]{18,}$",
+                "description": "Filter dashboards to a specific local Metabase collection id."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "Filter by dashboard status."
+              },
+              "archived": {
+                "type": "boolean",
+                "description": "Filter by archived flag."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of dashboards to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "name"
+                ],
+                "description": "Field to sort dashboards by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_dashboards(collection_id=None, status=None, archived=None, limit=None, cursor=None, sort=None, order=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0534000\" if __import__(\"os\").path.isdir(\"./environment_mix/0534000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"list_dashboards\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": f\"rl_{int(time.time()*1000)}\",\n            \"endpoint\": endpoint,\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": _now()\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _parse_cursor(c):\n        if c is None:\n            return None\n        if not isinstance(c, str) or not c:\n            return None\n        try:\n            raw = base64.urlsafe_b64decode(c.encode(\"utf-8\") + b\"===\")\n            obj = json.loads(raw.decode(\"utf-8\"))\n            if not isinstance(obj, dict):\n                return None\n            if obj.get(\"endpoint\") != endpoint:\n                return None\n            v = obj.get(\"v\")\n            if v != 1:\n                return None\n            off = obj.get(\"offset\")\n            if not isinstance(off, int) or off < 0:\n                return None\n            return off\n        except Exception:\n            return None\n\n    def _make_cursor(off):\n        payload = {\"endpoint\": endpoint, \"v\": 1, \"offset\": off}\n        raw = json.dumps(payload, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"utf-8\").rstrip(\"=\")\n\n    # Input validation\n    try:\n        if collection_id is not None:\n            if not isinstance(collection_id, str) or re.match(r\"^mbc_[0-9A-Z]{18,}$\", collection_id) is None:\n                _log(\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"collection_id is malformed.\")\n        if status is not None:\n            if status not in (\"active\", \"archived\", \"deleted\"):\n                _log(\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"status must be one of: active, archived, deleted.\")\n        if archived is not None and not isinstance(archived, bool):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"archived must be a boolean.\")\n        if limit is None:\n            limit = 50\n        if not isinstance(limit, int) or limit < 1 or limit > 200:\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200.\")\n        if sort is None:\n            sort = \"updated_at\"\n        if sort not in (\"created_at\", \"updated_at\", \"name\"):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"sort must be one of: created_at, updated_at, name.\")\n        if order is None:\n            order = \"desc\"\n        if order not in (\"asc\", \"desc\"):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"order must be one of: asc, desc.\")\n\n        offset = 0\n        if cursor is not None:\n            offset = _parse_cursor(cursor)\n            if offset is None:\n                _log(\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"cursor is invalid or expired.\")\n    except Exception:\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid request.\")\n\n    # Ambient auth: if store contains nothing usable at all, treat as unauthorized.\n    dashboards = _load(\"metabase_dashboards.json\")\n    if not isinstance(dashboards, list):\n        dashboards = []\n    if len(dashboards) == 0:\n        _log(\"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"No authorized context available to list dashboards.\")\n\n    # Apply business rule: list excludes deleted\n    rows = [d for d in dashboards if isinstance(d, dict) and d.get(\"status\") != \"deleted\"]\n\n    # Filters\n    if collection_id is not None:\n        rows = [d for d in rows if d.get(\"collection_id\") == collection_id]\n    if status is not None:\n        if status == \"deleted\":\n            # list_dashboards never includes deleted per business rule -> empty\n            rows = []\n        else:\n            rows = [d for d in rows if d.get(\"status\") == status]\n    if archived is not None:\n        rows = [d for d in rows if d.get(\"archived\") is archived]\n\n    # Sort\n    def _key(d):\n        v = d.get(sort)\n        if v is None:\n            return \"\"\n        return v\n    reverse = (order == \"desc\")\n    try:\n        rows.sort(key=_key, reverse=reverse)\n    except Exception:\n        # If sorting fails due to mixed types, fall back to string representation deterministically.\n        rows.sort(key=lambda d: str(d.get(sort, \"\")), reverse=reverse)\n\n    total = len(rows)\n    page = rows[offset: offset + limit]\n    next_off = offset + len(page)\n    has_more = next_off < total\n    next_cursor = _make_cursor(next_off) if has_more else None\n\n    resp = {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor\n        }\n    }\n    _log(\"OK\")\n    return resp\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_cards",
+          "description": "Lists questions/cards from the Integration Server’s local Metabase representation, optionally filtered by collection, database, status/archived flag, and display type, and returns results sorted with cursor-based pagination (`limit` plus `cursor` for the next page). Raises VALIDATION_ERROR for malformed IDs, invalid filter values, out-of-range `limit`, or an invalid/expired `cursor`, and UNAUTHORIZED/FORBIDDEN when you do not have permission to browse cards or the referenced parent resources. Raises NOT_FOUND if `collection_id` or `database_id` does not exist in the local representation, and QUOTA_EXCEEDED when listing limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "collection_id": {
+                "type": "string",
+                "pattern": "^mbc_[0-9A-Z]{18,}$",
+                "description": "Filter cards to a specific local Metabase collection id."
+              },
+              "database_id": {
+                "type": "string",
+                "pattern": "^mbdb_[0-9A-Z]{18,}$",
+                "description": "Filter cards to a specific local Metabase database id."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "Filter by card status."
+              },
+              "archived": {
+                "type": "boolean",
+                "description": "Filter by archived flag."
+              },
+              "display": {
+                "type": "string",
+                "description": "Filter by card display type (e.g., table, bar, line)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of cards to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "name"
+                ],
+                "description": "Field to sort cards by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_cards(collection_id=None, database_id=None, status=None, archived=None, display=None, limit=None, cursor=None, sort=None, order=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0534000\" if __import__(\"os\").path.isdir(\"./environment_mix/0534000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"list_cards\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": f\"rl_{int(time.time()*1000)}\",\n            \"endpoint\": endpoint,\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": _now()\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _parse_cursor(c):\n        if c is None:\n            return None\n        if not isinstance(c, str) or not c:\n            return None\n        try:\n            raw = base64.urlsafe_b64decode(c.encode(\"utf-8\") + b\"===\")\n            obj = json.loads(raw.decode(\"utf-8\"))\n            if not isinstance(obj, dict):\n                return None\n            if obj.get(\"endpoint\") != endpoint:\n                return None\n            if obj.get(\"v\") != 1:\n                return None\n            off = obj.get(\"offset\")\n            if not isinstance(off, int) or off < 0:\n                return None\n            return off\n        except Exception:\n            return None\n\n    def _make_cursor(off):\n        payload = {\"endpoint\": endpoint, \"v\": 1, \"offset\": off}\n        raw = json.dumps(payload, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"utf-8\").rstrip(\"=\")\n\n    # Validation\n    try:\n        if collection_id is not None:\n            if not isinstance(collection_id, str) or re.match(r\"^mbc_[0-9A-Z]{18,}$\", collection_id) is None:\n                _log(\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"collection_id is malformed.\")\n        if database_id is not None:\n            if not isinstance(database_id, str) or re.match(r\"^mbdb_[0-9A-Z]{18,}$\", database_id) is None:\n                _log(\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"database_id is malformed.\")\n        if status is not None:\n            if status not in (\"active\", \"archived\", \"deleted\"):\n                _log(\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"status must be one of: active, archived, deleted.\")\n        if archived is not None and not isinstance(archived, bool):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"archived must be a boolean.\")\n        if display is not None and not isinstance(display, str):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"display must be a string.\")\n        if limit is None:\n            limit = 50\n        if not isinstance(limit, int) or limit < 1 or limit > 200:\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200.\")\n        if sort is None:\n            sort = \"updated_at\"\n        if sort not in (\"created_at\", \"updated_at\", \"name\"):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"sort must be one of: created_at, updated_at, name.\")\n        if order is None:\n            order = \"desc\"\n        if order not in (\"asc\", \"desc\"):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"order must be one of: asc, desc.\")\n        offset = 0\n        if cursor is not None:\n            offset = _parse_cursor(cursor)\n            if offset is None:\n                _log(\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"cursor is invalid or expired.\")\n    except Exception:\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid request.\")\n\n    cards = _load(\"metabase_cards.json\")\n    if not isinstance(cards, list):\n        cards = []\n    if len(cards) == 0:\n        _log(\"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"No authorized context available to list cards.\")\n\n    # Business rule: list excludes deleted\n    rows = [c for c in cards if isinstance(c, dict) and c.get(\"status\") != \"deleted\"]\n\n    if collection_id is not None:\n        rows = [c for c in rows if c.get(\"collection_id\") == collection_id]\n    if database_id is not None:\n        rows = [c for c in rows if c.get(\"database_id\") == database_id]\n    if status is not None:\n        if status == \"deleted\":\n            rows = []\n        else:\n            rows = [c for c in rows if c.get(\"status\") == status]\n    if archived is not None:\n        rows = [c for c in rows if c.get(\"archived\") is archived]\n    if display is not None:\n        rows = [c for c in rows if (c.get(\"display\") or \"\") == display]\n\n    def _key(c):\n        v = c.get(sort)\n        if v is None:\n            return \"\"\n        return v\n    reverse = (order == \"desc\")\n    try:\n        rows.sort(key=_key, reverse=reverse)\n    except Exception:\n        rows.sort(key=lambda c: str(c.get(sort, \"\")), reverse=reverse)\n\n    total = len(rows)\n    page = rows[offset: offset + limit]\n    next_off = offset + len(page)\n    has_more = next_off < total\n    next_cursor = _make_cursor(next_off) if has_more else None\n\n    resp = {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor\n        }\n    }\n    _log(\"OK\")\n    return resp\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_databases",
+          "description": "Lists Metabase databases known to the Integration Server, optionally filtered by status and engine, returning up to `limit` items per page with an opaque `cursor` for pagination and optional sorting by the supported fields. Raises VALIDATION_ERROR for invalid filter/sort values, out-of-range `limit`, or an invalid `cursor`, and UNAUTHORIZED/FORBIDDEN if you are not allowed to browse database metadata. Raises QUOTA_EXCEEDED when list-rate limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "deleted"
+                ],
+                "description": "Filter by database status."
+              },
+              "engine": {
+                "type": "string",
+                "description": "Filter by database engine (e.g., postgres, mysql)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of databases to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "name"
+                ],
+                "description": "Field to sort databases by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_databases(status=None, engine=None, limit=None, cursor=None, sort=None, order=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0534000\" if __import__(\"os\").path.isdir(\"./environment_mix/0534000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"list_databases\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": f\"rl_{int(time.time()*1000)}\",\n            \"endpoint\": endpoint,\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": _now()\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _parse_cursor(c):\n        if c is None:\n            return None\n        if not isinstance(c, str) or not c:\n            return None\n        try:\n            raw = base64.urlsafe_b64decode(c.encode(\"utf-8\") + b\"===\")\n            obj = json.loads(raw.decode(\"utf-8\"))\n            if not isinstance(obj, dict):\n                return None\n            if obj.get(\"endpoint\") != endpoint:\n                return None\n            if obj.get(\"v\") != 1:\n                return None\n            off = obj.get(\"offset\")\n            if not isinstance(off, int) or off < 0:\n                return None\n            return off\n        except Exception:\n            return None\n\n    def _make_cursor(off):\n        payload = {\"endpoint\": endpoint, \"v\": 1, \"offset\": off}\n        raw = json.dumps(payload, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"utf-8\").rstrip(\"=\")\n\n    # Validation\n    try:\n        if status is not None and status not in (\"active\", \"deleted\"):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: active, deleted.\")\n        if engine is not None and not isinstance(engine, str):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"engine must be a string.\")\n        if limit is None:\n            limit = 50\n        if not isinstance(limit, int) or limit < 1 or limit > 200:\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200.\")\n        if sort is None:\n            sort = \"updated_at\"\n        if sort not in (\"created_at\", \"updated_at\", \"name\"):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"sort must be one of: created_at, updated_at, name.\")\n        if order is None:\n            order = \"desc\"\n        if order not in (\"asc\", \"desc\"):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"order must be one of: asc, desc.\")\n        offset = 0\n        if cursor is not None:\n            offset = _parse_cursor(cursor)\n            if offset is None:\n                _log(\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"cursor is invalid or expired.\")\n    except Exception:\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid request.\")\n\n    dbs = _load(\"metabase_databases_schema.json\")\n    if not isinstance(dbs, list):\n        dbs = []\n    if len(dbs) == 0:\n        _log(\"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"No authorized context available to list databases.\")\n\n    # Business rule: list_databases returns active by default (and per rule)\n    rows = [d for d in dbs if isinstance(d, dict)]\n    if status is None:\n        rows = [d for d in rows if d.get(\"status\") == \"active\"]\n    else:\n        rows = [d for d in rows if d.get(\"status\") == status]\n\n    if engine is not None:\n        rows = [d for d in rows if (d.get(\"engine\") or \"\") == engine]\n\n    def _key(d):\n        v = d.get(sort)\n        if v is None:\n            return \"\"\n        return v\n    reverse = (order == \"desc\")\n    try:\n        rows.sort(key=_key, reverse=reverse)\n    except Exception:\n        rows.sort(key=lambda d: str(d.get(sort, \"\")), reverse=reverse)\n\n    total = len(rows)\n    page = rows[offset: offset + limit]\n    next_off = offset + len(page)\n    has_more = next_off < total\n    next_cursor = _make_cursor(next_off) if has_more else None\n\n    resp = {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor\n        }\n    }\n    _log(\"OK\")\n    return resp\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "execute_card",
+          "description": "Executes the specified card/question through the Integration Server, applying `parameters_json` and returning the card’s execution output in the requested `result_format` along with an execution/audit-log entry reference. Raises VALIDATION_ERROR if `card_id` is malformed, parameters are not acceptable for the card, or `result_format` is unsupported, and UNAUTHORIZED/FORBIDDEN if you are not permitted to run the card or access its underlying data. Raises NOT_FOUND if `card_id` does not exist in the local representation, CONFLICT if the card is not in an executable state (for example archived/deleted), and QUOTA_EXCEEDED when query execution limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "card_id": {
+                "type": "string",
+                "pattern": "^mbq_[0-9A-Z]{18,}$",
+                "description": "Local Metabase card id to execute."
+              },
+              "parameters_json": {
+                "type": "object",
+                "description": "Parameter values to apply when executing the card."
+              },
+              "result_format": {
+                "type": "string",
+                "description": "Desired result format identifier for the execution output."
+              }
+            },
+            "required": [
+              "card_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def execute_card(card_id, parameters_json=None, result_format=None, **_extra):\n    import json, os, datetime, time, re, random\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0534000\" if __import__(\"os\").path.isdir(\"./environment_mix/0534000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"execute_card\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code, execution_id=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": f\"rl_{int(time.time()*1000)}\",\n            \"endpoint\": endpoint,\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": _now(),\n            \"execution_id\": execution_id\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\"\n        return prefix + \"_\" + \"\".join(random.choice(alphabet) for _ in range(20))\n\n    # Validation\n    try:\n        if not isinstance(card_id, str) or re.match(r\"^mbq_[0-9A-Z]{18,}$\", card_id) is None:\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"card_id is malformed.\")\n        if parameters_json is not None and not isinstance(parameters_json, dict):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"parameters_json must be an object.\")\n        if result_format is not None and not isinstance(result_format, str):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"result_format must be a string.\")\n        if result_format is None:\n            result_format = \"json\"\n        if result_format not in (\"json\", \"csv\"):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Unsupported result_format.\", supported_formats=[\"json\", \"csv\"])\n    except Exception:\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid request.\")\n\n    cards = _load(\"metabase_cards.json\")\n    if not isinstance(cards, list):\n        cards = []\n\n    # Find card, ensure non-deleted\n    card = None\n    for c in cards:\n        if isinstance(c, dict) and c.get(\"id\") == card_id:\n            card = c\n            break\n    if card is None or card.get(\"status\") == \"deleted\":\n        _log(\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Card not found.\")\n\n    # Ambient auth: require presence of at least one database mirror if card references a metabase_database_id or database_id\n    dbs = _load(\"metabase_databases_schema.json\")\n    if not isinstance(dbs, list):\n        dbs = []\n    # determine metabase_database_id for execution when possible\n    metabase_database_id = card.get(\"metabase_database_id\")\n    database_id = card.get(\"database_id\")\n\n    db_row = None\n    if database_id is not None:\n        for d in dbs:\n            if isinstance(d, dict) and d.get(\"id\") == database_id and d.get(\"status\") == \"active\":\n                db_row = d\n                break\n        if db_row is None:\n            _log(\"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"No authorized context available to execute this card (database unavailable).\")\n        if metabase_database_id is None:\n            metabase_database_id = db_row.get(\"metabase_database_id\")\n    elif metabase_database_id is not None:\n        for d in dbs:\n            if isinstance(d, dict) and d.get(\"metabase_database_id\") == metabase_database_id and d.get(\"status\") == \"active\":\n                db_row = d\n                break\n        if db_row is None:\n            _log(\"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"No authorized context available to execute this card (database unavailable).\")\n    else:\n        # Allow if system has any active database context at all (best-effort ambient auth)\n        any_active = any(isinstance(d, dict) and d.get(\"status\") == \"active\" for d in dbs)\n        if not any_active:\n            _log(\"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"No authorized context available to execute cards.\")\n        # Pick none; metabase_database_id remains None (still allowed by tool contract), but execution row must satisfy schema constraint:\n        # execution_type='card' => metabase_card_id IS NOT NULL (true), no requirement for metabase_database_id.\n\n    # Parameter acceptability (minimal, schema-driven): ensure provided parameters keys exist in card.dataset_query_json/template?\n    # If card has no parameters template, accept empty/none only.\n    try:\n        if parameters_json is None:\n            parameters_json = {}\n        if not isinstance(parameters_json, dict):\n            _log(\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"parameters_json must be an object.\")\n        # If dashboard-like parameter template exists on card, validate keys; otherwise accept any (Metabase can accept native params).\n        template = card.get(\"dataset_query_json\")\n        if template is None:\n            # no template: accept but require it's JSON object already (done)\n            pass\n    except Exception:\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"parameters_json is not acceptable for this card.\")\n\n    executions = _load(\"metabase_executions.json\")\n    if not isinstance(executions, list):\n        executions = []\n\n    # Create execution: queued -> running -> succeeded (offline deterministic stub result)\n    exec_id = _gen_id(\"mbx\")\n    now = _now()\n    metabase_card_id = card.get(\"metabase_card_id\")\n    if metabase_card_id is None or not isinstance(metabase_card_id, int):\n        _log(\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Card is missing metabase_card_id and cannot be executed.\")\n\n    row = {\n        \"id\": exec_id,\n        \"execution_type\": \"card\",\n        \"card_id\": card_id,\n        \"metabase_card_id\": metabase_card_id,\n        \"database_id\": db_row.get(\"id\") if isinstance(db_row, dict) else None,\n        \"metabase_database_id\": metabase_database_id,\n        \"sql_text\": None,\n        \"parameters_json\": parameters_json,\n        \"result_format\": result_format,\n        \"result_metadata_json\": None,\n        \"row_count\": None,\n        \"runtime_ms\": None,\n        \"status\": \"queued\",\n        \"error_message\": None,\n        \"error_details_json\": None,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n\n    # Persist queued\n    executions.append(row)\n    _save(\"metabase_executions.json\", executions)\n\n    # Transition to running\n    try:\n        started = _now()\n        row[\"status\"] = \"running\"\n        row[\"started_at\"] = started\n        row[\"updated_at\"] = started\n        _save(\"metabase_executions.json\", executions)\n    except Exception:\n        _log(\"FAILED\", execution_id=exec_id)\n        return _err(\"CONFLICT\", \"Failed to start execution.\", execution_id=exec_id)\n\n    # Produce offline result (since no external Metabase): succeed with empty dataset and basic metadata\n    try:\n        finished = _now()\n        runtime_ms = max(0, int((time.time() - t0) * 1000))\n        # Basic metadata: no columns known\n        meta = {\"columns\": [], \"source\": \"integration_server_offline\"}\n        result = {\"rows\": [], \"columns\": []}\n        if result_format == \"csv\":\n            output = \"\"  # header-less empty\n        else:\n            output = result\n\n        row[\"status\"] = \"succeeded\"\n        row[\"result_metadata_json\"] = meta\n        row[\"row_count\"] = 0\n        row[\"runtime_ms\"] = runtime_ms\n        row[\"finished_at\"] = finished\n        row[\"updated_at\"] = finished\n        _save(\"metabase_executions.json\", executions)\n\n        resp = {\n            \"execution\": row,\n            \"result_format\": result_format,\n            \"data\": output\n        }\n        _log(\"OK\", execution_id=exec_id)\n        return resp\n    except Exception:\n        # Transition to failed (allowed from running)\n        try:\n            finished = _now()\n            row[\"status\"] = \"failed\"\n            row[\"error_message\"] = \"Execution failed.\"\n            row[\"error_details_json\"] = {\"reason\": \"offline_execution_error\"}\n            row[\"finished_at\"] = finished\n            row[\"updated_at\"] = finished\n            _save(\"metabase_executions.json\", executions)\n        except Exception:\n            pass\n        _log(\"FAILED\", execution_id=exec_id)\n        return _err(\"CONFLICT\", \"Execution failed.\", execution_id=exec_id)\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_dashboard_cards",
+          "description": "Returns the dashboard-card links (cards placed on a dashboard), optionally filtered by link status, sorted as requested, and paged with `limit` and an opaque `cursor` for the next page. Raises VALIDATION_ERROR for malformed `dashboard_id`, invalid sort/order values, out-of-range `limit`, or an invalid `cursor`, and UNAUTHORIZED/FORBIDDEN if you cannot view the dashboard or its cards. Raises NOT_FOUND if the dashboard does not exist in the local representation, and QUOTA_EXCEEDED when listing limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "dashboard_id": {
+                "type": "string",
+                "pattern": "^mbd_[0-9A-Z]{18,}$",
+                "description": "Local Metabase dashboard id whose cards should be returned."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "removed"
+                ],
+                "description": "Filter dashboard-card links by status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500,
+                "description": "Maximum number of dashboard cards to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "row",
+                  "col"
+                ],
+                "description": "Field to sort dashboard cards by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order."
+              }
+            },
+            "required": [
+              "dashboard_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_dashboard_cards(dashboard_id, status=None, limit=None, cursor=None, sort=None, order=None, **_extra):\n    import json, os, datetime, time, re, base64, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0534000\" if __import__(\"os\").path.isdir(\"./environment_mix/0534000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # request log (best-effort even if errors)\n    req_file = \"request_logs.json\"\n    reqs = _load(req_file)\n\n    def _log(status_code, credential_id=None, details=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        row = {\n            \"id\": \"req_\" + hashlib.sha256((now + \"|\" + str(len(reqs) + 1)).encode(\"utf-8\")).hexdigest()[:22].upper(),\n            \"endpoint\": \"get_dashboard_cards\",\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": now\n        }\n        if details is not None:\n            row[\"details\"] = details\n        reqs.append(row)\n        _save(req_file, reqs)\n\n    # rate limit / quota (if configured)\n    def _enforce_limits():\n        limits = _load(\"rate_limits.json\")\n        if not isinstance(limits, list):\n            return None\n        # find any applicable global limit rows\n        for lim in limits:\n            if not isinstance(lim, dict):\n                continue\n            if lim.get(\"enabled\") is False:\n                continue\n            scope = lim.get(\"scope\", \"global\")\n            if scope not in (\"global\", \"all\"):\n                continue\n            # rate_limit_per_minute\n            rpm = lim.get(\"requests_per_minute\")\n            if isinstance(rpm, int) and rpm > 0:\n                cutoff = (datetime.datetime.utcnow() - datetime.timedelta(minutes=1)).replace(microsecond=0).isoformat() + \"Z\"\n                recent = [r for r in reqs if isinstance(r, dict) and r.get(\"timestamp\", \"\") >= cutoff]\n                if len(recent) >= rpm:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n            # quota_per_day\n            qpd = lim.get(\"requests_per_day\")\n            if isinstance(qpd, int) and qpd > 0:\n                day = datetime.datetime.utcnow().date().isoformat()\n                today = [r for r in reqs if isinstance(r, dict) and str(r.get(\"timestamp\", \"\")).startswith(day)]\n                if len(today) >= qpd:\n                    return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\")\n        return None\n\n    lim_err = _enforce_limits()\n    if lim_err:\n        _log(lim_err[\"error\"][\"code\"])\n        return lim_err\n\n    # Validate inputs\n    if not isinstance(dashboard_id, str) or not re.match(r\"^mbd_[0-9A-Z]{18,}$\", dashboard_id):\n        e = _err(\"VALIDATION_ERROR\", \"Malformed dashboard_id.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"active\", \"removed\"):\n            e = _err(\"VALIDATION_ERROR\", \"Invalid status filter.\")\n            _log(\"VALIDATION_ERROR\")\n            return e\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int) or limit < 1 or limit > 500:\n        e = _err(\"VALIDATION_ERROR\", \"Invalid limit; must be 1..500.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n    if sort is None:\n        sort = \"created_at\"\n    if order is None:\n        order = \"asc\"\n    if sort not in (\"created_at\", \"updated_at\", \"row\", \"col\") or order not in (\"asc\", \"desc\"):\n        e = _err(\"VALIDATION_ERROR\", \"Invalid sort/order.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n\n    # Load data\n    dashboards = _load(\"metabase_dashboards.json\")\n    placements = _load(\"metabase_dashboard_cards.json\")\n    cards = _load(\"metabase_cards.json\")\n\n    # Find dashboard and enforce viewability (ambient auth: allow if exists)\n    dash = next((d for d in dashboards if isinstance(d, dict) and d.get(\"id\") == dashboard_id), None)\n    if not dash or dash.get(\"status\") == \"deleted\":\n        e = _err(\"NOT_FOUND\", \"Dashboard not found.\")\n        _log(\"NOT_FOUND\")\n        return e\n\n    # Filter placements\n    filtered = []\n    cards_by_id = {c.get(\"id\"): c for c in cards if isinstance(c, dict)}\n    for p in placements:\n        if not isinstance(p, dict):\n            continue\n        if p.get(\"dashboard_id\") != dashboard_id:\n            continue\n        if status is not None and p.get(\"status\") != status:\n            continue\n        # join to card and exclude deleted cards\n        c = cards_by_id.get(p.get(\"card_id\"))\n        if not c or c.get(\"status\") == \"deleted\":\n            continue\n        # include placement row plus card summary\n        out = dict(p)\n        out[\"card\"] = {\n            \"id\": c.get(\"id\"),\n            \"metabase_card_id\": c.get(\"metabase_card_id\"),\n            \"name\": c.get(\"name\"),\n            \"description\": c.get(\"description\"),\n            \"collection_id\": c.get(\"collection_id\"),\n            \"metabase_collection_id\": c.get(\"metabase_collection_id\"),\n            \"database_id\": c.get(\"database_id\"),\n            \"metabase_database_id\": c.get(\"metabase_database_id\"),\n            \"display\": c.get(\"display\"),\n            \"archived\": c.get(\"archived\"),\n            \"status\": c.get(\"status\"),\n            \"created_at\": c.get(\"created_at\"),\n            \"updated_at\": c.get(\"updated_at\"),\n        }\n        filtered.append(out)\n\n    # Sorting\n    def _sort_key(x):\n        v = x.get(sort)\n        # normalize None for numeric sorts\n        if sort in (\"row\", \"col\"):\n            if v is None:\n                return -1 if order == \"asc\" else 10**18\n            if isinstance(v, int):\n                return v\n            return -1 if order == \"asc\" else 10**18\n        # datetime-ish strings\n        if v is None:\n            return \"\"\n        return str(v)\n\n    reverse = (order == \"desc\")\n    filtered.sort(key=_sort_key, reverse=reverse)\n\n    # Cursor pagination: opaque base64 of {\"i\": index, \"sig\": sha256(dashboard_id|sort|order|status|i)}\n    start = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or cursor.strip() == \"\":\n            e = _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n            _log(\"VALIDATION_ERROR\")\n            return e\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\").decode(\"utf-8\")\n            payload = json.loads(raw)\n            if not isinstance(payload, dict) or \"i\" not in payload or \"sig\" not in payload:\n                raise ValueError(\"bad cursor\")\n            i = payload[\"i\"]\n            sig = payload[\"sig\"]\n            if not isinstance(i, int) or i < 0:\n                raise ValueError(\"bad index\")\n            expected = hashlib.sha256((dashboard_id + \"|\" + sort + \"|\" + order + \"|\" + str(status) + \"|\" + str(i)).encode(\"utf-8\")).hexdigest()\n            if sig != expected:\n                raise ValueError(\"bad sig\")\n            start = i\n        except Exception:\n            e = _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n            _log(\"VALIDATION_ERROR\")\n            return e\n\n    total = len(filtered)\n    page = filtered[start:start + limit]\n    next_cursor = None\n    if start + limit < total:\n        ni = start + limit\n        sig = hashlib.sha256((dashboard_id + \"|\" + sort + \"|\" + order + \"|\" + str(status) + \"|\" + str(ni)).encode(\"utf-8\")).hexdigest()\n        next_cursor = base64.urlsafe_b64encode(json.dumps({\"i\": ni, \"sig\": sig}).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    resp = {\n        \"dashboard_id\": dashboard_id,\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": (next_cursor is not None),\n            \"next_cursor\": next_cursor,\n            \"sort\": sort,\n            \"order\": order,\n            \"status\": status\n        }\n    }\n    _log(\"OK\")\n    return resp\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "execute_query",
+          "description": "Executes the provided SQL text against the specified Metabase database via the Integration Server, applies optional `parameters_json`, and returns the execution output in the requested `result_format` along with an execution/audit-log entry reference. Raises VALIDATION_ERROR if `database_id` is malformed, `sql_text` is empty/invalid, parameters are invalid for the execution, or `result_format` is unsupported, and UNAUTHORIZED/FORBIDDEN if you are not allowed to run SQL against the database. Raises NOT_FOUND if `database_id` does not exist in the local representation, CONFLICT if the database is not in an executable state (for example deleted), and QUOTA_EXCEEDED when query execution limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "database_id": {
+                "type": "string",
+                "pattern": "^mbdb_[0-9A-Z]{18,}$",
+                "description": "Local Metabase database id to run the SQL against."
+              },
+              "sql_text": {
+                "type": "string",
+                "description": "SQL text to execute."
+              },
+              "parameters_json": {
+                "type": "object",
+                "description": "Optional parameter values used by the query execution."
+              },
+              "result_format": {
+                "type": "string",
+                "description": "Desired result format identifier for the execution output."
+              }
+            },
+            "required": [
+              "database_id",
+              "sql_text"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def execute_query(database_id, sql_text, parameters_json=None, result_format=None, **_extra):\n    import json, os, datetime, time, re, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0534000\" if __import__(\"os\").path.isdir(\"./environment_mix/0534000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now = now_dt.isoformat() + \"Z\"\n\n    req_file = \"request_logs.json\"\n    reqs = _load(req_file)\n\n    def _log(status_code, credential_id=None, details=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        row = {\n            \"id\": \"req_\" + hashlib.sha256((now + \"|\" + str(len(reqs) + 1)).encode(\"utf-8\")).hexdigest()[:22].upper(),\n            \"endpoint\": \"execute_query\",\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": now\n        }\n        if details is not None:\n            row[\"details\"] = details\n        reqs.append(row)\n        _save(req_file, reqs)\n\n    def _enforce_limits():\n        limits = _load(\"rate_limits.json\")\n        if not isinstance(limits, list):\n            return None\n        for lim in limits:\n            if not isinstance(lim, dict):\n                continue\n            if lim.get(\"enabled\") is False:\n                continue\n            scope = lim.get(\"scope\", \"global\")\n            if scope not in (\"global\", \"all\"):\n                continue\n            rpm = lim.get(\"requests_per_minute\")\n            if isinstance(rpm, int) and rpm > 0:\n                cutoff = (datetime.datetime.utcnow() - datetime.timedelta(minutes=1)).replace(microsecond=0).isoformat() + \"Z\"\n                recent = [r for r in reqs if isinstance(r, dict) and r.get(\"timestamp\", \"\") >= cutoff]\n                if len(recent) >= rpm:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n            qpd = lim.get(\"requests_per_day\")\n            if isinstance(qpd, int) and qpd > 0:\n                day = datetime.datetime.utcnow().date().isoformat()\n                today = [r for r in reqs if isinstance(r, dict) and str(r.get(\"timestamp\", \"\")).startswith(day)]\n                if len(today) >= qpd:\n                    return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\")\n        return None\n\n    lim_err = _enforce_limits()\n    if lim_err:\n        _log(lim_err[\"error\"][\"code\"])\n        return lim_err\n\n    # Validate inputs\n    if not isinstance(database_id, str) or not re.match(r\"^mbdb_[0-9A-Z]{18,}$\", database_id):\n        e = _err(\"VALIDATION_ERROR\", \"Malformed database_id.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n    if not isinstance(sql_text, str) or sql_text.strip() == \"\":\n        e = _err(\"VALIDATION_ERROR\", \"sql_text must be a non-empty string.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n    if parameters_json is not None and not isinstance(parameters_json, dict):\n        e = _err(\"VALIDATION_ERROR\", \"parameters_json must be an object.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n    if result_format is not None and not isinstance(result_format, str):\n        e = _err(\"VALIDATION_ERROR\", \"result_format must be a string.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n\n    dbs = _load(\"metabase_databases_schema.json\")\n    db = next((d for d in dbs if isinstance(d, dict) and d.get(\"id\") == database_id), None)\n    if not db or db.get(\"status\") != \"active\":\n        e = _err(\"NOT_FOUND\", \"Database not found or not active.\")\n        _log(\"NOT_FOUND\")\n        return e\n\n    metabase_database_id = db.get(\"metabase_database_id\")\n    if not isinstance(metabase_database_id, int):\n        e = _err(\"VALIDATION_ERROR\", \"Database mirror missing metabase_database_id.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n\n    executions_file = \"metabase_executions.json\"\n    executions = _load(executions_file)\n\n    def _new_exec_id():\n        seed = f\"{now}|query|{database_id}|{len(executions)+1}\"\n        return \"mbe_\" + hashlib.sha256(seed.encode(\"utf-8\")).hexdigest()[:22].upper()\n\n    exec_id = _new_exec_id()\n\n    # Create execution in queued\n    exec_row = {\n        \"id\": exec_id,\n        \"execution_type\": \"query\",\n        \"card_id\": None,\n        \"metabase_card_id\": None,\n        \"database_id\": database_id,\n        \"metabase_database_id\": metabase_database_id,\n        \"sql_text\": sql_text,\n        \"parameters_json\": parameters_json,\n        \"result_format\": result_format,\n        \"result_metadata_json\": None,\n        \"row_count\": None,\n        \"runtime_ms\": None,\n        \"status\": \"queued\",\n        \"error_message\": None,\n        \"error_details_json\": None,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n    executions.append(exec_row)\n    _save(executions_file, executions)\n\n    # Transition queued -> running\n    exec_row[\"status\"] = \"running\"\n    exec_row[\"started_at\"] = now\n    exec_row[\"updated_at\"] = now\n    _save(executions_file, executions)\n\n    # Offline \"execution\": do not actually run SQL; simulate deterministic success unless configured to fail\n    # Optional redaction config\n    cfg = _load(\"integration_config.json\")\n    redact = False\n    if isinstance(cfg, dict):\n        redact = bool(cfg.get(\"redact_sql_text\", False))\n    if redact:\n        exec_row[\"sql_text\"] = \"[REDACTED]\"\n        _save(executions_file, executions)\n\n    # Simulate output\n    # If sql contains a clear error marker, fail deterministically\n    sql_lower = sql_text.lower()\n    failed = (\"-- fail\" in sql_lower) or (\"/* fail */\" in sql_lower) or (\"raise_error\" in sql_lower)\n\n    finished_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    runtime_ms = max(0, int((finished_dt - now_dt).total_seconds() * 1000))\n\n    if failed:\n        # running -> failed (legal)\n        exec_row[\"status\"] = \"failed\"\n        exec_row[\"error_message\"] = \"Query execution failed.\"\n        exec_row[\"error_details_json\"] = {\"reason\": \"Simulated failure (offline execution).\"}\n        exec_row[\"runtime_ms\"] = runtime_ms\n        exec_row[\"finished_at\"] = finished_dt.isoformat() + \"Z\"\n        exec_row[\"updated_at\"] = exec_row[\"finished_at\"]\n        _save(executions_file, executions)\n        resp = {\n            \"execution\": exec_row,\n            \"result\": None\n        }\n        _log(\"OK\", details={\"terminal_status\": \"failed\"})\n        return resp\n\n    # running -> succeeded (legal)\n    exec_row[\"status\"] = \"succeeded\"\n    exec_row[\"runtime_ms\"] = runtime_ms\n    exec_row[\"finished_at\"] = finished_dt.isoformat() + \"Z\"\n    exec_row[\"updated_at\"] = exec_row[\"finished_at\"]\n\n    # Provide lightweight, deterministic \"result\"\n    # Return format: json default\n    fmt = (result_format or \"json\").lower()\n    exec_row[\"result_metadata_json\"] = {\n        \"format\": fmt,\n        \"offline\": True,\n        \"metabase_database_id\": metabase_database_id\n    }\n\n    # Minimal dummy rows; row_count set\n    dummy_rows = [{\"ok\": True, \"database\": db.get(\"name\"), \"metabase_database_id\": metabase_database_id}]\n    exec_row[\"row_count\"] = len(dummy_rows)\n    _save(executions_file, executions)\n\n    if fmt == \"csv\":\n        # simple CSV string\n        result = \"ok,database,metabase_database_id\\ntrue,{},{:d}\\n\".format(\n            (db.get(\"name\") or \"\").replace(\",\", \" \"),\n            metabase_database_id\n        )\n    else:\n        result = {\"rows\": dummy_rows}\n\n    resp = {\n        \"execution\": exec_row,\n        \"result\": result\n    }\n    _log(\"OK\", details={\"terminal_status\": \"succeeded\"})\n    return resp\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_card",
+          "description": "Creates a new card/question in the Integration Server’s local Metabase representation with the provided name, database association, dataset_query, and display settings, returning the created card record. Raises VALIDATION_ERROR if required fields are missing, IDs are malformed, `dataset_query_json` is not valid for the selected database, or `display` is unsupported, and UNAUTHORIZED/FORBIDDEN if you are not allowed to create cards in the target collection or database. Raises NOT_FOUND if `collection_id` (when provided) or `database_id` does not exist in the local representation, and CONFLICT if the request attempts to create a card in an invalid state (for example creating directly as deleted) or violates server-side constraints for new cards.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Card name."
+              },
+              "description": {
+                "type": "string",
+                "description": "Card description."
+              },
+              "collection_id": {
+                "type": "string",
+                "pattern": "^mbc_[0-9A-Z]{18,}$",
+                "description": "Local Metabase collection id to place the card in."
+              },
+              "database_id": {
+                "type": "string",
+                "pattern": "^mbdb_[0-9A-Z]{18,}$",
+                "description": "Local Metabase database id the card is associated with."
+              },
+              "dataset_query_json": {
+                "type": "object",
+                "description": "Metabase dataset_query JSON defining the question."
+              },
+              "display": {
+                "type": "string",
+                "description": "Card display type (e.g., table, bar, line)."
+              },
+              "visualization_settings_json": {
+                "type": "object",
+                "description": "Visualization settings JSON for the card."
+              },
+              "archived": {
+                "type": "boolean",
+                "description": "Whether the card is archived."
+              }
+            },
+            "required": [
+              "name",
+              "database_id",
+              "dataset_query_json",
+              "display"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_card(name, database_id, dataset_query_json, display, description=None, collection_id=None, visualization_settings_json=None, archived=None, **_extra):\n    import json, os, datetime, time, re, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0534000\" if __import__(\"os\").path.isdir(\"./environment_mix/0534000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    req_file = \"request_logs.json\"\n    reqs = _load(req_file)\n\n    def _log(status_code, credential_id=None, details=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        row = {\n            \"id\": \"req_\" + hashlib.sha256((now + \"|\" + str(len(reqs) + 1)).encode(\"utf-8\")).hexdigest()[:22].upper(),\n            \"endpoint\": \"create_card\",\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": now\n        }\n        if details is not None:\n            row[\"details\"] = details\n        reqs.append(row)\n        _save(req_file, reqs)\n\n    def _enforce_limits():\n        limits = _load(\"rate_limits.json\")\n        if not isinstance(limits, list):\n            return None\n        for lim in limits:\n            if not isinstance(lim, dict):\n                continue\n            if lim.get(\"enabled\") is False:\n                continue\n            scope = lim.get(\"scope\", \"global\")\n            if scope not in (\"global\", \"all\"):\n                continue\n            rpm = lim.get(\"requests_per_minute\")\n            if isinstance(rpm, int) and rpm > 0:\n                cutoff = (datetime.datetime.utcnow() - datetime.timedelta(minutes=1)).replace(microsecond=0).isoformat() + \"Z\"\n                recent = [r for r in reqs if isinstance(r, dict) and r.get(\"timestamp\", \"\") >= cutoff]\n                if len(recent) >= rpm:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n            qpd = lim.get(\"requests_per_day\")\n            if isinstance(qpd, int) and qpd > 0:\n                day = datetime.datetime.utcnow().date().isoformat()\n                today = [r for r in reqs if isinstance(r, dict) and str(r.get(\"timestamp\", \"\")).startswith(day)]\n                if len(today) >= qpd:\n                    return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\")\n        return None\n\n    lim_err = _enforce_limits()\n    if lim_err:\n        _log(lim_err[\"error\"][\"code\"])\n        return lim_err\n\n    # Validate inputs\n    if not isinstance(name, str) or name.strip() == \"\":\n        e = _err(\"VALIDATION_ERROR\", \"name must be a non-empty string.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n    if description is not None and not isinstance(description, str):\n        e = _err(\"VALIDATION_ERROR\", \"description must be a string.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n    if not isinstance(database_id, str) or not re.match(r\"^mbdb_[0-9A-Z]{18,}$\", database_id):\n        e = _err(\"VALIDATION_ERROR\", \"Malformed database_id.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n    if collection_id is not None:\n        if not isinstance(collection_id, str) or not re.match(r\"^mbc_[0-9A-Z]{18,}$\", collection_id):\n            e = _err(\"VALIDATION_ERROR\", \"Malformed collection_id.\")\n            _log(\"VALIDATION_ERROR\")\n            return e\n    if not isinstance(dataset_query_json, dict):\n        e = _err(\"VALIDATION_ERROR\", \"dataset_query_json must be an object.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n    if not isinstance(display, str) or display.strip() == \"\":\n        e = _err(\"VALIDATION_ERROR\", \"display must be a non-empty string.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n    if visualization_settings_json is not None and not isinstance(visualization_settings_json, dict):\n        e = _err(\"VALIDATION_ERROR\", \"visualization_settings_json must be an object.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n    if archived is None:\n        archived = False\n    if not isinstance(archived, bool):\n        e = _err(\"VALIDATION_ERROR\", \"archived must be boolean.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n\n    # Supported display types (basic sanity list; accept common Metabase viz types)\n    supported = {\n        \"table\", \"scalar\", \"bar\", \"line\", \"area\", \"pie\", \"map\",\n        \"pivot\", \"scatter\", \"combo\", \"row\", \"funnel\"\n    }\n    if display.lower() not in supported:\n        e = _err(\"VALIDATION_ERROR\", \"Unsupported display type.\", supported=sorted(supported))\n        _log(\"VALIDATION_ERROR\")\n        return e\n\n    dbs = _load(\"metabase_databases_schema.json\")\n    db = next((d for d in dbs if isinstance(d, dict) and d.get(\"id\") == database_id), None)\n    if not db or db.get(\"status\") != \"active\":\n        e = _err(\"NOT_FOUND\", \"Database not found or not active.\")\n        _log(\"NOT_FOUND\")\n        return e\n    metabase_database_id = db.get(\"metabase_database_id\")\n    if not isinstance(metabase_database_id, int):\n        e = _err(\"VALIDATION_ERROR\", \"Database mirror missing metabase_database_id.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n\n    collections = _load(\"metabase_collections.json\")\n    metabase_collection_id = None\n    if collection_id is not None:\n        col = next((c for c in collections if isinstance(c, dict) and c.get(\"id\") == collection_id), None)\n        if not col or col.get(\"status\") == \"deleted\":\n            e = _err(\"NOT_FOUND\", \"Collection not found.\")\n            _log(\"NOT_FOUND\")\n            return e\n        metabase_collection_id = col.get(\"metabase_collection_id\")\n        if not isinstance(metabase_collection_id, int):\n            e = _err(\"VALIDATION_ERROR\", \"Collection mirror missing metabase_collection_id.\")\n            _log(\"VALIDATION_ERROR\")\n            return e\n\n    cards_file = \"metabase_cards.json\"\n    cards = _load(cards_file)\n\n    # Generate unique metabase_card_id (as if from Metabase response)\n    used_mb_ids = {c.get(\"metabase_card_id\") for c in cards if isinstance(c, dict)}\n    next_mb_id = 1\n    for v in used_mb_ids:\n        if isinstance(v, int) and v >= next_mb_id:\n            next_mb_id = v + 1\n    metabase_card_id = next_mb_id\n\n    # Generate local id\n    local_id = \"mbq_\" + hashlib.sha256(f\"{now}|{metabase_card_id}|{name}\".encode(\"utf-8\")).hexdigest()[:22].upper()\n\n    # Enforce uniqueness on metabase_card_id\n    if any(isinstance(c, dict) and c.get(\"metabase_card_id\") == metabase_card_id for c in cards):\n        e = _err(\"CONFLICT\", \"metabase_card_id must be unique.\")\n        _log(\"CONFLICT\")\n        return e\n\n    status = \"archived\" if archived else \"active\"\n\n    row = {\n        \"id\": local_id,\n        \"metabase_card_id\": metabase_card_id,\n        \"name\": name,\n        \"description\": description,\n        \"collection_id\": collection_id,\n        \"metabase_collection_id\": metabase_collection_id,\n        \"database_id\": database_id,\n        \"metabase_database_id\": metabase_database_id,\n        \"dataset_query_json\": dataset_query_json,\n        \"display\": display,\n        \"visualization_settings_json\": visualization_settings_json,\n        \"archived\": archived,\n        \"status\": status,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n\n    cards.append(row)\n    _save(cards_file, cards)\n    _log(\"OK\")\n    return {\"card\": row}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "update_card_visualization",
+          "description": "Updates a card’s visualization settings (and optionally its display type) and returns the updated card record. Raises VALIDATION_ERROR if `card_id` is malformed, `visualization_settings_json` is invalid, or the requested `display` is unsupported/incompatible, and UNAUTHORIZED/FORBIDDEN if you are not permitted to edit the card. Raises NOT_FOUND if the card does not exist in the local representation, and CONFLICT if the card is not editable due to its current state (for example archived/deleted).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "card_id": {
+                "type": "string",
+                "pattern": "^mbq_[0-9A-Z]{18,}$",
+                "description": "Local Metabase card id to update."
+              },
+              "visualization_settings_json": {
+                "type": "object",
+                "description": "New visualization settings JSON to apply to the card."
+              },
+              "display": {
+                "type": "string",
+                "description": "Optional new display type for the card."
+              }
+            },
+            "required": [
+              "card_id",
+              "visualization_settings_json"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def update_card_visualization(card_id, visualization_settings_json, display=None, **_extra):\n    import json, os, datetime, time, re, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0534000\" if __import__(\"os\").path.isdir(\"./environment_mix/0534000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    req_file = \"request_logs.json\"\n    reqs = _load(req_file)\n\n    def _log(status_code, credential_id=None, details=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        row = {\n            \"id\": \"req_\" + hashlib.sha256((now + \"|\" + str(len(reqs) + 1)).encode(\"utf-8\")).hexdigest()[:22].upper(),\n            \"endpoint\": \"update_card_visualization\",\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": now\n        }\n        if details is not None:\n            row[\"details\"] = details\n        reqs.append(row)\n        _save(req_file, reqs)\n\n    def _enforce_limits():\n        limits = _load(\"rate_limits.json\")\n        if not isinstance(limits, list):\n            return None\n        for lim in limits:\n            if not isinstance(lim, dict):\n                continue\n            if lim.get(\"enabled\") is False:\n                continue\n            scope = lim.get(\"scope\", \"global\")\n            if scope not in (\"global\", \"all\"):\n                continue\n            rpm = lim.get(\"requests_per_minute\")\n            if isinstance(rpm, int) and rpm > 0:\n                cutoff = (datetime.datetime.utcnow() - datetime.timedelta(minutes=1)).replace(microsecond=0).isoformat() + \"Z\"\n                recent = [r for r in reqs if isinstance(r, dict) and r.get(\"timestamp\", \"\") >= cutoff]\n                if len(recent) >= rpm:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n            qpd = lim.get(\"requests_per_day\")\n            if isinstance(qpd, int) and qpd > 0:\n                day = datetime.datetime.utcnow().date().isoformat()\n                today = [r for r in reqs if isinstance(r, dict) and str(r.get(\"timestamp\", \"\")).startswith(day)]\n                if len(today) >= qpd:\n                    return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\")\n        return None\n\n    lim_err = _enforce_limits()\n    if lim_err:\n        _log(lim_err[\"error\"][\"code\"])\n        return lim_err\n\n    # Validate\n    if not isinstance(card_id, str) or not re.match(r\"^mbq_[0-9A-Z]{18,}$\", card_id):\n        e = _err(\"VALIDATION_ERROR\", \"Malformed card_id.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n    if not isinstance(visualization_settings_json, dict):\n        e = _err(\"VALIDATION_ERROR\", \"visualization_settings_json must be an object.\")\n        _log(\"VALIDATION_ERROR\")\n        return e\n    if display is not None:\n        if not isinstance(display, str) or display.strip() == \"\":\n            e = _err(\"VALIDATION_ERROR\", \"display must be a non-empty string.\")\n            _log(\"VALIDATION_ERROR\")\n            return e\n        supported = {\n            \"table\", \"scalar\", \"bar\", \"line\", \"area\", \"pie\", \"map\",\n            \"pivot\", \"scatter\", \"combo\", \"row\", \"funnel\"\n        }\n        if display.lower() not in supported:\n            e = _err(\"VALIDATION_ERROR\", \"Unsupported display type.\", supported=sorted(supported))\n            _log(\"VALIDATION_ERROR\")\n            return e\n\n    cards_file = \"metabase_cards.json\"\n    cards = _load(cards_file)\n\n    idx = None\n    for i, c in enumerate(cards):\n        if isinstance(c, dict) and c.get(\"id\") == card_id:\n            idx = i\n            break\n    if idx is None:\n        e = _err(\"NOT_FOUND\", \"Card not found.\")\n        _log(\"NOT_FOUND\")\n        return e\n\n    card = cards[idx]\n    if card.get(\"status\") == \"deleted\":\n        e = _err(\"NOT_FOUND\", \"Card not found.\")\n        _log(\"NOT_FOUND\")\n        return e\n\n    # Mutate\n    card[\"visualization_settings_json\"] = visualization_settings_json\n    if display is not None:\n        card[\"display\"] = display\n    card[\"updated_at\"] = now\n\n    cards[idx] = card\n    _save(cards_file, cards)\n\n    _log(\"OK\")\n    return {\"card\": card}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "add_card_to_dashboard",
+          "description": "Adds an existing card to an existing dashboard with optional layout (row/col/size) and per-dashcard parameter/visualization overrides, returning the created dashboard-card link record. Raises VALIDATION_ERROR for malformed IDs, negative/invalid grid values, or invalid override JSON, and UNAUTHORIZED/FORBIDDEN if you cannot edit the dashboard or read the card. Raises NOT_FOUND if the dashboard or card does not exist in the local representation, and CONFLICT if the card cannot be placed on the dashboard in its current state (for example removed/deleted) or if the link already exists and duplicate placement is not allowed.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "dashboard_id": {
+                "type": "string",
+                "pattern": "^mbd_[0-9A-Z]{18,}$",
+                "description": "Integration Server dashboard id to add the card to."
+              },
+              "card_id": {
+                "type": "string",
+                "pattern": "^mbq_[0-9A-Z]{18,}$",
+                "description": "Integration Server card/question id to add to the dashboard."
+              },
+              "row": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Grid row position for the card on the dashboard."
+              },
+              "col": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Grid column position for the card on the dashboard."
+              },
+              "size_x": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Grid width (in dashboard units) for the card."
+              },
+              "size_y": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Grid height (in dashboard units) for the card."
+              },
+              "parameter_mappings_json": {
+                "type": "object",
+                "description": "Dashboard parameter mappings for the card (stored as JSON)."
+              },
+              "visualization_settings_json": {
+                "type": "object",
+                "description": "Per-dashboard-card visualization overrides (stored as JSON)."
+              }
+            },
+            "required": [
+              "dashboard_id",
+              "card_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def add_card_to_dashboard(dashboard_id, card_id, row=None, col=None, size_x=None, size_y=None, parameter_mappings_json=None, visualization_settings_json=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0534000\" if __import__(\"os\").path.isdir(\"./environment_mix/0534000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # ---- logging / quota (best-effort if collection exists) ----\n    usage_files = [\"request_logs.json\", \"requests.json\", \"usage.json\", \"audit_log.json\", \"audit_logs.json\"]\n    usage_file = None\n    for fn in usage_files:\n        if os.path.exists(os.path.join(_DB, fn)):\n            usage_file = fn\n            break\n\n    def _log(status, credential=None, error_code=None):\n        if not usage_file:\n            return\n        logs = _load(usage_file)\n        entry = {\n            \"id\": \"req_\" + base64.b32encode(os.urandom(10)).decode(\"ascii\").rstrip(\"=\"),\n            \"endpoint\": \"add_card_to_dashboard\",\n            \"timestamp\": now,\n            \"status\": status,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if credential is not None:\n            entry[\"credential\"] = credential\n        if error_code is not None:\n            entry[\"error_code\"] = error_code\n        if isinstance(logs, list):\n            logs.append(entry)\n            _save(usage_file, logs)\n\n    # ---- validation ----\n    if not isinstance(dashboard_id, str) or not re.match(r\"^mbd_[0-9A-Z]{18,}$\", dashboard_id):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Malformed dashboard_id.\")\n    if not isinstance(card_id, str) or not re.match(r\"^mbq_[0-9A-Z]{18,}$\", card_id):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Malformed card_id.\")\n\n    for nm, v in [(\"row\", row), (\"col\", col)]:\n        if v is not None:\n            if not isinstance(v, int):\n                _log(\"error\", error_code=\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", f\"{nm} must be an integer.\")\n            if v < 0:\n                _log(\"error\", error_code=\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", f\"{nm} must be >= 0.\")\n    for nm, v in [(\"size_x\", size_x), (\"size_y\", size_y)]:\n        if v is not None:\n            if not isinstance(v, int):\n                _log(\"error\", error_code=\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", f\"{nm} must be an integer.\")\n            if v < 1:\n                _log(\"error\", error_code=\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", f\"{nm} must be >= 1.\")\n\n    if parameter_mappings_json is not None and not isinstance(parameter_mappings_json, dict):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"parameter_mappings_json must be an object.\")\n    if visualization_settings_json is not None and not isinstance(visualization_settings_json, dict):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"visualization_settings_json must be an object.\")\n\n    dashboards = _load(\"metabase_dashboards.json\")\n    cards = _load(\"metabase_cards.json\")\n    placements = _load(\"metabase_dashboard_cards.json\")\n\n    dash = next((d for d in dashboards if d.get(\"id\") == dashboard_id), None)\n    if not dash or dash.get(\"status\") == \"deleted\":\n        _log(\"error\", error_code=\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Dashboard not found.\")\n    card = next((c for c in cards if c.get(\"id\") == card_id), None)\n    if not card or card.get(\"status\") == \"deleted\":\n        _log(\"error\", error_code=\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Card not found.\")\n\n    # uniqueness(dashboard_id, card_id, status) where status='active'\n    existing_active = next((p for p in placements if p.get(\"dashboard_id\") == dashboard_id and p.get(\"card_id\") == card_id and p.get(\"status\") == \"active\"), None)\n    if existing_active:\n        # Idempotently return existing active placement\n        _log(\"ok\")\n        return {\"data\": existing_active}\n\n    # FK integrity at insert time already checked: dashboard/card exist and non-deleted\n    # metabase_dashboard_card_id must be unique if present; we are not setting it here (unknown)\n    new_id = \"mbdc_\" + base64.b32encode(os.urandom(12)).decode(\"ascii\").rstrip(\"=\")\n    row_obj = {\n        \"id\": new_id,\n        \"metabase_dashboard_card_id\": None,\n        \"dashboard_id\": dashboard_id,\n        \"card_id\": card_id,\n        \"row\": row,\n        \"col\": col,\n        \"size_x\": size_x,\n        \"size_y\": size_y,\n        \"parameter_mappings_json\": parameter_mappings_json,\n        \"visualization_settings_json\": visualization_settings_json,\n        \"status\": \"active\",\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    placements.append(row_obj)\n    _save(\"metabase_dashboard_cards.json\", placements)\n    _log(\"ok\")\n    return {\"data\": row_obj}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_dashboard",
+          "description": "Creates a new dashboard in the Integration Server’s local Metabase representation, optionally assigning it to a collection and setting dashboard parameters and archived state, and returns the created dashboard record. Raises VALIDATION_ERROR if required fields are missing, `collection_id` is malformed, or `parameters_json` is invalid, and UNAUTHORIZED/FORBIDDEN if you are not permitted to create dashboards or to write into the specified collection. Raises NOT_FOUND if `collection_id` is provided but does not exist in the local representation, and CONFLICT if the requested initial state is not allowed (for example creating directly as deleted).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Dashboard name."
+              },
+              "description": {
+                "type": "string",
+                "description": "Dashboard description."
+              },
+              "collection_id": {
+                "type": "string",
+                "pattern": "^mbc_[0-9A-Z]{18,}$",
+                "description": "Integration Server collection id to place the dashboard in."
+              },
+              "parameters_json": {
+                "type": "object",
+                "description": "Dashboard parameters definition (stored as JSON)."
+              },
+              "archived": {
+                "type": "boolean",
+                "description": "Whether the dashboard should be created as archived."
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_dashboard(name, description=None, collection_id=None, parameters_json=None, archived=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0534000\" if __import__(\"os\").path.isdir(\"./environment_mix/0534000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    usage_files = [\"request_logs.json\", \"requests.json\", \"usage.json\", \"audit_log.json\", \"audit_logs.json\"]\n    usage_file = None\n    for fn in usage_files:\n        if os.path.exists(os.path.join(_DB, fn)):\n            usage_file = fn\n            break\n\n    def _log(status, credential=None, error_code=None):\n        if not usage_file:\n            return\n        logs = _load(usage_file)\n        entry = {\n            \"id\": \"req_\" + base64.b32encode(os.urandom(10)).decode(\"ascii\").rstrip(\"=\"),\n            \"endpoint\": \"create_dashboard\",\n            \"timestamp\": now,\n            \"status\": status,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if credential is not None:\n            entry[\"credential\"] = credential\n        if error_code is not None:\n            entry[\"error_code\"] = error_code\n        if isinstance(logs, list):\n            logs.append(entry)\n            _save(usage_file, logs)\n\n    if not isinstance(name, str) or name.strip() == \"\":\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"name is required and must be a non-empty string.\")\n    if description is not None and not isinstance(description, str):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"description must be a string.\")\n    if collection_id is not None:\n        if not isinstance(collection_id, str) or not re.match(r\"^mbc_[0-9A-Z]{18,}$\", collection_id):\n            _log(\"error\", error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Malformed collection_id.\")\n    if parameters_json is not None and not isinstance(parameters_json, dict):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"parameters_json must be an object.\")\n    if archived is not None and not isinstance(archived, bool):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"archived must be a boolean.\")\n\n    collections = _load(\"metabase_collections.json\")\n    if collection_id is not None:\n        colrow = next((c for c in collections if c.get(\"id\") == collection_id), None)\n        if not colrow or colrow.get(\"status\") == \"deleted\":\n            _log(\"error\", error_code=\"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Collection not found.\")\n        metabase_collection_id = colrow.get(\"metabase_collection_id\")\n    else:\n        colrow = None\n        metabase_collection_id = None\n\n    dashboards = _load(\"metabase_dashboards.json\")\n\n    # create unique metabase_dashboard_id (simulating Metabase response id assignment)\n    used = {d.get(\"metabase_dashboard_id\") for d in dashboards if isinstance(d.get(\"metabase_dashboard_id\"), int)}\n    metabase_dashboard_id = 1\n    while metabase_dashboard_id in used:\n        metabase_dashboard_id += 1\n\n    # local id convention: mbd_\n    new_id = \"mbd_\" + base64.b32encode(os.urandom(12)).decode(\"ascii\").rstrip(\"=\")\n\n    is_archived = bool(archived) if archived is not None else False\n    status = \"archived\" if is_archived else \"active\"\n\n    row = {\n        \"id\": new_id,\n        \"metabase_dashboard_id\": metabase_dashboard_id,\n        \"name\": name.strip(),\n        \"description\": description,\n        \"collection_id\": collection_id,\n        \"metabase_collection_id\": metabase_collection_id,\n        \"parameters_json\": parameters_json,\n        \"archived\": is_archived,\n        \"status\": status,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # Constraint: archived = (status='archived') OR status in ('active','deleted') is satisfied.\n    # Constraint: collection mapping consistency if both set is satisfied by our assignment.\n\n    dashboards.append(row)\n    _save(\"metabase_dashboards.json\", dashboards)\n    _log(\"ok\")\n    return {\"data\": row}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_collections",
+          "description": "Returns a cursor-paginated list of collections from the Integration Server’s local Metabase representation, optionally filtered by lifecycle status and/or a specific Metabase parent collection id and sorted by the requested field and order. Results are limited by `limit` (default server behavior if omitted) and you can pass the returned `cursor` to fetch the next page. Raises VALIDATION_ERROR for invalid filter/sort/pagination values, UNAUTHORIZED if you are not permitted to browse collections, and QUOTA_EXCEEDED if the request exceeds service rate limits.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "Filter collections by lifecycle status."
+              },
+              "parent_metabase_collection_id": {
+                "type": "integer",
+                "description": "Filter to collections whose Metabase parent collection id matches."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of collections to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "name"
+                ],
+                "description": "Field to sort collections by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_collections(status=None, parent_metabase_collection_id=None, limit=None, cursor=None, sort=None, order=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0534000\" if __import__(\"os\").path.isdir(\"./environment_mix/0534000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    usage_files = [\"request_logs.json\", \"requests.json\", \"usage.json\", \"audit_log.json\", \"audit_logs.json\"]\n    usage_file = None\n    for fn in usage_files:\n        if os.path.exists(os.path.join(_DB, fn)):\n            usage_file = fn\n            break\n\n    def _log(status_s, credential=None, error_code=None):\n        if not usage_file:\n            return\n        logs = _load(usage_file)\n        entry = {\n            \"id\": \"req_\" + base64.b32encode(os.urandom(10)).decode(\"ascii\").rstrip(\"=\"),\n            \"endpoint\": \"list_collections\",\n            \"timestamp\": now,\n            \"status\": status_s,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if credential is not None:\n            entry[\"credential\"] = credential\n        if error_code is not None:\n            entry[\"error_code\"] = error_code\n        if isinstance(logs, list):\n            logs.append(entry)\n            _save(usage_file, logs)\n\n    if status is not None and status not in (\"active\", \"archived\", \"deleted\"):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid status.\")\n    if parent_metabase_collection_id is not None and not isinstance(parent_metabase_collection_id, int):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"parent_metabase_collection_id must be an integer.\")\n    if limit is not None:\n        if not isinstance(limit, int):\n            _log(\"error\", error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer.\")\n        if limit < 1 or limit > 200:\n            _log(\"error\", error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200.\")\n    if sort is not None and sort not in (\"created_at\", \"updated_at\", \"name\"):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort field.\")\n    if order is not None and order not in (\"asc\", \"desc\"):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid order.\")\n    if cursor is not None and not isinstance(cursor, str):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n\n    # default server behavior if omitted\n    if limit is None:\n        limit = 50\n    if sort is None:\n        sort = \"updated_at\"\n    if order is None:\n        order = \"desc\"\n\n    start = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            payload = json.loads(raw.decode(\"utf-8\"))\n            if isinstance(payload, dict) and payload.get(\"o\") == \"collections\" and isinstance(payload.get(\"s\"), int) and payload.get(\"s\") >= 0:\n                start = payload[\"s\"]\n            else:\n                _log(\"error\", error_code=\"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n        except Exception:\n            _log(\"error\", error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n    rows = _load(\"metabase_collections.json\")\n    # Business rule: list_collections returns status != 'deleted' unless explicitly filtered\n    if status is None:\n        rows = [r for r in rows if r.get(\"status\") != \"deleted\"]\n    else:\n        rows = [r for r in rows if r.get(\"status\") == status]\n\n    if parent_metabase_collection_id is not None:\n        rows = [r for r in rows if r.get(\"parent_metabase_collection_id\") == parent_metabase_collection_id]\n\n    total = len(rows)\n\n    reverse = (order == \"desc\")\n\n    def _sort_key(r):\n        v = r.get(sort)\n        if sort in (\"created_at\", \"updated_at\"):\n            if not isinstance(v, str):\n                v = \"\"\n            return v\n        if sort == \"name\":\n            return (v or \"\").lower()\n        return v\n\n    rows.sort(key=_sort_key, reverse=reverse)\n\n    page = rows[start:start + limit]\n    next_start = start + len(page)\n    has_more = next_start < total\n    next_cursor = None\n    if has_more:\n        payload = {\"o\": \"collections\", \"s\": next_start}\n        next_cursor = base64.urlsafe_b64encode(json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    _log(\"ok\")\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"sort\": sort,\n            \"order\": order,\n        },\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_collection",
+          "description": "Creates a new collection in the Integration Server’s local Metabase representation with the provided name and optional description, parent Metabase collection id, color, and authority level, returning the created collection record. The request is rejected if required fields are missing or invalid. Raises VALIDATION_ERROR for invalid input, UNAUTHORIZED if you are not permitted to create collections, CONFLICT if the requested parent Metabase collection id cannot be used for nesting, and QUOTA_EXCEEDED if the request exceeds service rate limits.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Collection name."
+              },
+              "description": {
+                "type": "string",
+                "description": "Collection description."
+              },
+              "parent_metabase_collection_id": {
+                "type": "integer",
+                "description": "Metabase parent collection id to nest this collection under."
+              },
+              "color": {
+                "type": "string",
+                "description": "Collection color (Metabase UI color string)."
+              },
+              "authority_level": {
+                "type": "string",
+                "description": "Metabase authority level for the collection (if applicable)."
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_collection(name, description=None, parent_metabase_collection_id=None, color=None, authority_level=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0534000\" if __import__(\"os\").path.isdir(\"./environment_mix/0534000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    usage_files = [\"request_logs.json\", \"requests.json\", \"usage.json\", \"audit_log.json\", \"audit_logs.json\"]\n    usage_file = None\n    for fn in usage_files:\n        if os.path.exists(os.path.join(_DB, fn)):\n            usage_file = fn\n            break\n\n    def _log(status_s, credential=None, error_code=None):\n        if not usage_file:\n            return\n        logs = _load(usage_file)\n        entry = {\n            \"id\": \"req_\" + base64.b32encode(os.urandom(10)).decode(\"ascii\").rstrip(\"=\"),\n            \"endpoint\": \"create_collection\",\n            \"timestamp\": now,\n            \"status\": status_s,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if credential is not None:\n            entry[\"credential\"] = credential\n        if error_code is not None:\n            entry[\"error_code\"] = error_code\n        if isinstance(logs, list):\n            logs.append(entry)\n            _save(usage_file, logs)\n\n    if not isinstance(name, str) or name.strip() == \"\":\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"name is required and must be a non-empty string.\")\n    if description is not None and not isinstance(description, str):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"description must be a string.\")\n    if parent_metabase_collection_id is not None and not isinstance(parent_metabase_collection_id, int):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"parent_metabase_collection_id must be an integer.\")\n    if color is not None and not isinstance(color, str):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"color must be a string.\")\n    if authority_level is not None and not isinstance(authority_level, str):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"authority_level must be a string.\")\n\n    collections = _load(\"metabase_collections.json\")\n\n    # parent_metabase_collection_id != metabase_collection_id will be validated after we assign new metabase_collection_id.\n    # Simulate Metabase assigning a new metabase_collection_id (source of truth).\n    used = {c.get(\"metabase_collection_id\") for c in collections if isinstance(c.get(\"metabase_collection_id\"), int)}\n    metabase_collection_id = 1\n    while metabase_collection_id in used:\n        metabase_collection_id += 1\n\n    if parent_metabase_collection_id is not None and parent_metabase_collection_id == metabase_collection_id:\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"parent_metabase_collection_id cannot equal metabase_collection_id.\")\n\n    new_id = \"mbc_\" + base64.b32encode(os.urandom(12)).decode(\"ascii\").rstrip(\"=\")\n\n    row = {\n        \"id\": new_id,\n        \"metabase_collection_id\": metabase_collection_id,\n        \"name\": name.strip(),\n        \"description\": description,\n        \"parent_metabase_collection_id\": parent_metabase_collection_id,\n        \"location_path\": None,\n        \"color\": color,\n        \"authority_level\": authority_level,\n        \"status\": \"active\",\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # Unique(metabase_collection_id) ensured by generation above\n    collections.append(row)\n    _save(\"metabase_collections.json\", collections)\n    _log(\"ok\")\n    return {\"data\": row}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_tables",
+          "description": "Returns a cursor-paginated list of tables for a single database, identified either by `database_id` (Integration Server schema id) or `metabase_database_id` (Metabase id). Results are limited by `limit` and you can pass the returned `cursor` to fetch the next page. Raises VALIDATION_ERROR if neither (or both) database identifiers are provided or malformed, NOT_FOUND if the specified database does not exist in the local representation, UNAUTHORIZED if you are not permitted to browse database metadata, and QUOTA_EXCEEDED if the request exceeds service rate limits.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "database_id": {
+                "type": "string",
+                "pattern": "^mbdb_[0-9A-Z]{18,}$",
+                "description": "Integration Server database schema id whose tables should be listed."
+              },
+              "metabase_database_id": {
+                "type": "integer",
+                "description": "Metabase database id whose tables should be listed."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of tables to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_tables(database_id=None, metabase_database_id=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, base64, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0534000\" if __import__(\"os\").path.isdir(\"./environment_mix/0534000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    _now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status, error_code=None, extra=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": f\"rlog_{int(time.time()*1000)}_{os.getpid()}_{len(logs)+1}\",\n            \"endpoint\": \"list_tables\",\n            \"credential_id\": None,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - _t0) * 1000),\n            \"timestamp\": _now,\n        }\n        if isinstance(extra, dict) and extra:\n            row.update(extra)\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _validate_cursor(cur):\n        # Accept vendor \"opaque cursor\" as either our base64 cursor or legacy/plain string (treated as offset 0)\n        if cur is None:\n            return (0, None)\n        if not isinstance(cur, str) or cur == \"\":\n            return (None, _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string when provided\"))\n        try:\n            raw = base64.urlsafe_b64decode(cur.encode(\"utf-8\") + b\"===\")\n            obj = json.loads(raw.decode(\"utf-8\"))\n            if isinstance(obj, dict) and obj.get(\"v\") == 1 and isinstance(obj.get(\"offset\"), int) and obj[\"offset\"] >= 0:\n                return (obj[\"offset\"], None)\n        except Exception:\n            pass\n        # If it's not our cursor format, treat as a valid opaque cursor that maps to offset 0\n        return (0, None)\n\n    def _make_cursor(offset):\n        payload = {\"v\": 1, \"offset\": offset}\n        raw = json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"utf-8\").rstrip(\"=\")\n\n    # Validate limit\n    if limit is None:\n        limit_i = 50\n    else:\n        if not isinstance(limit, int):\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n        if limit < 1 or limit > 200:\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200\")\n        limit_i = limit\n\n    # Validate identifiers (relaxed: allow both; prefer database_id when present, else metabase_database_id)\n    dbid = None\n    mbid = None\n    if database_id is not None:\n        if not isinstance(database_id, str) or not re.match(r\"^mbdb_[0-9A-Z]{18,}$\", database_id):\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"database_id is malformed\")\n        dbid = database_id\n    if metabase_database_id is not None:\n        if not isinstance(metabase_database_id, int):\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"metabase_database_id must be an integer\")\n        mbid = metabase_database_id\n    if dbid is None and mbid is None:\n        _log(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Provide at least one of database_id or metabase_database_id\")\n\n    offset, cerr = _validate_cursor(cursor)\n    if cerr:\n        _log(\"error\", \"VALIDATION_ERROR\")\n        return cerr\n\n    # Load database mirror rows\n    dbs = _load(\"metabase_databases_schema.json\")\n    if not isinstance(dbs, list):\n        dbs = []\n\n    # Resolve database row: prefer explicit database_id match; else metabase id match; if both provided and conflict -> CONFLICT\n    db_row = None\n    if dbid is not None:\n        for r in dbs:\n            if isinstance(r, dict) and r.get(\"id\") == dbid:\n                db_row = r\n                break\n        if db_row is None:\n            _log(\"error\", \"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Database not found\", database_id=dbid)\n        if db_row.get(\"status\") != \"active\":\n            _log(\"error\", \"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Database not active\", database_id=dbid)\n        if mbid is not None and isinstance(db_row.get(\"metabase_database_id\"), int) and db_row.get(\"metabase_database_id\") != mbid:\n            _log(\"error\", \"CONFLICT\")\n            return _err(\"CONFLICT\", \"database_id and metabase_database_id refer to different databases\",\n                        database_id=dbid, metabase_database_id=mbid)\n    else:\n        for r in dbs:\n            if isinstance(r, dict) and r.get(\"metabase_database_id\") == mbid and r.get(\"status\") == \"active\":\n                db_row = r\n                break\n        if db_row is None:\n            _log(\"error\", \"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Database not found\", metabase_database_id=mbid)\n\n    tables = db_row.get(\"tables\")\n    if not isinstance(tables, list):\n        tables = []\n\n    # Stable sort for pagination\n    def _tkey(t):\n        if not isinstance(t, dict):\n            return (\"\", -1)\n        name = t.get(\"name\")\n        if not isinstance(name, str):\n            name = \"\"\n        tid = t.get(\"metabase_table_id\")\n        if not isinstance(tid, int):\n            tid = -1\n        return (name.lower(), tid)\n\n    tables_sorted = [t for t in tables if isinstance(t, dict)]\n    tables_sorted.sort(key=_tkey)\n\n    total = len(tables_sorted)\n    page = tables_sorted[offset: offset + limit_i]\n    next_off = offset + len(page)\n    has_more = next_off < total\n    next_cursor = _make_cursor(next_off) if has_more else None\n\n    resp = {\n        \"database\": {\n            \"id\": db_row.get(\"id\"),\n            \"metabase_database_id\": db_row.get(\"metabase_database_id\"),\n            \"name\": db_row.get(\"name\"),\n            \"engine\": db_row.get(\"engine\"),\n        },\n        \"tables\": [\n            {\n                \"metabase_table_id\": t.get(\"metabase_table_id\"),\n                \"name\": t.get(\"name\"),\n                \"schema\": t.get(\"schema\"),\n                \"description\": t.get(\"description\"),\n            }\n            for t in page\n        ],\n        \"pagination\": {\n            \"limit\": limit_i,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"total\": total,\n            \"has_more\": has_more,\n        },\n    }\n    _log(\"ok\")\n    return resp\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_table_fields",
+          "description": "Returns a cursor-paginated list of fields/columns for `table_name` within a single database identified by `database_id` or `metabase_database_id`. Results are limited by `limit` and you can pass the returned `cursor` to fetch the next page. Raises VALIDATION_ERROR if `table_name` is missing/invalid or if the database identifier is missing/ambiguous, NOT_FOUND if the database or table is not present in the local representation, UNAUTHORIZED if you are not permitted to browse schema metadata, and QUOTA_EXCEEDED if the request exceeds service rate limits.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "database_id": {
+                "type": "string",
+                "pattern": "^mbdb_[0-9A-Z]{18,}$",
+                "description": "Integration Server database schema id that contains the table."
+              },
+              "metabase_database_id": {
+                "type": "integer",
+                "description": "Metabase database id that contains the table."
+              },
+              "table_name": {
+                "type": "string",
+                "description": "Name of the table to fetch fields/columns for."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500,
+                "description": "Maximum number of fields to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              }
+            },
+            "required": [
+              "table_name"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_table_fields(database_id=None, metabase_database_id=None, table_name=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0534000\" if __import__(\"os\").path.isdir(\"./environment_mix/0534000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    _now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    _now = _now_dt.isoformat() + \"Z\"\n\n    # ---------------- logs / rate limit (best-effort if request_logs.json exists) ----------------\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        return logs if isinstance(logs, list) else []\n\n    def _parse_ts(x):\n        if not isinstance(x, str):\n            return None\n        s = x.strip()\n        if s.endswith(\"Z\"):\n            s = s[:-1]\n        try:\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _write_log(status, error_code=None, extra=None):\n        try:\n            logs = _load_logs()\n            row = {\n                \"id\": f\"rlog_{int(time.time()*1000)}_{os.getpid()}_{len(logs)+1}\",\n                \"endpoint\": \"get_table_fields\",\n                \"credential_id\": None,\n                \"status\": status,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - _t0) * 1000),\n                \"timestamp\": _now,\n            }\n            if isinstance(extra, dict):\n                row.update(extra)\n            logs.append(row)\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            # Never fail the API call because logging failed\n            return\n\n    def _enforce_rate_limit():\n        try:\n            logs = _load_logs()\n            window_s = 60\n            limit_per_window = 60\n            cutoff = _now_dt - datetime.timedelta(seconds=window_s)\n            recent = 0\n            for r in logs:\n                if not isinstance(r, dict):\n                    continue\n                if r.get(\"endpoint\") != \"get_table_fields\":\n                    continue\n                ts = _parse_ts(r.get(\"timestamp\"))\n                if ts is None:\n                    continue\n                if ts >= cutoff:\n                    recent += 1\n            if recent >= limit_per_window:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded\", window_seconds=window_s, limit=limit_per_window)\n            return None\n        except Exception:\n            return None\n\n    rl = _enforce_rate_limit()\n    if isinstance(rl, dict) and rl.get(\"error\"):\n        _write_log(\"error\", rl[\"error\"].get(\"code\"))\n        return rl\n\n    # ---------------- validation ----------------\n    if not isinstance(table_name, str) or not table_name.strip():\n        e = _err(\"VALIDATION_ERROR\", \"table_name is required and must be a non-empty string\", table_name=table_name)\n        _write_log(\"error\", e[\"error\"][\"code\"])\n        return e\n    table_name_norm = table_name.strip()\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        e = _err(\"VALIDATION_ERROR\", \"limit must be an integer\", limit=limit)\n        _write_log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if limit < 1 or limit > 500:\n        e = _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 500\", limit=limit)\n        _write_log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    if cursor is not None and not isinstance(cursor, str):\n        e = _err(\"VALIDATION_ERROR\", \"cursor must be a string when provided\", cursor=cursor)\n        _write_log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    if database_id is not None:\n        if not isinstance(database_id, str):\n            e = _err(\"VALIDATION_ERROR\", \"database_id must be a string when provided\", database_id=database_id)\n            _write_log(\"error\", e[\"error\"][\"code\"])\n            return e\n        # Relaxed validation: accept valid ids but do not reject unknown formats too aggressively\n        if not re.match(r\"^mbdb_[0-9A-Z]{18,}$\", database_id):\n            e = _err(\"VALIDATION_ERROR\", \"database_id has an invalid format\", database_id=database_id)\n            _write_log(\"error\", e[\"error\"][\"code\"])\n            return e\n\n    if metabase_database_id is not None and not isinstance(metabase_database_id, int):\n        e = _err(\"VALIDATION_ERROR\", \"metabase_database_id must be an integer when provided\", metabase_database_id=metabase_database_id)\n        _write_log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    if database_id is None and metabase_database_id is None:\n        e = _err(\"VALIDATION_ERROR\", \"Either database_id or metabase_database_id must be provided\")\n        _write_log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    # ---------------- load databases schema mirror ----------------\n    raw = _load(\"metabase_databases_schema.json\")\n    rows = raw.get(\"data\") if isinstance(raw, dict) and isinstance(raw.get(\"data\"), list) else (raw if isinstance(raw, list) else [])\n    if not isinstance(rows, list):\n        rows = []\n\n    # Prefer active rows; if none match, fall back to any status for identifier matching then enforce NOT_FOUND/deleted\n    def _matches_db(r):\n        if not isinstance(r, dict):\n            return False\n        if database_id is not None and r.get(\"id\") == database_id:\n            return True\n        if metabase_database_id is not None and r.get(\"metabase_database_id\") == metabase_database_id:\n            return True\n        return False\n\n    candidate_rows = [r for r in rows if _matches_db(r)]\n    # If both identifiers supplied, try to find a row satisfying both; otherwise accept any match by the provided identifier\n    chosen = None\n    if database_id is not None and metabase_database_id is not None:\n        for r in candidate_rows:\n            if r.get(\"id\") == database_id and r.get(\"metabase_database_id\") == metabase_database_id:\n                chosen = r\n                break\n        if chosen is None:\n            # Ambiguous or inconsistent identifiers\n            e = _err(\n                \"VALIDATION_ERROR\",\n                \"database_id and metabase_database_id refer to different databases\",\n                database_id=database_id,\n                metabase_database_id=metabase_database_id,\n            )\n            _write_log(\"error\", e[\"error\"][\"code\"])\n            return e\n    else:\n        chosen = candidate_rows[0] if candidate_rows else None\n\n    if chosen is None:\n        e = _err(\n            \"NOT_FOUND\",\n            \"Database schema mirror not found\",\n            database_id=database_id,\n            metabase_database_id=metabase_database_id,\n        )\n        _write_log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    if chosen.get(\"status\") != \"active\":\n        e = _err(\n            \"NOT_FOUND\",\n            \"Database schema mirror not found\",\n            database_id=chosen.get(\"id\"),\n            metabase_database_id=chosen.get(\"metabase_database_id\"),\n        )\n        _write_log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    tables = chosen.get(\"tables\")\n    if not isinstance(tables, list):\n        tables = []\n\n    # ---------------- locate table ----------------\n    # Primary: match by exact name; fallback: case-insensitive name match\n    table = None\n    for t in tables:\n        if isinstance(t, dict) and t.get(\"name\") == table_name_norm:\n            table = t\n            break\n    if table is None:\n        lname = table_name_norm.lower()\n        for t in tables:\n            if isinstance(t, dict) and isinstance(t.get(\"name\"), str) and t.get(\"name\").lower() == lname:\n                table = t\n                break\n\n    if table is None:\n        e = _err(\n            \"NOT_FOUND\",\n            \"Table not found in database schema mirror\",\n            table_name=table_name_norm,\n            database_id=chosen.get(\"id\"),\n            metabase_database_id=chosen.get(\"metabase_database_id\"),\n        )\n        _write_log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    fields = table.get(\"fields\")\n    if not isinstance(fields, list):\n        fields = []\n\n    # Only active fields\n    active_fields = [f for f in fields if isinstance(f, dict) and f.get(\"active\") is True]\n\n    # Stable ordering: by metabase_field_id then name\n    def _field_key(f):\n        mfi = f.get(\"metabase_field_id\")\n        try:\n            mfi2 = int(mfi)\n        except Exception:\n            mfi2 = 10**18\n        nm = f.get(\"name\")\n        return (mfi2, nm if isinstance(nm, str) else \"\")\n    active_fields.sort(key=_field_key)\n\n    # ---------------- pagination ----------------\n    # Cursor is \"offset:<int>\" (opaque to caller; accept any string)\n    offset = 0\n    if isinstance(cursor, str) and cursor:\n        if cursor.startswith(\"offset:\"):\n            try:\n                offset = int(cursor.split(\":\", 1)[1])\n                if offset < 0:\n                    offset = 0\n            except Exception:\n                offset = 0\n        else:\n            # If cursor isn't recognized, treat as 0 (do not error; cursor is opaque)\n            offset = 0\n\n    total = len(active_fields)\n    page = active_fields[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = f\"offset:{next_offset}\" if has_more else None\n\n    resp = {\n        \"database\": {\n            \"id\": chosen.get(\"id\"),\n            \"metabase_database_id\": chosen.get(\"metabase_database_id\"),\n            \"name\": chosen.get(\"name\"),\n            \"engine\": chosen.get(\"engine\"),\n        },\n        \"table\": {\n            \"metabase_table_id\": table.get(\"metabase_table_id\"),\n            \"name\": table.get(\"name\"),\n            \"schema\": table.get(\"schema\"),\n            \"description\": table.get(\"description\"),\n        },\n        \"fields\": page,\n        \"pagination\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n        },\n    }\n\n    _write_log(\"success\", None, extra={\"database_id\": chosen.get(\"id\"), \"metabase_database_id\": chosen.get(\"metabase_database_id\")})\n    return resp\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "update_dashboard",
+          "description": "Updates an existing dashboard’s mutable properties (name, description, collection, parameters definition, and lifecycle state) and returns the updated dashboard record. The service validates field types, enforces allowed `status` values, and refuses invalid lifecycle transitions (for example, updating a deleted dashboard). Raises VALIDATION_ERROR for malformed input, NOT_FOUND if `dashboard_id` does not exist, CONFLICT if the dashboard cannot be moved to the requested collection or the requested state change is not allowed, UNAUTHORIZED if you are not permitted to modify the dashboard, and QUOTA_EXCEEDED if the request exceeds service rate limits.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "dashboard_id": {
+                "type": "string",
+                "pattern": "^mbd_[0-9A-Z]{18,}$",
+                "description": "Integration Server dashboard id to update."
+              },
+              "name": {
+                "type": "string",
+                "description": "New dashboard name."
+              },
+              "description": {
+                "type": "string",
+                "description": "New dashboard description."
+              },
+              "collection_id": {
+                "type": "string",
+                "pattern": "^mbc_[0-9A-Z]{18,}$",
+                "description": "New Integration Server collection id to move the dashboard into."
+              },
+              "parameters_json": {
+                "type": "object",
+                "description": "Updated dashboard parameters definition (stored as JSON)."
+              },
+              "archived": {
+                "type": "boolean",
+                "description": "Whether the dashboard should be archived."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "Lifecycle status to set for the dashboard."
+              }
+            },
+            "required": [
+              "dashboard_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def update_dashboard(dashboard_id, name=None, description=None, collection_id=None, parameters_json=None, archived=None, status=None, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0534000\" if __import__(\"os\").path.isdir(\"./environment_mix/0534000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    _now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    _now = _now_dt.isoformat() + \"Z\"\n\n    def _log(status_s, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": f\"rlog_{int(time.time()*1000)}_{os.getpid()}_{len(logs)+1}\",\n            \"endpoint\": \"update_dashboard\",\n            \"credential_id\": None,\n            \"status\": status_s,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - _t0) * 1000),\n            \"timestamp\": _now,\n        }\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    # Validate dashboard_id\n    if not isinstance(dashboard_id, str) or not re.match(r\"^mbd_[0-9A-Z]{18,}$\", dashboard_id):\n        _log(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"dashboard_id is malformed\")\n\n    # Validate optional fields types\n    if name is not None and (not isinstance(name, str) or name.strip() == \"\"):\n        _log(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string when provided\")\n    if description is not None and not isinstance(description, str):\n        _log(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"description must be a string when provided\")\n    if collection_id is not None:\n        if not isinstance(collection_id, str) or not re.match(r\"^mbc_[0-9A-Z]{18,}$\", collection_id):\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"collection_id is malformed\")\n    if parameters_json is not None and not isinstance(parameters_json, dict):\n        _log(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"parameters_json must be an object when provided\")\n    if archived is not None and not isinstance(archived, bool):\n        _log(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"archived must be a boolean when provided\")\n    allowed_status = {\"active\", \"archived\", \"deleted\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of active, archived, deleted\")\n\n    dashboards = _load(\"metabase_dashboards.json\")\n    if not isinstance(dashboards, list):\n        dashboards = []\n\n    idx = None\n    for i, d in enumerate(dashboards):\n        if isinstance(d, dict) and d.get(\"id\") == dashboard_id:\n            idx = i\n            break\n    if idx is None:\n        _log(\"error\", \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Dashboard not found\")\n\n    dash = dashboards[idx]\n    cur_status = dash.get(\"status\")\n    transitions = {\n        \"active\": {\"archived\", \"deleted\"},\n        \"archived\": {\"active\", \"deleted\"},\n        \"deleted\": set(),\n    }\n    if cur_status not in transitions:\n        _log(\"error\", \"INVALID_TRANSITION\")\n        return _err(\"INVALID_TRANSITION\", \"Dashboard is in an unknown lifecycle state\", current_status=cur_status)\n\n    # If deleted, refuse any updates (including no-op)\n    if cur_status == \"deleted\":\n        _log(\"error\", \"INVALID_TRANSITION\")\n        return _err(\"INVALID_TRANSITION\", \"Cannot update a deleted dashboard\", current_status=cur_status)\n\n    # Resolve desired status considering archived flag\n    desired_status = status\n    if archived is not None:\n        desired_status_from_archived = \"archived\" if archived else \"active\"\n        if desired_status is not None and desired_status != desired_status_from_archived:\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status conflicts with archived flag\", status=status, archived=archived)\n        desired_status = desired_status_from_archived\n\n    # If collection_id provided, validate it exists and is not deleted; also enforce metabase_collection_id mapping constraint\n    collections = _load(\"metabase_collections.json\")\n    if not isinstance(collections, list):\n        collections = []\n    coll_row = None\n    if collection_id is not None:\n        for c in collections:\n            if isinstance(c, dict) and c.get(\"id\") == collection_id:\n                coll_row = c\n                break\n        if coll_row is None or coll_row.get(\"status\") == \"deleted\":\n            _log(\"error\", \"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Collection not found\")\n        # Enforce constraint: if both local collection_id and metabase_collection_id present, they must match\n        if dash.get(\"metabase_collection_id\") is not None and coll_row.get(\"metabase_collection_id\") is not None:\n            if dash.get(\"metabase_collection_id\") != coll_row.get(\"metabase_collection_id\"):\n                _log(\"error\", \"CONFLICT\")\n                return _err(\"CONFLICT\", \"metabase_collection_id does not match referenced collection\", metabase_collection_id=dash.get(\"metabase_collection_id\"), collection_metabase_collection_id=coll_row.get(\"metabase_collection_id\"))\n\n    # Apply mutations (track if anything changes)\n    changed = False\n\n    if name is not None and name != dash.get(\"name\"):\n        dash[\"name\"] = name\n        changed = True\n    if description is not None and description != dash.get(\"description\"):\n        dash[\"description\"] = description\n        changed = True\n    if parameters_json is not None and parameters_json != dash.get(\"parameters_json\"):\n        dash[\"parameters_json\"] = parameters_json\n        changed = True\n    if collection_id is not None and collection_id != dash.get(\"collection_id\"):\n        dash[\"collection_id\"] = collection_id\n        # Keep metabase_collection_id consistent if we have the collection row\n        if coll_row is not None and coll_row.get(\"metabase_collection_id\") is not None:\n            dash[\"metabase_collection_id\"] = coll_row.get(\"metabase_collection_id\")\n        changed = True\n\n    # Lifecycle / archived handling\n    if desired_status is not None and desired_status != cur_status:\n        if desired_status not in transitions.get(cur_status, set()):\n            _log(\"error\", \"INVALID_TRANSITION\")\n            return _err(\"INVALID_TRANSITION\", \"Invalid dashboard status transition\", from_status=cur_status, to_status=desired_status)\n        dash[\"status\"] = desired_status\n        # Ensure archived flag consistent per constraint\n        dash[\"archived\"] = (desired_status == \"archived\")\n        changed = True\n    elif archived is not None:\n        # archived change without status change (should not happen due to mapping above), but keep consistent anyway\n        expected_status = \"archived\" if archived else \"active\"\n        if expected_status != cur_status:\n            if expected_status not in transitions.get(cur_status, set()):\n                _log(\"error\", \"INVALID_TRANSITION\")\n                return _err(\"INVALID_TRANSITION\", \"Invalid dashboard status transition\", from_status=cur_status, to_status=expected_status)\n            dash[\"status\"] = expected_status\n            changed = True\n        dash[\"archived\"] = archived\n        changed = True\n\n    if not changed:\n        # Realistic behavior: return current record without mutating timestamps\n        _log(\"ok\", None)\n        return {\"dashboard\": dash, \"updated\": False}\n\n    dash[\"updated_at\"] = _now\n    dashboards[idx] = dash\n    _save(\"metabase_dashboards.json\", dashboards)\n\n    _log(\"ok\", None)\n    return {\"dashboard\": dash, \"updated\": True}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "delete_dashboard",
+          "description": "Deletes the specified dashboard from the Integration Server’s local Metabase representation and returns the resulting dashboard record (or deletion confirmation) reflecting its deleted lifecycle state. The operation is idempotent only for dashboards that are not already deleted, and it refuses deletion when the dashboard is in a state that cannot transition to deleted. Raises VALIDATION_ERROR for an invalid `dashboard_id`, NOT_FOUND if the dashboard does not exist, CONFLICT if the dashboard cannot be deleted due to its current state, UNAUTHORIZED if you are not permitted to delete dashboards, and QUOTA_EXCEEDED if the request exceeds service rate limits.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "dashboard_id": {
+                "type": "string",
+                "pattern": "^mbd_[0-9A-Z]{18,}$",
+                "description": "Integration Server dashboard id to delete."
+              }
+            },
+            "required": [
+              "dashboard_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def delete_dashboard(dashboard_id, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0534000\" if __import__(\"os\").path.isdir(\"./environment_mix/0534000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    _now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_s, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": f\"rlog_{int(time.time()*1000)}_{os.getpid()}_{len(logs)+1}\",\n            \"endpoint\": \"delete_dashboard\",\n            \"credential_id\": None,\n            \"status\": status_s,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - _t0) * 1000),\n            \"timestamp\": _now,\n        }\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(dashboard_id, str) or not re.match(r\"^mbd_[0-9A-Z]{18,}$\", dashboard_id):\n        _log(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"dashboard_id is malformed\")\n\n    dashboards = _load(\"metabase_dashboards.json\")\n    if not isinstance(dashboards, list):\n        dashboards = []\n\n    idx = None\n    for i, d in enumerate(dashboards):\n        if isinstance(d, dict) and d.get(\"id\") == dashboard_id:\n            idx = i\n            break\n    if idx is None:\n        _log(\"error\", \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Dashboard not found\")\n\n    dash = dashboards[idx]\n    cur_status = dash.get(\"status\")\n\n    transitions = {\n        \"active\": {\"archived\", \"deleted\"},\n        \"archived\": {\"active\", \"deleted\"},\n        \"deleted\": set(),\n    }\n    if cur_status not in transitions:\n        _log(\"error\", \"INVALID_TRANSITION\")\n        return _err(\"INVALID_TRANSITION\", \"Dashboard is in an unknown lifecycle state\", current_status=cur_status)\n\n    if cur_status == \"deleted\":\n        # Mutation with no effect must not report success\n        _log(\"error\", \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Dashboard already deleted\")\n\n    if \"deleted\" not in transitions[cur_status]:\n        _log(\"error\", \"INVALID_TRANSITION\")\n        return _err(\"INVALID_TRANSITION\", \"Cannot transition dashboard to deleted\", from_status=cur_status, to_status=\"deleted\")\n\n    # Soft delete dashboard\n    dash[\"status\"] = \"deleted\"\n    dash[\"archived\"] = False\n    dash[\"updated_at\"] = _now\n    dashboards[idx] = dash\n    _save(\"metabase_dashboards.json\", dashboards)\n\n    # Soft remove active placements\n    placements = _load(\"metabase_dashboard_cards.json\")\n    if not isinstance(placements, list):\n        placements = []\n    changed_any = False\n    for i, p in enumerate(placements):\n        if not isinstance(p, dict):\n            continue\n        if p.get(\"dashboard_id\") == dashboard_id and p.get(\"status\") == \"active\":\n            # transition active -> removed only\n            p[\"status\"] = \"removed\"\n            p[\"updated_at\"] = _now\n            placements[i] = p\n            changed_any = True\n    if changed_any:\n        _save(\"metabase_dashboard_cards.json\", placements)\n\n    _log(\"ok\", None)\n    return {\"dashboard\": dash, \"removed_dashboard_cards_updated\": changed_any}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0534000",
+    "index": 534,
+    "name": "Metabase Analytics Integration Server",
+    "description": "This backend stores a local representation of a Metabase instance (collections, dashboards, cards/questions, databases, tables, and fields) plus an execution/audit log for queries and card runs performed through the Integration Server. Core workflows include browsing Metabase metadata, creating/upda",
+    "taxonomy": {
+      "L1_id": "L1-10",
+      "L1_name": "Data Storage & Databases",
+      "L1_name_zh": "数据存储与数据库",
+      "L2_id": "L2-25",
+      "L2_name": "Relational Databases",
+      "L2_name_zh": "关系型数据库",
+      "L3_name": "Analytics & BI Query Layers over Relational Data",
+      "L3_name_zh": "面向关系数据的分析与BI查询层"
+    },
+    "database_dir": "./environment_mix/0534000",
+    "mount_path": "/app/database",
+    "n_tools": 16,
+    "n_collections": 6,
+    "n_records": 180,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 16,
+      "loaded": 16,
+      "reads_returning_data": 7,
+      "read_operations": 8,
+      "mutations_persisted": 8,
+      "mutations_attempted": 8
+    },
+    "tools_loadable_from_database_dir": 16,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_dashboards",
+      "returned_chars": 87
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

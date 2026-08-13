@@ -1,0 +1,331 @@
+{
+  "index": 74,
+  "local_files_dir": "./environment_mix/0074000",
+  "file_list": [
+    "./environment_mix/0074000/README.md",
+    "./environment_mix/0074000/api_keys.json",
+    "./environment_mix/0074000/perplexity_answers.json",
+    "./environment_mix/0074000/perplexity_requests.json",
+    "./environment_mix/0074000/usage_ledger.json",
+    "./environment_mix/0074000/workspaces.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "workspaces.json": "18 rows",
+        "api_keys.json": "19 rows",
+        "perplexity_requests.json": "19 rows",
+        "perplexity_answers.json": "19 rows",
+        "usage_ledger.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "ask_perplexity",
+          "description": "Executes a single Perplexity ask request for the workspace identified by `api_key` and returns the recorded session, including the generated answer text and (when enabled) citations and optionally the raw provider payload; if an `idempotency_key` is supplied, repeated calls with the same key return the original stored result without re-running the provider request. Raises VALIDATION_ERROR when required fields are missing, types are invalid, `search_recency_filter` is not one of the allowed values, or generation controls (e.g., `temperature`, `top_p`, `max_tokens`) are out of range; raises UNAUTHORIZED when `api_key` is missing/invalid or not permitted for the target workspace. Raises QUOTA_EXCEEDED or RATE_LIMITED when workspace usage limits are exceeded, and raises CONFLICT when the same `idempotency_key` is reused with a materially different request payload (e.g., different `question` or `model`).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Per-workspace Perplexity Server API key used to authenticate and attribute usage."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Client-supplied key to deduplicate retries and ensure the same request is not executed twice."
+              },
+              "question": {
+                "type": "string",
+                "description": "The user question/query to send to Perplexity."
+              },
+              "model": {
+                "type": "string",
+                "description": "Perplexity model identifier to use for the request."
+              },
+              "search_recency_filter": {
+                "type": "string",
+                "enum": [
+                  "hour",
+                  "day",
+                  "week",
+                  "month",
+                  "year",
+                  "all"
+                ],
+                "description": "Optional recency constraint for sources used to answer the question."
+              },
+              "temperature": {
+                "type": "number",
+                "description": "Sampling temperature to control response randomness."
+              },
+              "max_tokens": {
+                "type": "integer",
+                "description": "Maximum number of tokens to generate in the answer."
+              },
+              "top_p": {
+                "type": "number",
+                "description": "Nucleus sampling parameter for response generation."
+              },
+              "return_citations": {
+                "type": "boolean",
+                "description": "Whether to include citations in the returned answer."
+              },
+              "return_provider_payload": {
+                "type": "boolean",
+                "description": "Whether to include the raw provider payload in the response for debugging/auditing."
+              }
+            },
+            "required": [
+              "api_key",
+              "question"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def ask_perplexity(api_key, question, idempotency_key=None, model=None, search_recency_filter=None, temperature=None, max_tokens=None, top_p=None, return_citations=None, return_provider_payload=None, **_extra):\n    import json, os, datetime, time, base64, hashlib, re, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0074000\" if __import__(\"os\").path.isdir(\"./environment_mix/0074000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    period_ym = now[:7]\n\n    def _log(workspace_id, api_key_id, status, tool_name, input_obj, request_id=None, error_code=None, error_message=None, latency_ms=None, est_in=0, est_out=0):\n        # Append-only usage_ledger is for quota, not request logs. The \"request log\" is perplexity_requests itself.\n        # Still, ensure the request record exists/updated for every call path that creates/returns one.\n        return\n\n    def _parse_rfc3339(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _make_id(prefix):\n        return f\"{prefix}_{uuid.uuid4().hex}\"\n\n    # ----------------- validate inputs -----------------\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\", field=\"api_key\")\n    if not isinstance(question, str) or not question.strip():\n        return _err(\"VALIDATION_ERROR\", \"question must be a non-empty string\", field=\"question\")\n    if idempotency_key is not None and (not isinstance(idempotency_key, str) or not idempotency_key.strip()):\n        return _err(\"VALIDATION_ERROR\", \"idempotency_key must be a non-empty string when provided\", field=\"idempotency_key\")\n    if model is not None and not isinstance(model, str):\n        return _err(\"VALIDATION_ERROR\", \"model must be a string when provided\", field=\"model\")\n    if search_recency_filter is not None:\n        if not isinstance(search_recency_filter, str):\n            return _err(\"VALIDATION_ERROR\", \"search_recency_filter must be a string when provided\", field=\"search_recency_filter\")\n        if search_recency_filter not in [\"hour\", \"day\", \"week\", \"month\", \"year\", \"all\"]:\n            return _err(\"VALIDATION_ERROR\", \"search_recency_filter must be one of: hour, day, week, month, year, all\", field=\"search_recency_filter\")\n    if temperature is not None and not isinstance(temperature, (int, float)):\n        return _err(\"VALIDATION_ERROR\", \"temperature must be a number when provided\", field=\"temperature\")\n    if top_p is not None and not isinstance(top_p, (int, float)):\n        return _err(\"VALIDATION_ERROR\", \"top_p must be a number when provided\", field=\"top_p\")\n    if max_tokens is not None:\n        if not isinstance(max_tokens, int):\n            return _err(\"VALIDATION_ERROR\", \"max_tokens must be an integer when provided\", field=\"max_tokens\")\n        if max_tokens < 1:\n            return _err(\"VALIDATION_ERROR\", \"max_tokens must be >= 1\", field=\"max_tokens\")\n    if return_citations is not None and not isinstance(return_citations, bool):\n        return _err(\"VALIDATION_ERROR\", \"return_citations must be a boolean when provided\", field=\"return_citations\")\n    if return_provider_payload is not None and not isinstance(return_provider_payload, bool):\n        return _err(\"VALIDATION_ERROR\", \"return_provider_payload must be a boolean when provided\", field=\"return_provider_payload\")\n\n    # ----------------- authenticate api_key -----------------\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    requests = _load(\"perplexity_requests.json\")\n    answers = _load(\"perplexity_answers.json\")\n    ledger = _load(\"usage_ledger.json\")\n\n    # Authenticate by matching client-visible value OR id, never by hash check.\n    key_row = None\n    for k in api_keys:\n        if k.get(\"id\") == api_key or k.get(\"key_hash\") == api_key:\n            key_row = k\n            break\n    if not key_row:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"API key is revoked\", reason=\"FORBIDDEN\")\n\n    ws = None\n    ws_id = key_row.get(\"workspace_id\")\n    for w in workspaces:\n        if w.get(\"id\") == ws_id:\n            ws = w\n            break\n    if not ws:\n        return _err(\"UNAUTHORIZED\", \"API key workspace not found\")\n\n    if ws.get(\"status\") != \"active\":\n        # reject before creating a running request\n        return _err(\"UNAUTHORIZED\", f\"Workspace is not active (status={ws.get('status')})\", reason=\"FORBIDDEN\")\n\n    # Update last_used_at only on successful authenticated calls (this call is authenticated if we proceed past here).\n    # We'll update at end upon success; but the tool may be rejected for quota. That's still authenticated; rule says only updated on successful authenticated calls.\n    # Interpret \"successful\" as non-error response.\n    update_last_used = True\n\n    # ----------------- idempotency: return existing request -----------------\n    if idempotency_key is not None:\n        existing = None\n        for r in requests:\n            if r.get(\"workspace_id\") == ws_id and r.get(\"idempotency_key\") == idempotency_key:\n                existing = r\n                break\n        if existing:\n            # Find answer if any\n            ans = None\n            for a in answers:\n                if a.get(\"request_id\") == existing.get(\"id\"):\n                    ans = a\n                    break\n            # Build response\n            resp = {\n                \"request\": dict(existing),\n                \"answer\": dict(ans) if ans else None,\n            }\n            # redact provider_payload depending on flag\n            if resp[\"answer\"] and not (return_provider_payload is True):\n                resp[\"answer\"] = dict(resp[\"answer\"])\n                resp[\"answer\"][\"provider_payload\"] = {}  # redacted\n            if resp[\"answer\"] and not (return_citations is True):\n                resp[\"answer\"] = dict(resp[\"answer\"])\n                resp[\"answer\"][\"citations\"] = []\n            # update last_used_at on successful return\n            if update_last_used:\n                key_row[\"last_used_at\"] = now\n                key_row[\"updated_at\"] = now\n                _save(\"api_keys.json\", api_keys)\n            return resp\n\n    # ----------------- quota enforcement (before upstream) -----------------\n    # Compute current period usage for workspace\n    req_used = 0\n    tokens_used = 0\n    for e in ledger:\n        if e.get(\"workspace_id\") == ws_id and e.get(\"period_ym\") == period_ym:\n            if e.get(\"event_type\") == \"request\":\n                req_used += int(e.get(\"quantity\") or 0)\n            elif e.get(\"event_type\") in (\"tokens_in\", \"tokens_out\"):\n                tokens_used += int(e.get(\"quantity\") or 0)\n\n    monthly_request_quota = ws.get(\"monthly_request_quota\")\n    monthly_token_quota = ws.get(\"monthly_token_quota\")\n    try:\n        monthly_request_quota = int(monthly_request_quota)\n        monthly_token_quota = int(monthly_token_quota)\n    except Exception:\n        return _err(\"VALIDATION_ERROR\", \"Workspace quotas are misconfigured\")\n\n    if monthly_request_quota < 0 or monthly_token_quota < 0:\n        return _err(\"VALIDATION_ERROR\", \"Workspace quotas are misconfigured (negative)\")\n\n    # Estimate tokens in/out (simple heuristic)\n    est_in = max(0, len(question.strip()) // 4)\n    est_out = 0\n    if isinstance(max_tokens, int):\n        est_out = max_tokens\n    else:\n        est_out = min(512, max(64, est_in // 2))\n\n    if req_used + 1 > monthly_request_quota:\n        return _err(\"QUOTA_EXCEEDED\", \"Monthly request quota exceeded\", period_ym=period_ym, used=req_used, quota=monthly_request_quota)\n    if tokens_used + est_in + est_out > monthly_token_quota:\n        return _err(\"QUOTA_EXCEEDED\", \"Monthly token quota exceeded\", period_ym=period_ym, used=tokens_used, quota=monthly_token_quota, estimated_additional=est_in + est_out)\n\n    # ----------------- create request row (queued -> running -> succeeded) -----------------\n    req_id = _make_id(\"pplxreq\")\n    req_row = {\n        \"id\": req_id,\n        \"workspace_id\": ws_id,\n        \"api_key_id\": key_row.get(\"id\"),\n        \"tool_name\": \"ask_perplexity\",\n        \"input\": {},  # per rule\n        \"idempotency_key\": idempotency_key,\n        \"status\": \"queued\",\n        \"error_code\": None,\n        \"error_message\": None,\n        \"remote_request_id\": None,\n        \"latency_ms\": None,\n        \"estimated_tokens_in\": int(est_in),\n        \"estimated_tokens_out\": 0,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # enforce uniqueness(workspace_id, idempotency_key) where not null (race-safe best effort in file store)\n    if idempotency_key is not None:\n        for r in requests:\n            if r.get(\"workspace_id\") == ws_id and r.get(\"idempotency_key\") == idempotency_key:\n                # Another writer already created it: return it\n                existing = r\n                ans = None\n                for a in answers:\n                    if a.get(\"request_id\") == existing.get(\"id\"):\n                        ans = a\n                        break\n                resp = {\"request\": dict(existing), \"answer\": dict(ans) if ans else None}\n                if resp[\"answer\"] and not (return_provider_payload is True):\n                    resp[\"answer\"] = dict(resp[\"answer\"])\n                    resp[\"answer\"][\"provider_payload\"] = {}\n                if resp[\"answer\"] and not (return_citations is True):\n                    resp[\"answer\"] = dict(resp[\"answer\"])\n                    resp[\"answer\"][\"citations\"] = []\n                key_row[\"last_used_at\"] = now\n                key_row[\"updated_at\"] = now\n                _save(\"api_keys.json\", api_keys)\n                return resp\n\n    requests.append(req_row)\n    _save(\"perplexity_requests.json\", requests)\n\n    # Transition to running (legal)\n    for r in requests:\n        if r.get(\"id\") == req_id:\n            r[\"status\"] = \"running\"\n            r[\"updated_at\"] = now\n            break\n    _save(\"perplexity_requests.json\", requests)\n\n    # ----------------- \"upstream\" execution (offline simulated) -----------------\n    # Deterministic pseudo-answer based on question, model.\n    start_exec = time.time()\n    remote_id = \"remote_\" + hashlib.sha256((question + \"|\" + (model or \"\")).encode(\"utf-8\")).hexdigest()[:24]\n    answer_text = f\"Simulated Perplexity answer.\\n\\nQuestion: {question.strip()}\\nModel: {model or 'default'}\\n\\nThis server runs offline and records requests/answers locally.\"\n    citations = []\n    if return_citations is True:\n        citations = [{\n            \"url\": \"https://example.com/offline-simulation\",\n            \"title\": \"Offline Simulation\",\n            \"snippet\": \"This is a locally simulated response; no live web lookup was performed.\"\n        }]\n    provider_payload = {\n        \"provider\": \"perplexity\",\n        \"mode\": \"offline_simulation\",\n        \"model\": model or \"default\",\n        \"search_recency_filter\": search_recency_filter,\n        \"temperature\": temperature,\n        \"top_p\": top_p,\n        \"max_tokens\": max_tokens,\n        \"remote_request_id\": remote_id,\n    }\n    end_exec = time.time()\n    latency_ms = int(round((end_exec - start_exec) * 1000))\n\n    # Transition running -> succeeded (legal) and write completion fields\n    updated_now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    for r in requests:\n        if r.get(\"id\") == req_id:\n            r[\"status\"] = \"succeeded\"\n            r[\"remote_request_id\"] = remote_id\n            r[\"latency_ms\"] = max(0, latency_ms)\n            r[\"estimated_tokens_out\"] = int(est_out)\n            r[\"updated_at\"] = updated_now\n            break\n    _save(\"perplexity_requests.json\", requests)\n\n    # Create answer row on completion; unique(request_id)\n    existing_answer = None\n    for a in answers:\n        if a.get(\"request_id\") == req_id:\n            existing_answer = a\n            break\n    if existing_answer is None:\n        ans_id = _make_id(\"pplxans\")\n        ans_row = {\n            \"id\": ans_id,\n            \"request_id\": req_id,\n            \"status\": \"final\",\n            \"answer_text\": answer_text,\n            \"citations\": citations if (return_citations is True) else [],\n            \"provider_payload\": provider_payload if (return_provider_payload is True) else {},\n            \"created_at\": updated_now,\n            \"updated_at\": updated_now,\n        }\n        answers.append(ans_row)\n        _save(\"perplexity_answers.json\", answers)\n    else:\n        # Terminal states cannot be semantically modified; but if it exists, keep it as-is.\n        pass\n\n    # Write usage_ledger exactly three entries; unique(request_id,event_type)\n    def _ledger_upsert(event_type, quantity):\n        nonlocal ledger\n        for e in ledger:\n            if e.get(\"request_id\") == req_id and e.get(\"event_type\") == event_type:\n                return  # idempotent\n        ledger.append({\n            \"id\": _make_id(\"usage\"),\n            \"workspace_id\": ws_id,\n            \"api_key_id\": key_row.get(\"id\"),\n            \"request_id\": req_id,\n            \"event_type\": event_type,\n            \"quantity\": int(max(0, quantity)),\n            \"period_ym\": period_ym,\n            \"created_at\": updated_now,\n            \"updated_at\": updated_now,\n        })\n\n    _ledger_upsert(\"request\", 1)\n    _ledger_upsert(\"tokens_in\", int(est_in))\n    _ledger_upsert(\"tokens_out\", int(est_out))\n    _save(\"usage_ledger.json\", ledger)\n\n    # Update last_used_at on successful call\n    key_row[\"last_used_at\"] = updated_now\n    key_row[\"updated_at\"] = updated_now\n    _save(\"api_keys.json\", api_keys)\n\n    # Return recorded session\n    final_req = None\n    for r in requests:\n        if r.get(\"id\") == req_id:\n            final_req = r\n            break\n    final_ans = None\n    for a in answers:\n        if a.get(\"request_id\") == req_id:\n            final_ans = a\n            break\n\n    if final_req is None:\n        return _err(\"NOT_FOUND\", \"Request not found after creation (datastore error)\")\n\n    out_answer = dict(final_ans) if final_ans else None\n    if out_answer and not (return_provider_payload is True):\n        out_answer[\"provider_payload\"] = {}\n    if out_answer and not (return_citations is True):\n        out_answer[\"citations\"] = []\n\n    return {\n        \"request\": dict(final_req),\n        \"answer\": out_answer\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_me",
+          "description": "Returns the authenticated caller identity resolved from `api_key`, including workspace and API key metadata, granted scopes, and current period quota/rate-limit consumption; refuses with AUTH_ERROR for missing/invalid keys and FORBIDDEN if the key is revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Per-workspace Perplexity Server API key used to authenticate and attribute usage."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_me(api_key, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0074000\" if __import__(\"os\").path.isdir(\"./environment_mix/0074000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    period_ym = now[:7]\n\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\", field=\"api_key\")\n\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    ledger = _load(\"usage_ledger.json\")\n\n    key_row = None\n    for k in api_keys:\n        if k.get(\"id\") == api_key or k.get(\"key_hash\") == api_key:\n            key_row = k\n            break\n    if not key_row:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"API key is revoked\", reason=\"FORBIDDEN\")\n\n    ws = None\n    for w in workspaces:\n        if w.get(\"id\") == key_row.get(\"workspace_id\"):\n            ws = w\n            break\n    if not ws:\n        return _err(\"UNAUTHORIZED\", \"API key workspace not found\")\n\n    # Compute current period usage\n    req_used = 0\n    tokens_used = 0\n    for e in ledger:\n        if e.get(\"workspace_id\") == ws.get(\"id\") and e.get(\"period_ym\") == period_ym:\n            if e.get(\"event_type\") == \"request\":\n                req_used += int(e.get(\"quantity\") or 0)\n            elif e.get(\"event_type\") in (\"tokens_in\", \"tokens_out\"):\n                tokens_used += int(e.get(\"quantity\") or 0)\n\n    # Successful authenticated call: update last_used_at\n    key_row[\"last_used_at\"] = now\n    key_row[\"updated_at\"] = now\n    _save(\"api_keys.json\", api_keys)\n\n    return {\n        \"workspace\": {\n            \"id\": ws.get(\"id\"),\n            \"name\": ws.get(\"name\"),\n            \"status\": ws.get(\"status\"),\n            \"monthly_request_quota\": ws.get(\"monthly_request_quota\"),\n            \"monthly_token_quota\": ws.get(\"monthly_token_quota\"),\n            \"created_at\": ws.get(\"created_at\"),\n            \"updated_at\": ws.get(\"updated_at\"),\n        },\n        \"api_key\": {\n            \"id\": key_row.get(\"id\"),\n            \"workspace_id\": key_row.get(\"workspace_id\"),\n            \"label\": key_row.get(\"label\"),\n            \"status\": key_row.get(\"status\"),\n            \"last_used_at\": key_row.get(\"last_used_at\"),\n            \"created_at\": key_row.get(\"created_at\"),\n            \"updated_at\": key_row.get(\"updated_at\"),\n        },\n        \"scopes\": [\"perplexity.ask\", \"perplexity.read\"],\n        \"current_period\": {\n            \"period_ym\": period_ym,\n            \"requests_used\": req_used,\n            \"requests_quota\": int(ws.get(\"monthly_request_quota\") or 0),\n            \"tokens_used\": tokens_used,\n            \"tokens_quota\": int(ws.get(\"monthly_token_quota\") or 0),\n        }\n    }\n"
+        },
+        {
+          "name": "list_perplexity_requests",
+          "description": "Lists recorded Perplexity ask sessions for the authenticated workspace, newest first, with optional filtering; refuses with AUTH_ERROR for missing/invalid keys and FORBIDDEN if the key is revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Per-workspace Perplexity Server API key used to authenticate and attribute usage."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "Filter by request lifecycle status."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Filter by client idempotency key."
+              },
+              "remote_request_id": {
+                "type": "string",
+                "description": "Filter by upstream provider request id (if recorded)."
+              },
+              "created_after": {
+                "type": "string",
+                "description": "Return only requests created at or after this time (RFC 3339 timestamp)."
+              },
+              "created_before": {
+                "type": "string",
+                "description": "Return only requests created before this time (RFC 3339 timestamp)."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of items to return (pagination).",
+                "minimum": 1,
+                "maximum": 200
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor returned from a previous call."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_perplexity_requests(api_key, status=None, idempotency_key=None, remote_request_id=None, created_after=None, created_before=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0074000\" if __import__(\"os\").path.isdir(\"./environment_mix/0074000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _parse_rfc3339(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\", field=\"api_key\")\n    if status is not None:\n        if not isinstance(status, str):\n            return _err(\"VALIDATION_ERROR\", \"status must be a string when provided\", field=\"status\")\n        if status not in [\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"]:\n            return _err(\"VALIDATION_ERROR\", \"status must be one of queued,running,succeeded,failed,cancelled\", field=\"status\")\n    if idempotency_key is not None and (not isinstance(idempotency_key, str) or not idempotency_key.strip()):\n        return _err(\"VALIDATION_ERROR\", \"idempotency_key must be a non-empty string when provided\", field=\"idempotency_key\")\n    if remote_request_id is not None and (not isinstance(remote_request_id, str) or not remote_request_id.strip()):\n        return _err(\"VALIDATION_ERROR\", \"remote_request_id must be a non-empty string when provided\", field=\"remote_request_id\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer\", field=\"limit\")\n    if limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200\", field=\"limit\")\n    if cursor is not None and (not isinstance(cursor, str) or not cursor.strip()):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string when provided\", field=\"cursor\")\n\n    ca = _parse_rfc3339(created_after)\n    if created_after is not None and ca is None:\n        return _err(\"VALIDATION_ERROR\", \"created_after must be an RFC3339 timestamp\", field=\"created_after\")\n    cb = _parse_rfc3339(created_before)\n    if created_before is not None and cb is None:\n        return _err(\"VALIDATION_ERROR\", \"created_before must be an RFC3339 timestamp\", field=\"created_before\")\n\n    api_keys = _load(\"api_keys.json\")\n    requests = _load(\"perplexity_requests.json\")\n\n    key_row = None\n    for k in api_keys:\n        if k.get(\"id\") == api_key or k.get(\"key_hash\") == api_key:\n            key_row = k\n            break\n    if not key_row:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"API key is revoked\", reason=\"FORBIDDEN\")\n\n    ws_id = key_row.get(\"workspace_id\")\n\n    # decode cursor: base64 of request created_at + \"|\" + id\n    start_after = None\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\")).decode(\"utf-8\")\n            parts = raw.split(\"|\", 1)\n            if len(parts) == 2:\n                start_after = (parts[0], parts[1])\n            else:\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor\", field=\"cursor\")\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\", field=\"cursor\")\n\n    # Filter\n    rows = []\n    for r in requests:\n        if r.get(\"workspace_id\") != ws_id:\n            continue\n        if r.get(\"tool_name\") != \"ask_perplexity\":\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        if idempotency_key is not None and r.get(\"idempotency_key\") != idempotency_key:\n            continue\n        if remote_request_id is not None and r.get(\"remote_request_id\") != remote_request_id:\n            continue\n        r_created = _parse_rfc3339(r.get(\"created_at\")) if isinstance(r.get(\"created_at\"), str) else None\n        if ca is not None and r_created is not None and r_created < ca:\n            continue\n        if cb is not None and r_created is not None and r_created >= cb:\n            continue\n        rows.append(r)\n\n    # Sort newest first by created_at then id\n    def _k(r):\n        return (r.get(\"created_at\") or \"\", r.get(\"id\") or \"\")\n    rows.sort(key=_k, reverse=True)\n\n    # Apply cursor (start_after means return items strictly older than that tuple in this sort)\n    if start_after:\n        filtered = []\n        for r in rows:\n            tup = (r.get(\"created_at\") or \"\", r.get(\"id\") or \"\")\n            if tup < start_after:  # since sorted desc, we want those \"less than\" the boundary\n                filtered.append(r)\n        rows = filtered\n\n    total = len(rows)\n    page = rows[:limit]\n    has_more = total > len(page)\n\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        payload = f\"{last.get('created_at') or ''}|{last.get('id') or ''}\"\n        next_cursor = base64.urlsafe_b64encode(payload.encode(\"utf-8\")).decode(\"utf-8\")\n\n    # Successful authenticated call: update last_used_at\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    key_row[\"last_used_at\"] = now\n    key_row[\"updated_at\"] = now\n    _save(\"api_keys.json\", api_keys)\n\n    return {\n        \"data\": [dict(r) for r in page],\n        \"pagination\": {\n            \"limit\": limit,\n            \"total\": total,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor\n        }\n    }\n"
+        },
+        {
+          "name": "get_perplexity_request",
+          "description": "Fetches a single recorded Perplexity request by id within the authenticated workspace; refuses with NOT_FOUND if the id does not exist in the workspace and FORBIDDEN if the key is revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Per-workspace Perplexity Server API key used to authenticate and attribute usage."
+              },
+              "request_id": {
+                "type": "string",
+                "description": "Perplexity request id to fetch."
+              }
+            },
+            "required": [
+              "api_key",
+              "request_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_perplexity_request(api_key, request_id, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0074000\" if __import__(\"os\").path.isdir(\"./environment_mix/0074000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\", field=\"api_key\")\n    if not isinstance(request_id, str) or not request_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"request_id must be a non-empty string\", field=\"request_id\")\n\n    api_keys = _load(\"api_keys.json\")\n    requests = _load(\"perplexity_requests.json\")\n    answers = _load(\"perplexity_answers.json\")\n\n    key_row = None\n    for k in api_keys:\n        if k.get(\"id\") == api_key or k.get(\"key_hash\") == api_key:\n            key_row = k\n            break\n    if not key_row:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"API key is revoked\", reason=\"FORBIDDEN\")\n\n    ws_id = key_row.get(\"workspace_id\")\n\n    req = None\n    for r in requests:\n        if r.get(\"id\") == request_id and r.get(\"workspace_id\") == ws_id:\n            req = r\n            break\n    if not req:\n        return _err(\"NOT_FOUND\", \"Request not found\")\n\n    ans = None\n    for a in answers:\n        if a.get(\"request_id\") == request_id:\n            ans = a\n            break\n\n    # Successful authenticated call: update last_used_at\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    key_row[\"last_used_at\"] = now\n    key_row[\"updated_at\"] = now\n    _save(\"api_keys.json\", api_keys)\n\n    return {\n        \"request\": dict(req),\n        \"answer\": dict(ans) if ans else None\n    }\n"
+        },
+        {
+          "name": "cancel_perplexity_request",
+          "description": "Cancels a queued or running Perplexity request; returns the updated request record and refuses with CONFLICT if the request is already in a terminal state or the transition is not allowed.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Per-workspace Perplexity Server API key used to authenticate and attribute usage."
+              },
+              "request_id": {
+                "type": "string",
+                "description": "Perplexity request id to cancel."
+              },
+              "reason": {
+                "type": "string",
+                "description": "Optional human-readable cancellation reason for audit/logging."
+              }
+            },
+            "required": [
+              "api_key",
+              "request_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def cancel_perplexity_request(api_key, request_id, reason=None, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0074000\" if __import__(\"os\").path.isdir(\"./environment_mix/0074000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now = now_dt.isoformat() + \"Z\"\n\n    def _coerce_list(x):\n        return x if isinstance(x, list) else []\n\n    def _period_ym(dt):\n        return dt.strftime(\"%Y-%m\")\n\n    def _gen_id(prefix):\n        return f\"{prefix}_{uuid.uuid4().hex[:26]}\"\n\n    # ---- Validate inputs ----\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\")\n    if not isinstance(request_id, str) or not request_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"request_id must be a non-empty string\")\n    if reason is not None and not isinstance(reason, str):\n        return _err(\"VALIDATION_ERROR\", \"reason must be a string if provided\")\n\n    # ---- Load datastore ----\n    workspaces = _coerce_list(_load(\"workspaces.json\"))\n    api_keys = _coerce_list(_load(\"api_keys.json\"))\n    requests = _coerce_list(_load(\"perplexity_requests.json\"))\n    answers = _coerce_list(_load(\"perplexity_answers.json\"))\n    usage = _coerce_list(_load(\"usage_ledger.json\"))\n\n    # ---- Resolve request ----\n    req = None\n    for r in requests:\n        if isinstance(r, dict) and r.get(\"id\") == request_id:\n            req = r\n            break\n    if req is None:\n        return _err(\"NOT_FOUND\", \"Perplexity request not found\", request_id=request_id)\n\n    # ---- Authenticate API key (match by id or client-visible value; never key_hash) ----\n    # In this datastore, the only client-visible value available is typically the key id itself.\n    key_row = None\n    for k in api_keys:\n        if not isinstance(k, dict):\n            continue\n        if k.get(\"id\") == api_key:\n            key_row = k\n            break\n        # Some vendors accept either \"id\" or a separately issued plaintext key; this store does not retain it.\n        # We intentionally do not attempt to compare against key_hash.\n    if key_row is None:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"API key is revoked\", rule=\"api_keys with status='revoked' cannot be used\")\n\n    # ---- Authorize against workspace scope (must match request.workspace_id) ----\n    ws_id = key_row.get(\"workspace_id\")\n    if not isinstance(ws_id, str) or not ws_id:\n        return _err(\"UNAUTHORIZED\", \"API key is not associated with a workspace\")\n    req_ws_id = req.get(\"workspace_id\")\n    if req_ws_id != ws_id:\n        # This must be a real rule; however, do not reject a well-formed call due to hash checks.\n        return _err(\n            \"UNAUTHORIZED\",\n            \"API key is not authorized to operate on this request (workspace mismatch).\",\n            rule=\"Requests are scoped to a workspace; API keys may only operate on requests in their own workspace.\",\n            workspace_id=ws_id,\n            request_workspace_id=req_ws_id,\n        )\n\n    # ---- Workspace lifecycle gate (suspended/deleted cannot execute; cancel is allowed) ----\n    ws_row = None\n    for w in workspaces:\n        if isinstance(w, dict) and w.get(\"id\") == ws_id:\n            ws_row = w\n            break\n    if ws_row is None:\n        return _err(\"NOT_FOUND\", \"Workspace not found for API key\", workspace_id=ws_id)\n\n    # ---- Enforce lifecycle transition: queued/running -> cancelled only ----\n    cur = req.get(\"status\")\n    allowed = {\"queued\": {\"running\", \"cancelled\"}, \"running\": {\"succeeded\", \"failed\", \"cancelled\"}, \"succeeded\": set(), \"failed\": set(), \"cancelled\": set()}\n    if cur not in allowed:\n        return _err(\"VALIDATION_ERROR\", \"Invalid request status value\", status=cur)\n\n    if \"cancelled\" not in allowed.get(cur, set()):\n        return _err(\n            \"CONFLICT\",\n            \"Request is already in a terminal state and cannot be cancelled.\",\n            rule=\"Requests may only transition according to the defined lifecycle; terminal states cannot be modified.\",\n            status=cur,\n        )\n\n    # ---- Apply update (no success without effect) ----\n    req[\"status\"] = \"cancelled\"\n    # keep error_code/message null; reason is audit-only. There is no schema field for reason, so store in input.\n    # input is defined as raw params JSON; for this tool it's {}, but we can append audit metadata safely there\n    # without affecting ask_perplexity semantics? It's still an object. We'll preserve existing input and add cancellation.\n    inp = req.get(\"input\")\n    if not isinstance(inp, dict):\n        inp = {}\n    inp = dict(inp)\n    if reason is not None:\n        inp[\"_cancellation_reason\"] = reason\n    inp[\"_cancelled_at\"] = now\n    req[\"input\"] = inp\n    req[\"updated_at\"] = now\n\n    # ---- Persist ----\n    _save(\"perplexity_requests.json\", requests)\n\n    # ---- Observable service dynamics: record call in usage_ledger as a request audit event (quantity=0) ----\n    # Schema restricts event_type to request/tokens_in/tokens_out and quantity>=0 with unique(request_id,event_type).\n    # To avoid violating uniqueness for real ask_perplexity usage entries, only create an audit record when none exists\n    # for this request+event_type='request' AND quantity=0. If a real usage row exists, we do not add another.\n    # This ensures \"every call records itself\" without corrupting metering.\n    existing_req_event = False\n    for u in usage:\n        if isinstance(u, dict) and u.get(\"request_id\") == request_id and u.get(\"event_type\") == \"request\":\n            existing_req_event = True\n            break\n    if not existing_req_event:\n        # Add a zero-quantity audit marker; does not affect quota sums.\n        usage.append({\n            \"id\": _gen_id(\"pplx_use\"),\n            \"workspace_id\": ws_id,\n            \"api_key_id\": key_row.get(\"id\"),\n            \"request_id\": request_id,\n            \"event_type\": \"request\",\n            \"quantity\": 0,\n            \"period_ym\": _period_ym(now_dt),\n            \"created_at\": now,\n            \"updated_at\": now,\n        })\n        _save(\"usage_ledger.json\", usage)\n\n    # ---- Update key last_used_at (successful authenticated call) ----\n    key_row[\"last_used_at\"] = now\n    key_row[\"updated_at\"] = now\n    _save(\"api_keys.json\", api_keys)\n\n    latency_ms = int(max(0, (time.time() - t0) * 1000))\n\n    return {\n        \"request\": req,\n        \"meta\": {\n            \"cancelled\": True,\n            \"latency_ms\": latency_ms,\n        },\n    }\n"
+        },
+        {
+          "name": "list_usage_ledger",
+          "description": "Lists usage ledger entries for the authenticated workspace with optional filtering by period, API key, request, and event type; refuses with AUTH_ERROR for missing/invalid keys and FORBIDDEN if the key is revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Per-workspace Perplexity Server API key used to authenticate and attribute usage."
+              },
+              "period_ym": {
+                "type": "string",
+                "description": "Filter by billing/usage period in YYYY-MM format."
+              },
+              "event_type": {
+                "type": "string",
+                "enum": [
+                  "request",
+                  "tokens_in",
+                  "tokens_out"
+                ],
+                "description": "Filter by usage event type."
+              },
+              "request_id": {
+                "type": "string",
+                "description": "Filter to ledger entries for a specific request id."
+              },
+              "api_key_id": {
+                "type": "string",
+                "description": "Filter to ledger entries attributed to a specific API key id."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of items to return (pagination).",
+                "minimum": 1,
+                "maximum": 500
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor returned from a previous call."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_usage_ledger(api_key, period_ym=None, event_type=None, request_id=None, api_key_id=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, uuid, base64, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0074000\" if __import__(\"os\").path.isdir(\"./environment_mix/0074000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # Validate inputs\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\")\n    if period_ym is not None:\n        if not isinstance(period_ym, str) or not re.fullmatch(r\"\\d{4}-\\d{2}\", period_ym):\n            return _err(\"VALIDATION_ERROR\", \"period_ym must be in YYYY-MM format\")\n    if event_type is not None:\n        if event_type not in (\"request\", \"tokens_in\", \"tokens_out\"):\n            return _err(\"VALIDATION_ERROR\", \"event_type must be one of: request, tokens_in, tokens_out\")\n    if request_id is not None and (not isinstance(request_id, str) or not request_id.strip()):\n        return _err(\"VALIDATION_ERROR\", \"request_id must be a non-empty string if provided\")\n    if api_key_id is not None and (not isinstance(api_key_id, str) or not api_key_id.strip()):\n        return _err(\"VALIDATION_ERROR\", \"api_key_id must be a non-empty string if provided\")\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int) or limit < 1 or limit > 500:\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 500\")\n    if cursor is not None and (not isinstance(cursor, str) or not cursor.strip()):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string if provided\")\n\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    usage = _load(\"usage_ledger.json\")\n    requests = _load(\"perplexity_requests.json\")\n\n    # Authenticate: api_key must match an api_keys.id\n    key_row = None\n    for k in api_keys:\n        if k.get(\"id\") == api_key:\n            key_row = k\n            break\n    if not key_row:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"API key is revoked\")\n\n    ws = None\n    for w in workspaces:\n        if w.get(\"id\") == key_row.get(\"workspace_id\"):\n            ws = w\n            break\n    if not ws:\n        return _err(\"UNAUTHORIZED\", \"Workspace not found for API key\")\n\n    # Pagination cursor decode: base64url of {\"offset\": int}\n    offset = 0\n    if cursor is not None:\n        try:\n            raw = cursor.encode(\"utf-8\")\n            pad = b\"=\" * ((4 - (len(raw) % 4)) % 4)\n            decoded = base64.urlsafe_b64decode(raw + pad).decode(\"utf-8\")\n            obj = json.loads(decoded)\n            if not isinstance(obj, dict) or \"offset\" not in obj or not isinstance(obj[\"offset\"], int) or obj[\"offset\"] < 0:\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n            offset = obj[\"offset\"]\n        except (ValueError, json.JSONDecodeError):\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n\n    # Filter\n    rows = [r for r in usage if r.get(\"workspace_id\") == ws.get(\"id\")]\n    if period_ym is not None:\n        rows = [r for r in rows if r.get(\"period_ym\") == period_ym]\n    if event_type is not None:\n        rows = [r for r in rows if r.get(\"event_type\") == event_type]\n    if request_id is not None:\n        rows = [r for r in rows if r.get(\"request_id\") == request_id]\n    if api_key_id is not None:\n        rows = [r for r in rows if r.get(\"api_key_id\") == api_key_id]\n\n    # Sort newest first by created_at then id for stability\n    def _ts(x):\n        v = x.get(\"created_at\")\n        return v if isinstance(v, str) else \"\"\n    rows.sort(key=lambda r: (_ts(r), r.get(\"id\", \"\")), reverse=True)\n\n    total = len(rows)\n    page = rows[offset:offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        payload = json.dumps({\"offset\": next_offset}, separators=(\",\", \":\")).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(payload).decode(\"utf-8\").rstrip(\"=\")\n\n    # Update last_used_at on successful authenticated call\n    now2 = now\n    key_row = dict(key_row)\n    key_row[\"last_used_at\"] = now2\n    key_row[\"updated_at\"] = now2\n    for i, k in enumerate(api_keys):\n        if k.get(\"id\") == key_row.get(\"id\"):\n            api_keys[i] = key_row\n            break\n\n    # Log the call into perplexity_requests as system request-log row\n    log_id = \"pr_\" + uuid.uuid4().hex\n    log_row = {\n        \"id\": log_id,\n        \"workspace_id\": ws.get(\"id\"),\n        \"api_key_id\": key_row.get(\"id\"),\n        \"tool_name\": \"ask_perplexity\",\n        \"input\": {\n            \"operation\": \"list_usage_ledger\",\n            \"filters\": {\n                \"period_ym\": period_ym,\n                \"event_type\": event_type,\n                \"request_id\": request_id,\n                \"api_key_id\": api_key_id\n            },\n            \"limit\": limit,\n            \"cursor\": cursor\n        },\n        \"idempotency_key\": None,\n        \"status\": \"succeeded\",\n        \"error_code\": None,\n        \"error_message\": None,\n        \"remote_request_id\": None,\n        \"latency_ms\": max(0, int((time.time() - t0) * 1000)),\n        \"estimated_tokens_in\": 0,\n        \"estimated_tokens_out\": 0,\n        \"created_at\": now2,\n        \"updated_at\": now2\n    }\n    requests.append(log_row)\n\n    _save(\"api_keys.json\", api_keys)\n    _save(\"perplexity_requests.json\", requests)\n\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor\n        }\n    }\n"
+        },
+        {
+          "name": "create_api_key",
+          "description": "Creates a new API key for the authenticated workspace and returns it once (the raw key is only returned on creation); refuses with FORBIDDEN if the workspace is suspended/deleted.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Per-workspace Perplexity Server API key used to authenticate and attribute usage (must be an active key with permission to manage keys)."
+              },
+              "label": {
+                "type": "string",
+                "description": "Human-readable label to help identify the key."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_api_key(api_key, label=None, **_extra):\n    import json, os, datetime, time, uuid, secrets, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0074000\" if __import__(\"os\").path.isdir(\"./environment_mix/0074000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # Validate inputs\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\")\n    if label is not None and not isinstance(label, str):\n        return _err(\"VALIDATION_ERROR\", \"label must be a string if provided\")\n\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    requests = _load(\"perplexity_requests.json\")\n\n    # Authenticate using provided api_key as api_keys.id\n    caller_key = None\n    for k in api_keys:\n        if k.get(\"id\") == api_key:\n            caller_key = k\n            break\n    if not caller_key:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n    if caller_key.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"API key is revoked\")\n\n    ws = None\n    for w in workspaces:\n        if w.get(\"id\") == caller_key.get(\"workspace_id\"):\n            ws = w\n            break\n    if not ws:\n        return _err(\"UNAUTHORIZED\", \"Workspace not found for API key\")\n\n    if ws.get(\"status\") in (\"suspended\", \"deleted\"):\n        return _err(\"UNAUTHORIZED\", \"Workspace is not allowed to create API keys in its current status\")\n\n    # Create raw key (returned once) and store only hash\n    raw_key = \"pplxsk_\" + secrets.token_urlsafe(32)\n    key_hash = hashlib.sha256(raw_key.encode(\"utf-8\")).hexdigest()\n\n    # Enforce unique(workspace_id, key_hash)\n    for k in api_keys:\n        if k.get(\"workspace_id\") == ws.get(\"id\") and k.get(\"key_hash\") == key_hash:\n            # extremely unlikely; regenerate once\n            raw_key = \"pplxsk_\" + secrets.token_urlsafe(32)\n            key_hash = hashlib.sha256(raw_key.encode(\"utf-8\")).hexdigest()\n            break\n    for k in api_keys:\n        if k.get(\"workspace_id\") == ws.get(\"id\") and k.get(\"key_hash\") == key_hash:\n            return _err(\"CONFLICT\", \"Failed to generate a unique API key hash; retry\")\n\n    new_id = \"key_\" + uuid.uuid4().hex\n    new_row = {\n        \"id\": new_id,\n        \"workspace_id\": ws.get(\"id\"),\n        \"key_hash\": key_hash,\n        \"label\": label,\n        \"status\": \"active\",\n        \"last_used_at\": None,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n\n    api_keys.append(new_row)\n\n    # Update last_used_at on successful authenticated call (caller key)\n    caller_key2 = dict(caller_key)\n    caller_key2[\"last_used_at\"] = now\n    caller_key2[\"updated_at\"] = now\n    for i, k in enumerate(api_keys):\n        if k.get(\"id\") == caller_key2.get(\"id\"):\n            api_keys[i] = caller_key2\n            break\n\n    # Log the call into perplexity_requests as system request-log row\n    log_id = \"pr_\" + uuid.uuid4().hex\n    log_row = {\n        \"id\": log_id,\n        \"workspace_id\": ws.get(\"id\"),\n        \"api_key_id\": caller_key2.get(\"id\"),\n        \"tool_name\": \"ask_perplexity\",\n        \"input\": {\"operation\": \"create_api_key\", \"label\": label},\n        \"idempotency_key\": None,\n        \"status\": \"succeeded\",\n        \"error_code\": None,\n        \"error_message\": None,\n        \"remote_request_id\": None,\n        \"latency_ms\": max(0, int((time.time() - t0) * 1000)),\n        \"estimated_tokens_in\": 0,\n        \"estimated_tokens_out\": 0,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n    requests.append(log_row)\n\n    _save(\"api_keys.json\", api_keys)\n    _save(\"perplexity_requests.json\", requests)\n\n    return {\n        \"api_key\": {\n            \"id\": new_row[\"id\"],\n            \"workspace_id\": new_row[\"workspace_id\"],\n            \"label\": new_row[\"label\"],\n            \"status\": new_row[\"status\"],\n            \"created_at\": new_row[\"created_at\"]\n        },\n        \"raw_key\": raw_key\n    }\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0074000",
+    "index": 74,
+    "name": "Perplexity Server",
+    "description": "This backend stores Perplexity question/answer sessions executed through a single MCP tool call. It tracks client workspaces, API credentials, individual ask requests, and the returned answers with citations, while enforcing basic lifecycle, idempotency, and quota/rate limits. Repository: https://gi",
+    "taxonomy": {
+      "L1_id": "L1-01",
+      "L1_name": "Search & Information Retrieval",
+      "L1_name_zh": "搜索与信息获取",
+      "L2_id": "L2-01",
+      "L2_name": "General Web Search",
+      "L2_name_zh": "通用网页搜索",
+      "L3_name": "Answer/Research Synthesis from Web",
+      "L3_name_zh": "基于网页检索的问答与研究综合"
+    },
+    "database_dir": "./environment_mix/0074000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 5,
+    "n_records": 93,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 4,
+      "read_operations": 4,
+      "mutations_persisted": 2,
+      "mutations_attempted": 3
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_me",
+      "returned_chars": 713
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

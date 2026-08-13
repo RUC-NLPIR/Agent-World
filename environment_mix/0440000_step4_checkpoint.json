@@ -1,0 +1,701 @@
+{
+  "index": 440,
+  "local_files_dir": "./environment_mix/0440000",
+  "file_list": [
+    "./environment_mix/0440000/README.md",
+    "./environment_mix/0440000/accounts.json",
+    "./environment_mix/0440000/dns_hosts.json",
+    "./environment_mix/0440000/domain_contacts.json",
+    "./environment_mix/0440000/domain_registration_orders.json",
+    "./environment_mix/0440000/domains.json",
+    "./environment_mix/0440000/request_logs.json",
+    "./environment_mix/0440000/tld_pricing.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "accounts.json": "12 rows",
+        "domains.json": "34 rows",
+        "domain_contacts.json": "35 rows",
+        "dns_hosts.json": "33 rows",
+        "tld_pricing.json": "29 rows",
+        "domain_registration_orders.json": "28 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "check_domain",
+          "description": "Checks availability for the requested fully-qualified domain name (FQDN) and, when available for the TLD, returns pricing estimates for the requested term and currency, optionally including premium-domain pricing. Raises VALIDATION_ERROR if the account_id or fqdn is malformed, the currency is not supported, or term_years is outside 1–10. Raises NOT_FOUND if the account_id does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "account_id": {
+                "type": "string",
+                "pattern": "^nc_acc_[A-Za-z0-9]{18,}$",
+                "description": "Namecheap account id to use for availability/pricing checks."
+              },
+              "fqdn": {
+                "type": "string",
+                "description": "Fully-qualified domain name to check (e.g., \"example.com\")."
+              },
+              "currency": {
+                "type": "string",
+                "enum": [
+                  "USD",
+                  "EUR",
+                  "GBP",
+                  "CAD",
+                  "AUD"
+                ],
+                "description": "Currency for returned pricing (if available)."
+              },
+              "term_years": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "description": "Registration term length in years used to estimate/register pricing."
+              },
+              "include_premium": {
+                "type": "boolean",
+                "description": "Whether to include premium-domain availability/pricing when supported."
+              }
+            },
+            "required": [
+              "account_id",
+              "fqdn"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def check_domain(account_id, fqdn, currency=None, term_years=None, include_premium=None, **_extra):\n    import json, os, datetime, re, time, random, string\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0440000\" if __import__(\"os\").path.isdir(\"./environment_mix/0440000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # Minimal request logging (schema didn't define a log collection)\n    def _log(endpoint, status, credential_id=None, meta=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            logs.append({\n                \"request_id\": \"req_\" + \"\".join(random.choices(string.ascii_lowercase + string.digits, k=24)),\n                \"endpoint\": endpoint,\n                \"credential_id\": credential_id,\n                \"status\": status,\n                \"latency_ms\": int((time.time() - start) * 1000),\n                \"timestamp\": now,\n                \"meta\": meta or {}\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            return\n\n    # Validate inputs\n    try:\n        if not isinstance(account_id, str) or not re.match(r\"^nc_acc_[A-Za-z0-9]{18,}$\", account_id):\n            _log(\"check_domain\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n            return _err(\"VALIDATION_ERROR\", \"account_id is malformed.\")\n        if not isinstance(fqdn, str) or not fqdn.strip():\n            _log(\"check_domain\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n            return _err(\"VALIDATION_ERROR\", \"fqdn is required and must be a non-empty string.\")\n    except Exception:\n        _log(\"check_domain\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"Invalid input.\")\n\n    if currency is None:\n        currency = \"USD\"\n    if include_premium is None:\n        include_premium = False\n    if term_years is None:\n        term_years = 1\n\n    allowed_currencies = {\"USD\", \"EUR\", \"GBP\", \"CAD\", \"AUD\"}\n    if not isinstance(currency, str) or currency not in allowed_currencies:\n        _log(\"check_domain\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"currency is not supported.\", allowed=list(sorted(allowed_currencies)))\n    if not isinstance(term_years, int) or term_years < 1 or term_years > 10:\n        _log(\"check_domain\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"term_years must be an integer between 1 and 10.\")\n    if not isinstance(include_premium, bool):\n        _log(\"check_domain\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"include_premium must be a boolean.\")\n\n    # Domain validation (pragmatic)\n    fqdn_norm = fqdn.strip().lower().rstrip(\".\")\n    # Basic: labels 1..63, total <=253, allowed chars a-z0-9- plus punycode prefix\n    if len(fqdn_norm) > 253 or \".\" not in fqdn_norm:\n        _log(\"check_domain\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"fqdn must be a valid domain name.\")\n    labels = fqdn_norm.split(\".\")\n    if any((not lab) or len(lab) > 63 for lab in labels):\n        _log(\"check_domain\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"fqdn must be a valid domain name.\")\n    lab_re = re.compile(r\"^(xn--)?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$\")\n    for lab in labels:\n        if not lab_re.match(lab):\n            _log(\"check_domain\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n            return _err(\"VALIDATION_ERROR\", \"fqdn must be a valid domain name (punycode allowed).\")\n    sld = labels[-2]\n    tld = labels[-1]\n    if not re.match(r\"^(xn--)?[a-z0-9-]{2,63}$\", tld):\n        _log(\"check_domain\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"tld must be lowercase ascii or punycode.\")\n\n    accounts = _load(\"accounts.json\")\n    acct = next((a for a in accounts if isinstance(a, dict) and a.get(\"account_id\") == account_id), None)\n    if not acct:\n        _log(\"check_domain\", \"error\", meta={\"code\": \"NOT_FOUND\"})\n        return _err(\"NOT_FOUND\", \"account_id does not exist.\")\n    if acct.get(\"status\") != \"active\":\n        _log(\"check_domain\", \"error\", meta={\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"Account connection is not active.\")\n\n    # Business rule: create/update (reuse) non-terminal order in status 'checking'\n    orders = _load(\"domain_registration_orders.json\")\n    if not isinstance(orders, list):\n        orders = []\n\n    non_terminal = {\"draft\", \"checking\", \"ready\", \"submitted\"}\n    order = None\n    for o in orders:\n        if not isinstance(o, dict):\n            continue\n        if o.get(\"account_id\") == account_id and str(o.get(\"fqdn\", \"\")).lower() == fqdn_norm and o.get(\"status\") in non_terminal:\n            order = o\n            break\n\n    def _gen_id(prefix):\n        return prefix + \"\".join(random.choices(string.ascii_letters + string.digits, k=22))\n\n    # Determine availability against existing active domains in this store (best-effort)\n    domains = _load(\"domains.json\")\n    is_taken = False\n    for d in domains:\n        if not isinstance(d, dict):\n            continue\n        if str(d.get(\"fqdn\", \"\")).lower() == fqdn_norm and d.get(\"status\") in {\"active\", \"pending_transfer\", \"suspended\", \"expired\"}:\n            is_taken = True\n            break\n\n    # Premium heuristic: very short SLD or contains \"premium\"\n    is_premium = False\n    premium_price = None\n    if include_premium:\n        if len(sld) <= 3 or \"premium\" in fqdn_norm:\n            is_premium = True\n            # Deterministic-ish premium price based on sld length\n            premium_price = float(max(199.0, 999.0 - (len(sld) * 100.0)))\n\n    # Pricing: use tld_pricing if present+valid; otherwise upsert a default row for this account\n    pricing_rows = _load(\"tld_pricing.json\")\n    if not isinstance(pricing_rows, list):\n        pricing_rows = []\n\n    def _parse_dt(x):\n        if not x or not isinstance(x, str):\n            return None\n        try:\n            if x.endswith(\"Z\"):\n                x2 = x[:-1]\n                return datetime.datetime.fromisoformat(x2)\n            return datetime.datetime.fromisoformat(x)\n        except Exception:\n            return None\n\n    def _is_not_expired(row):\n        exp = _parse_dt(row.get(\"expires_at\"))\n        eff = _parse_dt(row.get(\"effective_at\"))\n        if eff is None:\n            return False\n        if exp is None:\n            return True\n        return exp > datetime.datetime.utcnow()\n\n    # pick most recent effective_at row matching\n    candidates = [\n        r for r in pricing_rows\n        if isinstance(r, dict)\n        and r.get(\"tld\") == tld\n        and r.get(\"currency\") == currency\n        and r.get(\"operation\") == \"register\"\n        and r.get(\"duration_years\") == term_years\n        and (r.get(\"source_account_id\") in (None, account_id))\n        and _is_not_expired(r)\n    ]\n    def _eff_key(r):\n        dt = _parse_dt(r.get(\"effective_at\")) or datetime.datetime.min\n        return dt\n    candidates.sort(key=_eff_key, reverse=True)\n    pricing = candidates[0] if candidates else None\n\n    if pricing is None:\n        # Upsert a default pricing row (simulating refresh from Namecheap)\n        base_by_tld = {\n            \"com\": 12.98, \"net\": 14.98, \"org\": 13.98, \"io\": 39.98, \"dev\": 17.98, \"app\": 17.98\n        }\n        base = float(base_by_tld.get(tld, 19.98))\n        # crude FX multipliers\n        fx = {\"USD\": 1.0, \"EUR\": 0.92, \"GBP\": 0.78, \"CAD\": 1.34, \"AUD\": 1.52}\n        price = round(base * term_years * fx[currency], 2)\n        promo = None\n        if term_years == 1 and tld in {\"com\", \"net\"}:\n            promo = round(price * 0.85, 2)\n        pricing = {\n            \"tld_price_id\": _gen_id(\"nc_tldp_\"),\n            \"tld\": tld,\n            \"currency\": currency,\n            \"operation\": \"register\",\n            \"duration_years\": term_years,\n            \"price\": float(price),\n            \"promo_price\": float(promo) if promo is not None else None,\n            \"is_premium_possible\": True,\n            \"effective_at\": now,\n            \"expires_at\": (datetime.datetime.utcnow() + datetime.timedelta(days=7)).replace(microsecond=0).isoformat() + \"Z\",\n            \"source_account_id\": account_id,\n            \"created_at\": now,\n            \"updated_at\": now\n        }\n        # Enforce numeric constraints\n        if pricing[\"price\"] < 0 or (pricing[\"promo_price\"] is not None and pricing[\"promo_price\"] < 0):\n            _log(\"check_domain\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n            return _err(\"VALIDATION_ERROR\", \"Computed pricing invalid.\")\n        pricing_rows.append(pricing)\n        _save(\"tld_pricing.json\", pricing_rows)\n\n    availability_result = {\n        \"fqdn\": fqdn_norm,\n        \"sld\": sld,\n        \"tld\": tld,\n        \"available\": (not is_taken),\n        \"premium\": bool(is_premium) if include_premium else False,\n        \"premium_price\": float(premium_price) if (include_premium and is_premium and premium_price is not None) else None,\n        \"checked_at\": now\n    }\n\n    pricing_snapshot = {\n        \"currency\": currency,\n        \"operation\": \"register\",\n        \"duration_years\": term_years,\n        \"list_price\": pricing.get(\"price\"),\n        \"promo_price\": pricing.get(\"promo_price\"),\n        \"premium_price\": availability_result.get(\"premium_price\"),\n        \"subtotal\": float(availability_result.get(\"premium_price\") if availability_result.get(\"premium_price\") is not None else (pricing.get(\"promo_price\") if pricing.get(\"promo_price\") is not None else pricing.get(\"price\"))),\n        \"taxes\": 0.0,\n        \"fees\": 0.0,\n        \"total\": float(availability_result.get(\"premium_price\") if availability_result.get(\"premium_price\") is not None else (pricing.get(\"promo_price\") if pricing.get(\"promo_price\") is not None else pricing.get(\"price\")))\n    }\n\n    # Create or update order row; set status to 'checking' (or keep in checking/ready etc. but BR says status 'checking')\n    if order is None:\n        order = {\n            \"order_id\": _gen_id(\"nc_ord_\"),\n            \"account_id\": account_id,\n            \"fqdn\": fqdn_norm,\n            \"tld\": tld,\n            \"term_years\": term_years,\n            \"add_whois_guard\": False,\n            \"contact_set_id\": None,\n            \"availability_result\": availability_result,\n            \"pricing_snapshot\": pricing_snapshot,\n            \"namecheap_order_id\": None,\n            \"namecheap_transaction_id\": None,\n            \"status\": \"checking\",\n            \"failure_code\": None,\n            \"failure_message\": None,\n            \"created_at\": now,\n            \"updated_at\": now\n        }\n        orders.append(order)\n    else:\n        # Transition to checking if needed, validate transitions\n        transitions = {\n            \"draft\": [\"checking\", \"cancelled\"],\n            \"checking\": [\"ready\", \"failed\", \"cancelled\"],\n            \"ready\": [\"submitted\", \"cancelled\"],\n            \"submitted\": [\"succeeded\", \"failed\"],\n            \"succeeded\": [],\n            \"failed\": [\"draft\"],\n            \"cancelled\": []\n        }\n        cur = order.get(\"status\")\n        if cur != \"checking\":\n            if \"checking\" not in transitions.get(cur, []):\n                _log(\"check_domain\", \"error\", meta={\"code\": \"INVALID_TRANSITION\", \"from\": cur, \"to\": \"checking\"})\n                return _err(\"INVALID_TRANSITION\", f\"Cannot transition order from {cur} to checking.\", from_status=cur, to_status=\"checking\")\n            order[\"status\"] = \"checking\"\n        order[\"tld\"] = tld\n        order[\"term_years\"] = term_years\n        order[\"availability_result\"] = availability_result\n        order[\"pricing_snapshot\"] = pricing_snapshot\n        order[\"failure_code\"] = None\n        order[\"failure_message\"] = None\n        order[\"updated_at\"] = now\n\n    # If available, mark order ready (common backend behavior after check)\n    if availability_result[\"available\"]:\n        transitions = {\n            \"draft\": [\"checking\", \"cancelled\"],\n            \"checking\": [\"ready\", \"failed\", \"cancelled\"],\n            \"ready\": [\"submitted\", \"cancelled\"],\n            \"submitted\": [\"succeeded\", \"failed\"],\n            \"succeeded\": [],\n            \"failed\": [\"draft\"],\n            \"cancelled\": []\n        }\n        if order[\"status\"] == \"checking\":\n            if \"ready\" in transitions[\"checking\"]:\n                order[\"status\"] = \"ready\"\n                order[\"updated_at\"] = now\n\n    _save(\"domain_registration_orders.json\", orders)\n\n    body = {\n        \"order\": order,\n        \"availability\": availability_result,\n        \"pricing\": pricing_snapshot\n    }\n    _log(\"check_domain\", \"ok\", meta={\"account_id\": account_id, \"fqdn\": fqdn_norm})\n    return body\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_dns_hosts",
+          "description": "Lists DNS host records for the specified domain, returning a paged result set using limit and cursor and supporting filtering by status, record type, and host plus the requested sort order. Raises VALIDATION_ERROR if domain_id is malformed, any filter value is not one of the allowed enums, or limit is outside 1–200. Raises NOT_FOUND if the domain_id does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "domain_id": {
+                "type": "string",
+                "pattern": "^nc_dom_[A-Za-z0-9]{18,}$",
+                "description": "Domain id to retrieve DNS host records for."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "deleted"
+                ],
+                "description": "Filter DNS host records by status."
+              },
+              "record_type": {
+                "type": "string",
+                "enum": [
+                  "A",
+                  "AAAA",
+                  "CNAME",
+                  "TXT",
+                  "MX",
+                  "NS",
+                  "SRV",
+                  "CAA",
+                  "URL",
+                  "URL301",
+                  "FRAME"
+                ],
+                "description": "Filter DNS host records by record type."
+              },
+              "host": {
+                "type": "string",
+                "description": "Filter DNS host records by host/name (e.g., \"@\", \"www\")."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of DNS host records to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor for the next page of DNS host records."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "-created_at",
+                  "updated_at",
+                  "-updated_at",
+                  "host",
+                  "-host"
+                ],
+                "description": "Sort order for returned DNS host records."
+              }
+            },
+            "required": [
+              "domain_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_dns_hosts(domain_id, status=None, record_type=None, host=None, limit=None, cursor=None, sort=None, **_extra):\n    import json, os, datetime, re, time, random, string\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0440000\" if __import__(\"os\").path.isdir(\"./environment_mix/0440000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status_s, meta=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            logs.append({\n                \"request_id\": \"req_\" + \"\".join(random.choices(string.ascii_lowercase + string.digits, k=24)),\n                \"endpoint\": endpoint,\n                \"status\": status_s,\n                \"latency_ms\": int((time.time() - start) * 1000),\n                \"timestamp\": now,\n                \"meta\": meta or {}\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            return\n\n    if not isinstance(domain_id, str) or not re.match(r\"^nc_dom_[A-Za-z0-9]{18,}$\", domain_id):\n        _log(\"get_dns_hosts\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"domain_id is malformed.\")\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        _log(\"get_dns_hosts\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200.\")\n    if status is not None and (not isinstance(status, str) or status not in {\"active\", \"deleted\"}):\n        _log(\"get_dns_hosts\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: active, deleted.\")\n    allowed_types = {\"A\",\"AAAA\",\"CNAME\",\"TXT\",\"MX\",\"NS\",\"SRV\",\"CAA\",\"URL\",\"URL301\",\"FRAME\"}\n    if record_type is not None and (not isinstance(record_type, str) or record_type not in allowed_types):\n        _log(\"get_dns_hosts\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"record_type is invalid.\", allowed=list(sorted(allowed_types)))\n    if host is not None and not isinstance(host, str):\n        _log(\"get_dns_hosts\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"host must be a string.\")\n    if sort is None:\n        sort = \"created_at\"\n    if sort not in {\"created_at\",\"-created_at\",\"updated_at\",\"-updated_at\",\"host\",\"-host\"}:\n        _log(\"get_dns_hosts\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"sort is invalid.\")\n    if cursor is not None and not isinstance(cursor, str):\n        _log(\"get_dns_hosts\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n\n    domains = _load(\"domains.json\")\n    dom = next((d for d in domains if isinstance(d, dict) and d.get(\"domain_id\") == domain_id), None)\n    if not dom:\n        _log(\"get_dns_hosts\", \"error\", meta={\"code\": \"NOT_FOUND\"})\n        return _err(\"NOT_FOUND\", \"domain_id does not exist.\")\n\n    # Scope/auth: pick an active account that owns this domain\n    accounts = _load(\"accounts.json\")\n    acct = next((a for a in accounts if isinstance(a, dict) and a.get(\"account_id\") == dom.get(\"account_id\") and a.get(\"status\") == \"active\"), None)\n    if not acct:\n        _log(\"get_dns_hosts\", \"error\", meta={\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"No active connected account can access this domain.\")\n\n    dns = _load(\"dns_hosts.json\")\n    if not isinstance(dns, list):\n        dns = []\n\n    # Business rule: only return active; and if stale, simulate resync + soft-delete missing\n    # Determine staleness using domain.last_synced_at\n    def _parse_dt(x):\n        if not x or not isinstance(x, str):\n            return None\n        try:\n            if x.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(x[:-1])\n            return datetime.datetime.fromisoformat(x)\n        except Exception:\n            return None\n\n    last = _parse_dt(dom.get(\"last_synced_at\"))\n    stale = (last is None) or ((datetime.datetime.utcnow() - last) > datetime.timedelta(hours=6))\n\n    # Simulate resync: if stale, update last_synced_at of existing active records; and soft-delete records that look orphaned\n    # Orphan heuristic: if record hasn't been synced in > 30 days, mark deleted.\n    if stale:\n        changed = False\n        cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=30)\n        for r in dns:\n            if not isinstance(r, dict) or r.get(\"domain_id\") != domain_id:\n                continue\n            if r.get(\"status\") == \"active\":\n                ls = _parse_dt(r.get(\"last_synced_at\"))\n                if ls is not None and ls < cutoff:\n                    # transition active -> deleted\n                    r[\"status\"] = \"deleted\"\n                    r[\"updated_at\"] = now\n                    changed = True\n                else:\n                    r[\"last_synced_at\"] = now\n                    r[\"updated_at\"] = now\n                    changed = True\n        if changed:\n            _save(\"dns_hosts.json\", dns)\n        dom[\"last_synced_at\"] = now\n        dom[\"updated_at\"] = now\n        _save(\"domains.json\", domains)\n\n    # Filter; business rule says return only active rows (regardless of filter)\n    rows = [r for r in dns if isinstance(r, dict) and r.get(\"domain_id\") == domain_id and r.get(\"status\") == \"active\"]\n    if status is not None:\n        # caller can request deleted, but backend rule forces active-only; return empty if asked for deleted\n        if status != \"active\":\n            rows = []\n    if record_type is not None:\n        rows = [r for r in rows if r.get(\"record_type\") == record_type]\n    if host is not None:\n        rows = [r for r in rows if r.get(\"host\") == host]\n\n    # Sort\n    reverse = sort.startswith(\"-\")\n    keyname = sort[1:] if reverse else sort\n    def _key(r):\n        v = r.get(keyname)\n        return \"\" if v is None else v\n    rows.sort(key=_key, reverse=reverse)\n\n    # Cursor is an integer offset encoded as \"off_<n>\"\n    offset = 0\n    if cursor:\n        m = re.match(r\"^off_(\\d+)$\", cursor)\n        if not m:\n            _log(\"get_dns_hosts\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid.\")\n        offset = int(m.group(1))\n\n    total = len(rows)\n    page = rows[offset:offset + limit]\n    next_off = offset + len(page)\n    has_more = next_off < total\n    next_cursor = f\"off_{next_off}\" if has_more else None\n\n    _log(\"get_dns_hosts\", \"ok\", meta={\"domain_id\": domain_id, \"returned\": len(page)})\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"sort\": sort\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_domain_contacts",
+          "description": "Lists contact sets (registrant/admin/tech/billing) for the specified domain, returning a paged result set using limit and cursor and supporting filtering by contact status and the requested sort order. Raises VALIDATION_ERROR if domain_id is malformed, status/sort is not one of the allowed values, or limit is outside 1–50. Raises NOT_FOUND if the domain_id does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "domain_id": {
+                "type": "string",
+                "pattern": "^nc_dom_[A-Za-z0-9]{18,}$",
+                "description": "Domain id to retrieve contact information for."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "current",
+                  "historical",
+                  "pending_update"
+                ],
+                "description": "Filter contact sets by status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Maximum number of contact sets to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor for the next page of contact sets."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "-created_at",
+                  "updated_at",
+                  "-updated_at",
+                  "last_synced_at",
+                  "-last_synced_at"
+                ],
+                "description": "Sort order for returned contact sets."
+              }
+            },
+            "required": [
+              "domain_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_domain_contacts(domain_id, status=None, limit=None, cursor=None, sort=None, **_extra):\n    import json, os, datetime, re, time, random, string\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0440000\" if __import__(\"os\").path.isdir(\"./environment_mix/0440000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status_s, meta=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            logs.append({\n                \"request_id\": \"req_\" + \"\".join(random.choices(string.ascii_lowercase + string.digits, k=24)),\n                \"endpoint\": endpoint,\n                \"status\": status_s,\n                \"latency_ms\": int((time.time() - start) * 1000),\n                \"timestamp\": now,\n                \"meta\": meta or {}\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            return\n\n    if not isinstance(domain_id, str) or not re.match(r\"^nc_dom_[A-Za-z0-9]{18,}$\", domain_id):\n        _log(\"get_domain_contacts\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"domain_id is malformed.\")\n    if limit is None:\n        limit = 20\n    if not isinstance(limit, int) or limit < 1 or limit > 50:\n        _log(\"get_domain_contacts\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 50.\")\n    if status is not None and (not isinstance(status, str) or status not in {\"current\",\"historical\",\"pending_update\"}):\n        _log(\"get_domain_contacts\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"status is invalid.\")\n    if sort is None:\n        sort = \"-created_at\"\n    if sort not in {\"created_at\",\"-created_at\",\"updated_at\",\"-updated_at\",\"last_synced_at\",\"-last_synced_at\"}:\n        _log(\"get_domain_contacts\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"sort is invalid.\")\n    if cursor is not None and not isinstance(cursor, str):\n        _log(\"get_domain_contacts\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n\n    domains = _load(\"domains.json\")\n    dom = next((d for d in domains if isinstance(d, dict) and d.get(\"domain_id\") == domain_id), None)\n    if not dom:\n        _log(\"get_domain_contacts\", \"error\", meta={\"code\": \"NOT_FOUND\"})\n        return _err(\"NOT_FOUND\", \"domain_id does not exist.\")\n\n    # Scope/auth: active account owning domain\n    accounts = _load(\"accounts.json\")\n    acct = next((a for a in accounts if isinstance(a, dict) and a.get(\"account_id\") == dom.get(\"account_id\") and a.get(\"status\") == \"active\"), None)\n    if not acct:\n        _log(\"get_domain_contacts\", \"error\", meta={\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"No active connected account can access this domain.\")\n\n    contacts = _load(\"domain_contacts.json\")\n    if not isinstance(contacts, list):\n        contacts = []\n\n    def _parse_dt(x):\n        if not x or not isinstance(x, str):\n            return None\n        try:\n            if x.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(x[:-1])\n            return datetime.datetime.fromisoformat(x)\n        except Exception:\n            return None\n\n    # Find current contact set\n    current = None\n    for c in contacts:\n        if isinstance(c, dict) and c.get(\"domain_id\") == domain_id and c.get(\"status\") == \"current\":\n            current = c\n            break\n\n    # Staleness: if none exists or last_synced_at older than 7 days -> \"sync\" from Namecheap\n    stale = True\n    if current and _parse_dt(current.get(\"last_synced_at\")):\n        stale = (datetime.datetime.utcnow() - _parse_dt(current.get(\"last_synced_at\"))) > datetime.timedelta(days=7)\n    elif current and current.get(\"last_synced_at\") == now:\n        stale = False\n\n    required_keys = [\"FirstName\",\"LastName\",\"Address1\",\"City\",\"StateProvince\",\"PostalCode\",\"Country\",\"Phone\",\"Email\"]\n    def _default_contact():\n        # Generate a plausible synced contact object\n        return {\n            \"FirstName\": \"Domain\",\n            \"LastName\": \"Owner\",\n            \"Address1\": \"1 Registrar Way\",\n            \"City\": \"Wilmington\",\n            \"StateProvince\": \"DE\",\n            \"PostalCode\": \"19801\",\n            \"Country\": \"US\",\n            \"Phone\": \"+1.3025550100\",\n            \"Email\": f\"admin@{dom.get('fqdn','example.com')}\"\n        }\n\n    def _gen_id(prefix):\n        return prefix + \"\".join(random.choices(string.ascii_letters + string.digits, k=22))\n\n    if stale:\n        # demote previous current to historical (lifecycle: current -> historical allowed)\n        changed = False\n        for c in contacts:\n            if not isinstance(c, dict) or c.get(\"domain_id\") != domain_id:\n                continue\n            if c.get(\"status\") == \"current\":\n                c[\"status\"] = \"historical\"\n                c[\"updated_at\"] = now\n                changed = True\n\n        new_set = {\n            \"contact_set_id\": _gen_id(\"nc_cset_\"),\n            \"domain_id\": domain_id,\n            \"status\": \"current\",\n            \"registrant\": _default_contact(),\n            \"admin\": _default_contact(),\n            \"tech\": _default_contact(),\n            \"billing\": _default_contact(),\n            \"source\": \"synced_from_namecheap\",\n            \"last_synced_at\": now,\n            \"created_at\": now,\n            \"updated_at\": now\n        }\n        # validate required keys\n        for k in (\"registrant\",\"admin\",\"tech\",\"billing\"):\n            obj = new_set.get(k)\n            if not isinstance(obj, dict) or any(rk not in obj or obj.get(rk) in (None, \"\") for rk in required_keys):\n                _log(\"get_domain_contacts\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n                return _err(\"VALIDATION_ERROR\", f\"{k} contact is missing required fields.\")\n        contacts.append(new_set)\n        _save(\"domain_contacts.json\", contacts)\n\n    # Filter/sort/paginate\n    rows = [c for c in contacts if isinstance(c, dict) and c.get(\"domain_id\") == domain_id]\n    if status is not None:\n        rows = [c for c in rows if c.get(\"status\") == status]\n\n    reverse = sort.startswith(\"-\")\n    keyname = sort[1:] if reverse else sort\n    def _key(r):\n        v = r.get(keyname)\n        return \"\" if v is None else v\n    rows.sort(key=_key, reverse=reverse)\n\n    offset = 0\n    if cursor:\n        m = re.match(r\"^off_(\\d+)$\", cursor)\n        if not m:\n            _log(\"get_domain_contacts\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid.\")\n        offset = int(m.group(1))\n\n    total = len(rows)\n    page = rows[offset:offset + limit]\n    next_off = offset + len(page)\n    has_more = next_off < total\n    next_cursor = f\"off_{next_off}\" if has_more else None\n\n    _log(\"get_domain_contacts\", \"ok\", meta={\"domain_id\": domain_id, \"returned\": len(page)})\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"sort\": sort\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_domain_info",
+          "description": "Returns detailed information for a single domain in your account by domain_id. Raises VALIDATION_ERROR if domain_id is malformed. Raises NOT_FOUND if the domain_id does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "domain_id": {
+                "type": "string",
+                "pattern": "^nc_dom_[A-Za-z0-9]{18,}$",
+                "description": "Domain id to fetch detailed information for."
+              }
+            },
+            "required": [
+              "domain_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_domain_info(domain_id, **_extra):\n    import json, os, datetime, re, time, random, string\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0440000\" if __import__(\"os\").path.isdir(\"./environment_mix/0440000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status_s, meta=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            logs.append({\n                \"request_id\": \"req_\" + \"\".join(random.choices(string.ascii_lowercase + string.digits, k=24)),\n                \"endpoint\": endpoint,\n                \"status\": status_s,\n                \"latency_ms\": int((time.time() - start) * 1000),\n                \"timestamp\": now,\n                \"meta\": meta or {}\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            return\n\n    if not isinstance(domain_id, str) or not re.match(r\"^nc_dom_[A-Za-z0-9]{18,}$\", domain_id):\n        _log(\"get_domain_info\", \"error\", meta={\"code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"domain_id is malformed.\")\n\n    domains = _load(\"domains.json\")\n    dom = next((d for d in domains if isinstance(d, dict) and d.get(\"domain_id\") == domain_id), None)\n    if not dom:\n        _log(\"get_domain_info\", \"error\", meta={\"code\": \"NOT_FOUND\"})\n        return _err(\"NOT_FOUND\", \"domain_id does not exist.\")\n\n    # Scope/auth: must be owned by an active connected account\n    accounts = _load(\"accounts.json\")\n    acct = next((a for a in accounts if isinstance(a, dict) and a.get(\"account_id\") == dom.get(\"account_id\") and a.get(\"status\") == \"active\"), None)\n    if not acct:\n        _log(\"get_domain_info\", \"error\", meta={\"code\": \"UNAUTHORIZED\"})\n        return _err(\"UNAUTHORIZED\", \"No active connected account can access this domain.\")\n\n    _log(\"get_domain_info\", \"ok\", meta={\"domain_id\": domain_id})\n    return {\"domain\": dom}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_domain_list",
+          "description": "Lists domains for the specified account, returning a paged result set using limit and cursor and supporting filtering by status, TLD, exact fqdn, substring search, auto-renew, WhoisGuard state, and expiry date range with the requested sort order. Raises VALIDATION_ERROR if account_id is malformed, any enum filter/sort is invalid, limit is outside 1–200, or expires_before/expires_after are not valid date-time values. Raises NOT_FOUND if the account_id does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "account_id": {
+                "type": "string",
+                "pattern": "^nc_acc_[A-Za-z0-9]{18,}$",
+                "description": "Namecheap account id whose domains should be listed."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "expired",
+                  "pending_transfer",
+                  "pending_delete",
+                  "suspended"
+                ],
+                "description": "Filter domains by status."
+              },
+              "tld": {
+                "type": "string",
+                "description": "Filter domains by TLD (e.g., \"com\")."
+              },
+              "fqdn": {
+                "type": "string",
+                "description": "Filter by exact fully-qualified domain name."
+              },
+              "search": {
+                "type": "string",
+                "description": "Substring search against domain fqdn."
+              },
+              "auto_renew": {
+                "type": "boolean",
+                "description": "Filter domains by auto-renew setting."
+              },
+              "whois_guard_enabled": {
+                "type": "boolean",
+                "description": "Filter domains by WhoisGuard status."
+              },
+              "expires_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Return only domains with expires_at before this timestamp."
+              },
+              "expires_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Return only domains with expires_at after this timestamp."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of domains to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor for the next page of domains."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "-created_at",
+                  "expires_at",
+                  "-expires_at",
+                  "fqdn",
+                  "-fqdn",
+                  "updated_at",
+                  "-updated_at"
+                ],
+                "description": "Sort order for returned domains."
+              }
+            },
+            "required": [
+              "account_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_domain_list(account_id, status=None, tld=None, fqdn=None, search=None, auto_renew=None, whois_guard_enabled=None, expires_before=None, expires_after=None, limit=None, cursor=None, sort=None, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0440000\" if __import__(\"os\").path.isdir(\"./environment_mix/0440000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.isoformat().replace(\"+00:00\", \"Z\")\n        return None\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            raise ValueError(f\"{field} must be an RFC3339 datetime string\")\n        try:\n            ss = s.strip()\n            if ss.endswith(\"Z\"):\n                ss = ss[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(ss)\n        except Exception:\n            raise ValueError(f\"{field} must be a valid RFC3339 datetime string\")\n\n    def _dt_val(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            try:\n                vv = v.strip()\n                if vv.endswith(\"Z\"):\n                    vv = vv[:-1] + \"+00:00\"\n                return datetime.datetime.fromisoformat(vv)\n            except Exception:\n                return None\n        return None\n\n    # Validate inputs\n    if not isinstance(account_id, str) or not re.match(r\"^nc_acc_[A-Za-z0-9]{18,}$\", account_id):\n        return _err(\"VALIDATION_ERROR\", \"account_id is malformed\", field=\"account_id\")\n\n    allowed_status = {\"active\", \"expired\", \"pending_transfer\", \"pending_delete\", \"suspended\"}\n    if status is not None and (not isinstance(status, str) or status not in allowed_status):\n        return _err(\"VALIDATION_ERROR\", \"Invalid status filter\", field=\"status\", allowed=sorted(allowed_status))\n\n    if tld is not None and not isinstance(tld, str):\n        return _err(\"VALIDATION_ERROR\", \"tld must be a string\", field=\"tld\")\n    if fqdn is not None and not isinstance(fqdn, str):\n        return _err(\"VALIDATION_ERROR\", \"fqdn must be a string\", field=\"fqdn\")\n    if search is not None and not isinstance(search, str):\n        return _err(\"VALIDATION_ERROR\", \"search must be a string\", field=\"search\")\n    if auto_renew is not None and not isinstance(auto_renew, bool):\n        return _err(\"VALIDATION_ERROR\", \"auto_renew must be a boolean\", field=\"auto_renew\")\n    if whois_guard_enabled is not None and not isinstance(whois_guard_enabled, bool):\n        return _err(\"VALIDATION_ERROR\", \"whois_guard_enabled must be a boolean\", field=\"whois_guard_enabled\")\n\n    try:\n        dt_before = _parse_dt(expires_before, \"expires_before\")\n        dt_after = _parse_dt(expires_after, \"expires_after\")\n    except ValueError as e:\n        return _err(\"VALIDATION_ERROR\", str(e))\n\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200\", field=\"limit\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\", field=\"cursor\")\n\n    allowed_sort = {\"created_at\", \"-created_at\", \"expires_at\", \"-expires_at\", \"fqdn\", \"-fqdn\", \"updated_at\", \"-updated_at\"}\n    if sort is None:\n        sort = \"fqdn\"\n    if not isinstance(sort, str) or sort not in allowed_sort:\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort\", field=\"sort\", allowed=sorted(allowed_sort))\n\n    # Authenticate ambient: ensure account exists and is usable\n    accounts = _load(\"accounts.json\")\n    acct = next((a for a in accounts if a.get(\"account_id\") == account_id and a.get(\"status\") == \"active\"), None)\n\n    request_logs = _load(\"request_logs.json\")\n    if not isinstance(request_logs, list):\n        request_logs = []\n\n    def _log(status_code, error_code=None):\n        request_logs.append({\n            \"request_id\": f\"req_{int(time.time()*1000)}_{os.getpid()}\",\n            \"endpoint\": \"get_domain_list\",\n            \"account_id\": account_id,\n            \"credential\": None,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - started) * 1000),\n            \"timestamp\": _iso(now),\n        })\n        _save(\"request_logs.json\", request_logs)\n\n    if acct is None:\n        _log(401, \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"No active account can serve this request\")\n\n    domains = _load(\"domains.json\")\n    if not isinstance(domains, list):\n        domains = []\n\n    # Scope by account_id (forbidden cross-account)\n    rows = [d for d in domains if d.get(\"account_id\") == account_id]\n\n    # Filters\n    if status is not None:\n        rows = [d for d in rows if d.get(\"status\") == status]\n    if tld is not None:\n        rows = [d for d in rows if isinstance(d.get(\"tld\"), str) and d.get(\"tld\") == tld]\n    if fqdn is not None:\n        rows = [d for d in rows if d.get(\"fqdn\") == fqdn]\n    if search is not None:\n        s = search.lower()\n        rows = [d for d in rows if isinstance(d.get(\"fqdn\"), str) and s in d.get(\"fqdn\").lower()]\n    if auto_renew is not None:\n        rows = [d for d in rows if d.get(\"auto_renew\") is auto_renew]\n    if whois_guard_enabled is not None:\n        rows = [d for d in rows if d.get(\"whois_guard_enabled\") is whois_guard_enabled]\n\n    if dt_before is not None:\n        def _before(d):\n            v = _dt_val(d.get(\"expires_at\"))\n            return v is not None and v < dt_before\n        rows = [d for d in rows if _before(d)]\n    if dt_after is not None:\n        def _after(d):\n            v = _dt_val(d.get(\"expires_at\"))\n            return v is not None and v > dt_after\n        rows = [d for d in rows if _after(d)]\n\n    # Sorting\n    desc = sort.startswith(\"-\")\n    key = sort[1:] if desc else sort\n\n    def _sort_key(d):\n        v = d.get(key)\n        if key in (\"created_at\", \"updated_at\", \"expires_at\", \"created_at_registrar\", \"last_synced_at\"):\n            dv = _dt_val(v)\n            # Ensure deterministic ordering even when missing: treat missing as far past for ascending\n            return dv if dv is not None else (datetime.datetime.max.replace(tzinfo=datetime.timezone.utc) if not desc else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc))\n        if v is None:\n            return \"\"\n        return v\n\n    rows.sort(key=_sort_key, reverse=desc)\n\n    # Cursor pagination: cursor is integer offset encoded as string \"o:<n>\"\n    offset = 0\n    if cursor:\n        if cursor.startswith(\"o:\"):\n            try:\n                offset = int(cursor[2:])\n                if offset < 0:\n                    raise ValueError()\n            except Exception:\n                _log(400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor\", field=\"cursor\")\n        else:\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\", field=\"cursor\")\n\n    total = len(rows)\n    page = rows[offset:offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = f\"o:{next_offset}\" if has_more else None\n\n    _log(200)\n    return {\n        \"object\": \"list\",\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"sort\": sort\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_tld_pricing",
+          "description": "Lists TLD pricing rows for the specified account, returning a paged result set using limit and cursor and supporting filtering by TLD, currency, operation type, duration, and effective timestamp, with an option to include rows that have expired and the requested sort order. Raises VALIDATION_ERROR if account_id is malformed, any enum filter/sort is invalid, duration_years is outside 1–10, limit is outside 1–200, or effective_at is not a valid date-time value. Raises NOT_FOUND if the account_id does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "account_id": {
+                "type": "string",
+                "pattern": "^nc_acc_[A-Za-z0-9]{18,}$",
+                "description": "Namecheap account id whose pricing feed should be used."
+              },
+              "tld": {
+                "type": "string",
+                "description": "Filter pricing by TLD (e.g., \"com\")."
+              },
+              "currency": {
+                "type": "string",
+                "enum": [
+                  "USD",
+                  "EUR",
+                  "GBP",
+                  "CAD",
+                  "AUD"
+                ],
+                "description": "Filter pricing by currency."
+              },
+              "operation": {
+                "type": "string",
+                "enum": [
+                  "register",
+                  "renew",
+                  "transfer",
+                  "redemption"
+                ],
+                "description": "Filter pricing by operation type."
+              },
+              "duration_years": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "description": "Filter pricing by duration in years."
+              },
+              "effective_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Return pricing effective at or before this timestamp."
+              },
+              "include_expired": {
+                "type": "boolean",
+                "description": "Whether to include pricing rows whose expires_at has passed."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of pricing rows to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor for the next page of pricing rows."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "tld",
+                  "-tld",
+                  "price",
+                  "-price",
+                  "effective_at",
+                  "-effective_at",
+                  "updated_at",
+                  "-updated_at"
+                ],
+                "description": "Sort order for returned pricing rows."
+              }
+            },
+            "required": [
+              "account_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_tld_pricing(account_id, tld=None, currency=None, operation=None, duration_years=None, effective_at=None, include_expired=None, limit=None, cursor=None, sort=None, **_extra):\n    import json, os, datetime, re, time, random\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0440000\" if __import__(\"os\").path.isdir(\"./environment_mix/0440000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.isoformat().replace(\"+00:00\", \"Z\")\n        return None\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            raise ValueError(f\"{field} must be an RFC3339 datetime string\")\n        try:\n            ss = s.strip()\n            if ss.endswith(\"Z\"):\n                ss = ss[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(ss)\n        except Exception:\n            raise ValueError(f\"{field} must be a valid RFC3339 datetime string\")\n\n    def _dt_val(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            try:\n                vv = v.strip()\n                if vv.endswith(\"Z\"):\n                    vv = vv[:-1] + \"+00:00\"\n                return datetime.datetime.fromisoformat(vv)\n            except Exception:\n                return None\n        return None\n\n    def _gen_id(prefix):\n        alphabet = \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\"\n        return prefix + \"\".join(random.choice(alphabet) for _ in range(22))\n\n    # Validate inputs\n    if not isinstance(account_id, str) or not re.match(r\"^nc_acc_[A-Za-z0-9]{18,}$\", account_id):\n        return _err(\"VALIDATION_ERROR\", \"account_id is malformed\", field=\"account_id\")\n\n    if tld is not None and not isinstance(tld, str):\n        return _err(\"VALIDATION_ERROR\", \"tld must be a string\", field=\"tld\")\n\n    allowed_currency = {\"USD\", \"EUR\", \"GBP\", \"CAD\", \"AUD\"}\n    if currency is not None and (not isinstance(currency, str) or currency not in allowed_currency):\n        return _err(\"VALIDATION_ERROR\", \"Invalid currency\", field=\"currency\", allowed=sorted(allowed_currency))\n\n    allowed_operation = {\"register\", \"renew\", \"transfer\", \"redemption\"}\n    if operation is not None and (not isinstance(operation, str) or operation not in allowed_operation):\n        return _err(\"VALIDATION_ERROR\", \"Invalid operation\", field=\"operation\", allowed=sorted(allowed_operation))\n\n    if duration_years is not None:\n        if not isinstance(duration_years, int) or duration_years < 1 or duration_years > 10:\n            return _err(\"VALIDATION_ERROR\", \"duration_years must be between 1 and 10\", field=\"duration_years\")\n\n    try:\n        eff_at = _parse_dt(effective_at, \"effective_at\")\n    except ValueError as e:\n        return _err(\"VALIDATION_ERROR\", str(e))\n\n    if include_expired is not None and not isinstance(include_expired, bool):\n        return _err(\"VALIDATION_ERROR\", \"include_expired must be a boolean\", field=\"include_expired\")\n\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200\", field=\"limit\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\", field=\"cursor\")\n\n    allowed_sort = {\"tld\", \"-tld\", \"price\", \"-price\", \"effective_at\", \"-effective_at\", \"updated_at\", \"-updated_at\"}\n    if sort is None:\n        sort = \"tld\"\n    if not isinstance(sort, str) or sort not in allowed_sort:\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort\", field=\"sort\", allowed=sorted(allowed_sort))\n\n    accounts = _load(\"accounts.json\")\n    acct = next((a for a in accounts if a.get(\"account_id\") == account_id and a.get(\"status\") == \"active\"), None)\n\n    request_logs = _load(\"request_logs.json\")\n    if not isinstance(request_logs, list):\n        request_logs = []\n\n    def _log(status_code, error_code=None):\n        request_logs.append({\n            \"request_id\": f\"req_{int(time.time()*1000)}_{os.getpid()}\",\n            \"endpoint\": \"get_tld_pricing\",\n            \"account_id\": account_id,\n            \"credential\": None,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - started) * 1000),\n            \"timestamp\": _iso(now),\n        })\n        _save(\"request_logs.json\", request_logs)\n\n    if acct is None:\n        _log(401, \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"No active account can serve this request\")\n\n    pricing = _load(\"tld_pricing.json\")\n    if not isinstance(pricing, list):\n        pricing = []\n\n    # Refresh from \"Namecheap\" when absent/expired for requested keys:\n    # Since offline, we simulate refresh deterministically by inserting a new effective price row now.\n    # We only refresh when the caller asks for a specific key (at least tld,currency,operation,duration_years).\n    def _is_expired(row, at):\n        ex = _dt_val(row.get(\"expires_at\"))\n        return ex is not None and ex <= at\n\n    def _matches_filters(row):\n        if tld is not None and row.get(\"tld\") != tld:\n            return False\n        if currency is not None and row.get(\"currency\") != currency:\n            return False\n        if operation is not None and row.get(\"operation\") != operation:\n            return False\n        if duration_years is not None and row.get(\"duration_years\") != duration_years:\n            return False\n        if eff_at is not None:\n            ea = _dt_val(row.get(\"effective_at\"))\n            if ea is None or ea > eff_at:\n                return False\n        if not include_expired:\n            if _is_expired(row, now):\n                return False\n        return True\n\n    def _group_key(row):\n        return (row.get(\"tld\"), row.get(\"currency\"), row.get(\"operation\"), row.get(\"duration_years\"), row.get(\"source_account_id\"))\n\n    # Determine if we should refresh: absent or only expired rows for requested specific key\n    specific_key = (tld is not None and currency is not None and operation is not None and duration_years is not None)\n    mutated = False\n    if specific_key:\n        key = (tld, currency, operation, duration_years, account_id)\n        candidates = [r for r in pricing if _group_key(r) == key]\n        usable = []\n        for r in candidates:\n            if eff_at is not None:\n                ea = _dt_val(r.get(\"effective_at\"))\n                if ea is None or ea > eff_at:\n                    continue\n            if include_expired:\n                usable.append(r)\n            else:\n                if not _is_expired(r, now):\n                    usable.append(r)\n        if len(usable) == 0:\n            base_price = 8.0 + (hash((tld, currency, operation, duration_years, account_id)) % 4000) / 100.0\n            promo = None\n            if operation == \"register\" and duration_years == 1:\n                promo = max(0.0, base_price - 1.5)\n            new_row = {\n                \"tld_price_id\": _gen_id(\"nc_tldp_\"),\n                \"tld\": tld,\n                \"currency\": currency,\n                \"operation\": operation,\n                \"duration_years\": duration_years,\n                \"price\": float(round(base_price, 2)),\n                \"promo_price\": float(round(promo, 2)) if promo is not None else None,\n                \"is_premium_possible\": True if tld not in (\"com\", \"net\", \"org\") else False,\n                \"effective_at\": _iso(now),\n                \"expires_at\": _iso(now + datetime.timedelta(days=7)),\n                \"source_account_id\": account_id,\n                \"created_at\": _iso(now),\n                \"updated_at\": _iso(now),\n            }\n            # Enforce constraints\n            if new_row[\"duration_years\"] < 1 or new_row[\"duration_years\"] > 10 or new_row[\"price\"] < 0 or (new_row[\"promo_price\"] is not None and new_row[\"promo_price\"] < 0):\n                _log(500, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"Generated pricing violated constraints\")\n            pricing.append(new_row)\n            mutated = True\n\n    # Filter rows\n    rows = [r for r in pricing if _matches_filters(r)]\n\n    # \"Most recent non-expired per group\" unless include_expired explicitly True\n    if not include_expired:\n        best = {}\n        for r in rows:\n            gk = _group_key(r)\n            ea = _dt_val(r.get(\"effective_at\")) or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n            cur = best.get(gk)\n            if cur is None:\n                best[gk] = r\n            else:\n                cea = _dt_val(cur.get(\"effective_at\")) or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n                if ea > cea:\n                    best[gk] = r\n        rows = list(best.values())\n\n    # Sorting\n    desc = sort.startswith(\"-\")\n    keyname = sort[1:] if desc else sort\n\n    def _sort_key(r):\n        v = r.get(keyname)\n        if keyname in (\"effective_at\", \"updated_at\", \"expires_at\", \"created_at\"):\n            dv = _dt_val(v)\n            return dv if dv is not None else (datetime.datetime.max.replace(tzinfo=datetime.timezone.utc) if not desc else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc))\n        if keyname == \"price\":\n            try:\n                return float(v)\n            except Exception:\n                return float(\"inf\") if not desc else float(\"-inf\")\n        if v is None:\n            return \"\"\n        return v\n\n    rows.sort(key=_sort_key, reverse=desc)\n\n    # Cursor pagination\n    offset = 0\n    if cursor:\n        if cursor.startswith(\"o:\"):\n            try:\n                offset = int(cursor[2:])\n                if offset < 0:\n                    raise ValueError()\n            except Exception:\n                _log(400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor\", field=\"cursor\")\n        else:\n            _log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\", field=\"cursor\")\n\n    total = len(rows)\n    page = rows[offset:offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = f\"o:{next_offset}\" if has_more else None\n\n    if mutated:\n        for r in pricing:\n            if isinstance(r, dict) and \"updated_at\" in r and r.get(\"updated_at\") is None:\n                r[\"updated_at\"] = _iso(now)\n        _save(\"tld_pricing.json\", pricing)\n\n    _log(200)\n    return {\n        \"object\": \"list\",\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"sort\": sort\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "register_domain",
+          "description": "Creates a domain registration request for the specified FQDN under the given account using the provided contact_set, term_years (1–10), and optional WhoisGuard add-on, and returns the resulting registration record. Raises VALIDATION_ERROR if account_id or fqdn is malformed, term_years is outside 1–10, required contact_set sections are missing, or contact_set is not an object containing registrant/admin/tech/billing. Raises NOT_FOUND if the account_id does not exist, and CONFLICT if the domain is not available to register.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "account_id": {
+                "type": "string",
+                "pattern": "^nc_acc_[A-Za-z0-9]{18,}$",
+                "description": "Namecheap account id to place the registration under."
+              },
+              "fqdn": {
+                "type": "string",
+                "description": "Fully-qualified domain name to register (e.g., \"example.com\")."
+              },
+              "term_years": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "description": "Number of years to register the domain for."
+              },
+              "add_whois_guard": {
+                "type": "boolean",
+                "description": "Whether to add WhoisGuard privacy to the registration."
+              },
+              "contact_set": {
+                "type": "object",
+                "description": "Contact data to use for registration (registrant/admin/tech/billing).",
+                "properties": {
+                  "registrant": {
+                    "type": "object",
+                    "description": "Registrant contact fields for the domain registration.",
+                    "additionalProperties": true
+                  },
+                  "admin": {
+                    "type": "object",
+                    "description": "Administrative contact fields for the domain registration.",
+                    "additionalProperties": true
+                  },
+                  "tech": {
+                    "type": "object",
+                    "description": "Technical contact fields for the domain registration.",
+                    "additionalProperties": true
+                  },
+                  "billing": {
+                    "type": "object",
+                    "description": "Billing contact fields for the domain registration.",
+                    "additionalProperties": true
+                  }
+                },
+                "required": [
+                  "registrant",
+                  "admin",
+                  "tech",
+                  "billing"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "account_id",
+              "fqdn",
+              "term_years",
+              "contact_set"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def register_domain(account_id, fqdn, term_years, add_whois_guard=None, contact_set=None, **_extra):\n    import json, os, datetime, re, time, random\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0440000\" if __import__(\"os\").path.isdir(\"./environment_mix/0440000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"register_domain\"\n    credential_used = None\n\n    def _utcnow():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n\n    def _iso(dt):\n        if isinstance(dt, str):\n            return dt\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s if s.tzinfo else s.replace(tzinfo=datetime.timezone.utc)\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1]).replace(tzinfo=datetime.timezone.utc)\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _log(status_str, error_code=None):\n        req = _load(\"request_log.json\")\n        if not isinstance(req, list):\n            req = []\n        now = _utcnow()\n        req.append(\n            {\n                \"request_id\": \"req_\" + os.urandom(9).hex(),\n                \"endpoint\": endpoint,\n                \"credential_used\": credential_used,\n                \"status\": status_str,\n                \"error_code\": error_code,\n                \"timestamp\": _iso(now),\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            }\n        )\n        _save(\"request_log.json\", req)\n\n    # Simple global rate limit using request log (observably enforced)\n    def _rate_limit_check():\n        req = _load(\"request_log.json\")\n        if not isinstance(req, list):\n            return None\n        now = _utcnow()\n        window_s = 60\n        limit = 120\n        cnt = 0\n        for r in req:\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if not ts:\n                continue\n            if (now - ts).total_seconds() <= window_s:\n                cnt += 1\n        if cnt >= limit:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded; retry later.\", limit=limit, window_seconds=window_s)\n        return None\n\n    def _gen_id(prefix):\n        alphabet = \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\"\n        return prefix + \"\".join(random.choice(alphabet) for _ in range(22))\n\n    def _parse_fqdn(s):\n        if not isinstance(s, str):\n            return None\n        s = s.strip().lower().rstrip(\".\")\n        if len(s) < 3 or len(s) > 253:\n            return None\n        labels = s.split(\".\")\n        if len(labels) < 2:\n            return None\n        label_re = re.compile(r\"^(xn--[a-z0-9-]{1,59}|[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)$\")\n        for lab in labels:\n            if len(lab) < 1 or len(lab) > 63:\n                return None\n            if not label_re.match(lab):\n                return None\n        tld = labels[-1]\n        if not re.match(r\"^(xn--[a-z0-9-]{2,59}|[a-z0-9]{2,63})$\", tld):\n            return None\n        return s\n\n    def _split_domain(norm_fqdn):\n        parts = norm_fqdn.split(\".\")\n        return parts[-2], parts[-1]\n\n    def _allowed_transition(cur, nxt):\n        transitions = {\n            \"draft\": [\"checking\", \"cancelled\"],\n            \"checking\": [\"ready\", \"failed\", \"cancelled\"],\n            \"ready\": [\"submitted\", \"cancelled\"],\n            \"submitted\": [\"succeeded\", \"failed\"],\n            \"succeeded\": [],\n            \"failed\": [\"draft\"],\n            \"cancelled\": [],\n        }\n        return nxt in transitions.get(cur, [])\n\n    # Rate limit\n    rl = _rate_limit_check()\n    if rl:\n        _log(\"error\", \"RATE_LIMIT\")\n        return rl\n\n    # Validate inputs\n    if not isinstance(account_id, str) or not re.match(r\"^nc_acc_[A-Za-z0-9]{18,}$\", account_id or \"\"):\n        _log(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"account_id is malformed.\", field=\"account_id\")\n\n    norm_fqdn = _parse_fqdn(fqdn)\n    if norm_fqdn is None:\n        _log(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"fqdn must be a valid domain name.\", field=\"fqdn\")\n\n    if not isinstance(term_years, int) or term_years < 1 or term_years > 10:\n        _log(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"term_years must be an integer between 1 and 10.\", field=\"term_years\")\n\n    if add_whois_guard is not None and not isinstance(add_whois_guard, bool):\n        _log(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"add_whois_guard must be boolean.\", field=\"add_whois_guard\")\n\n    if not isinstance(contact_set, dict):\n        _log(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"contact_set must be an object.\", field=\"contact_set\")\n\n    for sec in [\"registrant\", \"admin\", \"tech\", \"billing\"]:\n        if sec not in contact_set:\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", f\"contact_set.{sec} is required.\", field=f\"contact_set.{sec}\")\n        if not isinstance(contact_set.get(sec), dict):\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", f\"contact_set.{sec} must be an object.\", field=f\"contact_set.{sec}\")\n\n    # IMPORTANT: Accept empty contact objects here (do not reject) because the datastore/business flows\n    # can support reusing an existing contact_set_id or syncing later; reject only missing required sections.\n    # (The schema-level \"required keys\" applies at domain_contacts API boundary; register_domain takes a\n    # vendor-style contact_set payload but this service must accept valid parameter schema inputs.)\n\n    # Authenticate/resolve account context (ambient auth; choose any active account matching account_id)\n    accounts = _load(\"accounts.json\")\n    if isinstance(accounts, dict) and \"rows\" in accounts:\n        accounts = accounts.get(\"rows\")  # defensive; but store appears list\n    if not isinstance(accounts, list):\n        accounts = []\n    acct = None\n    for a in accounts:\n        if a.get(\"account_id\") == account_id and a.get(\"status\") == \"active\":\n            acct = a\n            break\n    if acct is None:\n        _log(\"error\", \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"No active connected account can serve this request.\", account_id=account_id)\n\n    now = _utcnow()\n    sld, tld = _split_domain(norm_fqdn)\n\n    # Load orders, find or create a non-terminal order (draft/checking/ready/submitted) for this account+fqdn\n    orders = _load(\"domain_registration_orders.json\")\n    if not isinstance(orders, list):\n        orders = []\n    non_terminal = {\"draft\", \"checking\", \"ready\", \"submitted\"}\n    existing = None\n    for o in orders:\n        if o.get(\"account_id\") == account_id and (o.get(\"fqdn\") or \"\").lower() == norm_fqdn and o.get(\"status\") in non_terminal:\n            existing = o\n            break\n\n    # Create a domain_contacts row for this contact_set (source=provided_for_registration) so we can reference it\n    domain_contacts = _load(\"domain_contacts.json\")\n    if not isinstance(domain_contacts, list):\n        domain_contacts = []\n    contact_set_id = _gen_id(\"nc_con_\")\n    contact_row = {\n        \"contact_set_id\": contact_set_id,\n        \"domain_id\": \"__pending__:\" + account_id + \":\" + norm_fqdn,\n        \"status\": \"pending_update\",\n        \"registrant\": contact_set.get(\"registrant\", {}),\n        \"admin\": contact_set.get(\"admin\", {}),\n        \"tech\": contact_set.get(\"tech\", {}),\n        \"billing\": contact_set.get(\"billing\", {}),\n        \"source\": \"provided_for_registration\",\n        \"last_synced_at\": None,\n        \"created_at\": _iso(now),\n        \"updated_at\": _iso(now),\n    }\n    domain_contacts.append(contact_row)\n    _save(\"domain_contacts.json\", domain_contacts)\n\n    # Build/refresh availability result (simulate; real system would call Namecheap)\n    # If already registered in our domains table for same account, treat as taken.\n    domains = _load(\"domains.json\")\n    if not isinstance(domains, list):\n        domains = []\n    already_owned = any(d.get(\"account_id\") == account_id and (d.get(\"fqdn\") or \"\").lower() == norm_fqdn and d.get(\"status\") in [\"active\", \"expired\", \"pending_transfer\", \"pending_delete\", \"suspended\"] for d in domains)\n\n    availability = {\n        \"fqdn\": norm_fqdn,\n        \"checked_at\": _iso(now),\n        \"available\": not already_owned,\n        \"is_premium\": False,\n        \"tld\": tld,\n    }\n\n    # Pricing snapshot: attempt to use existing tld_pricing, else create a simple row\n    pricing_rows = _load(\"tld_pricing.json\")\n    if not isinstance(pricing_rows, list):\n        pricing_rows = []\n\n    def _most_recent_pricing(tld_, currency_, operation_, duration_, source_account_id_):\n        best = None\n        best_eff = None\n        for r in pricing_rows:\n            if r.get(\"tld\") != tld_:\n                continue\n            if r.get(\"currency\") != currency_:\n                continue\n            if r.get(\"operation\") != operation_:\n                continue\n            if r.get(\"duration_years\") != duration_:\n                continue\n            if (r.get(\"source_account_id\") or None) != (source_account_id_ or None):\n                continue\n            exp = _parse_dt(r.get(\"expires_at\"))\n            if exp is not None and exp <= now:\n                continue\n            eff = _parse_dt(r.get(\"effective_at\")) or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n            if best is None or eff > best_eff:\n                best = r\n                best_eff = eff\n        return best\n\n    currency = \"USD\"\n    pr = _most_recent_pricing(tld, currency, \"register\", term_years, account_id)\n    if pr is None:\n        # Upsert a minimal price row (valid constraints)\n        price_val = float(12.98 * term_years)\n        tld_price_id = _gen_id(\"nc_tldp_\")\n        pr = {\n            \"tld_price_id\": tld_price_id,\n            \"tld\": tld,\n            \"currency\": currency,\n            \"operation\": \"register\",\n            \"duration_years\": term_years,\n            \"price\": price_val,\n            \"promo_price\": None,\n            \"is_premium_possible\": True,\n            \"effective_at\": _iso(now),\n            \"expires_at\": _iso(now + datetime.timedelta(days=30)),\n            \"source_account_id\": account_id,\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(now),\n        }\n        pricing_rows.append(pr)\n        _save(\"tld_pricing.json\", pricing_rows)\n\n    subtotal = pr.get(\"promo_price\") if pr.get(\"promo_price\") is not None else pr.get(\"price\")\n    if not isinstance(subtotal, (int, float)) or subtotal < 0:\n        _log(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Pricing data is invalid (non-negative price required).\", field=\"tld_pricing.price\")\n\n    pricing_snapshot = {\n        \"currency\": pr.get(\"currency\"),\n        \"operation\": \"register\",\n        \"duration_years\": term_years,\n        \"unit_price\": float(subtotal) / float(term_years) if term_years else float(subtotal),\n        \"subtotal\": float(subtotal),\n        \"promo_applied\": pr.get(\"promo_price\") is not None,\n        \"whois_guard\": bool(add_whois_guard) if add_whois_guard is not None else False,\n        \"estimated_total\": float(subtotal),\n        \"priced_at\": _iso(now),\n    }\n\n    # Create or update order, ensuring uniqueness among non-terminal statuses\n    if existing is None:\n        order_id = _gen_id(\"nc_ord_\")\n        order = {\n            \"order_id\": order_id,\n            \"account_id\": account_id,\n            \"fqdn\": norm_fqdn,\n            \"tld\": tld,\n            \"term_years\": term_years,\n            \"add_whois_guard\": bool(add_whois_guard) if add_whois_guard is not None else False,\n            \"contact_set_id\": contact_set_id,\n            \"availability_result\": availability,\n            \"pricing_snapshot\": pricing_snapshot,\n            \"namecheap_order_id\": None,\n            \"namecheap_transaction_id\": None,\n            \"status\": \"ready\" if availability.get(\"available\") else \"failed\",\n            \"failure_code\": None if availability.get(\"available\") else \"DOMAIN_TAKEN\",\n            \"failure_message\": None if availability.get(\"available\") else \"Domain is already registered.\",\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(now),\n        }\n        orders.append(order)\n    else:\n        # Only update permitted fields; do not claim success if cannot proceed due to terminal status.\n        existing[\"term_years\"] = term_years\n        existing[\"add_whois_guard\"] = bool(add_whois_guard) if add_whois_guard is not None else existing.get(\"add_whois_guard\", False)\n        existing[\"contact_set_id\"] = contact_set_id\n        existing[\"availability_result\"] = availability\n        existing[\"pricing_snapshot\"] = pricing_snapshot\n        existing[\"tld\"] = tld\n        existing[\"updated_at\"] = _iso(now)\n        order = existing\n\n        # If availability says not available, move to failed if allowed\n        if not availability.get(\"available\"):\n            if order.get(\"status\") in [\"draft\", \"checking\", \"ready\"]:\n                if _allowed_transition(order[\"status\"], \"failed\"):\n                    order[\"status\"] = \"failed\"\n                    order[\"failure_code\"] = \"DOMAIN_TAKEN\"\n                    order[\"failure_message\"] = \"Domain is already registered.\"\n                    order[\"updated_at\"] = _iso(now)\n\n    # Persist order changes\n    _save(\"domain_registration_orders.json\", orders)\n\n    # If not available, return the order as failed (no further mutation)\n    if not availability.get(\"available\"):\n        _log(\"ok\", None)\n        return {\"order\": order, \"domain\": None}\n\n    # Proceed to submit (status must be ready, or transition from draft/checking to ready then submitted)\n    cur_status = order.get(\"status\")\n    if cur_status in [\"draft\", \"checking\"]:\n        # promote to ready if allowed\n        if _allowed_transition(cur_status, \"ready\"):\n            order[\"status\"] = \"ready\"\n            order[\"updated_at\"] = _iso(now)\n        cur_status = order.get(\"status\")\n\n    if cur_status != \"ready\":\n        _log(\"error\", \"INVALID_TRANSITION\")\n        return _err(\n            \"INVALID_TRANSITION\",\n            \"register_domain can only submit an order when status is 'ready' (or convertible from 'draft'/'checking' after a successful availability check).\",\n            order_id=order.get(\"order_id\"),\n            current_status=cur_status,\n            required_status=\"ready\",\n        )\n\n    # Transition to submitted\n    if not _allowed_transition(order[\"status\"], \"submitted\"):\n        _log(\"error\", \"INVALID_TRANSITION\")\n        return _err(\"INVALID_TRANSITION\", \"Order status transition to 'submitted' is not allowed.\", order_id=order.get(\"order_id\"), from_status=order.get(\"status\"), to_status=\"submitted\")\n\n    order[\"status\"] = \"submitted\"\n    order[\"updated_at\"] = _iso(now)\n    _save(\"domain_registration_orders.json\", orders)\n\n    # Simulate registrar response success\n    registrar_ok = True\n\n    now2 = _utcnow()\n    if registrar_ok:\n        if not _allowed_transition(order[\"status\"], \"succeeded\"):\n            _log(\"error\", \"INVALID_TRANSITION\")\n            return _err(\"INVALID_TRANSITION\", \"Order status transition to 'succeeded' is not allowed.\", order_id=order.get(\"order_id\"), from_status=order.get(\"status\"), to_status=\"succeeded\")\n\n        order[\"status\"] = \"succeeded\"\n        order[\"namecheap_order_id\"] = order.get(\"namecheap_order_id\") or (\"nc_order_\" + os.urandom(6).hex())\n        order[\"namecheap_transaction_id\"] = order.get(\"namecheap_transaction_id\") or (\"nc_txn_\" + os.urandom(6).hex())\n        order[\"failure_code\"] = None\n        order[\"failure_message\"] = None\n        order[\"updated_at\"] = _iso(now2)\n        _save(\"domain_registration_orders.json\", orders)\n\n        # Upsert domain row\n        domains = _load(\"domains.json\")\n        if not isinstance(domains, list):\n            domains = []\n        dom = None\n        for d in domains:\n            if d.get(\"account_id\") == account_id and (d.get(\"fqdn\") or \"\").lower() == norm_fqdn:\n                dom = d\n                break\n\n        if dom is None:\n            dom = {\n                \"domain_id\": _gen_id(\"nc_dom_\"),\n                \"account_id\": account_id,\n                \"fqdn\": norm_fqdn,\n                \"sld\": sld,\n                \"tld\": tld,\n                \"status\": \"active\",\n                \"auto_renew\": True,\n                \"whois_guard_enabled\": bool(order.get(\"add_whois_guard\")),\n                \"nameservers\": None,\n                \"created_at_registrar\": _iso(now2),\n                \"expires_at\": _iso(now2 + datetime.timedelta(days=365 * term_years)),\n                \"last_synced_at\": _iso(now2),\n                \"created_at\": _iso(now2),\n                \"updated_at\": _iso(now2),\n            }\n            domains.append(dom)\n        else:\n            # enforce allowed domain transitions: anything -> active is not always allowed; but on registration we set active\n            dom[\"status\"] = \"active\"\n            dom[\"tld\"] = tld\n            dom[\"sld\"] = sld\n            dom[\"whois_guard_enabled\"] = bool(order.get(\"add_whois_guard\"))\n            dom[\"last_synced_at\"] = _iso(now2)\n            if dom.get(\"expires_at\") is None:\n                dom[\"expires_at\"] = _iso(now2 + datetime.timedelta(days=365 * term_years))\n            dom[\"updated_at\"] = _iso(now2)\n        _save(\"domains.json\", domains)\n\n        # Attach contact set to real domain: set current and demote any previous current to historical\n        domain_contacts = _load(\"domain_contacts.json\")\n        if not isinstance(domain_contacts, list):\n            domain_contacts = []\n        # demote existing current rows for this domain\n        for r in domain_contacts:\n            if r.get(\"domain_id\") == dom[\"domain_id\"] and r.get(\"status\") == \"current\":\n                r[\"status\"] = \"historical\"\n                r[\"updated_at\"] = _iso(now2)\n        # update our pending contact row\n        for r in domain_contacts:\n            if r.get(\"contact_set_id\") == contact_set_id:\n                r[\"domain_id\"] = dom[\"domain_id\"]\n                # transition pending_update -> current allowed\n                if r.get(\"status\") in [\"pending_update\"]:\n                    r[\"status\"] = \"current\"\n                elif r.get(\"status\") == \"current\":\n                    pass\n                else:\n                    # if it was something else, keep but do not violate lifecycle by forcing\n                    pass\n                r[\"updated_at\"] = _iso(now2)\n                break\n        _save(\"domain_contacts.json\", domain_contacts)\n\n        _log(\"ok\", None)\n        return {\"order\": order, \"domain\": dom}\n\n    # Failure path\n    if not _allowed_transition(order[\"status\"], \"failed\"):\n        _log(\"error\", \"INVALID_TRANSITION\")\n        return _err(\"INVALID_TRANSITION\", \"Order status transition to 'failed' is not allowed.\", order_id=order.get(\"order_id\"), from_status=order.get(\"status\"), to_status=\"failed\")\n    order[\"status\"] = \"failed\"\n    order[\"failure_code\"] = \"PAYMENT_DECLINED\"\n    order[\"failure_message\"] = \"Card was declined by issuer; please use a different payment method.\"\n    order[\"updated_at\"] = _iso(now2)\n    _save(\"domain_registration_orders.json\", orders)\n    _log(\"ok\", None)\n    return {\"order\": order, \"domain\": None}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_domain_registration_order",
+          "description": "Creates a new domain registration order in status 'draft' for the authenticated account and FQDN, capturing desired term, currency context, optional WhoisGuard, and an optional existing contact_set_id. If a non-terminal order already exists for the same account and fqdn, the service may return that order instead of creating a duplicate. Raises VALIDATION_ERROR if fqdn is invalid, term_years is outside 1–10, or required fields are missing.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "fqdn": {
+                "type": "string",
+                "description": "Fully-qualified domain name to register (e.g., \"example.com\")."
+              },
+              "term_years": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "description": "Registration term length in years (1–10)."
+              },
+              "currency": {
+                "type": "string",
+                "enum": [
+                  "USD",
+                  "EUR",
+                  "GBP",
+                  "CAD",
+                  "AUD"
+                ],
+                "description": "Currency context for pricing snapshot and subsequent registration."
+              },
+              "add_whois_guard": {
+                "type": "boolean",
+                "description": "Whether to add WhoisGuard (when supported for the TLD)."
+              },
+              "contact_set_id": {
+                "type": "string",
+                "pattern": "^nc_con_[A-Za-z0-9]{18,}$",
+                "description": "Existing contact set id to use for registration; must belong to the same domain once created/linked."
+              }
+            },
+            "required": [
+              "fqdn",
+              "term_years"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_domain_registration_order(fqdn, term_years, currency=None, add_whois_guard=None, contact_set_id=None, **_extra):\n    import json, os, datetime, re, time, random\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0440000\" if __import__(\"os\").path.isdir(\"./environment_mix/0440000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.isoformat().replace(\"+00:00\", \"Z\")\n\n    def _gen_id(prefix):\n        alphabet = \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\"\n        return prefix + \"\".join(random.choice(alphabet) for _ in range(22))\n\n    def _parse_fqdn(s):\n        if not isinstance(s, str):\n            return None\n        s = s.strip().lower().rstrip(\".\")\n        if len(s) < 3 or len(s) > 253:\n            return None\n        labels = s.split(\".\")\n        if len(labels) < 2:\n            return None\n        label_re = re.compile(r\"^(xn--[a-z0-9-]{1,59}|[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)$\")\n        for lab in labels:\n            if len(lab) < 1 or len(lab) > 63:\n                return None\n            if not label_re.match(lab):\n                return None\n        tld = labels[-1]\n        if not re.match(r\"^(xn--[a-z0-9-]{2,59}|[a-z0-9]{2,63})$\", tld):\n            return None\n        return s\n\n    # Validate inputs\n    norm_fqdn = _parse_fqdn(fqdn)\n    if norm_fqdn is None:\n        return _err(\"VALIDATION_ERROR\", \"fqdn is malformed\", field=\"fqdn\")\n    if not isinstance(term_years, int) or term_years < 1 or term_years > 10:\n        return _err(\"VALIDATION_ERROR\", \"term_years must be between 1 and 10\", field=\"term_years\")\n\n    allowed_currency = {\"USD\", \"EUR\", \"GBP\", \"CAD\", \"AUD\"}\n    if currency is not None and (not isinstance(currency, str) or currency not in allowed_currency):\n        return _err(\"VALIDATION_ERROR\", \"Invalid currency\", field=\"currency\", allowed=sorted(allowed_currency))\n    if add_whois_guard is not None and not isinstance(add_whois_guard, bool):\n        return _err(\"VALIDATION_ERROR\", \"add_whois_guard must be a boolean\", field=\"add_whois_guard\")\n    if contact_set_id is not None:\n        if not isinstance(contact_set_id, str) or not re.match(r\"^nc_con_[A-Za-z0-9]{18,}$\", contact_set_id):\n            return _err(\"VALIDATION_ERROR\", \"contact_set_id is malformed\", field=\"contact_set_id\")\n\n    accounts = _load(\"accounts.json\")\n\n    # Ambient authentication: pick a working active account (cannot infer from params otherwise).\n    acct = next((a for a in accounts if a.get(\"status\") == \"active\"), None)\n\n    request_logs = _load(\"request_logs.json\")\n    if not isinstance(request_logs, list):\n        request_logs = []\n\n    def _log(status_code, error_code=None, account_id=None):\n        request_logs.append({\n            \"request_id\": f\"req_{int(time.time()*1000)}_{os.getpid()}\",\n            \"endpoint\": \"create_domain_registration_order\",\n            \"account_id\": account_id,\n            \"credential\": None,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - started) * 1000),\n            \"timestamp\": _iso(now),\n        })\n        _save(\"request_logs.json\", request_logs)\n\n    if acct is None:\n        _log(401, \"UNAUTHORIZED\", None)\n        return _err(\"UNAUTHORIZED\", \"No active account can serve this request\")\n\n    account_id = acct.get(\"account_id\")\n\n    orders = _load(\"domain_registration_orders.json\")\n    if not isinstance(orders, list):\n        orders = []\n    contacts = _load(\"domain_contacts.json\")\n    if not isinstance(contacts, list):\n        contacts = []\n\n    # Validate contact_set_id exists if provided\n    if contact_set_id is not None:\n        if not any(c.get(\"contact_set_id\") == contact_set_id for c in contacts):\n            _log(404, \"NOT_FOUND\", account_id)\n            return _err(\"NOT_FOUND\", \"contact_set_id not found\", contact_set_id=contact_set_id)\n\n    non_terminal = {\"draft\", \"checking\", \"ready\", \"submitted\"}\n    existing = [o for o in orders if o.get(\"account_id\") == account_id and o.get(\"fqdn\") == norm_fqdn and o.get(\"status\") in non_terminal]\n    # Return an existing order instead of duplicate (prefer draft/ready/checking/submitted)\n    rank = {\"draft\": 0, \"ready\": 1, \"checking\": 2, \"submitted\": 3}\n    existing.sort(key=lambda o: rank.get(o.get(\"status\"), 99))\n    if existing:\n        o = existing[0]\n        # update desired term/currency/addon/contact ref idempotently\n        o[\"term_years\"] = term_years\n        if currency is not None:\n            # capture pricing context in snapshot, not a schema field; store in pricing_snapshot\n            ps = o.get(\"pricing_snapshot\") if isinstance(o.get(\"pricing_snapshot\"), dict) else {}\n            ps[\"currency\"] = currency\n            o[\"pricing_snapshot\"] = ps\n        if add_whois_guard is not None:\n            o[\"add_whois_guard\"] = add_whois_guard\n        if contact_set_id is not None:\n            o[\"contact_set_id\"] = contact_set_id\n        o[\"updated_at\"] = _iso(now)\n        _save(\"domain_registration_orders.json\", orders)\n        _log(200, None, account_id)\n        return {\"order\": o, \"reused\": True}\n\n    tld = norm_fqdn.split(\".\")[-1]\n    order = {\n        \"order_id\": _gen_id(\"nc_ord_\"),\n        \"account_id\": account_id,\n        \"fqdn\": norm_fqdn,\n        \"tld\": tld,\n        \"term_years\": term_years,\n        \"add_whois_guard\": bool(add_whois_guard) if add_whois_guard is not None else False,\n        \"contact_set_id\": contact_set_id,\n        \"availability_result\": None,\n        \"pricing_snapshot\": {\"currency\": currency} if currency is not None else None,\n        \"namecheap_order_id\": None,\n        \"namecheap_transaction_id\": None,\n        \"status\": \"draft\",\n        \"failure_code\": None,\n        \"failure_message\": None,\n        \"created_at\": _iso(now),\n        \"updated_at\": _iso(now),\n    }\n\n    # Enforce uniqueness constraint for non-terminal statuses:\n    if any(o.get(\"account_id\") == account_id and o.get(\"fqdn\") == norm_fqdn and o.get(\"status\") in non_terminal for o in orders):\n        _log(409, \"CONFLICT\", account_id)\n        return _err(\"CONFLICT\", \"A non-terminal order already exists for this account and fqdn\")\n\n    orders.append(order)\n    _save(\"domain_registration_orders.json\", orders)\n\n    _log(200, None, account_id)\n    return {\"order\": order, \"reused\": False}\n"
+        },
+        {
+          "name": "get_domain_registration_order",
+          "description": "Returns a single domain registration order by order_id for the authenticated account, including its current status, availability result (if checked), and any stored Namecheap order/transaction identifiers. Raises VALIDATION_ERROR if order_id is malformed. Raises NOT_FOUND if the order does not exist or is not owned by the authenticated account.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "order_id": {
+                "type": "string",
+                "pattern": "^nc_ord_[A-Za-z0-9]{18,}$",
+                "description": "Domain registration order id to fetch."
+              }
+            },
+            "required": [
+              "order_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_domain_registration_order(order_id, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0440000\" if __import__(\"os\").path.isdir(\"./environment_mix/0440000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_domain_registration_order\"\n    credential_used = None\n\n    # Best-effort request logging if present\n    def _log(status, error_code=None):\n        req = _load(\"request_log.json\")\n        now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n        row = {\n            \"request_id\": \"req_\" + os.urandom(9).hex(),\n            \"endpoint\": endpoint,\n            \"credential_used\": credential_used,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if isinstance(req, list):\n            req.append(row)\n            _save(\"request_log.json\", req)\n\n    # Validation\n    if not isinstance(order_id, str) or not re.match(r\"^nc_ord_[A-Za-z0-9]{18,}$\", order_id or \"\"):\n        _log(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"order_id is malformed.\", field=\"order_id\")\n\n    accounts = _load(\"accounts.json\")\n    orders = _load(\"domain_registration_orders.json\")\n\n    # Ambient auth resolution: pick any active account (tool has no explicit credential parameter)\n    active_accounts = [a for a in accounts if isinstance(a, dict) and a.get(\"status\") == \"active\"]\n    if not active_accounts:\n        _log(\"error\", \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"No authenticated account context is available to serve this request.\")\n\n    # Enforce account scoping: order must be owned by the authenticated account.\n    # Since credentials are ambient and not provided, resolve to an account that actually owns the order.\n    order = None\n    for a in active_accounts:\n        for o in orders:\n            if isinstance(o, dict) and o.get(\"order_id\") == order_id and o.get(\"account_id\") == a.get(\"account_id\"):\n                order = o\n                credential_used = a.get(\"account_id\")\n                break\n        if order:\n            break\n\n    if not order:\n        _log(\"error\", \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Order not found for the authenticated account.\", order_id=order_id)\n\n    _log(\"ok\", None)\n    return {\n        \"order\": order\n    }\n"
+        },
+        {
+          "name": "update_domain_registration_order",
+          "description": "Updates a draft/failed domain registration order fields (term_years, add_whois_guard, contact_set_id) or transitions its status where allowed by the lifecycle. Rejects invalid status transitions and refuses updates for terminal orders. Raises VALIDATION_ERROR if order_id is malformed, term_years is outside 1–10, or the requested transition is not allowed. Raises NOT_FOUND if the order does not exist or is not owned by the authenticated account.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "order_id": {
+                "type": "string",
+                "pattern": "^nc_ord_[A-Za-z0-9]{18,}$",
+                "description": "Domain registration order id to update."
+              },
+              "term_years": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "description": "New registration term length in years (1–10)."
+              },
+              "add_whois_guard": {
+                "type": "boolean",
+                "description": "Whether to add WhoisGuard (when supported for the TLD)."
+              },
+              "contact_set_id": {
+                "type": "string",
+                "pattern": "^nc_con_[A-Za-z0-9]{18,}$",
+                "description": "Contact set id to associate with this order."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "checking",
+                  "ready",
+                  "submitted",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "Requested new order status. Transition must be allowed by the order lifecycle."
+              }
+            },
+            "required": [
+              "order_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_domain_registration_order(order_id, term_years=None, add_whois_guard=None, contact_set_id=None, status=None, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0440000\" if __import__(\"os\").path.isdir(\"./environment_mix/0440000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"update_domain_registration_order\"\n    credential_used = None  # ambient auth (no explicit credential parameter)\n\n    def _utcnow():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n\n    def _iso(dt):\n        if isinstance(dt, str):\n            return dt\n        if not isinstance(dt, datetime.datetime):\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s if s.tzinfo else s.replace(tzinfo=datetime.timezone.utc)\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1]).replace(tzinfo=datetime.timezone.utc)\n            dt = datetime.datetime.fromisoformat(s)\n            return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _append_request_log(status_str, error_code=None):\n        req = _load(\"request_log.json\")\n        if not isinstance(req, list):\n            req = []\n        now = _utcnow()\n        req.append(\n            {\n                \"request_id\": \"req_\" + os.urandom(9).hex(),\n                \"endpoint\": endpoint,\n                \"credential_used\": credential_used,\n                \"status\": status_str,\n                \"error_code\": error_code,\n                \"timestamp\": _iso(now),\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            }\n        )\n        _save(\"request_log.json\", req)\n\n    def _rate_limit_check():\n        # Simple per-endpoint sliding window rate limit (observable via request_log.json)\n        req = _load(\"request_log.json\")\n        if not isinstance(req, list):\n            return None\n        now = _utcnow()\n        window_s = 60\n        limit = 180\n        cnt = 0\n        for r in req:\n            if r.get(\"endpoint\") != endpoint:\n                continue\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if ts is None:\n                continue\n            if (now - ts).total_seconds() <= window_s:\n                cnt += 1\n                if cnt >= limit:\n                    return _err(\"RATE_LIMIT\", f\"Rate limit exceeded for {endpoint}: {limit} requests per {window_s}s.\")\n        return None\n\n    def _lifecycle_allowed_next(cur):\n        transitions = {\n            \"draft\": [\"checking\", \"cancelled\"],\n            \"checking\": [\"ready\", \"failed\", \"cancelled\"],\n            \"ready\": [\"submitted\", \"cancelled\"],\n            \"submitted\": [\"succeeded\", \"failed\"],\n            \"succeeded\": [],\n            \"failed\": [\"draft\"],\n            \"cancelled\": [],\n        }\n        return transitions.get(cur, [])\n\n    def _is_terminal(st):\n        return st in (\"succeeded\", \"cancelled\")\n\n    # ---- validate inputs (before any mutation) ----\n    if not isinstance(order_id, str) or not re.match(r\"^nc_ord_[A-Za-z0-9]{18,}$\", order_id):\n        rl = _rate_limit_check()\n        if rl:\n            _append_request_log(\"error\", rl[\"error\"][\"code\"])\n            return rl\n        e = _err(\"VALIDATION_ERROR\", \"order_id is malformed; expected pattern ^nc_ord_[A-Za-z0-9]{18,}$.\", order_id=order_id)\n        _append_request_log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    if term_years is not None:\n        if not isinstance(term_years, int) or isinstance(term_years, bool) or term_years < 1 or term_years > 10:\n            rl = _rate_limit_check()\n            if rl:\n                _append_request_log(\"error\", rl[\"error\"][\"code\"])\n                return rl\n            e = _err(\"VALIDATION_ERROR\", \"term_years must be an integer in [1,10].\", term_years=term_years)\n            _append_request_log(\"error\", e[\"error\"][\"code\"])\n            return e\n\n    if add_whois_guard is not None and not isinstance(add_whois_guard, bool):\n        rl = _rate_limit_check()\n        if rl:\n            _append_request_log(\"error\", rl[\"error\"][\"code\"])\n            return rl\n        e = _err(\"VALIDATION_ERROR\", \"add_whois_guard must be boolean when provided.\", add_whois_guard=add_whois_guard)\n        _append_request_log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    if contact_set_id is not None:\n        if not isinstance(contact_set_id, str) or not re.match(r\"^nc_con_[A-Za-z0-9]{18,}$\", contact_set_id):\n            rl = _rate_limit_check()\n            if rl:\n                _append_request_log(\"error\", rl[\"error\"][\"code\"])\n                return rl\n            e = _err(\n                \"VALIDATION_ERROR\",\n                \"contact_set_id is malformed; expected pattern ^nc_con_[A-Za-z0-9]{18,}$.\",\n                contact_set_id=contact_set_id,\n            )\n            _append_request_log(\"error\", e[\"error\"][\"code\"])\n            return e\n\n    if status is not None:\n        allowed = {\"draft\", \"checking\", \"ready\", \"submitted\", \"succeeded\", \"failed\", \"cancelled\"}\n        if not isinstance(status, str) or status not in allowed:\n            rl = _rate_limit_check()\n            if rl:\n                _append_request_log(\"error\", rl[\"error\"][\"code\"])\n                return rl\n            e = _err(\"VALIDATION_ERROR\", \"status must be one of: draft, checking, ready, submitted, succeeded, failed, cancelled.\", status=status)\n            _append_request_log(\"error\", e[\"error\"][\"code\"])\n            return e\n\n    # ---- rate limit enforcement ----\n    rl = _rate_limit_check()\n    if rl:\n        _append_request_log(\"error\", rl[\"error\"][\"code\"])\n        return rl\n\n    # ---- load order and related refs ----\n    orders = _load(\"domain_registration_orders.json\")\n    if not isinstance(orders, list):\n        orders = []\n\n    idx = None\n    order = None\n    for i, r in enumerate(orders):\n        if isinstance(r, dict) and r.get(\"order_id\") == order_id:\n            idx = i\n            order = r\n            break\n\n    if order is None:\n        e = _err(\"NOT_FOUND\", \"Order not found.\", order_id=order_id)\n        _append_request_log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    cur_status = order.get(\"status\")\n    if cur_status not in {\"draft\", \"checking\", \"ready\", \"submitted\", \"succeeded\", \"failed\", \"cancelled\"}:\n        e = _err(\"VALIDATION_ERROR\", \"Order has an unknown status in datastore; cannot update safely.\", order_id=order_id, current_status=cur_status)\n        _append_request_log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    # ---- enforce terminal-order update rules ----\n    # Real behaviour: terminal orders cannot be edited. However, treat \"no-op\" updates as idempotent success.\n    any_field_update = term_years is not None or add_whois_guard is not None or contact_set_id is not None\n    requested_transition = status is not None and status != cur_status\n\n    if _is_terminal(cur_status):\n        # allow no-op (including status==current) as idempotent read-your-write confirmation\n        if not any_field_update and not requested_transition:\n            _append_request_log(\"success\", None)\n            return {\n                \"order\": order,\n                \"updated\": False,\n            }\n        # allow explicit retry workflow for failed only; succeeded/cancelled are immutable\n        e = _err(\n            \"INVALID_TRANSITION\",\n            \"Order is in a terminal state and cannot be modified (business rule: terminal orders are immutable).\",\n            order_id=order_id,\n            current_status=cur_status,\n            requested_status=status,\n            allowed_next=_lifecycle_allowed_next(cur_status),\n        )\n        _append_request_log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    # ---- validate and enforce status transition (if requested) ----\n    new_status = cur_status\n    if status is not None:\n        if status == cur_status:\n            # idempotent: no transition\n            new_status = cur_status\n        else:\n            allowed_next = _lifecycle_allowed_next(cur_status)\n            if status not in allowed_next:\n                # IMPORTANT: vendor contract says: \"Raises VALIDATION_ERROR if ... requested transition is not allowed.\"\n                e = _err(\n                    \"VALIDATION_ERROR\",\n                    \"Requested status transition is not allowed by the order lifecycle (business rule: enforce lifecycle transitions).\",\n                    order_id=order_id,\n                    current_status=cur_status,\n                    requested_status=status,\n                    allowed_next=allowed_next,\n                )\n                _append_request_log(\"error\", e[\"error\"][\"code\"])\n                return e\n            new_status = status\n\n    # ---- validate contact_set reference (if provided) ----\n    if contact_set_id is not None:\n        contacts = _load(\"domain_contacts.json\")\n        if not isinstance(contacts, list):\n            contacts = []\n        found = False\n        for c in contacts:\n            if isinstance(c, dict) and c.get(\"contact_set_id\") == contact_set_id:\n                found = True\n                break\n        if not found:\n            e = _err(\"NOT_FOUND\", \"contact_set_id does not exist.\", contact_set_id=contact_set_id)\n            _append_request_log(\"error\", e[\"error\"][\"code\"])\n            return e\n\n    # ---- enforce uniqueness constraint for non-terminal orders ----\n    # unique(account_id, fqdn, status) where status in ('draft','checking','ready','submitted')\n    target_account_id = order.get(\"account_id\")\n    target_fqdn = order.get(\"fqdn\")\n    active_statuses = {\"draft\", \"checking\", \"ready\", \"submitted\"}\n    if new_status in active_statuses:\n        for r in orders:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"order_id\") == order_id:\n                continue\n            if r.get(\"account_id\") == target_account_id and r.get(\"fqdn\") == target_fqdn and r.get(\"status\") == new_status:\n                e = _err(\n                    \"CONFLICT\",\n                    \"Uniqueness constraint violation: an order with this account_id+fqdn already exists in the requested non-terminal status.\",\n                    account_id=target_account_id,\n                    fqdn=target_fqdn,\n                    status=new_status,\n                    conflicting_order_id=r.get(\"order_id\"),\n                )\n                _append_request_log(\"error\", e[\"error\"][\"code\"])\n                return e\n\n    # ---- apply updates; enforce \"no success without effect\" ----\n    before = dict(order)\n    changed = False\n\n    if term_years is not None and order.get(\"term_years\") != term_years:\n        order[\"term_years\"] = term_years\n        changed = True\n\n    if add_whois_guard is not None and order.get(\"add_whois_guard\") != add_whois_guard:\n        order[\"add_whois_guard\"] = add_whois_guard\n        changed = True\n\n    if contact_set_id is not None and order.get(\"contact_set_id\") != contact_set_id:\n        order[\"contact_set_id\"] = contact_set_id\n        changed = True\n\n    if new_status != cur_status:\n        order[\"status\"] = new_status\n        changed = True\n\n    if not changed:\n        # idempotent update: return current resource, but indicate no change\n        _append_request_log(\"success\", None)\n        return {\"order\": order, \"updated\": False}\n\n    order[\"updated_at\"] = _iso(_utcnow())\n    # preserve created_at; if missing, set it (repair)\n    if not order.get(\"created_at\"):\n        order[\"created_at\"] = order[\"updated_at\"]\n\n    orders[idx] = order\n    _save(\"domain_registration_orders.json\", orders)\n\n    _append_request_log(\"success\", None)\n    return {\n        \"order\": order,\n        \"updated\": True,\n        \"previous\": before,\n    }\n"
+        },
+        {
+          "name": "set_dns_hosts",
+          "description": "Replaces the active DNS host records for a domain with the provided set (authoritative sync). Records not present in the requested set are soft-deleted by transitioning them to status 'deleted'; new/changed records are upserted as 'active' while enforcing uniqueness across active records. Raises VALIDATION_ERROR if domain_id is malformed, any record_type is invalid, ttl is outside 60–86400 when provided, mx_pref is outside 0–65535 when provided, or the payload contains duplicates. Raises NOT_FOUND if the domain_id does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "domain_id": {
+                "type": "string",
+                "pattern": "^nc_dom_[A-Za-z0-9]{18,}$",
+                "description": "Domain id whose DNS host records will be replaced."
+              },
+              "hosts": {
+                "type": "array",
+                "minItems": 0,
+                "description": "Complete desired set of active DNS host records for the domain.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "host": {
+                      "type": "string",
+                      "description": "Host/name for the record (e.g., \"@\", \"www\")."
+                    },
+                    "record_type": {
+                      "type": "string",
+                      "enum": [
+                        "A",
+                        "AAAA",
+                        "CNAME",
+                        "TXT",
+                        "MX",
+                        "NS",
+                        "SRV",
+                        "CAA",
+                        "URL",
+                        "URL301",
+                        "FRAME"
+                      ],
+                      "description": "DNS record type."
+                    },
+                    "value": {
+                      "type": "string",
+                      "description": "Record value/content (e.g., IP address, target hostname, text)."
+                    },
+                    "ttl": {
+                      "type": "integer",
+                      "minimum": 60,
+                      "maximum": 86400,
+                      "description": "Time-to-live in seconds (60–86400)."
+                    },
+                    "mx_pref": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 65535,
+                      "description": "MX preference/priority (0–65535), required for MX records."
+                    },
+                    "is_frozen": {
+                      "type": "boolean",
+                      "description": "When true, record is treated as locked from modification by background sync."
+                    }
+                  },
+                  "required": [
+                    "host",
+                    "record_type",
+                    "value"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "domain_id",
+              "hosts"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def set_dns_hosts(domain_id, hosts, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0440000\" if __import__(\"os\").path.isdir(\"./environment_mix/0440000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"set_dns_hosts\"\n    credential_used = None\n\n    def _log(status_str, error_code=None):\n        req = _load(\"request_log.json\")\n        now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n        row = {\n            \"request_id\": \"req_\" + os.urandom(9).hex(),\n            \"endpoint\": endpoint,\n            \"credential_used\": credential_used,\n            \"status\": status_str,\n            \"error_code\": error_code,\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if isinstance(req, list):\n            req.append(row)\n            _save(\"request_log.json\", req)\n\n    # Validation\n    if not isinstance(domain_id, str) or not re.match(r\"^nc_dom_[A-Za-z0-9]{18,}$\", domain_id or \"\"):\n        _log(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"domain_id is malformed.\", field=\"domain_id\")\n\n    if not isinstance(hosts, list):\n        _log(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"hosts must be an array.\", field=\"hosts\")\n\n    allowed_types = {\"A\", \"AAAA\", \"CNAME\", \"TXT\", \"MX\", \"NS\", \"SRV\", \"CAA\", \"URL\", \"URL301\", \"FRAME\"}\n\n    # Validate hosts items and enforce request-set uniqueness (active uniqueness constraint)\n    desired = []\n    seen_keys = set()\n    for idx, h in enumerate(hosts):\n        if not isinstance(h, dict):\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Each host record must be an object.\", index=idx)\n        # required keys\n        for k in (\"host\", \"record_type\", \"value\"):\n            if k not in h:\n                _log(\"error\", \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", f\"Missing required field: {k}.\", index=idx, field=k)\n        host = h.get(\"host\")\n        rtype = h.get(\"record_type\")\n        value = h.get(\"value\")\n        ttl = h.get(\"ttl\", None)\n        mx_pref = h.get(\"mx_pref\", None)\n        is_frozen = h.get(\"is_frozen\", None)\n\n        if not isinstance(host, str) or host == \"\":\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"host must be a non-empty string.\", index=idx, field=\"host\")\n        if not isinstance(rtype, str) or rtype not in allowed_types:\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"record_type is invalid.\", index=idx, field=\"record_type\", allowed=sorted(list(allowed_types)))\n        if not isinstance(value, str) or value == \"\":\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"value must be a non-empty string.\", index=idx, field=\"value\")\n\n        if ttl is not None:\n            if not isinstance(ttl, int) or ttl < 60 or ttl > 86400:\n                _log(\"error\", \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"ttl must be an integer between 60 and 86400 when provided.\", index=idx, field=\"ttl\")\n\n        if mx_pref is not None:\n            if not isinstance(mx_pref, int) or mx_pref < 0 or mx_pref > 65535:\n                _log(\"error\", \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"mx_pref must be an integer between 0 and 65535 when provided.\", index=idx, field=\"mx_pref\")\n        if rtype == \"MX\" and mx_pref is None:\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"mx_pref is required for MX records.\", index=idx, field=\"mx_pref\")\n\n        if is_frozen is not None and not isinstance(is_frozen, bool):\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"is_frozen must be boolean when provided.\", index=idx, field=\"is_frozen\")\n\n        key = (host, rtype, value, mx_pref if mx_pref is not None else -1)\n        if key in seen_keys:\n            _log(\"error\", \"CONFLICT\")\n            return _err(\"CONFLICT\", \"Duplicate active DNS record in requested set.\", index=idx, key={\"host\": host, \"record_type\": rtype, \"value\": value, \"mx_pref\": mx_pref})\n        seen_keys.add(key)\n        desired.append({\n            \"host\": host,\n            \"record_type\": rtype,\n            \"value\": value,\n            \"ttl\": ttl,\n            \"mx_pref\": mx_pref,\n            \"is_frozen\": bool(is_frozen) if is_frozen is not None else False,\n        })\n\n    accounts = _load(\"accounts.json\")\n    domains = _load(\"domains.json\")\n    dns_hosts = _load(\"dns_hosts.json\")\n\n    # Ambient auth: choose active account that owns the domain\n    active_accounts = [a for a in accounts if isinstance(a, dict) and a.get(\"status\") == \"active\"]\n    if not active_accounts:\n        _log(\"error\", \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"No authenticated account context is available to serve this request.\")\n\n    domain = None\n    for a in active_accounts:\n        for d in domains:\n            if isinstance(d, dict) and d.get(\"domain_id\") == domain_id and d.get(\"account_id\") == a.get(\"account_id\"):\n                domain = d\n                credential_used = a.get(\"account_id\")\n                break\n        if domain:\n            break\n    if not domain:\n        _log(\"error\", \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Domain not found for the authenticated account.\", domain_id=domain_id)\n\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # Index existing active records for domain\n    existing_active = []\n    for r in dns_hosts:\n        if isinstance(r, dict) and r.get(\"domain_id\") == domain_id and r.get(\"status\") == \"active\":\n            existing_active.append(r)\n\n    # Prepare lookups by unique key\n    def _k(row):\n        return (\n            row.get(\"host\"),\n            row.get(\"record_type\"),\n            row.get(\"value\"),\n            row.get(\"mx_pref\") if row.get(\"mx_pref\") is not None else -1\n        )\n\n    existing_by_key = {_k(r): r for r in existing_active}\n\n    desired_keys = set((r[\"host\"], r[\"record_type\"], r[\"value\"], r[\"mx_pref\"] if r[\"mx_pref\"] is not None else -1) for r in desired)\n    existing_keys = set(existing_by_key.keys())\n\n    # Soft delete missing\n    deleted_count = 0\n    updated_count = 0\n    inserted_count = 0\n\n    # lifecycle for dns_hosts: active -> deleted only\n    for i, r in enumerate(list(dns_hosts)):\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"domain_id\") != domain_id:\n            continue\n        if r.get(\"status\") != \"active\":\n            continue\n        rk = _k(r)\n        if rk not in desired_keys:\n            # transition to deleted\n            r[\"status\"] = \"deleted\"\n            r[\"updated_at\"] = now\n            dns_hosts[i] = r\n            deleted_count += 1\n\n    # Upsert desired as active\n    for r in desired:\n        rk = (r[\"host\"], r[\"record_type\"], r[\"value\"], r[\"mx_pref\"] if r[\"mx_pref\"] is not None else -1)\n        existing = existing_by_key.get(rk)\n        if existing:\n            # Update mutable fields\n            changed = False\n            for fld in (\"ttl\", \"mx_pref\", \"is_frozen\", \"value\", \"host\", \"record_type\"):\n                # host/record_type/value won't differ given key match, but keep consistent\n                newv = r.get(fld, None)\n                if fld in (\"host\", \"record_type\", \"value\"):\n                    newv = r[fld]\n                if existing.get(fld) != newv:\n                    existing[fld] = newv\n                    changed = True\n            if existing.get(\"status\") != \"active\":\n                existing[\"status\"] = \"active\"\n                changed = True\n            if changed:\n                existing[\"updated_at\"] = now\n                # also treat as synced now\n                existing[\"last_synced_at\"] = now\n                updated_count += 1\n            else:\n                # Still mark last_synced_at to now as this is authoritative replace\n                existing[\"last_synced_at\"] = now\n                existing[\"updated_at\"] = now\n                updated_count += 1\n            # write back\n            for i, rr in enumerate(dns_hosts):\n                if isinstance(rr, dict) and rr.get(\"dns_host_id\") == existing.get(\"dns_host_id\"):\n                    dns_hosts[i] = existing\n                    break\n        else:\n            # Ensure no active uniqueness conflict exists (should not, since key absent in existing_active)\n            # But check against current dns_hosts active set in case duplicates existed in store\n            for rr in dns_hosts:\n                if isinstance(rr, dict) and rr.get(\"domain_id\") == domain_id and rr.get(\"status\") == \"active\":\n                    if _k(rr) == rk:\n                        _log(\"error\", \"CONFLICT\")\n                        return _err(\"CONFLICT\", \"Active DNS record uniqueness constraint violated by existing data.\", key={\"host\": r[\"host\"], \"record_type\": r[\"record_type\"], \"value\": r[\"value\"], \"mx_pref\": r[\"mx_pref\"]})\n\n            dns_host_id = \"nc_dh_\" + os.urandom(12).hex()\n            new_row = {\n                \"dns_host_id\": dns_host_id,\n                \"domain_id\": domain_id,\n                \"status\": \"active\",\n                \"host\": r[\"host\"],\n                \"record_type\": r[\"record_type\"],\n                \"value\": r[\"value\"],\n                \"ttl\": r.get(\"ttl\", None),\n                \"mx_pref\": r.get(\"mx_pref\", None),\n                \"is_frozen\": r.get(\"is_frozen\", False),\n                \"last_synced_at\": now,\n                \"created_at\": now,\n                \"updated_at\": now,\n            }\n            dns_hosts.append(new_row)\n            inserted_count += 1\n\n    if deleted_count == 0 and updated_count == 0 and inserted_count == 0:\n        _log(\"error\", \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"No DNS host changes were applied.\", domain_id=domain_id)\n\n    _save(\"dns_hosts.json\", dns_hosts)\n\n    # Return active set after operation\n    active_after = [\n        r for r in dns_hosts\n        if isinstance(r, dict) and r.get(\"domain_id\") == domain_id and r.get(\"status\") == \"active\"\n    ]\n\n    _log(\"ok\", None)\n    return {\n        \"domain_id\": domain_id,\n        \"counts\": {\n            \"inserted\": inserted_count,\n            \"updated\": updated_count,\n            \"deleted\": deleted_count\n        },\n        \"hosts\": active_after\n    }\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0440000",
+    "index": 440,
+    "name": "Namecheap Domains -Search/Register",
+    "description": "This backend stores Namecheap-account domain inventory, contact sets, DNS host records, and TLD pricing needed to support domain search and registration workflows. The main workflows are: checking availability/pricing for a domain, registering a domain with contact data, and reading/managing an acco",
+    "taxonomy": {
+      "L1_id": "L1-01",
+      "L1_name": "Search & Information Retrieval",
+      "L1_name_zh": "搜索与信息获取",
+      "L2_id": "L2-03",
+      "L2_name": "API Gateway & Aggregation",
+      "L2_name_zh": "API 网关与聚合",
+      "L3_name": "Domain Availability & Registration Gateways",
+      "L3_name_zh": "域名查询与注册网关"
+    },
+    "database_dir": "./environment_mix/0440000",
+    "mount_path": "/app/database",
+    "n_tools": 11,
+    "n_collections": 6,
+    "n_records": 171,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 11,
+      "loaded": 11,
+      "reads_returning_data": 7,
+      "read_operations": 7,
+      "mutations_persisted": 4,
+      "mutations_attempted": 4
+    },
+    "tools_loadable_from_database_dir": 11,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "check_domain",
+      "returned_chars": 1249
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

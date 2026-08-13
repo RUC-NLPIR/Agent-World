@@ -1,0 +1,617 @@
+{
+  "index": 506,
+  "local_files_dir": "./environment_mix/0506000",
+  "file_list": [
+    "./environment_mix/0506000/README.md",
+    "./environment_mix/0506000/api_keys.json",
+    "./environment_mix/0506000/job_results.json",
+    "./environment_mix/0506000/scrape_jobs.json",
+    "./environment_mix/0506000/usage_ledger.json",
+    "./environment_mix/0506000/workspaces.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "workspaces.json": "12 rows",
+        "api_keys.json": "18 rows",
+        "scrape_jobs.json": "20 rows",
+        "job_results.json": "19 rows",
+        "usage_ledger.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "universal_scraper",
+          "description": "Submits a Universal scrape job for the provided url and returns an accepted job record for your workspace, including the persisted input parameters and the initial execution state; the job output is stored for later retrieval in the requested output_format (and parsed when parse_content=true). This endpoint does not page results; pagination_page and pagination_pages control how many pages the job will attempt to fetch as part of a single submission. Raises VALIDATION_ERROR when required fields are missing/invalid (e.g., url not a string, unsupported enums, non-integer pagination values, or scheduled_at not date-time), UNAUTHORIZED/FORBIDDEN when credentials are missing or do not grant access to the workspace, QUOTA_EXCEEDED when your workspace has insufficient remaining usage to accept the job, and CONFLICT when the same idempotency_key is reused with different parameters or when a scheduled_at time is not acceptable for scheduling.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "url": {
+                "type": "string",
+                "description": "Target URL to scrape."
+              },
+              "parse_content": {
+                "type": "boolean",
+                "description": "Whether to parse the response content into structured data when possible."
+              },
+              "output_format": {
+                "type": "string",
+                "enum": [
+                  "json",
+                  "html",
+                  "text",
+                  "csv"
+                ],
+                "description": "Desired output format for the job result."
+              },
+              "user_agent_type": {
+                "type": "string",
+                "enum": [
+                  "desktop",
+                  "mobile",
+                  "tablet",
+                  "bot",
+                  "custom"
+                ],
+                "description": "User agent profile used to fetch the target."
+              },
+              "target_domain": {
+                "type": "string",
+                "description": "Provider domain to target (e.g., a country TLD) when applicable."
+              },
+              "geo": {
+                "type": "string",
+                "description": "Geolocation hint for the request (provider-specific geo code/string)."
+              },
+              "locale": {
+                "type": "string",
+                "description": "Locale/language hint for the request (provider-specific locale code/string)."
+              },
+              "pagination_page": {
+                "type": "integer",
+                "description": "Starting page index for paginated scraping."
+              },
+              "pagination_pages": {
+                "type": "integer",
+                "description": "Number of pages to scrape for paginated requests."
+              },
+              "priority": {
+                "type": "integer",
+                "description": "Optional scheduling priority for the job (higher typically runs sooner)."
+              },
+              "scheduled_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional time to schedule the job execution."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Client-provided key to deduplicate repeated submissions."
+              }
+            },
+            "required": [
+              "url"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def universal_scraper(url, parse_content=None, output_format=None, user_agent_type=None, target_domain=None, geo=None, locale=None, pagination_page=None, pagination_pages=None, priority=None, scheduled_at=None, idempotency_key=None, **_extra):\n    import json, os, datetime, time, hashlib, uuid, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0506000\" if __import__(\"os\").path.isdir(\"./environment_mix/0506000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    period = datetime.datetime.utcnow().strftime(\"%Y%m\")\n\n    def _log_usage(workspace_id, api_key_id, job_id, tool, units, unit_type, status):\n        usage = _load(\"usage_ledger.json\")\n        rid = \"ul_\" + uuid.uuid4().hex\n        row = {\n            \"id\": rid,\n            \"workspace_id\": workspace_id,\n            \"api_key_id\": api_key_id,\n            \"job_id\": job_id,\n            \"tool\": tool,\n            \"units\": int(units),\n            \"unit_type\": unit_type,\n            \"period_yyyymm\": period,\n            \"created_at\": now,\n            \"updated_at\": now\n        }\n        usage.append(row)\n        _save(\"usage_ledger.json\", usage)\n        return row\n\n    def _resolve_auth():\n        # No explicit credential parameter exists; pick a working active key whose workspace is active.\n        workspaces = _load(\"workspaces.json\")\n        ws_by_id = {w.get(\"id\"): w for w in workspaces if isinstance(w, dict)}\n        keys = _load(\"api_keys.json\")\n        for k in keys:\n            if not isinstance(k, dict): \n                continue\n            if k.get(\"status\") != \"active\":\n                continue\n            ws = ws_by_id.get(k.get(\"workspace_id\"))\n            if not ws or ws.get(\"status\") != \"active\":\n                continue\n            return ws, k\n        return None, None\n\n    def _validate():\n        if not isinstance(url, str) or not url.strip():\n            return _err(\"VALIDATION_ERROR\", \"url must be a non-empty string\", field=\"url\")\n        if parse_content is None:\n            return _err(\"VALIDATION_ERROR\", \"parse_content is required\", field=\"parse_content\")\n        if not isinstance(parse_content, bool):\n            return _err(\"VALIDATION_ERROR\", \"parse_content must be a boolean\", field=\"parse_content\")\n        if output_format is not None:\n            if not isinstance(output_format, str) or output_format not in (\"json\", \"html\", \"text\", \"csv\"):\n                return _err(\"VALIDATION_ERROR\", \"output_format must be one of: json, html, text, csv\", field=\"output_format\")\n        if user_agent_type is not None:\n            if not isinstance(user_agent_type, str) or user_agent_type not in (\"desktop\", \"mobile\", \"tablet\", \"bot\", \"custom\"):\n                return _err(\"VALIDATION_ERROR\", \"user_agent_type must be one of: desktop, mobile, tablet, bot, custom\", field=\"user_agent_type\")\n        for nm, v in ((\"target_domain\", target_domain), (\"geo\", geo), (\"locale\", locale), (\"idempotency_key\", idempotency_key)):\n            if v is not None and (not isinstance(v, str)):\n                return _err(\"VALIDATION_ERROR\", f\"{nm} must be a string\", field=nm)\n        if pagination_page is not None:\n            if not isinstance(pagination_page, int) or pagination_page < 1:\n                return _err(\"VALIDATION_ERROR\", \"pagination_page must be an integer >= 1\", field=\"pagination_page\")\n        if pagination_pages is not None:\n            if not isinstance(pagination_pages, int) or not (1 <= pagination_pages <= 50):\n                return _err(\"VALIDATION_ERROR\", \"pagination_pages must be an integer between 1 and 50\", field=\"pagination_pages\")\n        if priority is not None:\n            if not isinstance(priority, int) or not (0 <= priority <= 100):\n                return _err(\"VALIDATION_ERROR\", \"priority must be an integer between 0 and 100\", field=\"priority\")\n        if scheduled_at is not None:\n            if not isinstance(scheduled_at, str):\n                return _err(\"VALIDATION_ERROR\", \"scheduled_at must be an RFC3339 date-time string\", field=\"scheduled_at\")\n            try:\n                s = scheduled_at\n                if s.endswith(\"Z\"):\n                    datetime.datetime.fromisoformat(s[:-1])\n                else:\n                    datetime.datetime.fromisoformat(s.replace(\"Z\", \"\"))\n            except ValueError:\n                return _err(\"VALIDATION_ERROR\", \"scheduled_at must be an RFC3339 date-time string\", field=\"scheduled_at\")\n        return None\n\n    verr = _validate()\n    if verr:\n        # Cannot write usage without auth context; return validation error.\n        return verr\n\n    ws, key = _resolve_auth()\n    if not ws or not key:\n        return _err(\"UNAUTHORIZED\", \"No active API key with an active workspace is available to authenticate this request\")\n\n    # Record the request itself as 1 request unit (even if later rejected by quota).\n    _log_usage(ws[\"id\"], key[\"id\"], None, \"universal_scraper\", 1, \"request\", \"attempt\")\n\n    # Quota enforcement (job quota + request quota in current period)\n    usage = _load(\"usage_ledger.json\")\n    jobs = _load(\"scrape_jobs.json\")\n\n    ws_id = ws[\"id\"]\n    monthly_job_quota = int(ws.get(\"monthly_job_quota\", 0))\n    monthly_request_quota = int(ws.get(\"monthly_request_quota\", 0))\n\n    jobs_this_period = 0\n    for j in jobs:\n        if isinstance(j, dict) and j.get(\"workspace_id\") == ws_id:\n            ca = j.get(\"created_at\")\n            if isinstance(ca, str) and len(ca) >= 7:\n                try:\n                    dt = ca.replace(\"Z\", \"\")\n                    yyyymm = dt[0:4] + dt[5:7]\n                    if yyyymm == period:\n                        jobs_this_period += 1\n                except Exception:\n                    pass\n\n    requests_units_this_period = 0\n    for u in usage:\n        if not isinstance(u, dict):\n            continue\n        if u.get(\"workspace_id\") != ws_id:\n            continue\n        if u.get(\"period_yyyymm\") != period:\n            continue\n        if u.get(\"unit_type\") == \"request\":\n            try:\n                requests_units_this_period += int(u.get(\"units\", 0))\n            except Exception:\n                pass\n\n    if monthly_job_quota <= 0:\n        _log_usage(ws_id, key[\"id\"], None, \"universal_scraper\", 0, \"job\", \"rejected\")\n        return _err(\"QUOTA_EXCEEDED\", \"Monthly job quota exceeded for workspace\", period_yyyymm=period)\n\n    if jobs_this_period >= monthly_job_quota:\n        _log_usage(ws_id, key[\"id\"], None, \"universal_scraper\", 0, \"job\", \"rejected\")\n        return _err(\"QUOTA_EXCEEDED\", \"Monthly job quota exceeded for workspace\", period_yyyymm=period)\n\n    if monthly_request_quota >= 0 and requests_units_this_period > monthly_request_quota:\n        _log_usage(ws_id, key[\"id\"], None, \"universal_scraper\", 0, \"job\", \"rejected\")\n        return _err(\"QUOTA_EXCEEDED\", \"Monthly request quota exceeded for workspace\", period_yyyymm=period)\n\n    # Idempotency\n    if idempotency_key is not None:\n        for j in jobs:\n            if not isinstance(j, dict):\n                continue\n            if j.get(\"workspace_id\") == ws_id and j.get(\"idempotency_key\") == idempotency_key:\n                # Successful auth; touch key last_used_at\n                keys = _load(\"api_keys.json\")\n                changed = False\n                for kk in keys:\n                    if isinstance(kk, dict) and kk.get(\"id\") == key[\"id\"]:\n                        kk[\"last_used_at\"] = now\n                        kk[\"updated_at\"] = now\n                        changed = True\n                        break\n                if changed:\n                    _save(\"api_keys.json\", keys)\n                _log_usage(ws_id, key[\"id\"], j.get(\"id\"), \"universal_scraper\", 0, \"job\", \"idempotent_hit\")\n                return {\"job\": j, \"idempotent\": True}\n\n    # Normalize inputs and compute fingerprint\n    norm = {\n        \"url\": url.strip(),\n        \"parse_content\": parse_content,\n        \"output_format\": output_format or \"json\",\n        \"user_agent_type\": user_agent_type,\n        \"target_domain\": target_domain,\n        \"geo\": geo or ws.get(\"default_geo\"),\n        \"locale\": locale or ws.get(\"default_locale\"),\n        \"pagination_page\": pagination_page,\n        \"pagination_pages\": pagination_pages\n    }\n    # universal requires at least one of input_url or input_query after normalization; here input_url always present.\n    input_url = norm[\"url\"]\n    input_query = None\n\n    fp_src = json.dumps({\"tool\": \"universal_scraper\", \"input\": norm}, sort_keys=True, ensure_ascii=False)\n    request_fingerprint = hashlib.sha256(fp_src.encode(\"utf-8\")).hexdigest()\n\n    # Create job\n    job_id = \"job_\" + uuid.uuid4().hex\n    prio = int(priority) if priority is not None else 50\n    job = {\n        \"id\": job_id,\n        \"workspace_id\": ws_id,\n        \"api_key_id\": key[\"id\"],\n        \"tool\": \"universal_scraper\",\n        \"status\": \"queued\",\n        \"priority\": prio,\n        \"scheduled_at\": scheduled_at,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"idempotency_key\": idempotency_key,\n        \"request_fingerprint\": request_fingerprint,\n        \"input\": norm,\n        \"input_url\": input_url,\n        \"input_query\": input_query,\n        \"target_domain\": target_domain,\n        \"geo\": norm[\"geo\"],\n        \"locale\": norm[\"locale\"],\n        \"user_agent_type\": user_agent_type,\n        \"pagination_page\": pagination_page,\n        \"pagination_pages\": pagination_pages,\n        \"output_format\": norm[\"output_format\"],\n        \"parse_content\": parse_content,\n        \"amazon_category_id\": None,\n        \"amazon_merchant_id\": None,\n        \"amazon_currency\": None,\n        \"amazon_asin\": None,\n        \"amazon_auto_select_variant\": None,\n        \"attempt\": 1,\n        \"max_attempts\": 3,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"billable_units\": 0,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n\n    jobs.append(job)\n    _save(\"scrape_jobs.json\", jobs)\n\n    # Job unit usage (creation)\n    _log_usage(ws_id, key[\"id\"], job_id, \"universal_scraper\", 1, \"job\", \"accepted\")\n\n    # Touch key last_used_at\n    keys = _load(\"api_keys.json\")\n    for kk in keys:\n        if isinstance(kk, dict) and kk.get(\"id\") == key[\"id\"]:\n            kk[\"last_used_at\"] = now\n            kk[\"updated_at\"] = now\n            break\n    _save(\"api_keys.json\", keys)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\"job\": job, \"idempotent\": False, \"latency_ms\": latency_ms}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "google_search_scraper",
+          "description": "Submits a Google Search scrape job for the provided query and returns an accepted job record for your workspace, persisting the input parameters and initial state; results are stored for later retrieval in the requested output_format and can be parsed into structured SERP data when parse_content=true. This endpoint does not page responses; pagination_page and pagination_pages specify which SERP pages the job will fetch within a single job submission. Raises VALIDATION_ERROR when query is missing/invalid or any parameter fails schema/enum checks (including scheduled_at formatting), UNAUTHORIZED/FORBIDDEN when the API credentials are invalid or not permitted for the workspace, QUOTA_EXCEEDED when workspace limits prevent accepting a new job, and CONFLICT when an idempotency_key is replayed with differing inputs or when the requested schedule cannot be honored.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Search query to run on Google."
+              },
+              "parse_content": {
+                "type": "boolean",
+                "description": "Whether to parse SERP content into structured results."
+              },
+              "output_format": {
+                "type": "string",
+                "enum": [
+                  "json",
+                  "html",
+                  "text",
+                  "csv"
+                ],
+                "description": "Desired output format for the job result."
+              },
+              "user_agent_type": {
+                "type": "string",
+                "enum": [
+                  "desktop",
+                  "mobile",
+                  "tablet",
+                  "bot",
+                  "custom"
+                ],
+                "description": "User agent profile used to fetch Google results."
+              },
+              "target_domain": {
+                "type": "string",
+                "description": "Google domain to target (e.g., google.com, google.co.uk)."
+              },
+              "geo": {
+                "type": "string",
+                "description": "Geolocation hint for localized results (provider-specific geo code/string)."
+              },
+              "locale": {
+                "type": "string",
+                "description": "Locale/language hint for results (provider-specific locale code/string)."
+              },
+              "pagination_page": {
+                "type": "integer",
+                "description": "Starting results page index."
+              },
+              "pagination_pages": {
+                "type": "integer",
+                "description": "Number of result pages to scrape."
+              },
+              "priority": {
+                "type": "integer",
+                "description": "Optional scheduling priority for the job (higher typically runs sooner)."
+              },
+              "scheduled_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional time to schedule the job execution."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Client-provided key to deduplicate repeated submissions."
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def google_search_scraper(query, parse_content=None, output_format=None, user_agent_type=None, target_domain=None, geo=None, locale=None, pagination_page=None, pagination_pages=None, priority=None, scheduled_at=None, idempotency_key=None, **_extra):\n    import json, os, datetime, time, hashlib, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0506000\" if __import__(\"os\").path.isdir(\"./environment_mix/0506000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    period = datetime.datetime.utcnow().strftime(\"%Y%m\")\n\n    def _log_usage(workspace_id, api_key_id, job_id, tool, units, unit_type, status):\n        usage = _load(\"usage_ledger.json\")\n        rid = \"ul_\" + uuid.uuid4().hex\n        row = {\n            \"id\": rid,\n            \"workspace_id\": workspace_id,\n            \"api_key_id\": api_key_id,\n            \"job_id\": job_id,\n            \"tool\": tool,\n            \"units\": int(units),\n            \"unit_type\": unit_type,\n            \"period_yyyymm\": period,\n            \"created_at\": now,\n            \"updated_at\": now\n        }\n        usage.append(row)\n        _save(\"usage_ledger.json\", usage)\n        return row\n\n    def _resolve_auth():\n        workspaces = _load(\"workspaces.json\")\n        ws_by_id = {w.get(\"id\"): w for w in workspaces if isinstance(w, dict)}\n        keys = _load(\"api_keys.json\")\n        for k in keys:\n            if not isinstance(k, dict): \n                continue\n            if k.get(\"status\") != \"active\":\n                continue\n            ws = ws_by_id.get(k.get(\"workspace_id\"))\n            if not ws or ws.get(\"status\") != \"active\":\n                continue\n            return ws, k\n        return None, None\n\n    def _validate():\n        if not isinstance(query, str) or not query.strip():\n            return _err(\"VALIDATION_ERROR\", \"query must be a non-empty string\", field=\"query\")\n        if parse_content is None:\n            return _err(\"VALIDATION_ERROR\", \"parse_content is required\", field=\"parse_content\")\n        if not isinstance(parse_content, bool):\n            return _err(\"VALIDATION_ERROR\", \"parse_content must be a boolean\", field=\"parse_content\")\n        if output_format is not None:\n            if not isinstance(output_format, str) or output_format not in (\"json\", \"html\", \"text\", \"csv\"):\n                return _err(\"VALIDATION_ERROR\", \"output_format must be one of: json, html, text, csv\", field=\"output_format\")\n        if user_agent_type is not None:\n            if not isinstance(user_agent_type, str) or user_agent_type not in (\"desktop\", \"mobile\", \"tablet\", \"bot\", \"custom\"):\n                return _err(\"VALIDATION_ERROR\", \"user_agent_type must be one of: desktop, mobile, tablet, bot, custom\", field=\"user_agent_type\")\n        for nm, v in ((\"target_domain\", target_domain), (\"geo\", geo), (\"locale\", locale), (\"idempotency_key\", idempotency_key)):\n            if v is not None and (not isinstance(v, str)):\n                return _err(\"VALIDATION_ERROR\", f\"{nm} must be a string\", field=nm)\n        if pagination_page is not None:\n            if not isinstance(pagination_page, int) or pagination_page < 1:\n                return _err(\"VALIDATION_ERROR\", \"pagination_page must be an integer >= 1\", field=\"pagination_page\")\n        if pagination_pages is not None:\n            if not isinstance(pagination_pages, int) or not (1 <= pagination_pages <= 50):\n                return _err(\"VALIDATION_ERROR\", \"pagination_pages must be an integer between 1 and 50\", field=\"pagination_pages\")\n        if priority is not None:\n            if not isinstance(priority, int) or not (0 <= priority <= 100):\n                return _err(\"VALIDATION_ERROR\", \"priority must be an integer between 0 and 100\", field=\"priority\")\n        if scheduled_at is not None:\n            if not isinstance(scheduled_at, str):\n                return _err(\"VALIDATION_ERROR\", \"scheduled_at must be an RFC3339 date-time string\", field=\"scheduled_at\")\n            try:\n                s = scheduled_at\n                if s.endswith(\"Z\"):\n                    datetime.datetime.fromisoformat(s[:-1])\n                else:\n                    datetime.datetime.fromisoformat(s.replace(\"Z\", \"\"))\n            except ValueError:\n                return _err(\"VALIDATION_ERROR\", \"scheduled_at must be an RFC3339 date-time string\", field=\"scheduled_at\")\n        return None\n\n    verr = _validate()\n    if verr:\n        return verr\n\n    ws, key = _resolve_auth()\n    if not ws or not key:\n        return _err(\"UNAUTHORIZED\", \"No active API key with an active workspace is available to authenticate this request\")\n\n    _log_usage(ws[\"id\"], key[\"id\"], None, \"google_search_scraper\", 1, \"request\", \"attempt\")\n\n    usage = _load(\"usage_ledger.json\")\n    jobs = _load(\"scrape_jobs.json\")\n    ws_id = ws[\"id\"]\n    monthly_job_quota = int(ws.get(\"monthly_job_quota\", 0))\n    monthly_request_quota = int(ws.get(\"monthly_request_quota\", 0))\n\n    jobs_this_period = 0\n    for j in jobs:\n        if isinstance(j, dict) and j.get(\"workspace_id\") == ws_id:\n            ca = j.get(\"created_at\")\n            if isinstance(ca, str) and len(ca) >= 7:\n                dt = ca.replace(\"Z\", \"\")\n                yyyymm = dt[0:4] + dt[5:7]\n                if yyyymm == period:\n                    jobs_this_period += 1\n\n    requests_units_this_period = 0\n    for u in usage:\n        if isinstance(u, dict) and u.get(\"workspace_id\") == ws_id and u.get(\"period_yyyymm\") == period and u.get(\"unit_type\") == \"request\":\n            try:\n                requests_units_this_period += int(u.get(\"units\", 0))\n            except Exception:\n                pass\n\n    if monthly_job_quota <= 0 or jobs_this_period >= monthly_job_quota:\n        _log_usage(ws_id, key[\"id\"], None, \"google_search_scraper\", 0, \"job\", \"rejected\")\n        return _err(\"QUOTA_EXCEEDED\", \"Monthly job quota exceeded for workspace\", period_yyyymm=period)\n\n    if monthly_request_quota >= 0 and requests_units_this_period > monthly_request_quota:\n        _log_usage(ws_id, key[\"id\"], None, \"google_search_scraper\", 0, \"job\", \"rejected\")\n        return _err(\"QUOTA_EXCEEDED\", \"Monthly request quota exceeded for workspace\", period_yyyymm=period)\n\n    if idempotency_key is not None:\n        for j in jobs:\n            if isinstance(j, dict) and j.get(\"workspace_id\") == ws_id and j.get(\"idempotency_key\") == idempotency_key:\n                keys = _load(\"api_keys.json\")\n                for kk in keys:\n                    if isinstance(kk, dict) and kk.get(\"id\") == key[\"id\"]:\n                        kk[\"last_used_at\"] = now\n                        kk[\"updated_at\"] = now\n                        break\n                _save(\"api_keys.json\", keys)\n                _log_usage(ws_id, key[\"id\"], j.get(\"id\"), \"google_search_scraper\", 0, \"job\", \"idempotent_hit\")\n                return {\"job\": j, \"idempotent\": True}\n\n    norm = {\n        \"query\": query.strip(),\n        \"parse_content\": parse_content,\n        \"output_format\": output_format or \"json\",\n        \"user_agent_type\": user_agent_type,\n        \"target_domain\": target_domain,\n        \"geo\": geo or ws.get(\"default_geo\"),\n        \"locale\": locale or ws.get(\"default_locale\"),\n        \"pagination_page\": pagination_page,\n        \"pagination_pages\": pagination_pages\n    }\n    fp_src = json.dumps({\"tool\": \"google_search_scraper\", \"input\": norm}, sort_keys=True, ensure_ascii=False)\n    request_fingerprint = hashlib.sha256(fp_src.encode(\"utf-8\")).hexdigest()\n\n    job_id = \"job_\" + uuid.uuid4().hex\n    prio = int(priority) if priority is not None else 50\n    job = {\n        \"id\": job_id,\n        \"workspace_id\": ws_id,\n        \"api_key_id\": key[\"id\"],\n        \"tool\": \"google_search_scraper\",\n        \"status\": \"queued\",\n        \"priority\": prio,\n        \"scheduled_at\": scheduled_at,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"idempotency_key\": idempotency_key,\n        \"request_fingerprint\": request_fingerprint,\n        \"input\": norm,\n        \"input_url\": None,\n        \"input_query\": norm[\"query\"],\n        \"target_domain\": target_domain,\n        \"geo\": norm[\"geo\"],\n        \"locale\": norm[\"locale\"],\n        \"user_agent_type\": user_agent_type,\n        \"pagination_page\": pagination_page,\n        \"pagination_pages\": pagination_pages,\n        \"output_format\": norm[\"output_format\"],\n        \"parse_content\": parse_content,\n        \"amazon_category_id\": None,\n        \"amazon_merchant_id\": None,\n        \"amazon_currency\": None,\n        \"amazon_asin\": None,\n        \"amazon_auto_select_variant\": None,\n        \"attempt\": 1,\n        \"max_attempts\": 3,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"billable_units\": 0,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n\n    jobs.append(job)\n    _save(\"scrape_jobs.json\", jobs)\n    _log_usage(ws_id, key[\"id\"], job_id, \"google_search_scraper\", 1, \"job\", \"accepted\")\n\n    keys = _load(\"api_keys.json\")\n    for kk in keys:\n        if isinstance(kk, dict) and kk.get(\"id\") == key[\"id\"]:\n            kk[\"last_used_at\"] = now\n            kk[\"updated_at\"] = now\n            break\n    _save(\"api_keys.json\", keys)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\"job\": job, \"idempotent\": False, \"latency_ms\": latency_ms}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "amazon_search_scraper",
+          "description": "Submits an Amazon Search scrape job for the provided query and returns an accepted job record, storing the job inputs (including optional amazon_category_id, amazon_merchant_id, and amazon_currency) and the initial execution state; the job output is persisted for later retrieval in the requested output_format and can be parsed into structured listings when parse_content=true. This endpoint does not page responses; pagination_page and pagination_pages control which Amazon result pages are fetched as part of the job. Raises VALIDATION_ERROR when query is missing/invalid, Amazon-specific fields are malformed, or any parameter fails schema/enum checks, UNAUTHORIZED/FORBIDDEN when credentials are missing/invalid or not authorized for the workspace, QUOTA_EXCEEDED when workspace usage limits would be exceeded by accepting the job, and CONFLICT when the same idempotency_key is reused with different inputs or the requested scheduled_at cannot be scheduled.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Search query to run on Amazon."
+              },
+              "parse_content": {
+                "type": "boolean",
+                "description": "Whether to parse search results into structured product entries."
+              },
+              "output_format": {
+                "type": "string",
+                "enum": [
+                  "json",
+                  "html",
+                  "text",
+                  "csv"
+                ],
+                "description": "Desired output format for the job result."
+              },
+              "user_agent_type": {
+                "type": "string",
+                "enum": [
+                  "desktop",
+                  "mobile",
+                  "tablet",
+                  "bot",
+                  "custom"
+                ],
+                "description": "User agent profile used to fetch Amazon results."
+              },
+              "target_domain": {
+                "type": "string",
+                "description": "Amazon domain to target (e.g., amazon.com, amazon.co.uk)."
+              },
+              "geo": {
+                "type": "string",
+                "description": "Geolocation hint for localized results (provider-specific geo code/string)."
+              },
+              "locale": {
+                "type": "string",
+                "description": "Locale/language hint for results (provider-specific locale code/string)."
+              },
+              "pagination_page": {
+                "type": "integer",
+                "description": "Starting results page index."
+              },
+              "pagination_pages": {
+                "type": "integer",
+                "description": "Number of result pages to scrape."
+              },
+              "amazon_category_id": {
+                "type": "string",
+                "description": "Amazon category/browse node identifier to scope the search."
+              },
+              "amazon_merchant_id": {
+                "type": "string",
+                "description": "Amazon merchant/seller identifier to scope the search."
+              },
+              "amazon_currency": {
+                "type": "string",
+                "description": "Currency code for pricing normalization (e.g., USD, EUR)."
+              },
+              "priority": {
+                "type": "integer",
+                "description": "Optional scheduling priority for the job (higher typically runs sooner)."
+              },
+              "scheduled_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional time to schedule the job execution."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Client-provided key to deduplicate repeated submissions."
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def amazon_search_scraper(query, parse_content=None, output_format=None, user_agent_type=None, target_domain=None, geo=None, locale=None, pagination_page=None, pagination_pages=None, amazon_category_id=None, amazon_merchant_id=None, amazon_currency=None, priority=None, scheduled_at=None, idempotency_key=None, **_extra):\n    import json, os, datetime, time, hashlib, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0506000\" if __import__(\"os\").path.isdir(\"./environment_mix/0506000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    period = datetime.datetime.utcnow().strftime(\"%Y%m\")\n\n    def _log_usage(workspace_id, api_key_id, job_id, tool, units, unit_type, status):\n        usage = _load(\"usage_ledger.json\")\n        rid = \"ul_\" + uuid.uuid4().hex\n        row = {\n            \"id\": rid,\n            \"workspace_id\": workspace_id,\n            \"api_key_id\": api_key_id,\n            \"job_id\": job_id,\n            \"tool\": tool,\n            \"units\": int(units),\n            \"unit_type\": unit_type,\n            \"period_yyyymm\": period,\n            \"created_at\": now,\n            \"updated_at\": now\n        }\n        usage.append(row)\n        _save(\"usage_ledger.json\", usage)\n        return row\n\n    def _resolve_auth():\n        workspaces = _load(\"workspaces.json\")\n        ws_by_id = {w.get(\"id\"): w for w in workspaces if isinstance(w, dict)}\n        keys = _load(\"api_keys.json\")\n        for k in keys:\n            if not isinstance(k, dict): \n                continue\n            if k.get(\"status\") != \"active\":\n                continue\n            ws = ws_by_id.get(k.get(\"workspace_id\"))\n            if not ws or ws.get(\"status\") != \"active\":\n                continue\n            return ws, k\n        return None, None\n\n    def _validate():\n        if not isinstance(query, str) or not query.strip():\n            return _err(\"VALIDATION_ERROR\", \"query must be a non-empty string\", field=\"query\")\n        if parse_content is None:\n            return _err(\"VALIDATION_ERROR\", \"parse_content is required\", field=\"parse_content\")\n        if not isinstance(parse_content, bool):\n            return _err(\"VALIDATION_ERROR\", \"parse_content must be a boolean\", field=\"parse_content\")\n        if output_format is not None:\n            if not isinstance(output_format, str) or output_format not in (\"json\", \"html\", \"text\", \"csv\"):\n                return _err(\"VALIDATION_ERROR\", \"output_format must be one of: json, html, text, csv\", field=\"output_format\")\n        if user_agent_type is not None:\n            if not isinstance(user_agent_type, str) or user_agent_type not in (\"desktop\", \"mobile\", \"tablet\", \"bot\", \"custom\"):\n                return _err(\"VALIDATION_ERROR\", \"user_agent_type must be one of: desktop, mobile, tablet, bot, custom\", field=\"user_agent_type\")\n        for nm, v in (\n            (\"target_domain\", target_domain), (\"geo\", geo), (\"locale\", locale),\n            (\"amazon_category_id\", amazon_category_id), (\"amazon_merchant_id\", amazon_merchant_id),\n            (\"amazon_currency\", amazon_currency), (\"idempotency_key\", idempotency_key)\n        ):\n            if v is not None and (not isinstance(v, str)):\n                return _err(\"VALIDATION_ERROR\", f\"{nm} must be a string\", field=nm)\n        if pagination_page is not None:\n            if not isinstance(pagination_page, int) or pagination_page < 1:\n                return _err(\"VALIDATION_ERROR\", \"pagination_page must be an integer >= 1\", field=\"pagination_page\")\n        if pagination_pages is not None:\n            if not isinstance(pagination_pages, int) or not (1 <= pagination_pages <= 50):\n                return _err(\"VALIDATION_ERROR\", \"pagination_pages must be an integer between 1 and 50\", field=\"pagination_pages\")\n        if priority is not None:\n            if not isinstance(priority, int) or not (0 <= priority <= 100):\n                return _err(\"VALIDATION_ERROR\", \"priority must be an integer between 0 and 100\", field=\"priority\")\n        if scheduled_at is not None:\n            if not isinstance(scheduled_at, str):\n                return _err(\"VALIDATION_ERROR\", \"scheduled_at must be an RFC3339 date-time string\", field=\"scheduled_at\")\n            try:\n                s = scheduled_at\n                if s.endswith(\"Z\"):\n                    datetime.datetime.fromisoformat(s[:-1])\n                else:\n                    datetime.datetime.fromisoformat(s.replace(\"Z\", \"\"))\n            except ValueError:\n                return _err(\"VALIDATION_ERROR\", \"scheduled_at must be an RFC3339 date-time string\", field=\"scheduled_at\")\n        return None\n\n    verr = _validate()\n    if verr:\n        return verr\n\n    ws, key = _resolve_auth()\n    if not ws or not key:\n        return _err(\"UNAUTHORIZED\", \"No active API key with an active workspace is available to authenticate this request\")\n\n    _log_usage(ws[\"id\"], key[\"id\"], None, \"amazon_search_scraper\", 1, \"request\", \"attempt\")\n\n    usage = _load(\"usage_ledger.json\")\n    jobs = _load(\"scrape_jobs.json\")\n    ws_id = ws[\"id\"]\n    monthly_job_quota = int(ws.get(\"monthly_job_quota\", 0))\n    monthly_request_quota = int(ws.get(\"monthly_request_quota\", 0))\n\n    jobs_this_period = 0\n    for j in jobs:\n        if isinstance(j, dict) and j.get(\"workspace_id\") == ws_id:\n            ca = j.get(\"created_at\")\n            if isinstance(ca, str) and len(ca) >= 7:\n                dt = ca.replace(\"Z\", \"\")\n                yyyymm = dt[0:4] + dt[5:7]\n                if yyyymm == period:\n                    jobs_this_period += 1\n\n    requests_units_this_period = 0\n    for u in usage:\n        if isinstance(u, dict) and u.get(\"workspace_id\") == ws_id and u.get(\"period_yyyymm\") == period and u.get(\"unit_type\") == \"request\":\n            try:\n                requests_units_this_period += int(u.get(\"units\", 0))\n            except Exception:\n                pass\n\n    if monthly_job_quota <= 0 or jobs_this_period >= monthly_job_quota:\n        _log_usage(ws_id, key[\"id\"], None, \"amazon_search_scraper\", 0, \"job\", \"rejected\")\n        return _err(\"QUOTA_EXCEEDED\", \"Monthly job quota exceeded for workspace\", period_yyyymm=period)\n\n    if monthly_request_quota >= 0 and requests_units_this_period > monthly_request_quota:\n        _log_usage(ws_id, key[\"id\"], None, \"amazon_search_scraper\", 0, \"job\", \"rejected\")\n        return _err(\"QUOTA_EXCEEDED\", \"Monthly request quota exceeded for workspace\", period_yyyymm=period)\n\n    if idempotency_key is not None:\n        for j in jobs:\n            if isinstance(j, dict) and j.get(\"workspace_id\") == ws_id and j.get(\"idempotency_key\") == idempotency_key:\n                keys = _load(\"api_keys.json\")\n                for kk in keys:\n                    if isinstance(kk, dict) and kk.get(\"id\") == key[\"id\"]:\n                        kk[\"last_used_at\"] = now\n                        kk[\"updated_at\"] = now\n                        break\n                _save(\"api_keys.json\", keys)\n                _log_usage(ws_id, key[\"id\"], j.get(\"id\"), \"amazon_search_scraper\", 0, \"job\", \"idempotent_hit\")\n                return {\"job\": j, \"idempotent\": True}\n\n    norm = {\n        \"query\": query.strip(),\n        \"parse_content\": parse_content,\n        \"output_format\": output_format or \"json\",\n        \"user_agent_type\": user_agent_type,\n        \"target_domain\": target_domain,\n        \"geo\": geo or ws.get(\"default_geo\"),\n        \"locale\": locale or ws.get(\"default_locale\"),\n        \"pagination_page\": pagination_page,\n        \"pagination_pages\": pagination_pages,\n        \"amazon_category_id\": amazon_category_id,\n        \"amazon_merchant_id\": amazon_merchant_id,\n        \"amazon_currency\": amazon_currency\n    }\n    fp_src = json.dumps({\"tool\": \"amazon_search_scraper\", \"input\": norm}, sort_keys=True, ensure_ascii=False)\n    request_fingerprint = hashlib.sha256(fp_src.encode(\"utf-8\")).hexdigest()\n\n    job_id = \"job_\" + uuid.uuid4().hex\n    prio = int(priority) if priority is not None else 50\n    job = {\n        \"id\": job_id,\n        \"workspace_id\": ws_id,\n        \"api_key_id\": key[\"id\"],\n        \"tool\": \"amazon_search_scraper\",\n        \"status\": \"queued\",\n        \"priority\": prio,\n        \"scheduled_at\": scheduled_at,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"idempotency_key\": idempotency_key,\n        \"request_fingerprint\": request_fingerprint,\n        \"input\": norm,\n        \"input_url\": None,\n        \"input_query\": norm[\"query\"],\n        \"target_domain\": target_domain,\n        \"geo\": norm[\"geo\"],\n        \"locale\": norm[\"locale\"],\n        \"user_agent_type\": user_agent_type,\n        \"pagination_page\": pagination_page,\n        \"pagination_pages\": pagination_pages,\n        \"output_format\": norm[\"output_format\"],\n        \"parse_content\": parse_content,\n        \"amazon_category_id\": amazon_category_id,\n        \"amazon_merchant_id\": amazon_merchant_id,\n        \"amazon_currency\": amazon_currency,\n        \"amazon_asin\": None,\n        \"amazon_auto_select_variant\": None,\n        \"attempt\": 1,\n        \"max_attempts\": 3,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"billable_units\": 0,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n\n    jobs.append(job)\n    _save(\"scrape_jobs.json\", jobs)\n    _log_usage(ws_id, key[\"id\"], job_id, \"amazon_search_scraper\", 1, \"job\", \"accepted\")\n\n    keys = _load(\"api_keys.json\")\n    for kk in keys:\n        if isinstance(kk, dict) and kk.get(\"id\") == key[\"id\"]:\n            kk[\"last_used_at\"] = now\n            kk[\"updated_at\"] = now\n            break\n    _save(\"api_keys.json\", keys)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\"job\": job, \"idempotent\": False, \"latency_ms\": latency_ms}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "amazon_product_scraper",
+          "description": "Submits an Amazon Product scrape job for the provided amazon_asin and returns an accepted job record for your workspace, persisting inputs (including amazon_currency and amazon_auto_select_variant) and the initial execution state; the product page output is stored for later retrieval in the requested output_format and can be parsed into structured fields when parse_content=true. This endpoint does not page results. Raises VALIDATION_ERROR when amazon_asin is missing/invalid or when any parameter fails schema/enum checks (including scheduled_at), UNAUTHORIZED/FORBIDDEN when API credentials are invalid or lack workspace access, QUOTA_EXCEEDED when your workspace cannot accept additional usage, and CONFLICT when idempotency_key deduplication detects mismatched parameters for the same key or the requested schedule is not acceptable.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "amazon_asin": {
+                "type": "string",
+                "description": "Amazon ASIN of the product to scrape."
+              },
+              "parse_content": {
+                "type": "boolean",
+                "description": "Whether to parse the product page into structured fields."
+              },
+              "output_format": {
+                "type": "string",
+                "enum": [
+                  "json",
+                  "html",
+                  "text",
+                  "csv"
+                ],
+                "description": "Desired output format for the job result."
+              },
+              "user_agent_type": {
+                "type": "string",
+                "enum": [
+                  "desktop",
+                  "mobile",
+                  "tablet",
+                  "bot",
+                  "custom"
+                ],
+                "description": "User agent profile used to fetch the product page."
+              },
+              "target_domain": {
+                "type": "string",
+                "description": "Amazon domain to target (e.g., amazon.com, amazon.de)."
+              },
+              "geo": {
+                "type": "string",
+                "description": "Geolocation hint for localized product availability/pricing (provider-specific geo code/string)."
+              },
+              "locale": {
+                "type": "string",
+                "description": "Locale/language hint for the product page (provider-specific locale code/string)."
+              },
+              "amazon_currency": {
+                "type": "string",
+                "description": "Currency code for pricing normalization (e.g., USD, EUR)."
+              },
+              "amazon_auto_select_variant": {
+                "type": "boolean",
+                "description": "Whether to auto-select a product variant to obtain more accurate pricing data."
+              },
+              "priority": {
+                "type": "integer",
+                "description": "Optional scheduling priority for the job (higher typically runs sooner)."
+              },
+              "scheduled_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional time to schedule the job execution."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Client-provided key to deduplicate repeated submissions."
+              }
+            },
+            "required": [
+              "amazon_asin"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def amazon_product_scraper(amazon_asin, parse_content=None, output_format=None, user_agent_type=None, target_domain=None, geo=None, locale=None, amazon_currency=None, amazon_auto_select_variant=None, priority=None, scheduled_at=None, idempotency_key=None, **_extra):\n    import json, os, datetime, time, hashlib, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0506000\" if __import__(\"os\").path.isdir(\"./environment_mix/0506000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    period = datetime.datetime.utcnow().strftime(\"%Y%m\")\n\n    def _log_usage(workspace_id, api_key_id, job_id, tool, units, unit_type, status):\n        usage = _load(\"usage_ledger.json\")\n        rid = \"ul_\" + uuid.uuid4().hex\n        row = {\n            \"id\": rid,\n            \"workspace_id\": workspace_id,\n            \"api_key_id\": api_key_id,\n            \"job_id\": job_id,\n            \"tool\": tool,\n            \"units\": int(units),\n            \"unit_type\": unit_type,\n            \"period_yyyymm\": period,\n            \"created_at\": now,\n            \"updated_at\": now\n        }\n        usage.append(row)\n        _save(\"usage_ledger.json\", usage)\n        return row\n\n    def _resolve_auth():\n        workspaces = _load(\"workspaces.json\")\n        ws_by_id = {w.get(\"id\"): w for w in workspaces if isinstance(w, dict)}\n        keys = _load(\"api_keys.json\")\n        for k in keys:\n            if not isinstance(k, dict): \n                continue\n            if k.get(\"status\") != \"active\":\n                continue\n            ws = ws_by_id.get(k.get(\"workspace_id\"))\n            if not ws or ws.get(\"status\") != \"active\":\n                continue\n            return ws, k\n        return None, None\n\n    def _validate():\n        if not isinstance(amazon_asin, str) or not amazon_asin.strip():\n            return _err(\"VALIDATION_ERROR\", \"amazon_asin must be a non-empty string\", field=\"amazon_asin\")\n        if parse_content is None:\n            return _err(\"VALIDATION_ERROR\", \"parse_content is required\", field=\"parse_content\")\n        if not isinstance(parse_content, bool):\n            return _err(\"VALIDATION_ERROR\", \"parse_content must be a boolean\", field=\"parse_content\")\n        if output_format is not None:\n            if not isinstance(output_format, str) or output_format not in (\"json\", \"html\", \"text\", \"csv\"):\n                return _err(\"VALIDATION_ERROR\", \"output_format must be one of: json, html, text, csv\", field=\"output_format\")\n        if user_agent_type is not None:\n            if not isinstance(user_agent_type, str) or user_agent_type not in (\"desktop\", \"mobile\", \"tablet\", \"bot\", \"custom\"):\n                return _err(\"VALIDATION_ERROR\", \"user_agent_type must be one of: desktop, mobile, tablet, bot, custom\", field=\"user_agent_type\")\n        for nm, v in ((\"target_domain\", target_domain), (\"geo\", geo), (\"locale\", locale), (\"amazon_currency\", amazon_currency), (\"idempotency_key\", idempotency_key)):\n            if v is not None and (not isinstance(v, str)):\n                return _err(\"VALIDATION_ERROR\", f\"{nm} must be a string\", field=nm)\n        if amazon_auto_select_variant is not None and not isinstance(amazon_auto_select_variant, bool):\n            return _err(\"VALIDATION_ERROR\", \"amazon_auto_select_variant must be a boolean\", field=\"amazon_auto_select_variant\")\n        if priority is not None:\n            if not isinstance(priority, int) or not (0 <= priority <= 100):\n                return _err(\"VALIDATION_ERROR\", \"priority must be an integer between 0 and 100\", field=\"priority\")\n        if scheduled_at is not None:\n            if not isinstance(scheduled_at, str):\n                return _err(\"VALIDATION_ERROR\", \"scheduled_at must be an RFC3339 date-time string\", field=\"scheduled_at\")\n            try:\n                s = scheduled_at\n                if s.endswith(\"Z\"):\n                    datetime.datetime.fromisoformat(s[:-1])\n                else:\n                    datetime.datetime.fromisoformat(s.replace(\"Z\", \"\"))\n            except ValueError:\n                return _err(\"VALIDATION_ERROR\", \"scheduled_at must be an RFC3339 date-time string\", field=\"scheduled_at\")\n        return None\n\n    verr = _validate()\n    if verr:\n        return verr\n\n    ws, key = _resolve_auth()\n    if not ws or not key:\n        return _err(\"UNAUTHORIZED\", \"No active API key with an active workspace is available to authenticate this request\")\n\n    _log_usage(ws[\"id\"], key[\"id\"], None, \"amazon_product_scraper\", 1, \"request\", \"attempt\")\n\n    usage = _load(\"usage_ledger.json\")\n    jobs = _load(\"scrape_jobs.json\")\n    ws_id = ws[\"id\"]\n    monthly_job_quota = int(ws.get(\"monthly_job_quota\", 0))\n    monthly_request_quota = int(ws.get(\"monthly_request_quota\", 0))\n\n    jobs_this_period = 0\n    for j in jobs:\n        if isinstance(j, dict) and j.get(\"workspace_id\") == ws_id:\n            ca = j.get(\"created_at\")\n            if isinstance(ca, str) and len(ca) >= 7:\n                dt = ca.replace(\"Z\", \"\")\n                yyyymm = dt[0:4] + dt[5:7]\n                if yyyymm == period:\n                    jobs_this_period += 1\n\n    requests_units_this_period = 0\n    for u in usage:\n        if isinstance(u, dict) and u.get(\"workspace_id\") == ws_id and u.get(\"period_yyyymm\") == period and u.get(\"unit_type\") == \"request\":\n            try:\n                requests_units_this_period += int(u.get(\"units\", 0))\n            except Exception:\n                pass\n\n    if monthly_job_quota <= 0 or jobs_this_period >= monthly_job_quota:\n        _log_usage(ws_id, key[\"id\"], None, \"amazon_product_scraper\", 0, \"job\", \"rejected\")\n        return _err(\"QUOTA_EXCEEDED\", \"Monthly job quota exceeded for workspace\", period_yyyymm=period)\n\n    if monthly_request_quota >= 0 and requests_units_this_period > monthly_request_quota:\n        _log_usage(ws_id, key[\"id\"], None, \"amazon_product_scraper\", 0, \"job\", \"rejected\")\n        return _err(\"QUOTA_EXCEEDED\", \"Monthly request quota exceeded for workspace\", period_yyyymm=period)\n\n    if idempotency_key is not None:\n        for j in jobs:\n            if isinstance(j, dict) and j.get(\"workspace_id\") == ws_id and j.get(\"idempotency_key\") == idempotency_key:\n                keys = _load(\"api_keys.json\")\n                for kk in keys:\n                    if isinstance(kk, dict) and kk.get(\"id\") == key[\"id\"]:\n                        kk[\"last_used_at\"] = now\n                        kk[\"updated_at\"] = now\n                        break\n                _save(\"api_keys.json\", keys)\n                _log_usage(ws_id, key[\"id\"], j.get(\"id\"), \"amazon_product_scraper\", 0, \"job\", \"idempotent_hit\")\n                return {\"job\": j, \"idempotent\": True}\n\n    norm = {\n        \"amazon_asin\": amazon_asin.strip(),\n        \"parse_content\": parse_content,\n        \"output_format\": output_format or \"json\",\n        \"user_agent_type\": user_agent_type,\n        \"target_domain\": target_domain,\n        \"geo\": geo or ws.get(\"default_geo\"),\n        \"locale\": locale or ws.get(\"default_locale\"),\n        \"amazon_currency\": amazon_currency,\n        \"amazon_auto_select_variant\": amazon_auto_select_variant\n    }\n    fp_src = json.dumps({\"tool\": \"amazon_product_scraper\", \"input\": norm}, sort_keys=True, ensure_ascii=False)\n    request_fingerprint = hashlib.sha256(fp_src.encode(\"utf-8\")).hexdigest()\n\n    job_id = \"job_\" + uuid.uuid4().hex\n    prio = int(priority) if priority is not None else 50\n    job = {\n        \"id\": job_id,\n        \"workspace_id\": ws_id,\n        \"api_key_id\": key[\"id\"],\n        \"tool\": \"amazon_product_scraper\",\n        \"status\": \"queued\",\n        \"priority\": prio,\n        \"scheduled_at\": scheduled_at,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"idempotency_key\": idempotency_key,\n        \"request_fingerprint\": request_fingerprint,\n        \"input\": norm,\n        \"input_url\": None,\n        \"input_query\": None,\n        \"target_domain\": target_domain,\n        \"geo\": norm[\"geo\"],\n        \"locale\": norm[\"locale\"],\n        \"user_agent_type\": user_agent_type,\n        \"pagination_page\": None,\n        \"pagination_pages\": None,\n        \"output_format\": norm[\"output_format\"],\n        \"parse_content\": parse_content,\n        \"amazon_category_id\": None,\n        \"amazon_merchant_id\": None,\n        \"amazon_currency\": amazon_currency,\n        \"amazon_asin\": norm[\"amazon_asin\"],\n        \"amazon_auto_select_variant\": amazon_auto_select_variant,\n        \"attempt\": 1,\n        \"max_attempts\": 3,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"billable_units\": 0,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n\n    jobs.append(job)\n    _save(\"scrape_jobs.json\", jobs)\n    _log_usage(ws_id, key[\"id\"], job_id, \"amazon_product_scraper\", 1, \"job\", \"accepted\")\n\n    keys = _load(\"api_keys.json\")\n    for kk in keys:\n        if isinstance(kk, dict) and kk.get(\"id\") == key[\"id\"]:\n            kk[\"last_used_at\"] = now\n            kk[\"updated_at\"] = now\n            break\n    _save(\"api_keys.json\", keys)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\"job\": job, \"idempotent\": False, \"latency_ms\": latency_ms}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_identity",
+          "description": "Returns the authenticated caller context resolved from the presented API key, including the workspace, API key status, granted scopes, and current-period quota and usage; refuses requests with missing/invalid/revoked credentials or a non-active workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Oxylabs API key used to authenticate the request."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_identity(api_key, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0506000\" if __import__(\"os\").path.isdir(\"./environment_mix/0506000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0)\n    now_iso = now.isoformat() + \"Z\"\n    period = now.strftime(\"%Y%m\")\n    endpoint = \"get_identity\"\n\n    def _log(status, workspace_id=None, api_key_id=None, job_id=None, tool=None, units=1, unit_type=\"request\"):\n        ledger = _load(\"usage_ledger.json\")\n        lid = \"ul_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"_\" + str(len(ledger) + 1)\n        row = {\n            \"id\": lid,\n            \"workspace_id\": workspace_id if workspace_id is not None else \"unknown\",\n            \"api_key_id\": api_key_id,\n            \"job_id\": job_id,\n            \"tool\": tool,\n            \"units\": int(units) if isinstance(units, int) and units >= 0 else 1,\n            \"unit_type\": unit_type,\n            \"period_yyyymm\": period,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        ledger.append(row)\n        _save(\"usage_ledger.json\", ledger)\n\n    # Validate\n    if not isinstance(api_key, str) or not api_key.strip():\n        _log(\"error\", workspace_id=\"unknown\", api_key_id=None)\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\")\n\n    api_keys = _load(\"api_keys.json\")\n    workspaces = _load(\"workspaces.json\")\n\n    # Authenticate: match by id or client-visible key (stored as key_hash)\n    key_row = None\n    for k in api_keys:\n        if k.get(\"id\") == api_key or k.get(\"key_hash\") == api_key:\n            key_row = k\n            break\n\n    if not key_row:\n        _log(\"error\", workspace_id=\"unknown\", api_key_id=None)\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n\n    if key_row.get(\"status\") != \"active\":\n        _log(\"error\", workspace_id=key_row.get(\"workspace_id\") or \"unknown\", api_key_id=key_row.get(\"id\"))\n        return _err(\"UNAUTHORIZED\", \"API key is not active\")\n\n    ws = None\n    for w in workspaces:\n        if w.get(\"id\") == key_row.get(\"workspace_id\"):\n            ws = w\n            break\n    if not ws:\n        _log(\"error\", workspace_id=key_row.get(\"workspace_id\") or \"unknown\", api_key_id=key_row.get(\"id\"))\n        return _err(\"UNAUTHORIZED\", \"Workspace not found for API key\")\n\n    if ws.get(\"status\") != \"active\":\n        _log(\"error\", workspace_id=ws.get(\"id\"), api_key_id=key_row.get(\"id\"))\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active\")\n\n    # Update last_used_at on successful auth\n    key_row[\"last_used_at\"] = now_iso\n    key_row[\"updated_at\"] = now_iso\n    for i, k in enumerate(api_keys):\n        if k.get(\"id\") == key_row.get(\"id\"):\n            api_keys[i] = key_row\n            break\n    _save(\"api_keys.json\", api_keys)\n\n    # Compute usage for current period\n    ledger = _load(\"usage_ledger.json\")\n    jobs = _load(\"scrape_jobs.json\")\n\n    used_request_units = 0\n    used_job_events = 0\n    for r in ledger:\n        if r.get(\"workspace_id\") == ws.get(\"id\") and r.get(\"period_yyyymm\") == period:\n            if r.get(\"unit_type\") == \"request\":\n                u = r.get(\"units\")\n                if isinstance(u, int) and u >= 0:\n                    used_request_units += u\n            if r.get(\"unit_type\") == \"job\":\n                u = r.get(\"units\")\n                if isinstance(u, int) and u >= 0:\n                    used_job_events += u\n\n    created_jobs_this_period = 0\n    for j in jobs:\n        if j.get(\"workspace_id\") == ws.get(\"id\"):\n            ca = j.get(\"created_at\")\n            if isinstance(ca, str) and len(ca) >= 7:\n                # accept both Z and non-Z\n                ca_period = ca[:7].replace(\"-\", \"\")\n                if ca_period == period:\n                    created_jobs_this_period += 1\n\n    mjq = ws.get(\"monthly_job_quota\")\n    mrq = ws.get(\"monthly_request_quota\")\n    mjq = mjq if isinstance(mjq, int) and mjq >= 0 else 0\n    mrq = mrq if isinstance(mrq, int) and mrq >= 0 else 0\n\n    quotas = {\n        \"period_yyyymm\": period,\n        \"monthly_job_quota\": mjq,\n        \"monthly_request_quota\": mrq,\n        \"usage\": {\n            \"jobs_created\": created_jobs_this_period,\n            \"request_units\": used_request_units,\n            \"job_events\": used_job_events,\n        },\n        \"remaining\": {\n            \"jobs\": None if ws.get(\"plan\") == \"enterprise\" else max(0, mjq - created_jobs_this_period),\n            \"requests\": None if ws.get(\"plan\") == \"enterprise\" else max(0, mrq - used_request_units),\n        },\n    }\n\n    scopes = [\"jobs:read\", \"jobs:write\", \"results:read\"]\n\n    _log(\"ok\", workspace_id=ws.get(\"id\"), api_key_id=key_row.get(\"id\"))\n\n    return {\n        \"workspace\": ws,\n        \"api_key\": {\n            \"id\": key_row.get(\"id\"),\n            \"workspace_id\": key_row.get(\"workspace_id\"),\n            \"name\": key_row.get(\"name\"),\n            \"status\": key_row.get(\"status\"),\n            \"last_used_at\": key_row.get(\"last_used_at\"),\n            \"created_at\": key_row.get(\"created_at\"),\n            \"updated_at\": key_row.get(\"updated_at\"),\n        },\n        \"scopes\": scopes,\n        \"quota\": quotas,\n    }\n"
+        },
+        {
+          "name": "list_scrape_jobs",
+          "description": "Lists scrape jobs for the authenticated workspace with filtering and pagination; returns persisted inputs and current execution state for traceability; refuses requests with missing/invalid/revoked credentials or a non-active workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Oxylabs API key used to authenticate the request."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of jobs to return."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled",
+                  "expired"
+                ],
+                "description": "Filter by job status."
+              },
+              "tool": {
+                "type": "string",
+                "enum": [
+                  "universal_scraper",
+                  "google_search_scraper",
+                  "amazon_search_scraper",
+                  "amazon_product_scraper"
+                ],
+                "description": "Filter by tool/provider."
+              },
+              "created_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Return jobs created at or after this time."
+              },
+              "created_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Return jobs created at or before this time."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Filter by client-provided idempotency key."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_scrape_jobs(api_key, cursor=None, limit=None, status=None, tool=None, created_after=None, created_before=None, idempotency_key=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0506000\" if __import__(\"os\").path.isdir(\"./environment_mix/0506000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0)\n    now_iso = now.isoformat() + \"Z\"\n    period = now.strftime(\"%Y%m\")\n    endpoint = \"list_scrape_jobs\"\n\n    def _log(status_s, workspace_id=None, api_key_id=None):\n        ledger = _load(\"usage_ledger.json\")\n        lid = \"ul_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"_\" + str(len(ledger) + 1)\n        ledger.append({\n            \"id\": lid,\n            \"workspace_id\": workspace_id if workspace_id is not None else \"unknown\",\n            \"api_key_id\": api_key_id,\n            \"job_id\": None,\n            \"tool\": None,\n            \"units\": 1,\n            \"unit_type\": \"request\",\n            \"period_yyyymm\": period,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n            \"endpoint\": endpoint,\n            \"status\": status_s,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"usage_ledger.json\", ledger)\n\n    # Validate\n    if not isinstance(api_key, str) or not api_key.strip():\n        _log(\"error\", workspace_id=\"unknown\", api_key_id=None)\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        _log(\"error\", workspace_id=\"unknown\", api_key_id=None)\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n    if limit < 1 or limit > 200:\n        _log(\"error\", workspace_id=\"unknown\", api_key_id=None)\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200\")\n\n    allowed_status = {\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\", \"expired\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            _log(\"error\", workspace_id=\"unknown\", api_key_id=None)\n            return _err(\"VALIDATION_ERROR\", \"Invalid status\")\n\n    allowed_tool = {\"universal_scraper\", \"google_search_scraper\", \"amazon_search_scraper\", \"amazon_product_scraper\"}\n    if tool is not None:\n        if not isinstance(tool, str) or tool not in allowed_tool:\n            _log(\"error\", workspace_id=\"unknown\", api_key_id=None)\n            return _err(\"VALIDATION_ERROR\", \"Invalid tool\")\n\n    if idempotency_key is not None and (not isinstance(idempotency_key, str) or not idempotency_key.strip()):\n        _log(\"error\", workspace_id=\"unknown\", api_key_id=None)\n        return _err(\"VALIDATION_ERROR\", \"idempotency_key must be a non-empty string\")\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s.strip():\n            raise ValueError(\"bad dt\")\n        ss = s.strip()\n        if ss.endswith(\"Z\"):\n            ss = ss[:-1]\n        return datetime.datetime.fromisoformat(ss)\n\n    try:\n        ca_after = _parse_dt(created_after)\n    except ValueError:\n        _log(\"error\", workspace_id=\"unknown\", api_key_id=None)\n        return _err(\"VALIDATION_ERROR\", \"created_after must be RFC3339 date-time\")\n    try:\n        ca_before = _parse_dt(created_before)\n    except ValueError:\n        _log(\"error\", workspace_id=\"unknown\", api_key_id=None)\n        return _err(\"VALIDATION_ERROR\", \"created_before must be RFC3339 date-time\")\n\n    # Authenticate\n    api_keys = _load(\"api_keys.json\")\n    workspaces = _load(\"workspaces.json\")\n\n    key_row = None\n    for k in api_keys:\n        if k.get(\"id\") == api_key or k.get(\"key_hash\") == api_key:\n            key_row = k\n            break\n    if not key_row or key_row.get(\"status\") != \"active\":\n        _log(\"error\", workspace_id=\"unknown\", api_key_id=key_row.get(\"id\") if key_row else None)\n        return _err(\"UNAUTHORIZED\", \"Invalid or inactive API key\")\n\n    ws = None\n    for w in workspaces:\n        if w.get(\"id\") == key_row.get(\"workspace_id\"):\n            ws = w\n            break\n    if not ws or ws.get(\"status\") != \"active\":\n        _log(\"error\", workspace_id=key_row.get(\"workspace_id\") if key_row else \"unknown\", api_key_id=key_row.get(\"id\") if key_row else None)\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active\")\n\n    # Update last_used_at\n    now_iso = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    for i, k in enumerate(api_keys):\n        if k.get(\"id\") == key_row.get(\"id\"):\n            api_keys[i][\"last_used_at\"] = now_iso\n            api_keys[i][\"updated_at\"] = now_iso\n            break\n    _save(\"api_keys.json\", api_keys)\n\n    # Decode cursor (offset-based)\n    offset = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or not cursor:\n            _log(\"error\", workspace_id=ws.get(\"id\"), api_key_id=key_row.get(\"id\"))\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string\")\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\").decode(\"utf-8\")\n            if not raw.startswith(\"offset:\"):\n                raise ValueError(\"bad\")\n            offset = int(raw.split(\":\", 1)[1])\n            if offset < 0:\n                raise ValueError(\"bad\")\n        except Exception:\n            _log(\"error\", workspace_id=ws.get(\"id\"), api_key_id=key_row.get(\"id\"))\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n\n    jobs = _load(\"scrape_jobs.json\")\n\n    def _job_created_dt(j):\n        s = j.get(\"created_at\")\n        if not isinstance(s, str) or not s:\n            return None\n        ss = s[:-1] if s.endswith(\"Z\") else s\n        try:\n            return datetime.datetime.fromisoformat(ss)\n        except Exception:\n            return None\n\n    # Filter by workspace and optional filters\n    filtered = []\n    for j in jobs:\n        if j.get(\"workspace_id\") != ws.get(\"id\"):\n            continue\n        if status is not None and j.get(\"status\") != status:\n            continue\n        if tool is not None and j.get(\"tool\") != tool:\n            continue\n        if idempotency_key is not None and j.get(\"idempotency_key\") != idempotency_key:\n            continue\n        cdt = _job_created_dt(j)\n        if ca_after is not None and (cdt is None or cdt < ca_after):\n            continue\n        if ca_before is not None and (cdt is None or cdt > ca_before):\n            continue\n        filtered.append(j)\n\n    # Sort newest first by created_at then id\n    filtered.sort(key=lambda x: ((x.get(\"created_at\") or \"\"), (x.get(\"id\") or \"\")), reverse=True)\n\n    total = len(filtered)\n    page = filtered[offset:offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(f\"offset:{next_offset}\".encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    _log(\"ok\", workspace_id=ws.get(\"id\"), api_key_id=key_row.get(\"id\"))\n\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n        },\n    }\n"
+        },
+        {
+          "name": "get_scrape_job",
+          "description": "Fetches a single scrape job by id for the authenticated workspace, including persisted input parameters and current lifecycle status; refuses access if the job is not in the caller workspace or the credentials/workspace are not active.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Oxylabs API key used to authenticate the request."
+              },
+              "job_id": {
+                "type": "string",
+                "description": "Scrape job id to retrieve."
+              }
+            },
+            "required": [
+              "api_key",
+              "job_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_scrape_job(api_key, job_id, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0506000\" if __import__(\"os\").path.isdir(\"./environment_mix/0506000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0)\n    now_iso = now.isoformat() + \"Z\"\n    period = now.strftime(\"%Y%m\")\n    endpoint = \"get_scrape_job\"\n\n    def _log(status, workspace_id=None, api_key_id=None, job_id_log=None):\n        ledger = _load(\"usage_ledger.json\")\n        lid = \"ul_\" + now.strftime(\"%Y%m%d%H%M%S\") + \"_\" + str(len(ledger) + 1)\n        ledger.append({\n            \"id\": lid,\n            \"workspace_id\": workspace_id if workspace_id is not None else \"unknown\",\n            \"api_key_id\": api_key_id,\n            \"job_id\": job_id_log,\n            \"tool\": None,\n            \"units\": 1,\n            \"unit_type\": \"request\",\n            \"period_yyyymm\": period,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"usage_ledger.json\", ledger)\n\n    if not isinstance(api_key, str) or not api_key.strip():\n        _log(\"error\", workspace_id=\"unknown\", api_key_id=None, job_id_log=None)\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\")\n    if not isinstance(job_id, str) or not job_id.strip():\n        _log(\"error\", workspace_id=\"unknown\", api_key_id=None, job_id_log=None)\n        return _err(\"VALIDATION_ERROR\", \"job_id must be a non-empty string\")\n\n    api_keys = _load(\"api_keys.json\")\n    workspaces = _load(\"workspaces.json\")\n\n    key_row = None\n    for k in api_keys:\n        if k.get(\"id\") == api_key or k.get(\"key_hash\") == api_key:\n            key_row = k\n            break\n    if not key_row or key_row.get(\"status\") != \"active\":\n        _log(\"error\", workspace_id=\"unknown\", api_key_id=key_row.get(\"id\") if key_row else None, job_id_log=job_id)\n        return _err(\"UNAUTHORIZED\", \"Invalid or inactive API key\")\n\n    ws = None\n    for w in workspaces:\n        if w.get(\"id\") == key_row.get(\"workspace_id\"):\n            ws = w\n            break\n    if not ws or ws.get(\"status\") != \"active\":\n        _log(\"error\", workspace_id=key_row.get(\"workspace_id\") if key_row else \"unknown\", api_key_id=key_row.get(\"id\") if key_row else None, job_id_log=job_id)\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active\")\n\n    # Update last_used_at\n    now2 = datetime.datetime.utcnow().replace(microsecond=0)\n    now2_iso = now2.isoformat() + \"Z\"\n    for i, k in enumerate(api_keys):\n        if k.get(\"id\") == key_row.get(\"id\"):\n            api_keys[i][\"last_used_at\"] = now2_iso\n            api_keys[i][\"updated_at\"] = now2_iso\n            break\n    _save(\"api_keys.json\", api_keys)\n\n    jobs = _load(\"scrape_jobs.json\")\n    job = None\n    for j in jobs:\n        if j.get(\"id\") == job_id:\n            job = j\n            break\n\n    if not job:\n        _log(\"error\", workspace_id=ws.get(\"id\"), api_key_id=key_row.get(\"id\"), job_id_log=job_id)\n        return _err(\"NOT_FOUND\", \"Job not found\")\n\n    if job.get(\"workspace_id\") != ws.get(\"id\"):\n        _log(\"error\", workspace_id=ws.get(\"id\"), api_key_id=key_row.get(\"id\"), job_id_log=job_id)\n        return _err(\"UNAUTHORIZED\", \"Job does not belong to this workspace\")\n\n    _log(\"ok\", workspace_id=ws.get(\"id\"), api_key_id=key_row.get(\"id\"), job_id_log=job_id)\n    return {\"data\": job}\n"
+        },
+        {
+          "name": "update_scrape_job",
+          "description": "Updates a scrape job lifecycle state when permitted (e.g., cancel a queued/running job, or retry a failed job back to queued) and optionally adjusts scheduling/priority; refuses invalid transitions, attempts to retry beyond max_attempts, or updates for jobs outside the caller workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Oxylabs API key used to authenticate the request."
+              },
+              "job_id": {
+                "type": "string",
+                "description": "Scrape job id to update."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "cancelled"
+                ],
+                "description": "Requested status transition. Use cancelled to stop a queued/running job; use queued to retry a failed job when attempt < max_attempts."
+              },
+              "priority": {
+                "type": "integer",
+                "description": "Optional updated scheduling priority (higher typically runs sooner)."
+              },
+              "scheduled_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional updated time to schedule the job execution (only while not finished)."
+              }
+            },
+            "required": [
+              "api_key",
+              "job_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_scrape_job(api_key, job_id, status=None, priority=None, scheduled_at=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0506000\" if __import__(\"os\").path.isdir(\"./environment_mix/0506000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"update_scrape_job\"\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now_iso = now_dt.isoformat() + \"Z\"\n    period = now_dt.strftime(\"%Y%m\")\n\n    usage = _load(\"usage_ledger.json\")\n    workspaces = _load(\"workspaces.json\")\n    keys = _load(\"api_keys.json\")\n    jobs = _load(\"scrape_jobs.json\")\n\n    def _new_ledger_id():\n        return f\"ox_usg_{int(time.time()*1000)}_{os.getpid()}_{len(usage)+1}\"\n\n    def _log(workspace_id, api_key_id, job_id_for_log, status_str, units=1, unit_type=\"request\", tool=None, extra=None):\n        nonlocal usage\n        row = {\n            \"id\": _new_ledger_id(),\n            \"workspace_id\": workspace_id if workspace_id is not None else \"unknown\",\n            \"api_key_id\": api_key_id,\n            \"job_id\": job_id_for_log,\n            \"tool\": tool,\n            \"units\": int(units),\n            \"unit_type\": unit_type,\n            \"period_yyyymm\": period,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n            \"_endpoint\": endpoint,\n            \"_status\": status_str,\n            \"_latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if extra is not None:\n            row[\"_meta\"] = extra\n        usage.append(row)\n        _save(\"usage_ledger.json\", usage)\n\n    def _parse_dt_isoz(s):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s.strip():\n            return \"INVALID\"\n        try:\n            datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n            return s\n        except ValueError:\n            return \"INVALID\"\n\n    def _find_key_and_ws(api_key_value):\n        # Authenticate by id OR by client-visible key material if present (never by hash).\n        for k in keys if isinstance(keys, list) else []:\n            if not isinstance(k, dict):\n                continue\n            if k.get(\"status\") != \"active\":\n                continue\n            if k.get(\"id\") == api_key_value or k.get(\"key\") == api_key_value or k.get(\"token\") == api_key_value:\n                wsid = k.get(\"workspace_id\")\n                ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == wsid), None)\n                if ws and ws.get(\"status\") == \"active\":\n                    return k, ws\n        return None, None\n\n    def _allowed_transition(frm, to):\n        transitions = {\n            \"queued\": [\"running\", \"cancelled\", \"expired\"],\n            \"running\": [\"succeeded\", \"failed\", \"cancelled\"],\n            \"succeeded\": [],\n            \"failed\": [\"queued\"],\n            \"cancelled\": [],\n            \"expired\": [],\n        }\n        return to in transitions.get(frm, [])\n\n    # Validate inputs (do not log as success on invalid args)\n    if not isinstance(api_key, str) or not api_key.strip():\n        _log(\"unknown\", None, None, \"error\", extra={\"reason\": \"validation\"})\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\")\n    if not isinstance(job_id, str) or not job_id.strip():\n        _log(\"unknown\", None, None, \"error\", extra={\"reason\": \"validation\"})\n        return _err(\"VALIDATION_ERROR\", \"job_id must be a non-empty string\")\n    if status is not None:\n        if not isinstance(status, str):\n            _log(\"unknown\", None, job_id, \"error\", extra={\"reason\": \"validation\"})\n            return _err(\"VALIDATION_ERROR\", \"status must be a string when provided\")\n        if status not in (\"queued\", \"cancelled\"):\n            _log(\"unknown\", None, job_id, \"error\", extra={\"reason\": \"validation\"})\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: queued, cancelled\")\n    if priority is not None:\n        if not isinstance(priority, int):\n            _log(\"unknown\", None, job_id, \"error\", extra={\"reason\": \"validation\"})\n            return _err(\"VALIDATION_ERROR\", \"priority must be an integer when provided\")\n        if priority < 0 or priority > 100:\n            _log(\"unknown\", None, job_id, \"error\", extra={\"reason\": \"validation\"})\n            return _err(\"VALIDATION_ERROR\", \"priority must be between 0 and 100\")\n    parsed_sched = _parse_dt_isoz(scheduled_at)\n    if parsed_sched == \"INVALID\":\n        _log(\"unknown\", None, job_id, \"error\", extra={\"reason\": \"validation\"})\n        return _err(\"VALIDATION_ERROR\", \"scheduled_at must be an ISO 8601 datetime string when provided\")\n\n    # Authenticate\n    key_row, ws_row = _find_key_and_ws(api_key)\n    if not key_row or not ws_row:\n        _log(\"unknown\", None, job_id, \"error\", extra={\"reason\": \"auth\"})\n        return _err(\"UNAUTHORIZED\", \"Invalid or inactive API key, or workspace not active\")\n\n    # Locate job and authorize workspace ownership\n    job = next((j for j in jobs if isinstance(j, dict) and j.get(\"id\") == job_id), None)\n    if not job:\n        _log(ws_row.get(\"id\"), key_row.get(\"id\"), job_id, \"error\", tool=None, extra={\"reason\": \"not_found\"})\n        return _err(\"NOT_FOUND\", \"Scrape job not found\")\n    if job.get(\"workspace_id\") != ws_row.get(\"id\"):\n        _log(ws_row.get(\"id\"), key_row.get(\"id\"), job_id, \"error\", tool=job.get(\"tool\"), extra={\"reason\": \"forbidden_workspace\"})\n        return _err(\"UNAUTHORIZED\", \"Job does not belong to authenticated workspace\")\n\n    # Apply updates according to lifecycle & business rules\n    changed = False\n\n    # status transition if requested\n    if status is not None:\n        current = job.get(\"status\")\n        if current is None:\n            _log(ws_row.get(\"id\"), key_row.get(\"id\"), job_id, \"error\", tool=job.get(\"tool\"), extra={\"reason\": \"invalid_state\"})\n            return _err(\"CONFLICT\", \"Job has no current status\")\n        if status == current:\n            # Idempotent: allow returning current job (but still enforce that transition would not be illegal)\n            pass\n        else:\n            # cancellation: only allowed from queued or running\n            if status == \"cancelled\":\n                if current not in (\"queued\", \"running\"):\n                    _log(ws_row.get(\"id\"), key_row.get(\"id\"), job_id, \"error\", tool=job.get(\"tool\"), extra={\"from\": current, \"to\": status})\n                    return _err(\"INVALID_TRANSITION\", f\"Cannot cancel a job from status '{current}'\")\n            # retry: only allowed from failed -> queued with attempt increment and attempt < max_attempts\n            if status == \"queued\":\n                if current != \"failed\":\n                    _log(ws_row.get(\"id\"), key_row.get(\"id\"), job_id, \"error\", tool=job.get(\"tool\"), extra={\"from\": current, \"to\": status})\n                    return _err(\"INVALID_TRANSITION\", f\"Retry to 'queued' is only allowed from 'failed' status (current: '{current}')\")\n                attempt = job.get(\"attempt\")\n                max_attempts = job.get(\"max_attempts\")\n                if not isinstance(attempt, int) or attempt < 1:\n                    _log(ws_row.get(\"id\"), key_row.get(\"id\"), job_id, \"error\", tool=job.get(\"tool\"), extra={\"reason\": \"bad_attempt\"})\n                    return _err(\"CONFLICT\", \"Job attempt counter is invalid\")\n                if not isinstance(max_attempts, int) or max_attempts < 1:\n                    _log(ws_row.get(\"id\"), key_row.get(\"id\"), job_id, \"error\", tool=job.get(\"tool\"), extra={\"reason\": \"bad_max_attempts\"})\n                    return _err(\"CONFLICT\", \"Job max_attempts is invalid\")\n                if attempt >= max_attempts:\n                    _log(ws_row.get(\"id\"), key_row.get(\"id\"), job_id, \"error\", tool=job.get(\"tool\"), extra={\"attempt\": attempt, \"max_attempts\": max_attempts})\n                    return _err(\"INVALID_TRANSITION\", \"Cannot retry job: attempt has reached max_attempts\")\n            # lifecycle transitions check (for completeness)\n            if not _allowed_transition(current, status):\n                _log(ws_row.get(\"id\"), key_row.get(\"id\"), job_id, \"error\", tool=job.get(\"tool\"), extra={\"from\": current, \"to\": status})\n                return _err(\"INVALID_TRANSITION\", f\"Invalid status transition: {current} -> {status}\")\n\n            # enact transition\n            job[\"status\"] = status\n            if status == \"cancelled\":\n                if job.get(\"started_at\") is None and current == \"queued\":\n                    # leave started_at null\n                    pass\n                # mark finished\n                job[\"finished_at\"] = now_iso\n            if status == \"queued\":\n                # retry: increment attempt; clear error fields; clear timing fields\n                job[\"attempt\"] = int(job.get(\"attempt\", 1)) + 1\n                job[\"error_code\"] = None\n                job[\"error_message\"] = None\n                job[\"started_at\"] = None\n                job[\"finished_at\"] = None\n            changed = True\n\n    # scheduling/priority updates: only while not finished (i.e., not in terminal states succeeded/failed/cancelled/expired)\n    terminal = job.get(\"status\") in (\"succeeded\", \"failed\", \"cancelled\", \"expired\")\n    if priority is not None:\n        if terminal:\n            _log(ws_row.get(\"id\"), key_row.get(\"id\"), job_id, \"error\", tool=job.get(\"tool\"), extra={\"reason\": \"terminal_update\"})\n            return _err(\"INVALID_TRANSITION\", \"Cannot update priority for a finished (terminal) job\")\n        if job.get(\"priority\") != priority:\n            job[\"priority\"] = priority\n            changed = True\n\n    if scheduled_at is not None:\n        if terminal:\n            _log(ws_row.get(\"id\"), key_row.get(\"id\"), job_id, \"error\", tool=job.get(\"tool\"), extra={\"reason\": \"terminal_update\"})\n            return _err(\"INVALID_TRANSITION\", \"Cannot update scheduled_at for a finished (terminal) job\")\n        if job.get(\"scheduled_at\") != parsed_sched:\n            job[\"scheduled_at\"] = parsed_sched\n            changed = True\n\n    if not changed:\n        # No success without effect: if request had no mutable fields or all were no-ops.\n        _log(ws_row.get(\"id\"), key_row.get(\"id\"), job_id, \"error\", tool=job.get(\"tool\"), extra={\"reason\": \"no_effect\"})\n        return _err(\"CONFLICT\", \"No changes applied (request had no effect)\")\n\n    job[\"updated_at\"] = now_iso\n    # best-effort link: note which key updated it\n    if job.get(\"api_key_id\") is None:\n        job[\"api_key_id\"] = key_row.get(\"id\")\n\n    _save(\"scrape_jobs.json\", jobs)\n\n    # mark key last_used_at on successful authorized mutation\n    key_row[\"last_used_at\"] = now_iso\n    key_row[\"updated_at\"] = now_iso\n    _save(\"api_keys.json\", keys)\n\n    _log(ws_row.get(\"id\"), key_row.get(\"id\"), job_id, \"ok\", tool=job.get(\"tool\"), extra={\"updated\": True})\n\n    return {\n        \"job\": job,\n        \"request_id\": _new_ledger_id(),\n    }\n"
+        },
+        {
+          "name": "list_job_results",
+          "description": "Lists stored result parts for a scrape job (one per fetched page when pagination_pages > 1), including status and metadata; refuses access if the job is not in the caller workspace or the credentials/workspace are not active.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Oxylabs API key used to authenticate the request."
+              },
+              "job_id": {
+                "type": "string",
+                "description": "Scrape job id whose results should be listed."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of result parts to return."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "ready",
+                  "redacted",
+                  "deleted"
+                ],
+                "description": "Filter results by retention status."
+              }
+            },
+            "required": [
+              "api_key",
+              "job_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_job_results(api_key, job_id, cursor=None, limit=None, status=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0506000\" if __import__(\"os\").path.isdir(\"./environment_mix/0506000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # Ensure request log collection exists (schema mentions usage ledger; use it as observable per-call ledger too)\n    usage = _load(\"usage_ledger.json\")\n    workspaces = _load(\"workspaces.json\")\n    keys = _load(\"api_keys.json\")\n    jobs = _load(\"scrape_jobs.json\")\n    results = _load(\"job_results.json\")\n\n    def _period_yyyymm(dtiso):\n        try:\n            dt = datetime.datetime.fromisoformat(dtiso.replace(\"Z\", \"+00:00\"))\n        except Exception:\n            dt = datetime.datetime.utcnow()\n        return f\"{dt.year:04d}{dt.month:02d}\"\n\n    def _log(workspace_id, api_key_id, job_id_for_log, tool, units, unit_type, status_str, extra=None):\n        nonlocal usage\n        rid = f\"usg_{int(time.time()*1000)}_{os.getpid()}_{len(usage)+1}\"\n        row = {\n            \"id\": rid,\n            \"workspace_id\": workspace_id,\n            \"api_key_id\": api_key_id,\n            \"job_id\": job_id_for_log,\n            \"tool\": tool,\n            \"units\": int(units),\n            \"unit_type\": unit_type,\n            \"period_yyyymm\": _period_yyyymm(now),\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        if extra:\n            row[\"_meta\"] = extra\n            row[\"_status\"] = status_str\n        else:\n            row[\"_status\"] = status_str\n        usage.append(row)\n\n    # Validate inputs\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\")\n    if not isinstance(job_id, str) or not job_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"job_id must be a non-empty string\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200\")\n    if status is not None:\n        if not isinstance(status, str):\n            return _err(\"VALIDATION_ERROR\", \"status must be a string\")\n        if status not in (\"ready\", \"redacted\", \"deleted\"):\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: ready, redacted, deleted\")\n\n    # Authenticate: match by id OR by client-visible key value (cannot verify hash)\n    key_row = None\n    for k in keys:\n        if k.get(\"id\") == api_key or k.get(\"key_hash\") == api_key:\n            key_row = k\n            break\n    if not key_row or key_row.get(\"status\") != \"active\":\n        # log unauth attempt (best-effort, no workspace)\n        _log(workspace_id=\"unknown\", api_key_id=None, job_id_for_log=None, tool=None, units=1, unit_type=\"request\", status_str=\"unauthorized\",\n             extra={\"endpoint\": \"list_job_results\", \"job_id\": job_id, \"latency_ms\": int((time.time() - t0) * 1000)})\n        _save(\"usage_ledger.json\", usage)\n        return _err(\"UNAUTHORIZED\", \"Invalid or revoked API key\")\n\n    ws_id = key_row.get(\"workspace_id\")\n    ws = next((w for w in workspaces if w.get(\"id\") == ws_id), None)\n    if not ws or ws.get(\"status\") != \"active\":\n        _log(workspace_id=ws_id or \"unknown\", api_key_id=key_row.get(\"id\"), job_id_for_log=None, tool=None, units=1, unit_type=\"request\", status_str=\"unauthorized\",\n             extra={\"endpoint\": \"list_job_results\", \"job_id\": job_id, \"latency_ms\": int((time.time() - t0) * 1000)})\n        _save(\"usage_ledger.json\", usage)\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active\")\n\n    job = next((j for j in jobs if j.get(\"id\") == job_id), None)\n    if not job:\n        _log(workspace_id=ws_id, api_key_id=key_row.get(\"id\"), job_id_for_log=None, tool=None, units=1, unit_type=\"request\", status_str=\"not_found\",\n             extra={\"endpoint\": \"list_job_results\", \"job_id\": job_id, \"latency_ms\": int((time.time() - t0) * 1000)})\n        _save(\"usage_ledger.json\", usage)\n        return _err(\"NOT_FOUND\", \"Job not found\")\n    if job.get(\"workspace_id\") != ws_id:\n        _log(workspace_id=ws_id, api_key_id=key_row.get(\"id\"), job_id_for_log=job_id, tool=job.get(\"tool\"), units=1, unit_type=\"request\", status_str=\"unauthorized\",\n             extra={\"endpoint\": \"list_job_results\", \"job_id\": job_id, \"latency_ms\": int((time.time() - t0) * 1000)})\n        _save(\"usage_ledger.json\", usage)\n        return _err(\"UNAUTHORIZED\", \"Job does not belong to this workspace\")\n\n    # Basic rate limiting: 60 requests/min per api_key_id based on usage_ledger request units (including meta logs)\n    window_seconds = 60\n    try:\n        now_dt = datetime.datetime.fromisoformat(now.replace(\"Z\", \"+00:00\"))\n    except Exception:\n        now_dt = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n    cutoff = now_dt - datetime.timedelta(seconds=window_seconds)\n    recent = 0\n    for u in usage:\n        if u.get(\"api_key_id\") != key_row.get(\"id\"):\n            continue\n        if u.get(\"unit_type\") != \"request\":\n            continue\n        ts = u.get(\"created_at\")\n        if not isinstance(ts, str):\n            continue\n        try:\n            dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\"))\n        except Exception:\n            continue\n        if dt >= cutoff:\n            recent += int(u.get(\"units\") or 0)\n    if recent >= 60:\n        _log(workspace_id=ws_id, api_key_id=key_row.get(\"id\"), job_id_for_log=job_id, tool=job.get(\"tool\"), units=1, unit_type=\"request\", status_str=\"rate_limited\",\n             extra={\"endpoint\": \"list_job_results\", \"job_id\": job_id, \"latency_ms\": int((time.time() - t0) * 1000)})\n        _save(\"usage_ledger.json\", usage)\n        return _err(\"RATE_LIMIT\", \"Too many requests; please retry later\")\n\n    # Pagination cursor: base64 JSON {\"offset\": int}\n    offset = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\").decode(\"utf-8\")\n            obj = json.loads(raw)\n            if not isinstance(obj, dict) or \"offset\" not in obj or not isinstance(obj[\"offset\"], int) or obj[\"offset\"] < 0:\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n            offset = obj[\"offset\"]\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n\n    # Filter results\n    matched = [r for r in results if r.get(\"job_id\") == job_id]\n    if status is not None:\n        matched = [r for r in matched if r.get(\"status\") == status]\n\n    # Sort by part_index asc then created_at\n    def _sort_key(r):\n        pi = r.get(\"part_index\")\n        if not isinstance(pi, int):\n            pi = 10**9\n        ca = r.get(\"created_at\") or \"\"\n        return (pi, ca, r.get(\"id\") or \"\")\n    matched.sort(key=_sort_key)\n\n    total = len(matched)\n    page = matched[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        payload = json.dumps({\"offset\": next_offset}, separators=(\",\", \":\")).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(payload).decode(\"utf-8\").rstrip(\"=\")\n\n    # Update key last_used_at on successful auth+access\n    key_row[\"last_used_at\"] = now\n    key_row[\"updated_at\"] = now\n    _save(\"api_keys.json\", keys)\n\n    # Log request usage (1 request unit)\n    _log(workspace_id=ws_id, api_key_id=key_row.get(\"id\"), job_id_for_log=job_id, tool=job.get(\"tool\"), units=1, unit_type=\"request\", status_str=\"ok\",\n         extra={\"endpoint\": \"list_job_results\", \"cursor\": cursor, \"limit\": limit, \"filter_status\": status, \"latency_ms\": int((time.time() - t0) * 1000)})\n    _save(\"usage_ledger.json\", usage)\n\n    return {\n        \"results\": page,\n        \"job\": {\"id\": job.get(\"id\"), \"status\": job.get(\"status\"), \"tool\": job.get(\"tool\")},\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n        },\n    }\n"
+        },
+        {
+          "name": "get_job_result",
+          "description": "Fetches a single stored result part by id for the authenticated workspace; returns raw_body and/or parsed payload depending on output_format and parse_content, and returns nulled/redacted bodies when status is redacted or deleted; refuses access if the result/job is not in the caller workspace or the credentials/workspace are not active.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Oxylabs API key used to authenticate the request."
+              },
+              "result_id": {
+                "type": "string",
+                "description": "Job result id to retrieve."
+              },
+              "include_raw_body": {
+                "type": "boolean",
+                "description": "Whether to include raw_body when available (may be null for redacted/deleted)."
+              },
+              "include_parsed": {
+                "type": "boolean",
+                "description": "Whether to include parsed when available (null when parse_content=false or redacted/deleted)."
+              }
+            },
+            "required": [
+              "api_key",
+              "result_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_job_result(api_key, result_id, include_raw_body=None, include_parsed=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0506000\" if __import__(\"os\").path.isdir(\"./environment_mix/0506000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_job_result\"\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now_iso = now_dt.isoformat() + \"Z\"\n    period = now_dt.strftime(\"%Y%m\")\n\n    usage = _load(\"usage_ledger.json\")\n    workspaces = _load(\"workspaces.json\")\n    keys = _load(\"api_keys.json\")\n    jobs = _load(\"scrape_jobs.json\")\n    results = _load(\"job_results.json\")\n\n    def _new_ledger_id():\n        return f\"ox_usg_{int(time.time()*1000)}_{os.getpid()}_{len(usage)+1}\"\n\n    def _log(workspace_id, api_key_id, job_id_for_log, status_str, units=1, unit_type=\"request\", tool=None, extra=None):\n        nonlocal usage\n        row = {\n            \"id\": _new_ledger_id(),\n            \"workspace_id\": workspace_id if workspace_id is not None else \"unknown\",\n            \"api_key_id\": api_key_id,\n            \"job_id\": job_id_for_log,\n            \"tool\": tool,\n            \"units\": int(units),\n            \"unit_type\": unit_type,\n            \"period_yyyymm\": period,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n            \"_endpoint\": endpoint,\n            \"_status\": status_str,\n            \"_latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if extra is not None:\n            row[\"_meta\"] = extra\n        usage.append(row)\n        _save(\"usage_ledger.json\", usage)\n\n    def _find_key_and_ws(api_key_value):\n        for k in keys if isinstance(keys, list) else []:\n            if not isinstance(k, dict):\n                continue\n            if k.get(\"status\") != \"active\":\n                continue\n            if k.get(\"id\") == api_key_value or k.get(\"key\") == api_key_value or k.get(\"token\") == api_key_value:\n                wsid = k.get(\"workspace_id\")\n                ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == wsid), None)\n                if ws and ws.get(\"status\") == \"active\":\n                    return k, ws\n        return None, None\n\n    # Validate\n    if not isinstance(api_key, str) or not api_key.strip():\n        _log(\"unknown\", None, None, \"error\", extra={\"reason\": \"validation\"})\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\")\n    if not isinstance(result_id, str) or not result_id.strip():\n        _log(\"unknown\", None, None, \"error\", extra={\"reason\": \"validation\"})\n        return _err(\"VALIDATION_ERROR\", \"result_id must be a non-empty string\")\n    if include_raw_body is None:\n        include_raw_body = True\n    if include_parsed is None:\n        include_parsed = True\n    if not isinstance(include_raw_body, bool):\n        _log(\"unknown\", None, None, \"error\", extra={\"reason\": \"validation\"})\n        return _err(\"VALIDATION_ERROR\", \"include_raw_body must be a boolean when provided\")\n    if not isinstance(include_parsed, bool):\n        _log(\"unknown\", None, None, \"error\", extra={\"reason\": \"validation\"})\n        return _err(\"VALIDATION_ERROR\", \"include_parsed must be a boolean when provided\")\n\n    # Authenticate\n    key_row, ws_row = _find_key_and_ws(api_key)\n    if not key_row or not ws_row:\n        _log(\"unknown\", None, None, \"error\", extra={\"reason\": \"auth\"})\n        return _err(\"UNAUTHORIZED\", \"Invalid or inactive API key, or workspace not active\")\n\n    # Find result\n    res = next((r for r in results if isinstance(r, dict) and r.get(\"id\") == result_id), None)\n    if not res:\n        _log(ws_row.get(\"id\"), key_row.get(\"id\"), None, \"ok\", units=1, unit_type=\"request\", extra={\"found\": False})\n        return {\"result\": None, \"found\": False, \"request_id\": _new_ledger_id()}\n\n    job_id = res.get(\"job_id\")\n    job = next((j for j in jobs if isinstance(j, dict) and j.get(\"id\") == job_id), None)\n    if not job:\n        _log(ws_row.get(\"id\"), key_row.get(\"id\"), job_id, \"error\", extra={\"reason\": \"fk_missing\"})\n        return _err(\"NOT_FOUND\", \"Owning job for this result was not found\")\n\n    if job.get(\"workspace_id\") != ws_row.get(\"id\"):\n        _log(ws_row.get(\"id\"), key_row.get(\"id\"), job_id, \"error\", tool=job.get(\"tool\"), extra={\"reason\": \"forbidden_workspace\"})\n        return _err(\"UNAUTHORIZED\", \"Result does not belong to authenticated workspace\")\n\n    # Apply redaction/deletion rules\n    out = dict(res)  # copy\n    rstatus = out.get(\"status\")\n    if rstatus in (\"redacted\", \"deleted\"):\n        out[\"raw_body\"] = None\n        if rstatus == \"deleted\":\n            out[\"bytes\"] = 0\n        out[\"parsed\"] = None\n\n    # Apply include flags and parse_content rule\n    if not include_raw_body:\n        out[\"raw_body\"] = None\n\n    parse_content = job.get(\"parse_content\")\n    if parse_content is False:\n        out[\"parsed\"] = None\n    if not include_parsed:\n        out[\"parsed\"] = None\n\n    # Successful read logging + key last_used_at\n    key_row[\"last_used_at\"] = now_iso\n    key_row[\"updated_at\"] = now_iso\n    _save(\"api_keys.json\", keys)\n\n    _log(ws_row.get(\"id\"), key_row.get(\"id\"), job_id, \"ok\", units=1, unit_type=\"request\", tool=job.get(\"tool\"), extra={\"result_status\": rstatus})\n\n    return {\n        \"result\": out,\n        \"job\": {\"id\": job.get(\"id\"), \"status\": job.get(\"status\"), \"tool\": job.get(\"tool\")},\n        \"request_id\": _new_ledger_id(),\n    }\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0506000",
+    "index": 506,
+    "name": "Oxylabs MCP",
+    "description": "This backend stores customers (workspaces) and their API credentials, accepts scrape/search jobs for multiple providers (Universal, Google Search, Amazon Search, Amazon Product), and persists job inputs, execution state, and outputs. The main workflow is: an authenticated client submits a scraper jo",
+    "taxonomy": {
+      "L1_id": "L1-01",
+      "L1_name": "Search & Information Retrieval",
+      "L1_name_zh": "搜索与信息获取",
+      "L2_id": "L2-02",
+      "L2_name": "Web Content Extraction",
+      "L2_name_zh": "网页内容抓取",
+      "L3_name": "SERP & Marketplace Data Extraction",
+      "L3_name_zh": "搜索引擎与电商数据采集"
+    },
+    "database_dir": "./environment_mix/0506000",
+    "mount_path": "/app/database",
+    "n_tools": 10,
+    "n_collections": 5,
+    "n_records": 87,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 10,
+      "loaded": 10,
+      "reads_returning_data": 7,
+      "read_operations": 7,
+      "mutations_persisted": 3,
+      "mutations_attempted": 3
+    },
+    "tools_loadable_from_database_dir": 10,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "google_search_scraper",
+      "returned_chars": 105
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

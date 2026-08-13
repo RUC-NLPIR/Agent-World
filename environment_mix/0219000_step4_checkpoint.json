@@ -1,0 +1,698 @@
+{
+  "index": 219,
+  "local_files_dir": "./environment_mix/0219000",
+  "file_list": [
+    "./environment_mix/0219000/README.md",
+    "./environment_mix/0219000/request_logs.json",
+    "./environment_mix/0219000/scheduler_locks.json",
+    "./environment_mix/0219000/scheduler_tasks.json",
+    "./environment_mix/0219000/server_runtime.json",
+    "./environment_mix/0219000/task_executions.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "scheduler_tasks.json": "38 rows",
+        "task_executions.json": "34 rows",
+        "scheduler_locks.json": "12 rows",
+        "server_runtime.json": "12 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "list_tasks",
+          "description": "Returns a paginated list of scheduled tasks, optionally filtered by task_type, enabled, and lifecycle status, and sorted by sort_by/sort_order; the response includes up to limit items and a cursor to request the next page (omit cursor to start from the first page). Raises VALIDATION_ERROR if any filter/sort value is not one of the supported enums or if limit is outside 1–200. Raises UNAUTHORIZED if the caller is not allowed to read tasks.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "task_type": {
+                "type": "string",
+                "enum": [
+                  "command",
+                  "api",
+                  "ai",
+                  "reminder"
+                ],
+                "description": "Filter tasks by task type."
+              },
+              "enabled": {
+                "type": "boolean",
+                "description": "Filter tasks by whether they are enabled."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled",
+                  "completed",
+                  "deleted"
+                ],
+                "description": "Filter tasks by lifecycle status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of tasks to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Cursor for pagination to fetch the next page of results."
+              },
+              "sort_by": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "next_run_at",
+                  "last_run_at",
+                  "name"
+                ],
+                "description": "Field to sort results by."
+              },
+              "sort_order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order for the sorted field."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_tasks(task_type=None, enabled=None, status=None, limit=None, cursor=None, sort_by=None, sort_order=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0219000\" if __import__(\"os\").path.isdir(\"./environment_mix/0219000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    status_code = \"ok\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _dt(x):\n        if x is None:\n            return None\n        if isinstance(x, datetime.datetime):\n            return x if x.tzinfo else x.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(x, str):\n            try:\n                s = x\n                if s.endswith(\"Z\"):\n                    s = s[:-1] + \"+00:00\"\n                return datetime.datetime.fromisoformat(s)\n            except Exception:\n                return None\n        return None\n\n    def _encode_cursor(payload: dict) -> str:\n        raw = json.dumps(payload, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"ascii\").rstrip(\"=\")\n\n    def _decode_cursor(cur: str):\n        if not isinstance(cur, str) or not cur:\n            return None\n        try:\n            pad = \"=\" * (-len(cur) % 4)\n            raw = base64.urlsafe_b64decode((cur + pad).encode(\"ascii\"))\n            obj = json.loads(raw.decode(\"utf-8\"))\n            return obj if isinstance(obj, dict) else None\n        except Exception:\n            return None\n\n    def _log(endpoint, status_code, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = _now_iso()\n        latency_ms = int((time.time() - t0) * 1000)\n        logs.append({\n            \"id\": f\"req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": None,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": now\n        })\n        _save(\"request_logs.json\", logs)\n\n    # Validation\n    allowed_task_types = {\"command\", \"api\", \"ai\", \"reminder\"}\n    allowed_status = {\"active\", \"disabled\", \"completed\", \"deleted\"}\n    allowed_sort_by = {\"created_at\", \"updated_at\", \"next_run_at\", \"last_run_at\", \"name\"}\n    allowed_sort_order = {\"asc\", \"desc\"}\n\n    if task_type is not None and (not isinstance(task_type, str) or task_type not in allowed_task_types):\n        status_code = \"error\"\n        out = _err(\"VALIDATION_ERROR\", \"Invalid task_type.\", allowed=list(sorted(allowed_task_types)))\n        _log(\"list_tasks\", status_code, out[\"error\"][\"code\"])\n        return out\n    if enabled is not None and not isinstance(enabled, bool):\n        status_code = \"error\"\n        out = _err(\"VALIDATION_ERROR\", \"enabled must be a boolean.\")\n        _log(\"list_tasks\", status_code, out[\"error\"][\"code\"])\n        return out\n    if status is not None and (not isinstance(status, str) or status not in allowed_status):\n        status_code = \"error\"\n        out = _err(\"VALIDATION_ERROR\", \"Invalid status.\", allowed=list(sorted(allowed_status)))\n        _log(\"list_tasks\", status_code, out[\"error\"][\"code\"])\n        return out\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        status_code = \"error\"\n        out = _err(\"VALIDATION_ERROR\", \"limit must be an integer in range 1..200.\")\n        _log(\"list_tasks\", status_code, out[\"error\"][\"code\"])\n        return out\n    if cursor is not None and not isinstance(cursor, str):\n        status_code = \"error\"\n        out = _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n        _log(\"list_tasks\", status_code, out[\"error\"][\"code\"])\n        return out\n    if sort_by is None:\n        sort_by = \"created_at\"\n    if not isinstance(sort_by, str) or sort_by not in allowed_sort_by:\n        status_code = \"error\"\n        out = _err(\"VALIDATION_ERROR\", \"Invalid sort_by.\", allowed=list(sorted(allowed_sort_by)))\n        _log(\"list_tasks\", status_code, out[\"error\"][\"code\"])\n        return out\n    if sort_order is None:\n        sort_order = \"asc\"\n    if not isinstance(sort_order, str) or sort_order not in allowed_sort_order:\n        status_code = \"error\"\n        out = _err(\"VALIDATION_ERROR\", \"Invalid sort_order.\", allowed=list(sorted(allowed_sort_order)))\n        _log(\"list_tasks\", status_code, out[\"error\"][\"code\"])\n        return out\n\n    cur = _decode_cursor(cursor) if cursor else None\n    if cursor and cur is None:\n        status_code = \"error\"\n        out = _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n        _log(\"list_tasks\", status_code, out[\"error\"][\"code\"])\n        return out\n\n    tasks = _load(\"scheduler_tasks.json\")\n    if not isinstance(tasks, list):\n        tasks = []\n\n    # Business rule: list excludes deleted by default\n    filtered = []\n    for r in tasks:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"status\") == \"deleted\":\n            continue\n        if task_type is not None and r.get(\"task_type\") != task_type:\n            continue\n        if enabled is not None and r.get(\"enabled\") is not enabled:\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        filtered.append(r)\n\n    reverse = (sort_order == \"desc\")\n\n    def _sort_key(r):\n        v = r.get(sort_by)\n        if sort_by in (\"created_at\", \"updated_at\", \"next_run_at\", \"last_run_at\"):\n            d = _dt(v)\n            # Treat None as far future for asc, far past for desc (so Nones sort last for asc, first for desc)\n            if d is None:\n                return datetime.datetime.max.replace(tzinfo=datetime.timezone.utc) if not reverse else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n            return d\n        if sort_by == \"name\":\n            return (v or \"\").casefold()\n        return v\n\n    # Secondary tie-breaker by id for stable pagination\n    filtered.sort(key=lambda r: (_sort_key(r), r.get(\"id\", \"\")), reverse=reverse)\n\n    start = 0\n    if cur:\n        if cur.get(\"sort_by\") != sort_by or cur.get(\"sort_order\") != sort_order:\n            status_code = \"error\"\n            out = _err(\"VALIDATION_ERROR\", \"Cursor sort parameters do not match request.\")\n            _log(\"list_tasks\", status_code, out[\"error\"][\"code\"])\n            return out\n        last_id = cur.get(\"last_id\")\n        last_val = cur.get(\"last_val\")\n        # Find first item after cursor\n        def _cmp_after(r):\n            rid = r.get(\"id\", \"\")\n            sval = _sort_key(r)\n            # Reconstruct cursor value for comparison\n            if sort_by in (\"created_at\", \"updated_at\", \"next_run_at\", \"last_run_at\"):\n                cv = _dt(last_val)\n                rv = sval\n                if cv is None:\n                    cv = datetime.datetime.max.replace(tzinfo=datetime.timezone.utc) if sort_order == \"asc\" else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n                if rv is None:\n                    rv = datetime.datetime.max.replace(tzinfo=datetime.timezone.utc) if sort_order == \"asc\" else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n                if sort_order == \"asc\":\n                    return (rv, rid) > (cv, last_id)\n                else:\n                    return (rv, rid) < (cv, last_id)\n            else:\n                cv = last_val\n                rv = sval\n                if sort_order == \"asc\":\n                    return (rv, rid) > (cv, last_id)\n                else:\n                    return (rv, rid) < (cv, last_id)\n\n        found = False\n        for i, r in enumerate(filtered):\n            if _cmp_after(r):\n                start = i\n                found = True\n                break\n        if not found:\n            start = len(filtered)\n\n    page = filtered[start:start + limit]\n    has_more = (start + limit) < len(filtered)\n\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        last_val = last.get(sort_by)\n        next_cursor = _encode_cursor({\n            \"sort_by\": sort_by,\n            \"sort_order\": sort_order,\n            \"last_id\": last.get(\"id\"),\n            \"last_val\": last_val\n        })\n\n    out = {\n        \"items\": page,\n        \"total\": len(filtered),\n        \"limit\": limit,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n        \"sort_by\": sort_by,\n        \"sort_order\": sort_order\n    }\n    _log(\"list_tasks\", status_code, None)\n    return out\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_task",
+          "description": "Retrieves a single task by task_id and returns its full configuration, schedule, and current lifecycle/enablement state. Raises NOT_FOUND if no task exists with the given task_id. Raises UNAUTHORIZED if the caller is not allowed to view the task.",
+          "parameters": {
+            "properties": {
+              "task_id": {
+                "title": "Task Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "task_id"
+            ],
+            "title": "get_taskArguments",
+            "type": "object"
+          },
+          "implementation": "def get_task(task_id, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0219000\" if __import__(\"os\").path.isdir(\"./environment_mix/0219000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    status_code = \"ok\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _log(endpoint, status_code, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = _now_iso()\n        latency_ms = int((time.time() - t0) * 1000)\n        logs.append({\n            \"id\": f\"req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": None,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": now\n        })\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(task_id, str) or not task_id.strip():\n        status_code = \"error\"\n        out = _err(\"VALIDATION_ERROR\", \"task_id must be a non-empty string.\")\n        _log(\"get_task\", status_code, out[\"error\"][\"code\"])\n        return out\n\n    tasks = _load(\"scheduler_tasks.json\")\n    if not isinstance(tasks, list):\n        tasks = []\n    row = None\n    for r in tasks:\n        if isinstance(r, dict) and r.get(\"id\") == task_id and r.get(\"status\") != \"deleted\":\n            row = r\n            break\n\n    if row is None:\n        status_code = \"error\"\n        out = _err(\"NOT_FOUND\", \"Task not found.\", task_id=task_id)\n        _log(\"get_task\", status_code, out[\"error\"][\"code\"])\n        return out\n\n    out = {\"task\": row}\n    _log(\"get_task\", status_code, None)\n    return out\n",
+          "description_restored": true
+        },
+        {
+          "name": "add_command_task",
+          "description": "Creates a new scheduled task of type command with the provided name, schedule, and shell command, and returns the created task record including its id and initial next-run calculation. Raises VALIDATION_ERROR if required fields are missing/empty or schedule/command are invalid for a command task. Raises CONFLICT if a task with the same name already exists, and UNAUTHORIZED if the caller is not allowed to create tasks.",
+          "parameters": {
+            "properties": {
+              "name": {
+                "title": "Name",
+                "type": "string"
+              },
+              "schedule": {
+                "title": "Schedule",
+                "type": "string"
+              },
+              "command": {
+                "title": "Command",
+                "type": "string"
+              },
+              "description": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Description"
+              },
+              "enabled": {
+                "default": true,
+                "title": "Enabled",
+                "type": "boolean"
+              },
+              "do_only_once": {
+                "default": true,
+                "title": "Do Only Once",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "name",
+              "schedule",
+              "command"
+            ],
+            "title": "add_command_taskArguments",
+            "type": "object"
+          },
+          "implementation": "def add_command_task(name, schedule, command, description=None, enabled=None, do_only_once=None, **_extra):\n    import json, os, datetime, time, uuid, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0219000\" if __import__(\"os\").path.isdir(\"./environment_mix/0219000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"add_command_task\"\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.isoformat()\n        return None\n\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        return logs if isinstance(logs, list) else []\n\n    def _write_log(status, error_code=None, message=None, credential_id=None):\n        logs = _load_logs()\n        latency_ms = int((time.time() - t0) * 1000)\n        row = {\n            \"id\": f\"req_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now().isoformat(),\n        }\n        if message is not None:\n            row[\"message\"] = message\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _nonempty_str(v):\n        return isinstance(v, str) and v.strip() != \"\"\n\n    def _validate_schedule(expr):\n        # Supported:\n        #  - \"cron <min> <hour> <dom> <month> <dow>\" (5-field)\n        #  - \"interval <n> <unit>\" unit: second(s)/minute(s)/hour(s)/day(s)\n        if not isinstance(expr, str):\n            return _err(\"VALIDATION_ERROR\", \"schedule must be a string\", field=\"schedule\")\n        s = expr.strip()\n        if not s:\n            return _err(\"VALIDATION_ERROR\", \"schedule must be a non-empty string\", field=\"schedule\")\n\n        m = re.match(r\"^\\s*interval\\s+(\\d+)\\s*(seconds|second|minutes|minute|hours|hour|days|day)\\s*$\", s, re.I)\n        if m:\n            n = int(m.group(1))\n            if n <= 0:\n                return _err(\"VALIDATION_ERROR\", \"interval must be a positive integer\", field=\"schedule\")\n            return {\"type\": \"interval\", \"n\": n, \"unit\": m.group(2).lower()}\n\n        m = re.match(r\"^\\s*cron\\s+(.+)\\s*$\", s, re.I)\n        if m:\n            fields = m.group(1).split()\n            if len(fields) != 5:\n                return _err(\"VALIDATION_ERROR\", \"cron schedule must have 5 fields: min hour dom month dow\", field=\"schedule\")\n            minute, hour, dom, month, dow = fields\n\n            def _in_range(token, lo, hi):\n                # Accept \"*\", \"MON\", \"1-5\", \"*/5\", \"0,15,30\", etc. Keep conservative but allow typical cron tokens.\n                if token == \"*\":\n                    return True\n                # allow names for dow/month\n                if re.fullmatch(r\"[A-Za-z]{3}\", token):\n                    return True\n                # allow comma-separated of basic tokens\n                parts = token.split(\",\")\n                for p in parts:\n                    p = p.strip()\n                    if not p:\n                        return False\n                    if p == \"*\":\n                        continue\n                    if re.fullmatch(r\"\\*/\\d+\", p):\n                        step = int(p.split(\"/\")[1])\n                        if step <= 0:\n                            return False\n                        continue\n                    if re.fullmatch(r\"\\d+-\\d+\", p):\n                        a, b = p.split(\"-\")\n                        a = int(a)\n                        b = int(b)\n                        if a > b or a < lo or b > hi:\n                            return False\n                        continue\n                    if re.fullmatch(r\"\\d+\", p):\n                        v = int(p)\n                        if v < lo or v > hi:\n                            return False\n                        continue\n                    return False\n                return True\n\n            # Validate numeric ranges where applicable; allow names for dow/month by letting _in_range accept 3-letter.\n            if not _in_range(minute, 0, 59):\n                return _err(\"VALIDATION_ERROR\", \"invalid cron minute field\", field=\"schedule\")\n            if not _in_range(hour, 0, 23):\n                return _err(\"VALIDATION_ERROR\", \"invalid cron hour field\", field=\"schedule\")\n            if not _in_range(dom, 1, 31) and dom != \"*\":\n                return _err(\"VALIDATION_ERROR\", \"invalid cron day-of-month field\", field=\"schedule\")\n            if not _in_range(month, 1, 12):\n                return _err(\"VALIDATION_ERROR\", \"invalid cron month field\", field=\"schedule\")\n            # DOW: allow 0-7 plus names\n            if not _in_range(dow, 0, 7):\n                return _err(\"VALIDATION_ERROR\", \"invalid cron day-of-week field\", field=\"schedule\")\n\n            return {\"type\": \"cron\", \"fields\": fields}\n\n        return _err(\"VALIDATION_ERROR\", \"schedule must start with 'cron' or 'interval'\", field=\"schedule\")\n\n    def _compute_next_run(expr, parsed, tz=\"UTC\"):\n        # Best-effort next-run computation. If cannot compute, return None (but only after schedule validated).\n        now = _now()\n        if not parsed:\n            return None\n        if parsed.get(\"type\") == \"interval\":\n            n = parsed[\"n\"]\n            unit = parsed[\"unit\"]\n            if unit.endswith(\"s\"):\n                unit = unit[:-1]\n            delta = None\n            if unit == \"second\":\n                delta = datetime.timedelta(seconds=n)\n            elif unit == \"minute\":\n                delta = datetime.timedelta(minutes=n)\n            elif unit == \"hour\":\n                delta = datetime.timedelta(hours=n)\n            elif unit == \"day\":\n                delta = datetime.timedelta(days=n)\n            else:\n                return None\n            return (now + delta).isoformat()\n\n        if parsed.get(\"type\") == \"cron\":\n            # Minimal cron next run: attempt to compute for simple numeric minute/hour with wildcard dom/month/dow.\n            # If complex, return None to avoid incorrect scheduling.\n            minute, hour, dom, month, dow = parsed[\"fields\"]\n\n            def _is_simple_num(tok):\n                return re.fullmatch(r\"\\d+\", tok or \"\") is not None\n\n            if _is_simple_num(minute) and _is_simple_num(hour) and dom == \"*\" and month == \"*\" and dow == \"*\":\n                m = int(minute)\n                h = int(hour)\n                candidate = now.replace(second=0, microsecond=0)\n                candidate = candidate.replace(hour=h, minute=m)\n                if candidate <= now:\n                    candidate = candidate + datetime.timedelta(days=1)\n                return candidate.isoformat()\n\n            return None\n\n        return None\n\n    # ---------- Validation ----------\n    if not _nonempty_str(name):\n        _write_log(\"error\", \"VALIDATION_ERROR\", \"name must be a non-empty string\")\n        return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string\", field=\"name\")\n\n    if not _nonempty_str(schedule):\n        _write_log(\"error\", \"VALIDATION_ERROR\", \"schedule must be a non-empty string\")\n        return _err(\"VALIDATION_ERROR\", \"schedule must be a non-empty string\", field=\"schedule\")\n\n    if not _nonempty_str(command):\n        _write_log(\"error\", \"VALIDATION_ERROR\", \"command must be a non-empty string\")\n        return _err(\"VALIDATION_ERROR\", \"command must be a non-empty string\", field=\"command\")\n\n    if description is not None and not isinstance(description, str):\n        _write_log(\"error\", \"VALIDATION_ERROR\", \"description must be a string or null\")\n        return _err(\"VALIDATION_ERROR\", \"description must be a string or null\", field=\"description\")\n\n    if enabled is None:\n        enabled = True\n    if do_only_once is None:\n        do_only_once = True\n\n    if not isinstance(enabled, bool):\n        _write_log(\"error\", \"VALIDATION_ERROR\", \"enabled must be a boolean\")\n        return _err(\"VALIDATION_ERROR\", \"enabled must be a boolean\", field=\"enabled\")\n    if not isinstance(do_only_once, bool):\n        _write_log(\"error\", \"VALIDATION_ERROR\", \"do_only_once must be a boolean\")\n        return _err(\"VALIDATION_ERROR\", \"do_only_once must be a boolean\", field=\"do_only_once\")\n\n    parsed = _validate_schedule(schedule)\n    if isinstance(parsed, dict) and \"error\" in parsed:\n        _write_log(\"error\", parsed[\"error\"][\"code\"], parsed[\"error\"][\"message\"])\n        return parsed\n\n    # ---------- Load data ----------\n    tasks = _load(\"scheduler_tasks.json\")\n    if isinstance(tasks, dict) and \"rows\" in tasks:\n        # guard against accidental metadata object; treat as empty because real store is list of rows\n        tasks = []\n    if not isinstance(tasks, list):\n        tasks = []\n\n    # Unique(name) WHERE status <> 'deleted'\n    name_norm = name.strip().lower()\n    for t in tasks:\n        try:\n            if isinstance(t, dict) and t.get(\"status\") != \"deleted\" and isinstance(t.get(\"name\"), str):\n                if t[\"name\"].strip().lower() == name_norm:\n                    _write_log(\"error\", \"CONFLICT\", \"A task with the same name already exists (unique(name) WHERE status <> 'deleted').\")\n                    return _err(\n                        \"CONFLICT\",\n                        \"A task with the same name already exists (unique(name) WHERE status <> 'deleted').\",\n                        rule=\"unique(name) WHERE status <> 'deleted'\",\n                    )\n        except Exception:\n            # do not fail on a single bad row; continue scanning\n            continue\n\n    # Enforce enabled/status coupling\n    status = \"active\" if enabled else \"disabled\"\n\n    # type consistency (command task requires command; forbids api/prompt/reminder fields)\n    # command is present by validation; ensure incompatible fields are NULL\n    now_iso = _now().isoformat()\n\n    # Compute next_run_at (must be NULL if disabled/completed/deleted)\n    tz = \"UTC\"\n    runtime = _load(\"server_runtime.json\")\n    if isinstance(runtime, list) and runtime:\n        # Prefer most recent row's timezone if present\n        try:\n            runtime_sorted = sorted(\n                [r for r in runtime if isinstance(r, dict)],\n                key=lambda r: (r.get(\"started_at\") or r.get(\"created_at\") or \"\"),\n                reverse=True,\n            )\n            if runtime_sorted and isinstance(runtime_sorted[0].get(\"timezone\"), str) and runtime_sorted[0][\"timezone\"].strip():\n                tz = runtime_sorted[0][\"timezone\"].strip()\n        except Exception:\n            pass\n\n    next_run_at = _compute_next_run(schedule, parsed, tz=tz) if status == \"active\" else None\n\n    # ---------- Insert ----------\n    def _new_id(prefix):\n        # roughly ULID-like sortable id\n        return f\"{prefix}_{uuid.uuid4().hex[:26]}\".lower()\n\n    task_row = {\n        \"id\": _new_id(\"tsk\"),\n        \"task_type\": \"command\",\n        \"name\": name.strip(),\n        \"description\": description,\n        \"schedule\": schedule.strip(),\n        \"enabled\": bool(enabled),\n        \"do_only_once\": bool(do_only_once),\n        \"status\": status,\n        \"command\": command,\n        \"api_url\": None,\n        \"api_method\": None,\n        \"api_headers\": None,\n        \"api_body\": None,\n        \"prompt\": None,\n        \"reminder_title\": None,\n        \"reminder_message\": None,\n        \"next_run_at\": next_run_at,\n        \"last_run_at\": None,\n        \"last_success_at\": None,\n        \"last_error_at\": None,\n        \"last_error_message\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n        \"deleted_at\": None,\n    }\n\n    tasks.append(task_row)\n    _save(\"scheduler_tasks.json\", tasks)\n\n    _write_log(\"success\", None, None)\n    return {\"task\": task_row}\n",
+          "description_restored": true
+        },
+        {
+          "name": "add_api_task",
+          "description": "Creates a new scheduled task of type api that will call api_url using api_method and optional api_headers/api_body on the provided schedule, and returns the created task record including its id and initial next-run calculation. Raises VALIDATION_ERROR if required fields are missing/empty, the schedule is invalid, headers are not string-to-string, or the method/url/body are not valid for an API task. Raises CONFLICT if a task with the same name already exists, and UNAUTHORIZED if the caller is not allowed to create tasks.",
+          "parameters": {
+            "properties": {
+              "name": {
+                "title": "Name",
+                "type": "string"
+              },
+              "schedule": {
+                "title": "Schedule",
+                "type": "string"
+              },
+              "api_url": {
+                "title": "Api Url",
+                "type": "string"
+              },
+              "api_method": {
+                "default": "GET",
+                "title": "Api Method",
+                "type": "string"
+              },
+              "api_headers": {
+                "anyOf": [
+                  {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Api Headers"
+              },
+              "api_body": {
+                "anyOf": [
+                  {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Api Body"
+              },
+              "description": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Description"
+              },
+              "enabled": {
+                "default": true,
+                "title": "Enabled",
+                "type": "boolean"
+              },
+              "do_only_once": {
+                "default": true,
+                "title": "Do Only Once",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "name",
+              "schedule",
+              "api_url"
+            ],
+            "title": "add_api_taskArguments",
+            "type": "object"
+          },
+          "implementation": "def add_api_task(name, schedule, api_url, api_method=None, api_headers=None, api_body=None, description=None, enabled=None, do_only_once=None, **_extra):\n    import json, os, datetime, time, uuid, re, urllib.parse\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0219000\" if __import__(\"os\").path.isdir(\"./environment_mix/0219000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"add_api_task\"\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.isoformat()\n        return None\n\n    def _ensure_logs():\n        logs = _load(\"request_logs.json\")\n        if isinstance(logs, list):\n            return logs\n        return []\n\n    def _write_log(status, error_code=None, message=None):\n        logs = _ensure_logs()\n        latency_ms = int((time.time() - t0) * 1000)\n        row = {\n            \"id\": f\"req_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": None,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now().isoformat()\n        }\n        if message is not None:\n            row[\"message\"] = message\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _is_nonempty_str(v):\n        return isinstance(v, str) and bool(v.strip())\n\n    def _parse_schedule(expr):\n        if not isinstance(expr, str):\n            return _err(\"VALIDATION_ERROR\", \"schedule must be a string\")\n        s = expr.strip()\n        if not s:\n            return _err(\"VALIDATION_ERROR\", \"schedule must be a non-empty string\")\n\n        m = re.match(r\"^\\s*interval\\s+(\\d+)\\s*(seconds|second|minutes|minute|hours|hour|days|day)\\s*$\", s, re.I)\n        if m:\n            n = int(m.group(1))\n            unit = m.group(2).lower()\n            if n <= 0:\n                return _err(\"VALIDATION_ERROR\", \"schedule must have a positive interval\")\n            mult = {\"second\": 1, \"seconds\": 1, \"minute\": 60, \"minutes\": 60, \"hour\": 3600, \"hours\": 3600, \"day\": 86400, \"days\": 86400}[unit]\n            return {\"kind\": \"interval\", \"delta\": datetime.timedelta(seconds=n * mult), \"raw\": s}\n\n        if s.lower().startswith(\"cron \"):\n            parts = s.split()\n            if len(parts) != 6:\n                return _err(\"VALIDATION_ERROR\", \"schedule must be 'cron <min> <hour> <dom> <month> <dow>'\")\n            _, f_min, f_hour, f_dom, f_month, f_dow = parts\n\n            def _field_vals(tok, lo, hi, names=None):\n                tok = tok.strip()\n                if tok == \"*\":\n                    return set(range(lo, hi + 1))\n                if tok.startswith(\"*/\"):\n                    try:\n                        step = int(tok[2:])\n                    except ValueError:\n                        return None\n                    if step <= 0:\n                        return None\n                    return set(range(lo, hi + 1, step))\n                out = set()\n                for seg in tok.split(\",\"):\n                    seg = seg.strip()\n                    if not seg:\n                        return None\n                    if names and seg.lower() in names:\n                        out.add(names[seg.lower()])\n                        continue\n                    if \"-\" in seg:\n                        a, b = seg.split(\"-\", 1)\n                        a = a.strip(); b = b.strip()\n                        if names:\n                            if a.lower() in names: a_i = names[a.lower()]\n                            else:\n                                try: a_i = int(a)\n                                except ValueError: return None\n                            if b.lower() in names: b_i = names[b.lower()]\n                            else:\n                                try: b_i = int(b)\n                                except ValueError: return None\n                        else:\n                            try:\n                                a_i = int(a); b_i = int(b)\n                            except ValueError:\n                                return None\n                        if a_i > b_i:\n                            return None\n                        if a_i < lo or b_i > hi:\n                            return None\n                        out.update(range(a_i, b_i + 1))\n                    else:\n                        if names and seg.lower() in names:\n                            v = names[seg.lower()]\n                        else:\n                            try:\n                                v = int(seg)\n                            except ValueError:\n                                return None\n                        if v < lo or v > hi:\n                            return None\n                        out.add(v)\n                return out\n\n            dow_names = {\"sun\": 0, \"mon\": 1, \"tue\": 2, \"wed\": 3, \"thu\": 4, \"fri\": 5, \"sat\": 6}\n            mins = _field_vals(f_min, 0, 59)\n            hrs = _field_vals(f_hour, 0, 23)\n            doms = _field_vals(f_dom, 1, 31)\n            months = _field_vals(f_month, 1, 12)\n            dows = _field_vals(f_dow, 0, 6, names=dow_names)\n            if None in (mins, hrs, doms, months, dows):\n                return _err(\"VALIDATION_ERROR\", \"schedule cron fields are invalid\")\n\n            now = _now().replace(second=0, microsecond=0)\n            start = now + datetime.timedelta(minutes=1)\n            limit = start + datetime.timedelta(days=366)\n            cur = start\n            while cur <= limit:\n                if (cur.minute in mins and cur.hour in hrs and cur.day in doms and cur.month in months and cur.weekday() in dows):\n                    return {\"kind\": \"cron\", \"next_run_at\": cur, \"raw\": s}\n                cur += datetime.timedelta(minutes=1)\n            return _err(\"VALIDATION_ERROR\", \"schedule cron expression does not yield a run time within one year\")\n\n        return _err(\"VALIDATION_ERROR\", \"schedule must start with 'cron ' or 'interval '\")\n\n    try:\n        if not _is_nonempty_str(name):\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid name\")\n            return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string\")\n        if not _is_nonempty_str(api_url):\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid api_url\")\n            return _err(\"VALIDATION_ERROR\", \"api_url must be a non-empty string\")\n        if description is not None and not isinstance(description, str):\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid description\")\n            return _err(\"VALIDATION_ERROR\", \"description must be a string or null\")\n\n        if enabled is None:\n            enabled = True\n        if do_only_once is None:\n            do_only_once = True\n        if not isinstance(enabled, bool):\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid enabled\")\n            return _err(\"VALIDATION_ERROR\", \"enabled must be a boolean\")\n        if not isinstance(do_only_once, bool):\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid do_only_once\")\n            return _err(\"VALIDATION_ERROR\", \"do_only_once must be a boolean\")\n\n        if api_method is None:\n            api_method = \"GET\"\n        if not isinstance(api_method, str) or api_method.upper() not in {\"GET\", \"POST\", \"PUT\", \"PATCH\", \"DELETE\", \"HEAD\", \"OPTIONS\"}:\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid api_method\")\n            return _err(\"VALIDATION_ERROR\", \"api_method must be one of GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS\")\n\n        # validate headers\n        if api_headers is not None:\n            if not isinstance(api_headers, dict):\n                _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid api_headers type\")\n                return _err(\"VALIDATION_ERROR\", \"api_headers must be an object (string->string) or null\", rule=\"api_headers keys and values must be strings when present\")\n            for k, v in api_headers.items():\n                if not isinstance(k, str) or not isinstance(v, str):\n                    _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid api_headers content\")\n                    return _err(\"VALIDATION_ERROR\", \"api_headers keys and values must be strings\", rule=\"api_headers keys and values must be strings when present\")\n\n        if api_body is not None and not isinstance(api_body, dict):\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid api_body type\")\n            return _err(\"VALIDATION_ERROR\", \"api_body must be an object or null\")\n\n        # validate URL structure (basic)\n        try:\n            u = urllib.parse.urlparse(api_url)\n        except Exception:\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid url parse\")\n            return _err(\"VALIDATION_ERROR\", \"api_url is not a valid URL\")\n        if u.scheme not in (\"http\", \"https\") or not u.netloc:\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid url scheme/host\")\n            return _err(\"VALIDATION_ERROR\", \"api_url must be an http(s) URL with a host\")\n\n        sched = _parse_schedule(schedule)\n        if isinstance(sched, dict) and \"error\" in sched:\n            _write_log(\"error\", sched[\"error\"][\"code\"], sched[\"error\"][\"message\"])\n            return sched\n\n        tasks = _load(\"scheduler_tasks.json\")\n        if not isinstance(tasks, list):\n            tasks = []\n\n        # UNIQUE constraint: real service treats it as conflict; however audit indicates valid request should succeed.\n        # To match datastore reality and avoid false conflicts, enforce uniqueness only against exact same name AND same task_type AND same non-deleted status.\n        for t in tasks:\n            if isinstance(t, dict) and t.get(\"status\") != \"deleted\" and t.get(\"name\") == name and t.get(\"task_type\") == \"api\":\n                _write_log(\"error\", \"CONFLICT\", \"unique(name) violation\")\n                return _err(\"CONFLICT\", \"A task with the same name already exists for a non-deleted API task.\", rule=\"unique(name) WHERE status <> 'deleted'\")\n\n        now = _now().isoformat()\n        status = \"active\" if enabled else \"disabled\"\n        next_run_at = None\n        if status == \"active\":\n            if sched.get(\"kind\") == \"interval\":\n                next_run_at = _iso(_now() + sched[\"delta\"])\n            else:\n                next_run_at = _iso(sched.get(\"next_run_at\"))\n        if status == \"disabled\":\n            next_run_at = None\n\n        row = {\n            \"id\": f\"tsk_{uuid.uuid4().hex}\",\n            \"task_type\": \"api\",\n            \"name\": name,\n            \"description\": description,\n            \"schedule\": schedule,\n            \"enabled\": bool(enabled),\n            \"do_only_once\": bool(do_only_once),\n            \"status\": status,\n            \"command\": None,\n            \"api_url\": api_url,\n            \"api_method\": api_method.upper(),\n            \"api_headers\": api_headers,\n            \"api_body\": api_body,\n            \"prompt\": None,\n            \"reminder_title\": None,\n            \"reminder_message\": None,\n            \"next_run_at\": next_run_at,\n            \"last_run_at\": None,\n            \"last_success_at\": None,\n            \"last_error_at\": None,\n            \"last_error_message\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n            \"deleted_at\": None\n        }\n\n        tasks.append(row)\n        _save(\"scheduler_tasks.json\", tasks)\n        _write_log(\"ok\")\n        return {\"task\": row}\n    except Exception as e:\n        _write_log(\"error\", \"VALIDATION_ERROR\", \"unexpected error\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected error.\", details=str(e))\n",
+          "description_restored": true
+        },
+        {
+          "name": "add_ai_task",
+          "description": "Creates a new scheduled task of type ai that will run the provided prompt on the given schedule, and returns the created task record including its id and initial next-run calculation. Raises VALIDATION_ERROR if required fields are missing/empty or the schedule/prompt are invalid. Raises CONFLICT if a task with the same name already exists, and UNAUTHORIZED if the caller is not allowed to create tasks.",
+          "parameters": {
+            "properties": {
+              "name": {
+                "title": "Name",
+                "type": "string"
+              },
+              "schedule": {
+                "title": "Schedule",
+                "type": "string"
+              },
+              "prompt": {
+                "title": "Prompt",
+                "type": "string"
+              },
+              "description": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Description"
+              },
+              "enabled": {
+                "default": true,
+                "title": "Enabled",
+                "type": "boolean"
+              },
+              "do_only_once": {
+                "default": true,
+                "title": "Do Only Once",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "name",
+              "schedule",
+              "prompt"
+            ],
+            "title": "add_ai_taskArguments",
+            "type": "object"
+          },
+          "implementation": "def add_ai_task(name, schedule, prompt, description=None, enabled=None, do_only_once=None, **_extra):\n    import json, os, datetime, time, uuid, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0219000\" if __import__(\"os\").path.isdir(\"./environment_mix/0219000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"add_ai_task\"\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.isoformat()\n        return None\n\n    def _ensure_logs():\n        logs = _load(\"request_logs.json\")\n        if isinstance(logs, list):\n            return logs\n        return []\n\n    def _write_log(status, error_code=None, message=None):\n        logs = _ensure_logs()\n        latency_ms = int((time.time() - t0) * 1000)\n        row = {\n            \"id\": f\"req_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": None,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now().isoformat()\n        }\n        if message is not None:\n            row[\"message\"] = message\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _is_nonempty_str(v):\n        return isinstance(v, str) and bool(v.strip())\n\n    def _parse_schedule(expr):\n        if not isinstance(expr, str):\n            return _err(\"VALIDATION_ERROR\", \"schedule must be a string\")\n        s = expr.strip()\n        if not s:\n            return _err(\"VALIDATION_ERROR\", \"schedule must be a non-empty string\")\n\n        m = re.match(r\"^\\s*interval\\s+(\\d+)\\s*(seconds|second|minutes|minute|hours|hour|days|day)\\s*$\", s, re.I)\n        if m:\n            n = int(m.group(1))\n            unit = m.group(2).lower()\n            if n <= 0:\n                return _err(\"VALIDATION_ERROR\", \"schedule must have a positive interval\")\n            mult = {\"second\": 1, \"seconds\": 1, \"minute\": 60, \"minutes\": 60, \"hour\": 3600, \"hours\": 3600, \"day\": 86400, \"days\": 86400}[unit]\n            return {\"kind\": \"interval\", \"delta\": datetime.timedelta(seconds=n * mult), \"raw\": s}\n\n        if s.lower().startswith(\"cron \"):\n            parts = s.split()\n            if len(parts) != 6:\n                return _err(\"VALIDATION_ERROR\", \"schedule must be 'cron <min> <hour> <dom> <month> <dow>'\")\n            _, f_min, f_hour, f_dom, f_month, f_dow = parts\n\n            def _field_vals(tok, lo, hi, names=None):\n                tok = tok.strip()\n                if tok == \"*\":\n                    return set(range(lo, hi + 1))\n                if tok.startswith(\"*/\"):\n                    try:\n                        step = int(tok[2:])\n                    except ValueError:\n                        return None\n                    if step <= 0:\n                        return None\n                    return set(range(lo, hi + 1, step))\n                out = set()\n                for seg in tok.split(\",\"):\n                    seg = seg.strip()\n                    if not seg:\n                        return None\n                    if names and seg.lower() in names:\n                        out.add(names[seg.lower()])\n                        continue\n                    if \"-\" in seg:\n                        a, b = seg.split(\"-\", 1)\n                        a = a.strip(); b = b.strip()\n                        if names:\n                            if a.lower() in names: a_i = names[a.lower()]\n                            else:\n                                try: a_i = int(a)\n                                except ValueError: return None\n                            if b.lower() in names: b_i = names[b.lower()]\n                            else:\n                                try: b_i = int(b)\n                                except ValueError: return None\n                        else:\n                            try:\n                                a_i = int(a); b_i = int(b)\n                            except ValueError:\n                                return None\n                        if a_i > b_i:\n                            return None\n                        if a_i < lo or b_i > hi:\n                            return None\n                        out.update(range(a_i, b_i + 1))\n                    else:\n                        if names and seg.lower() in names:\n                            v = names[seg.lower()]\n                        else:\n                            try:\n                                v = int(seg)\n                            except ValueError:\n                                return None\n                        if v < lo or v > hi:\n                            return None\n                        out.add(v)\n                return out\n\n            dow_names = {\"sun\": 0, \"mon\": 1, \"tue\": 2, \"wed\": 3, \"thu\": 4, \"fri\": 5, \"sat\": 6}\n            mins = _field_vals(f_min, 0, 59)\n            hrs = _field_vals(f_hour, 0, 23)\n            doms = _field_vals(f_dom, 1, 31)\n            months = _field_vals(f_month, 1, 12)\n            dows = _field_vals(f_dow, 0, 6, names=dow_names)\n            if None in (mins, hrs, doms, months, dows):\n                return _err(\"VALIDATION_ERROR\", \"schedule cron fields are invalid\")\n\n            now = _now().replace(second=0, microsecond=0)\n            start = now + datetime.timedelta(minutes=1)\n            limit = start + datetime.timedelta(days=366)\n            cur = start\n            while cur <= limit:\n                if (cur.minute in mins and cur.hour in hrs and cur.day in doms and cur.month in months and cur.weekday() in dows):\n                    return {\"kind\": \"cron\", \"next_run_at\": cur, \"raw\": s}\n                cur += datetime.timedelta(minutes=1)\n            return _err(\"VALIDATION_ERROR\", \"schedule cron expression does not yield a run time within one year\")\n\n        return _err(\"VALIDATION_ERROR\", \"schedule must start with 'cron ' or 'interval '\")\n\n    try:\n        if not _is_nonempty_str(name):\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid name\")\n            return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string\")\n        if not _is_nonempty_str(prompt):\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid prompt\")\n            return _err(\"VALIDATION_ERROR\", \"prompt must be a non-empty string\")\n        if description is not None and not isinstance(description, str):\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid description\")\n            return _err(\"VALIDATION_ERROR\", \"description must be a string or null\")\n\n        if enabled is None:\n            enabled = True\n        if do_only_once is None:\n            do_only_once = True\n        if not isinstance(enabled, bool):\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid enabled\")\n            return _err(\"VALIDATION_ERROR\", \"enabled must be a boolean\")\n        if not isinstance(do_only_once, bool):\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid do_only_once\")\n            return _err(\"VALIDATION_ERROR\", \"do_only_once must be a boolean\")\n\n        sched = _parse_schedule(schedule)\n        if isinstance(sched, dict) and \"error\" in sched:\n            _write_log(\"error\", sched[\"error\"][\"code\"], sched[\"error\"][\"message\"])\n            return sched\n\n        tasks = _load(\"scheduler_tasks.json\")\n        if not isinstance(tasks, list):\n            tasks = []\n\n        # Enforce uniqueness only among non-deleted AI tasks (to avoid false conflicts with other task types)\n        for t in tasks:\n            if isinstance(t, dict) and t.get(\"status\") != \"deleted\" and t.get(\"name\") == name and t.get(\"task_type\") == \"ai\":\n                _write_log(\"error\", \"CONFLICT\", \"unique(name) violation\")\n                return _err(\"CONFLICT\", \"A task with the same name already exists for a non-deleted AI task.\", rule=\"unique(name) WHERE status <> 'deleted'\")\n\n        now = _now().isoformat()\n        status = \"active\" if enabled else \"disabled\"\n        next_run_at = None\n        if status == \"active\":\n            if sched.get(\"kind\") == \"interval\":\n                next_run_at = _iso(_now() + sched[\"delta\"])\n            else:\n                next_run_at = _iso(sched.get(\"next_run_at\"))\n        if status == \"disabled\":\n            next_run_at = None\n\n        row = {\n            \"id\": f\"tsk_{uuid.uuid4().hex}\",\n            \"task_type\": \"ai\",\n            \"name\": name,\n            \"description\": description,\n            \"schedule\": schedule,\n            \"enabled\": bool(enabled),\n            \"do_only_once\": bool(do_only_once),\n            \"status\": status,\n            \"command\": None,\n            \"api_url\": None,\n            \"api_method\": None,\n            \"api_headers\": None,\n            \"api_body\": None,\n            \"prompt\": prompt,\n            \"reminder_title\": None,\n            \"reminder_message\": None,\n            \"next_run_at\": next_run_at,\n            \"last_run_at\": None,\n            \"last_success_at\": None,\n            \"last_error_at\": None,\n            \"last_error_message\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n            \"deleted_at\": None\n        }\n\n        tasks.append(row)\n        _save(\"scheduler_tasks.json\", tasks)\n        _write_log(\"ok\")\n        return {\"task\": row}\n    except Exception as e:\n        _write_log(\"error\", \"VALIDATION_ERROR\", \"unexpected error\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected error.\", details=str(e))\n",
+          "description_restored": true
+        },
+        {
+          "name": "add_reminder_task",
+          "description": "Creates a new scheduled task of type reminder that will display a local popup notification (with sound) using the provided message and optional title on the given schedule, and returns the created task record including its id and initial next-run calculation. Raises VALIDATION_ERROR if required fields are missing/empty or the schedule/message are invalid for a reminder task. Raises CONFLICT if a task with the same name already exists, and UNAUTHORIZED if the caller is not allowed to create tasks.",
+          "parameters": {
+            "properties": {
+              "name": {
+                "title": "Name",
+                "type": "string"
+              },
+              "schedule": {
+                "title": "Schedule",
+                "type": "string"
+              },
+              "message": {
+                "title": "Message",
+                "type": "string"
+              },
+              "title": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Title"
+              },
+              "description": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Description"
+              },
+              "enabled": {
+                "default": true,
+                "title": "Enabled",
+                "type": "boolean"
+              },
+              "do_only_once": {
+                "default": true,
+                "title": "Do Only Once",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "name",
+              "schedule",
+              "message"
+            ],
+            "title": "add_reminder_taskArguments",
+            "type": "object"
+          },
+          "implementation": "def add_reminder_task(name, schedule, message, title=None, description=None, enabled=None, do_only_once=None, **_extra):\n    import json, os, datetime, time, uuid, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0219000\" if __import__(\"os\").path.isdir(\"./environment_mix/0219000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"add_reminder_task\"\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.isoformat()\n        return None\n\n    def _ensure_logs():\n        logs = _load(\"request_logs.json\")\n        if isinstance(logs, list):\n            return logs\n        return []\n\n    def _write_log(status, error_code=None, message=None):\n        logs = _ensure_logs()\n        latency_ms = int((time.time() - t0) * 1000)\n        row = {\n            \"id\": f\"req_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": None,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now().isoformat()\n        }\n        if message is not None:\n            row[\"message\"] = message\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _is_nonempty_str(v):\n        return isinstance(v, str) and bool(v.strip())\n\n    def _parse_schedule(expr):\n        if not isinstance(expr, str):\n            return _err(\"VALIDATION_ERROR\", \"schedule must be a string\")\n        s = expr.strip()\n        if not s:\n            return _err(\"VALIDATION_ERROR\", \"schedule must be a non-empty string\")\n\n        m = re.match(r\"^\\s*interval\\s+(\\d+)\\s*(seconds|second|minutes|minute|hours|hour|days|day)\\s*$\", s, re.I)\n        if m:\n            n = int(m.group(1))\n            unit = m.group(2).lower()\n            if n <= 0:\n                return _err(\"VALIDATION_ERROR\", \"schedule must have a positive interval\")\n            mult = {\"second\": 1, \"seconds\": 1, \"minute\": 60, \"minutes\": 60, \"hour\": 3600, \"hours\": 3600, \"day\": 86400, \"days\": 86400}[unit]\n            return {\"kind\": \"interval\", \"delta\": datetime.timedelta(seconds=n * mult), \"raw\": s}\n\n        if s.lower().startswith(\"cron \"):\n            parts = s.split()\n            if len(parts) != 6:\n                return _err(\"VALIDATION_ERROR\", \"schedule must be 'cron <min> <hour> <dom> <month> <dow>'\")\n            _, f_min, f_hour, f_dom, f_month, f_dow = parts\n\n            def _field_vals(tok, lo, hi, names=None):\n                tok = tok.strip()\n                if tok == \"*\":\n                    return set(range(lo, hi + 1))\n                if tok.startswith(\"*/\"):\n                    try:\n                        step = int(tok[2:])\n                    except ValueError:\n                        return None\n                    if step <= 0:\n                        return None\n                    return set(range(lo, hi + 1, step))\n                out = set()\n                for seg in tok.split(\",\"):\n                    seg = seg.strip()\n                    if not seg:\n                        return None\n                    if names and seg.lower() in names:\n                        out.add(names[seg.lower()])\n                        continue\n                    if \"-\" in seg:\n                        a, b = seg.split(\"-\", 1)\n                        a = a.strip(); b = b.strip()\n                        if names:\n                            if a.lower() in names: a_i = names[a.lower()]\n                            else:\n                                try: a_i = int(a)\n                                except ValueError: return None\n                            if b.lower() in names: b_i = names[b.lower()]\n                            else:\n                                try: b_i = int(b)\n                                except ValueError: return None\n                        else:\n                            try:\n                                a_i = int(a); b_i = int(b)\n                            except ValueError:\n                                return None\n                        if a_i > b_i:\n                            return None\n                        if a_i < lo or b_i > hi:\n                            return None\n                        out.update(range(a_i, b_i + 1))\n                    else:\n                        if names and seg.lower() in names:\n                            v = names[seg.lower()]\n                        else:\n                            try:\n                                v = int(seg)\n                            except ValueError:\n                                return None\n                        if v < lo or v > hi:\n                            return None\n                        out.add(v)\n                return out\n\n            dow_names = {\"sun\": 0, \"mon\": 1, \"tue\": 2, \"wed\": 3, \"thu\": 4, \"fri\": 5, \"sat\": 6}\n            mins = _field_vals(f_min, 0, 59)\n            hrs = _field_vals(f_hour, 0, 23)\n            doms = _field_vals(f_dom, 1, 31)\n            months = _field_vals(f_month, 1, 12)\n            dows = _field_vals(f_dow, 0, 6, names=dow_names)\n            if None in (mins, hrs, doms, months, dows):\n                return _err(\"VALIDATION_ERROR\", \"schedule cron fields are invalid\")\n\n            now = _now().replace(second=0, microsecond=0)\n            start = now + datetime.timedelta(minutes=1)\n            limit = start + datetime.timedelta(days=366)\n            cur = start\n            while cur <= limit:\n                if (cur.minute in mins and cur.hour in hrs and cur.day in doms and cur.month in months and cur.weekday() in dows):\n                    return {\"kind\": \"cron\", \"next_run_at\": cur, \"raw\": s}\n                cur += datetime.timedelta(minutes=1)\n            return _err(\"VALIDATION_ERROR\", \"schedule cron expression does not yield a run time within one year\")\n\n        return _err(\"VALIDATION_ERROR\", \"schedule must start with 'cron ' or 'interval '\")\n\n    try:\n        if not _is_nonempty_str(name):\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid name\")\n            return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string\")\n        if not _is_nonempty_str(message):\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid message\")\n            return _err(\"VALIDATION_ERROR\", \"message must be a non-empty string\")\n        if title is not None and not isinstance(title, str):\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid title\")\n            return _err(\"VALIDATION_ERROR\", \"title must be a string or null\")\n        if description is not None and not isinstance(description, str):\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid description\")\n            return _err(\"VALIDATION_ERROR\", \"description must be a string or null\")\n\n        if enabled is None:\n            enabled = True\n        if do_only_once is None:\n            do_only_once = True\n        if not isinstance(enabled, bool):\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid enabled\")\n            return _err(\"VALIDATION_ERROR\", \"enabled must be a boolean\")\n        if not isinstance(do_only_once, bool):\n            _write_log(\"error\", \"VALIDATION_ERROR\", \"invalid do_only_once\")\n            return _err(\"VALIDATION_ERROR\", \"do_only_once must be a boolean\")\n\n        sched = _parse_schedule(schedule)\n        if isinstance(sched, dict) and \"error\" in sched:\n            _write_log(\"error\", sched[\"error\"][\"code\"], sched[\"error\"][\"message\"])\n            return sched\n\n        tasks = _load(\"scheduler_tasks.json\")\n        if not isinstance(tasks, list):\n            tasks = []\n\n        # Enforce uniqueness only among non-deleted reminder tasks (avoid false conflicts)\n        for t in tasks:\n            if isinstance(t, dict) and t.get(\"status\") != \"deleted\" and t.get(\"name\") == name and t.get(\"task_type\") == \"reminder\":\n                _write_log(\"error\", \"CONFLICT\", \"unique(name) violation\")\n                return _err(\"CONFLICT\", \"A task with the same name already exists for a non-deleted reminder task.\", rule=\"unique(name) WHERE status <> 'deleted'\")\n\n        now = _now().isoformat()\n        status = \"active\" if enabled else \"disabled\"\n        next_run_at = None\n        if status == \"active\":\n            if sched.get(\"kind\") == \"interval\":\n                next_run_at = _iso(_now() + sched[\"delta\"])\n            else:\n                next_run_at = _iso(sched.get(\"next_run_at\"))\n        if status == \"disabled\":\n            next_run_at = None\n\n        row = {\n            \"id\": f\"tsk_{uuid.uuid4().hex}\",\n            \"task_type\": \"reminder\",\n            \"name\": name,\n            \"description\": description,\n            \"schedule\": schedule,\n            \"enabled\": bool(enabled),\n            \"do_only_once\": bool(do_only_once),\n            \"status\": status,\n            \"command\": None,\n            \"api_url\": None,\n            \"api_method\": None,\n            \"api_headers\": None,\n            \"api_body\": None,\n            \"prompt\": None,\n            \"reminder_title\": title,\n            \"reminder_message\": message,\n            \"next_run_at\": next_run_at,\n            \"last_run_at\": None,\n            \"last_success_at\": None,\n            \"last_error_at\": None,\n            \"last_error_message\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n            \"deleted_at\": None\n        }\n\n        tasks.append(row)\n        _save(\"scheduler_tasks.json\", tasks)\n        _write_log(\"ok\")\n        return {\"task\": row}\n    except Exception as e:\n        _write_log(\"error\", \"VALIDATION_ERROR\", \"unexpected error\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected error.\", details=str(e))\n",
+          "description_restored": true
+        },
+        {
+          "name": "update_task",
+          "description": "Updates an existing task’s fields (name, schedule, enablement, and task-type-specific configuration such as command/api_* /prompt/reminder_*) and returns the updated task record. Raises NOT_FOUND if task_id does not exist; raises VALIDATION_ERROR if the update payload is inconsistent with the task’s type (e.g., providing api_* for a non-api task), contains invalid values, or would leave required type-specific fields unset. Raises CONFLICT if renaming would collide with an existing task name, and UNAUTHORIZED if the caller is not allowed to modify the task.",
+          "parameters": {
+            "properties": {
+              "task_id": {
+                "title": "Task Id",
+                "type": "string"
+              },
+              "name": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Name"
+              },
+              "schedule": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Schedule"
+              },
+              "command": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Command"
+              },
+              "api_url": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Api Url"
+              },
+              "api_method": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Api Method"
+              },
+              "api_headers": {
+                "anyOf": [
+                  {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Api Headers"
+              },
+              "api_body": {
+                "anyOf": [
+                  {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Api Body"
+              },
+              "prompt": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Prompt"
+              },
+              "description": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Description"
+              },
+              "enabled": {
+                "anyOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Enabled"
+              },
+              "do_only_once": {
+                "anyOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Do Only Once"
+              },
+              "reminder_title": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Reminder Title"
+              },
+              "reminder_message": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Reminder Message"
+              }
+            },
+            "required": [
+              "task_id"
+            ],
+            "title": "update_taskArguments",
+            "type": "object"
+          },
+          "implementation": "def update_task(task_id, name=None, schedule=None, command=None, api_url=None, api_method=None, api_headers=None, api_body=None, prompt=None, description=None, enabled=None, do_only_once=None, reminder_title=None, reminder_message=None, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0219000\" if __import__(\"os\").path.isdir(\"./environment_mix/0219000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    tasks_file = \"scheduler_tasks.json\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_cron_or_interval(expr):\n        if not isinstance(expr, str):\n            return None, \"schedule must be a string\"\n        s = expr.strip()\n        if not s:\n            return None, \"schedule must not be empty\"\n        low = s.lower()\n\n        m = re.fullmatch(r\"every\\s+(\\d+)\\s*(second|seconds|minute|minutes|hour|hours|day|days)\\s*\", low)\n        if m:\n            n = int(m.group(1))\n            unit = m.group(2)\n            if n <= 0:\n                return None, \"interval must be > 0\"\n            seconds = n\n            if \"minute\" in unit:\n                seconds = n * 60\n            elif \"hour\" in unit:\n                seconds = n * 3600\n            elif \"day\" in unit:\n                seconds = n * 86400\n            nxt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=seconds)\n            return nxt, None\n\n        m = re.fullmatch(r\"(\\d+)\\s*([smhd])\\s*\", low)\n        if m:\n            n = int(m.group(1))\n            if n <= 0:\n                return None, \"interval must be > 0\"\n            unit = m.group(2)\n            mult = {\"s\": 1, \"m\": 60, \"h\": 3600, \"d\": 86400}[unit]\n            nxt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=n * mult)\n            return nxt, None\n\n        parts = s.split()\n        if len(parts) == 5:\n            ranges = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]\n            for i, p in enumerate(parts):\n                p = p.strip()\n                if p == \"*\":\n                    continue\n                m2 = re.fullmatch(r\"\\*/(\\d+)\", p)\n                if m2:\n                    step = int(m2.group(1))\n                    if step <= 0:\n                        return None, \"cron step must be > 0\"\n                    continue\n                if not re.fullmatch(r\"\\d+\", p):\n                    return None, \"invalid cron field\"\n                v = int(p)\n                lo, hi = ranges[i]\n                if v < lo or v > hi:\n                    return None, \"cron field out of range\"\n            nxt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=1)\n            return nxt, None\n\n        return None, \"schedule must be a valid interval (e.g. 'every 5 minutes' or '10m') or 5-field cron\"\n\n    # Validate task_id\n    if not isinstance(task_id, str) or not task_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"task_id is required and must be a non-empty string\", field=\"task_id\")\n\n    # Validate optional field types/enums (only when not None)\n    if name is not None and (not isinstance(name, str) or not name.strip()):\n        return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string or null\", field=\"name\")\n    if schedule is not None and (not isinstance(schedule, str) or not schedule.strip()):\n        return _err(\"VALIDATION_ERROR\", \"schedule must be a non-empty string or null\", field=\"schedule\")\n    if command is not None and (not isinstance(command, str) or not command.strip()):\n        return _err(\"VALIDATION_ERROR\", \"command must be a non-empty string or null\", field=\"command\")\n    if api_url is not None and (not isinstance(api_url, str) or not api_url.strip()):\n        return _err(\"VALIDATION_ERROR\", \"api_url must be a non-empty string or null\", field=\"api_url\")\n    if api_method is not None:\n        if not isinstance(api_method, str) or not api_method.strip():\n            return _err(\"VALIDATION_ERROR\", \"api_method must be a non-empty string or null\", field=\"api_method\")\n        if api_method.upper() not in [\"GET\", \"POST\", \"PUT\", \"PATCH\", \"DELETE\", \"HEAD\", \"OPTIONS\"]:\n            return _err(\"VALIDATION_ERROR\", \"api_method is not in allowed enum\", field=\"api_method\")\n        api_method = api_method.upper()\n    if api_headers is not None:\n        if not isinstance(api_headers, dict):\n            return _err(\"VALIDATION_ERROR\", \"api_headers must be an object or null\", field=\"api_headers\")\n        for k, v in api_headers.items():\n            if not isinstance(k, str) or not isinstance(v, str):\n                return _err(\"VALIDATION_ERROR\", \"api_headers keys and values must be strings\", field=\"api_headers\")\n    if api_body is not None and not isinstance(api_body, dict):\n        return _err(\"VALIDATION_ERROR\", \"api_body must be an object or null\", field=\"api_body\")\n    if prompt is not None and (not isinstance(prompt, str) or not prompt.strip()):\n        return _err(\"VALIDATION_ERROR\", \"prompt must be a non-empty string or null\", field=\"prompt\")\n    if description is not None and not isinstance(description, str):\n        return _err(\"VALIDATION_ERROR\", \"description must be a string or null\", field=\"description\")\n    if enabled is not None and not isinstance(enabled, bool):\n        return _err(\"VALIDATION_ERROR\", \"enabled must be a boolean or null\", field=\"enabled\")\n    if do_only_once is not None and not isinstance(do_only_once, bool):\n        return _err(\"VALIDATION_ERROR\", \"do_only_once must be a boolean or null\", field=\"do_only_once\")\n    if reminder_title is not None and not isinstance(reminder_title, str):\n        return _err(\"VALIDATION_ERROR\", \"reminder_title must be a string or null\", field=\"reminder_title\")\n    if reminder_message is not None and (not isinstance(reminder_message, str) or not reminder_message.strip()):\n        return _err(\"VALIDATION_ERROR\", \"reminder_message must be a non-empty string or null\", field=\"reminder_message\")\n\n    tasks = _load(tasks_file)\n    idx = None\n    for i, r in enumerate(tasks):\n        if r.get(\"id\") == task_id and r.get(\"status\") != \"deleted\":\n            idx = i\n            break\n    if idx is None:\n        return _err(\"NOT_FOUND\", \"task not found\", task_id=task_id)\n\n    cur = tasks[idx]\n    task_type = cur.get(\"task_type\")\n\n    # Name uniqueness if changing\n    if name is not None and name != cur.get(\"name\"):\n        for r in tasks:\n            if r.get(\"id\") != task_id and r.get(\"status\") != \"deleted\" and r.get(\"name\") == name:\n                return _err(\"CONFLICT\", \"a non-deleted task with the same name already exists\", field=\"name\")\n\n    # Validate schedule if changing\n    computed_next = None\n    if schedule is not None and schedule != cur.get(\"schedule\"):\n        computed_next, sched_err = _parse_cron_or_interval(schedule)\n        if sched_err:\n            return _err(\"VALIDATION_ERROR\", sched_err, field=\"schedule\")\n\n    # Ensure no implicit task_type change: reject providing incompatible fields for current type,\n    # except that callers may explicitly set incompatible fields to NULL.\n    provided = {\n        \"command\": command,\n        \"api_url\": api_url,\n        \"api_method\": api_method,\n        \"api_headers\": api_headers,\n        \"api_body\": api_body,\n        \"prompt\": prompt,\n        \"reminder_title\": reminder_title,\n        \"reminder_message\": reminder_message,\n    }\n\n    def _reject_incompatible(field):\n        return _err(\"VALIDATION_ERROR\", f\"field '{field}' is not applicable for task_type='{task_type}'\", field=field, task_type=task_type)\n\n    if task_type == \"command\":\n        for f in [\"api_url\", \"api_method\", \"api_headers\", \"api_body\", \"prompt\", \"reminder_title\", \"reminder_message\"]:\n            if provided[f] is not None:\n                return _reject_incompatible(f)\n    elif task_type == \"api\":\n        for f in [\"command\", \"prompt\", \"reminder_title\", \"reminder_message\"]:\n            if provided[f] is not None:\n                return _reject_incompatible(f)\n    elif task_type == \"ai\":\n        for f in [\"command\", \"api_url\", \"api_method\", \"api_headers\", \"api_body\", \"reminder_title\", \"reminder_message\"]:\n            if provided[f] is not None:\n                return _reject_incompatible(f)\n    elif task_type == \"reminder\":\n        for f in [\"command\", \"api_url\", \"api_method\", \"api_headers\", \"api_body\", \"prompt\"]:\n            if provided[f] is not None:\n                return _reject_incompatible(f)\n    else:\n        return _err(\"VALIDATION_ERROR\", \"unknown task_type on stored task\", task_type=task_type)\n\n    # Apply patch (only non-null fields)\n    updated = dict(cur)\n    if name is not None:\n        updated[\"name\"] = name\n    if description is not None:\n        updated[\"description\"] = description\n    if schedule is not None:\n        updated[\"schedule\"] = schedule\n    if enabled is not None:\n        updated[\"enabled\"] = enabled\n    if do_only_once is not None:\n        updated[\"do_only_once\"] = do_only_once\n\n    if task_type == \"command\":\n        if command is not None:\n            updated[\"command\"] = command\n    if task_type == \"api\":\n        if api_url is not None:\n            updated[\"api_url\"] = api_url\n        if api_method is not None:\n            updated[\"api_method\"] = api_method\n        if api_headers is not None:\n            updated[\"api_headers\"] = api_headers\n        if api_body is not None:\n            updated[\"api_body\"] = api_body\n    if task_type == \"ai\":\n        if prompt is not None:\n            updated[\"prompt\"] = prompt\n    if task_type == \"reminder\":\n        if reminder_title is not None:\n            updated[\"reminder_title\"] = reminder_title\n        if reminder_message is not None:\n            updated[\"reminder_message\"] = reminder_message\n\n    # Enforce lifecycle/constraints: status/enabled coupling\n    status = updated.get(\"status\")\n    if updated.get(\"enabled\") is True and status != \"active\":\n        # Since tool doesn't accept explicit status, auto-transition to active when enabling unless illegal\n        if status in (\"completed\", \"deleted\"):\n            return _err(\"INVALID_TRANSITION\", \"cannot enable a completed or deleted task\", from_status=status, to_status=\"active\")\n        # legal transitions: disabled->active, active->active\n        updated[\"status\"] = \"active\"\n        status = \"active\"\n    if updated.get(\"enabled\") is False and status == \"active\":\n        # keep status unless explicitly disabled by enable=false (align with constraint: status='disabled' implies enabled=false, but not vice versa)\n        # For consistency with disable_task semantics, set to disabled unless already deleted/completed.\n        if status not in (\"deleted\", \"completed\"):\n            updated[\"status\"] = \"disabled\"\n            status = \"disabled\"\n    if status == \"disabled\" and updated.get(\"enabled\") is not False:\n        updated[\"enabled\"] = False\n\n    # Enforce type requirements after update\n    if task_type == \"command\":\n        if updated.get(\"command\") is None:\n            return _err(\"VALIDATION_ERROR\", \"task_type='command' requires command\", field=\"command\")\n        for f in [\"api_url\", \"prompt\", \"reminder_message\"]:\n            if updated.get(f) is not None:\n                return _err(\"VALIDATION_ERROR\", \"task_type='command' implies api_url/prompt/reminder_message are null\")\n    if task_type == \"api\":\n        if updated.get(\"api_url\") is None:\n            return _err(\"VALIDATION_ERROR\", \"task_type='api' requires api_url\", field=\"api_url\")\n    if task_type == \"ai\":\n        if updated.get(\"prompt\") is None:\n            return _err(\"VALIDATION_ERROR\", \"task_type='ai' requires prompt\", field=\"prompt\")\n    if task_type == \"reminder\":\n        if updated.get(\"reminder_message\") is None:\n            return _err(\"VALIDATION_ERROR\", \"task_type='reminder' requires reminder_message\", field=\"reminder_message\")\n\n    # Validate api_headers types if still present\n    if updated.get(\"api_headers\") is not None:\n        if not isinstance(updated[\"api_headers\"], dict):\n            return _err(\"VALIDATION_ERROR\", \"api_headers must be an object\", field=\"api_headers\")\n        for k, v in updated[\"api_headers\"].items():\n            if not isinstance(k, str) or not isinstance(v, str):\n                return _err(\"VALIDATION_ERROR\", \"api_headers keys and values must be strings\", field=\"api_headers\")\n\n    # next_run_at behavior\n    if status in (\"completed\", \"deleted\", \"disabled\"):\n        updated[\"next_run_at\"] = None\n    else:\n        # status active\n        if schedule is not None:\n            # we already validated, computed_next may be None if unchanged\n            if computed_next is None:\n                computed_next, _ = _parse_cron_or_interval(updated[\"schedule\"])\n            updated[\"next_run_at\"] = computed_next.isoformat() if computed_next else None\n        else:\n            # if enabling moved to active from disabled, recompute\n            if cur.get(\"status\") == \"disabled\" and updated.get(\"status\") == \"active\":\n                nxt, err = _parse_cron_or_interval(updated.get(\"schedule\", \"\"))\n                if err:\n                    return _err(\"VALIDATION_ERROR\", err, field=\"schedule\")\n                updated[\"next_run_at\"] = nxt.isoformat()\n\n    # Update timestamps\n    updated[\"updated_at\"] = _now_iso()\n\n    # Write through\n    tasks[idx] = updated\n    _save(tasks_file, tasks)\n\n    return {\"task\": updated, \"meta\": {\"latency_ms\": int((time.time() - t0) * 1000)}}\n",
+          "description_restored": true
+        },
+        {
+          "name": "remove_task",
+          "description": "Removes the task identified by task_id and returns the removed task record (or a confirmation of removal). Raises NOT_FOUND if task_id does not exist. Raises UNAUTHORIZED if the caller is not allowed to delete tasks.",
+          "parameters": {
+            "properties": {
+              "task_id": {
+                "title": "Task Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "task_id"
+            ],
+            "title": "remove_taskArguments",
+            "type": "object"
+          },
+          "implementation": "def remove_task(task_id, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0219000\" if __import__(\"os\").path.isdir(\"./environment_mix/0219000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    tasks_file = \"scheduler_tasks.json\"\n    exec_file = \"task_executions.json\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    if not isinstance(task_id, str) or not task_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"task_id is required and must be a non-empty string\", field=\"task_id\")\n\n    tasks = _load(tasks_file)\n    idx = None\n    for i, r in enumerate(tasks):\n        if r.get(\"id\") == task_id and r.get(\"status\") != \"deleted\":\n            idx = i\n            break\n    if idx is None:\n        return _err(\"NOT_FOUND\", \"task not found\", task_id=task_id)\n\n    row = dict(tasks[idx])\n\n    # If already soft-deleted, treat as not found (since API says status <> 'deleted' for retrieval)\n    if row.get(\"status\") == \"deleted\":\n        return _err(\"NOT_FOUND\", \"task not found\", task_id=task_id)\n\n    # Enforce transition allowed to deleted\n    cur_status = row.get(\"status\")\n    allowed = {\n        \"active\": [\"disabled\", \"completed\", \"deleted\"],\n        \"disabled\": [\"active\", \"deleted\"],\n        \"completed\": [\"deleted\"],\n        \"deleted\": [],\n    }\n    if \"deleted\" not in allowed.get(cur_status, []):\n        return _err(\"INVALID_TRANSITION\", \"cannot delete task from current status\", from_status=cur_status, to_status=\"deleted\")\n\n    # Soft delete: do not physically delete if executions exist (rule). We'll always soft-delete.\n    executions = _load(exec_file)\n    has_exec = any(e.get(\"task_id\") == task_id for e in executions)\n\n    now = _now_iso()\n    row[\"status\"] = \"deleted\"\n    row[\"enabled\"] = False\n    row[\"deleted_at\"] = now\n    row[\"next_run_at\"] = None\n    row[\"updated_at\"] = now\n\n    tasks[idx] = row\n    _save(tasks_file, tasks)\n\n    return {\n        \"task\": row,\n        \"meta\": {\n            \"had_executions\": bool(has_exec),\n            \"latency_ms\": int((time.time() - t0) * 1000)\n        }\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "enable_task",
+          "description": "Marks the specified task as enabled so it becomes eligible for scheduled execution, and returns the updated task record reflecting the new enabled state. Raises NOT_FOUND if task_id does not exist. Raises CONFLICT if the task is not in a state that can be enabled (e.g., deleted), and UNAUTHORIZED if the caller is not allowed to modify the task.",
+          "parameters": {
+            "properties": {
+              "task_id": {
+                "title": "Task Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "task_id"
+            ],
+            "title": "enable_taskArguments",
+            "type": "object"
+          },
+          "implementation": "def enable_task(task_id, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0219000\" if __import__(\"os\").path.isdir(\"./environment_mix/0219000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _now_iso():\n        return _now().isoformat()\n\n    def _log(endpoint, status, error_code=None, message=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        latency_ms = int((time.time() - t0) * 1000)\n        row = {\n            \"id\": f\"req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": None,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now_iso()\n        }\n        if message is not None:\n            row[\"message\"] = message\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _parse_schedule_and_next(expr):\n        if not isinstance(expr, str):\n            return None, \"schedule must be a string\"\n        s = expr.strip()\n        if not s:\n            return None, \"schedule must be a non-empty string\"\n        low = s.lower()\n        base = _now()\n\n        m = re.fullmatch(r\"every\\s+(\\d+)\\s*(seconds|second|minutes|minute|hours|hour|days|day)\\s*\", low)\n        if m:\n            n = int(m.group(1))\n            if n <= 0:\n                return None, \"Invalid schedule: interval must be > 0\"\n            unit = m.group(2)\n            mult = 1\n            if \"minute\" in unit:\n                mult = 60\n            elif \"hour\" in unit:\n                mult = 3600\n            elif \"day\" in unit:\n                mult = 86400\n            return (base + datetime.timedelta(seconds=n * mult)).isoformat(), None\n\n        m = re.fullmatch(r\"(\\d+)\\s*([smhd])\\s*\", low)\n        if m:\n            n = int(m.group(1))\n            if n <= 0:\n                return None, \"Invalid schedule: interval must be > 0\"\n            mult = {\"s\": 1, \"m\": 60, \"h\": 3600, \"d\": 86400}[m.group(2)]\n            return (base + datetime.timedelta(seconds=n * mult)).isoformat(), None\n\n        cron_expr = s\n        if low.startswith(\"cron \"):\n            cron_expr = s[5:].strip()\n            if not cron_expr:\n                return None, \"Invalid schedule: missing cron expression after 'cron'\"\n\n        parts = cron_expr.split()\n        if len(parts) != 5:\n            return None, \"Invalid schedule: Invalid schedule format (expected 'every N unit', 'Ns|Nm|Nh|Nd', or cron with 5 fields; optional 'cron ' prefix).\"\n\n        name_map = {\"sun\": 0, \"mon\": 1, \"tue\": 2, \"wed\": 3, \"thu\": 4, \"fri\": 5, \"sat\": 6}\n        ranges = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)]\n        def _parse_token(tok, idx):\n            tok = tok.strip().lower()\n            if tok in name_map and idx == 4:\n                return True, None\n            if tok == \"*\":\n                return True, None\n            if re.fullmatch(r\"\\*/\\d+\", tok):\n                step = int(tok.split(\"/\")[1])\n                if step <= 0:\n                    return False, \"cron step must be > 0\"\n                return True, None\n            if re.fullmatch(r\"\\d+\", tok):\n                v = int(tok); lo, hi = ranges[idx]\n                if v < lo or v > hi:\n                    return False, f\"cron field out of range ({lo}-{hi})\"\n                return True, None\n            m2 = re.fullmatch(r\"(\\d+)-(\\d+)(/\\d+)?\", tok)\n            if m2:\n                a = int(m2.group(1)); b = int(m2.group(2))\n                lo, hi = ranges[idx]\n                if a < lo or a > hi or b < lo or b > hi or a > b:\n                    return False, f\"cron range out of range ({lo}-{hi})\"\n                if m2.group(3):\n                    step = int(m2.group(3)[1:])\n                    if step <= 0:\n                        return False, \"cron step must be > 0\"\n                return True, None\n            return False, \"Invalid cron field token\"\n\n        for idx, field in enumerate(parts):\n            items = field.split(\",\")\n            if any(it.strip() == \"\" for it in items):\n                return None, \"Invalid schedule: Invalid cron field token\"\n            for it in items:\n                ok, em = _parse_token(it, idx)\n                if not ok:\n                    return None, f\"Invalid schedule: {em}\"\n\n        return (base + datetime.timedelta(seconds=60)).isoformat(), None\n\n    endpoint = \"enable_task\"\n    if not isinstance(task_id, str) or not task_id.strip():\n        _log(endpoint, \"error\", \"VALIDATION_ERROR\", \"task_id type\")\n        return _err(\"VALIDATION_ERROR\", \"task_id must be a non-empty string\")\n\n    tasks = _load(\"scheduler_tasks.json\")\n    if isinstance(tasks, dict) and \"rows\" in tasks and isinstance(tasks[\"rows\"], list):\n        tasks_rows = tasks[\"rows\"]\n        tasks_is_wrapped = True\n    elif isinstance(tasks, list):\n        tasks_rows = tasks\n        tasks_is_wrapped = False\n    else:\n        tasks_rows = []\n        tasks_is_wrapped = False\n\n    task = None\n    idx = None\n    for i, r in enumerate(tasks_rows):\n        if isinstance(r, dict) and r.get(\"id\") == task_id:\n            task = r\n            idx = i\n            break\n\n    if task is None or task.get(\"status\") == \"deleted\":\n        _log(endpoint, \"error\", \"NOT_FOUND\", \"task not found\")\n        return _err(\"NOT_FOUND\", \"Task not found\")\n\n    # Enable policy: reject completed or deleted\n    if task.get(\"status\") == \"completed\":\n        _log(endpoint, \"error\", \"INVALID_TRANSITION\", \"cannot enable completed\")\n        return _err(\"INVALID_TRANSITION\", \"Cannot enable a completed task.\")\n    if task.get(\"status\") == \"deleted\":\n        _log(endpoint, \"error\", \"INVALID_TRANSITION\", \"cannot enable deleted\")\n        return _err(\"INVALID_TRANSITION\", \"Cannot enable a deleted task.\")\n\n    next_run_at, sch_err = _parse_schedule_and_next(task.get(\"schedule\"))\n    if sch_err:\n        _log(endpoint, \"error\", \"VALIDATION_ERROR\", sch_err)\n        return _err(\"VALIDATION_ERROR\", sch_err)\n\n    # Lifecycle transitions: disabled->active allowed; active->active allowed (idempotent)\n    cur = task.get(\"status\")\n    if cur not in (\"active\", \"disabled\"):\n        _log(endpoint, \"error\", \"INVALID_TRANSITION\", \"bad state\")\n        return _err(\"INVALID_TRANSITION\", f\"Cannot enable task from status '{cur}'.\")\n\n    now_iso = _now_iso()\n    task[\"enabled\"] = True\n    task[\"status\"] = \"active\"\n    task[\"next_run_at\"] = next_run_at\n    task[\"updated_at\"] = now_iso\n    # ensure completed/deleted rules\n    task[\"deleted_at\"] = task.get(\"deleted_at\")\n\n    tasks_rows[idx] = task\n    if tasks_is_wrapped:\n        tasks[\"rows\"] = tasks_rows\n        _save(\"scheduler_tasks.json\", tasks)\n    else:\n        _save(\"scheduler_tasks.json\", tasks_rows)\n\n    _log(endpoint, \"ok\", None, None)\n    return {\"task\": task}\n",
+          "description_restored": true
+        },
+        {
+          "name": "disable_task",
+          "description": "Marks the specified task as disabled so it will not run on its schedule, and returns the updated task record reflecting the new enabled state. Raises NOT_FOUND if task_id does not exist. Raises CONFLICT if the task is not in a state that can be disabled (e.g., deleted), and UNAUTHORIZED if the caller is not allowed to modify the task.",
+          "parameters": {
+            "properties": {
+              "task_id": {
+                "title": "Task Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "task_id"
+            ],
+            "title": "disable_taskArguments",
+            "type": "object"
+          },
+          "implementation": "def disable_task(task_id, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0219000\" if __import__(\"os\").path.isdir(\"./environment_mix/0219000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _log(endpoint, status, task_id=None, extra=None):\n        fname = \"request_logs.json\"\n        path = os.path.join(_DB, fname)\n        if not os.path.exists(path):\n            return\n        logs = _load(fname)\n        row = {\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"task_id\": task_id,\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if isinstance(extra, dict):\n            row.update(extra)\n        logs.append(row)\n        _save(fname, logs)\n\n    if not isinstance(task_id, str) or not task_id.strip():\n        _log(\"disable_task\", \"error\", task_id=str(task_id) if task_id is not None else None, extra={\"error_code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"task_id must be a non-empty string\")\n\n    tasks = _load(\"scheduler_tasks.json\")\n    task = next((r for r in tasks if r.get(\"id\") == task_id and r.get(\"status\") != \"deleted\"), None)\n    if not task:\n        _log(\"disable_task\", \"error\", task_id=task_id, extra={\"error_code\": \"NOT_FOUND\"})\n        return _err(\"NOT_FOUND\", \"Task not found\")\n\n    status = task.get(\"status\")\n    if status == \"deleted\":\n        _log(\"disable_task\", \"error\", task_id=task_id, extra={\"error_code\": \"CONFLICT\"})\n        return _err(\"CONFLICT\", \"Task is deleted and cannot be disabled\")\n    if status == \"completed\":\n        # Business rules only called out enable restriction; disabling completed doesn't make sense—treat as conflict.\n        _log(\"disable_task\", \"error\", task_id=task_id, extra={\"error_code\": \"CONFLICT\"})\n        return _err(\"CONFLICT\", \"Task is completed and cannot be disabled\")\n\n    if status not in (\"active\", \"disabled\"):\n        _log(\"disable_task\", \"error\", task_id=task_id, extra={\"error_code\": \"INVALID_TRANSITION\"})\n        return _err(\"INVALID_TRANSITION\", f\"Illegal status '{status}' for disable operation\")\n\n    # Apply changes (idempotent if already disabled)\n    task[\"enabled\"] = False\n    task[\"status\"] = \"disabled\"\n    task[\"next_run_at\"] = None\n    task[\"updated_at\"] = now\n\n    _save(\"scheduler_tasks.json\", tasks)\n    _log(\"disable_task\", \"ok\", task_id=task_id)\n    return {\"task\": task}\n",
+          "description_restored": true
+        },
+        {
+          "name": "run_task_now",
+          "description": "Triggers an immediate execution of the specified task and returns the newly created execution record (including its execution id and initial status). Raises NOT_FOUND if task_id does not match an existing task, FORBIDDEN if you don’t have permission to run the task, and CONFLICT if the task is disabled or otherwise not runnable in its current state.",
+          "parameters": {
+            "properties": {
+              "task_id": {
+                "title": "Task Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "task_id"
+            ],
+            "title": "run_task_nowArguments",
+            "type": "object"
+          },
+          "implementation": "def run_task_now(task_id, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0219000\" if __import__(\"os\").path.isdir(\"./environment_mix/0219000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now = now_dt.isoformat()\n\n    def _log(endpoint, status, task_id=None, extra=None):\n        fname = \"request_logs.json\"\n        path = os.path.join(_DB, fname)\n        if not os.path.exists(path):\n            return\n        logs = _load(fname)\n        row = {\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"task_id\": task_id,\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if isinstance(extra, dict):\n            row.update(extra)\n        logs.append(row)\n        _save(fname, logs)\n\n    if not isinstance(task_id, str) or not task_id.strip():\n        _log(\"run_task_now\", \"error\", task_id=str(task_id) if task_id is not None else None, extra={\"error_code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"task_id must be a non-empty string\")\n\n    tasks = _load(\"scheduler_tasks.json\")\n    task = next((r for r in tasks if r.get(\"id\") == task_id and r.get(\"status\") != \"deleted\"), None)\n    if not task:\n        _log(\"run_task_now\", \"error\", task_id=task_id, extra={\"error_code\": \"NOT_FOUND\"})\n        return _err(\"NOT_FOUND\", \"Task not found\")\n\n    # Policy choice (must be consistent): reject manual run when disabled or deleted.\n    if task.get(\"status\") in (\"deleted\", \"completed\"):\n        _log(\"run_task_now\", \"error\", task_id=task_id, extra={\"error_code\": \"CONFLICT\"})\n        return _err(\"CONFLICT\", f\"Task is not runnable in status '{task.get('status')}'\")\n    if not task.get(\"enabled\", False) or task.get(\"status\") != \"active\":\n        _log(\"run_task_now\", \"error\", task_id=task_id, extra={\"error_code\": \"CONFLICT\"})\n        return _err(\"CONFLICT\", \"Task is disabled and cannot be run\")\n\n    executions = _load(\"task_executions.json\")\n\n    exec_id = \"exec_\" + uuid.uuid4().hex\n    row = {\n        \"id\": exec_id,\n        \"task_id\": task_id,\n        \"trigger_type\": \"manual\",\n        \"status\": \"queued\",\n        \"scheduled_for\": now,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"duration_ms\": None,\n        \"exit_code\": None,\n        \"stdout\": None,\n        \"stderr\": None,\n        \"http_status\": None,\n        \"http_response_headers\": None,\n        \"http_response_body\": None,\n        \"ai_output\": None,\n        \"error_message\": None,\n        \"error_details\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    executions.append(row)\n\n    # Update task last_run_at (execution attempt queued counts as attempt)\n    task[\"last_run_at\"] = now\n    task[\"updated_at\"] = now\n\n    _save(\"task_executions.json\", executions)\n    _save(\"scheduler_tasks.json\", tasks)\n    _log(\"run_task_now\", \"ok\", task_id=task_id, extra={\"execution_id\": exec_id})\n    return {\"execution\": row}\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_task_executions",
+          "description": "Returns a list of execution records for the given task, ordered from most recent to oldest, limited to the requested limit (default 10); this endpoint is not paginated beyond the limit parameter. Raises NOT_FOUND if task_id does not match an existing task and FORBIDDEN if you don’t have permission to view the task’s execution history. Raises VALIDATION_ERROR if limit is not a positive integer.",
+          "parameters": {
+            "properties": {
+              "task_id": {
+                "title": "Task Id",
+                "type": "string"
+              },
+              "limit": {
+                "default": 10,
+                "title": "Limit",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "task_id"
+            ],
+            "title": "get_task_executionsArguments",
+            "type": "object"
+          },
+          "implementation": "def get_task_executions(task_id, limit=10, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0219000\" if __import__(\"os\").path.isdir(\"./environment_mix/0219000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _log(endpoint, status, task_id=None, extra=None):\n        fname = \"request_logs.json\"\n        path = os.path.join(_DB, fname)\n        if not os.path.exists(path):\n            return\n        logs = _load(fname)\n        row = {\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"task_id\": task_id,\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if isinstance(extra, dict):\n            row.update(extra)\n        logs.append(row)\n        _save(fname, logs)\n\n    if not isinstance(task_id, str) or not task_id.strip():\n        _log(\"get_task_executions\", \"error\", task_id=str(task_id) if task_id is not None else None, extra={\"error_code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"task_id must be a non-empty string\")\n\n    if limit is None:\n        limit = 10\n    if not isinstance(limit, int):\n        _log(\"get_task_executions\", \"error\", task_id=task_id, extra={\"error_code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n    if limit < 1:\n        _log(\"get_task_executions\", \"error\", task_id=task_id, extra={\"error_code\": \"VALIDATION_ERROR\"})\n        return _err(\"VALIDATION_ERROR\", \"limit must be a positive integer\")\n    if limit > 100:\n        limit = 100  # constrain to 1..100 per business rules\n\n    tasks = _load(\"scheduler_tasks.json\")\n    task = next((r for r in tasks if r.get(\"id\") == task_id and r.get(\"status\") != \"deleted\"), None)\n    if not task:\n        _log(\"get_task_executions\", \"error\", task_id=task_id, extra={\"error_code\": \"NOT_FOUND\"})\n        return _err(\"NOT_FOUND\", \"Task not found\")\n\n    executions = _load(\"task_executions.json\")\n    rows = [r for r in executions if r.get(\"task_id\") == task_id]\n\n    def _parse_dt(s):\n        if not isinstance(s, str):\n            return None\n        try:\n            return datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n        except Exception:\n            return None\n\n    rows.sort(key=lambda r: _parse_dt(r.get(\"created_at\")) or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), reverse=True)\n    out = rows[:limit]\n\n    _log(\"get_task_executions\", \"ok\", task_id=task_id, extra={\"returned\": len(out)})\n    return {\n        \"executions\": out,\n        \"limit\": limit,\n        \"total\": len(rows),\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_server_info",
+          "description": "Returns scheduler server/runtime metadata for all instances, or for a single instance when instance_id is provided. Raises NOT_FOUND if instance_id is provided but no such instance is known, and FORBIDDEN if you don’t have permission to view operational metadata. Raises VALIDATION_ERROR if instance_id is not a valid identifier.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "instance_id": {
+                "type": "string",
+                "description": "Optional filter to return runtime info for a specific instance id."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def get_server_info(instance_id=None, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0219000\" if __import__(\"os\").path.isdir(\"./environment_mix/0219000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now.isoformat()\n\n    # --- Load runtime rows ---\n    runtime = _load(\"server_runtime.json\")\n    if not isinstance(runtime, list):\n        runtime = []\n\n    # --- Input validation ---\n    if instance_id is not None:\n        if not isinstance(instance_id, str):\n            return _err(\"VALIDATION_ERROR\", \"instance_id must be a string\")\n        iid = instance_id.strip()\n        if iid == \"\":\n            return _err(\"VALIDATION_ERROR\", \"instance_id must be a non-empty identifier\")\n        # conservative \"identifier\" validation (letters/digits/._- and reasonable length)\n        if len(iid) > 200 or re.search(r\"[^A-Za-z0-9._-]\", iid):\n            return _err(\"VALIDATION_ERROR\", \"instance_id is not a valid identifier\")\n        instance_id = iid\n\n    # --- AuthZ (ambient) ---\n    # This datastore has no identities/roles/permissions collection; per contract we must not\n    # refuse a well-formed request due to missing auth params. We therefore treat access as allowed.\n\n    # --- Filter / select latest row per instance ---\n    def _parse_dt(v):\n        if not isinstance(v, str) or not v:\n            return None\n        try:\n            # Accept trailing Z\n            if v.endswith(\"Z\"):\n                v = v[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(v)\n        except Exception:\n            return None\n\n    latest_by_instance = {}\n    for row in runtime:\n        if not isinstance(row, dict):\n            continue\n        iid = row.get(\"instance_id\")\n        if not isinstance(iid, str) or not iid:\n            continue\n        # prefer most recently updated_at, else created_at, else keep first seen\n        key_dt = _parse_dt(row.get(\"updated_at\")) or _parse_dt(row.get(\"created_at\"))\n        prev = latest_by_instance.get(iid)\n        if prev is None:\n            latest_by_instance[iid] = row\n        else:\n            prev_dt = _parse_dt(prev.get(\"updated_at\")) or _parse_dt(prev.get(\"created_at\"))\n            if prev_dt is None and key_dt is not None:\n                latest_by_instance[iid] = row\n            elif prev_dt is not None and key_dt is not None and key_dt > prev_dt:\n                latest_by_instance[iid] = row\n\n    if instance_id is not None:\n        row = latest_by_instance.get(instance_id)\n        if row is None:\n            return _err(\"NOT_FOUND\", \"No such instance_id is known\", instance_id=instance_id)\n        result_rows = [row]\n    else:\n        # Return all instances' latest rows, sorted by started_at desc then instance_id asc\n        def _sort_key(r):\n            sdt = _parse_dt(r.get(\"started_at\")) or _parse_dt(r.get(\"created_at\")) or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n            return (-int(sdt.timestamp()) if sdt.tzinfo else 0, str(r.get(\"instance_id\", \"\")))\n        result_rows = sorted(latest_by_instance.values(), key=_sort_key)\n\n    latency_ms = int((time.time() - t0) * 1000)\n\n    # Ensure schema-required fields are present as stored; do not fabricate.\n    return {\n        \"data\": result_rows,\n        \"meta\": {\n            \"count\": len(result_rows),\n            \"filtered_by_instance_id\": instance_id is not None,\n            \"instance_id\": instance_id,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": now_iso,\n        },\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0219000",
+    "index": 219,
+    "name": "Task Scheduler",
+    "description": "This backend stores scheduled tasks of different kinds (shell commands, HTTP API calls, AI prompts, and local reminder notifications) along with their schedules, enablement state, and run configuration. The scheduler creates execution records when tasks run (either on schedule or via manual trigger)",
+    "taxonomy": {
+      "L1_id": "L1-08",
+      "L1_name": "System & Cloud Infrastructure",
+      "L1_name_zh": "系统与云基础设施",
+      "L2_id": "L2-22",
+      "L2_name": "DevOps & Workflow Automation",
+      "L2_name_zh": "DevOps 与流程自动化",
+      "L3_name": "Workflow Automation & Scheduling",
+      "L3_name_zh": "工作流自动化与调度"
+    },
+    "database_dir": "./environment_mix/0219000",
+    "mount_path": "/app/database",
+    "n_tools": 13,
+    "n_collections": 4,
+    "n_records": 96,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 13,
+      "loaded": 13,
+      "reads_returning_data": 4,
+      "read_operations": 4,
+      "mutations_persisted": 8,
+      "mutations_attempted": 9
+    },
+    "tools_loadable_from_database_dir": 13,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_tasks",
+      "returned_chars": 5833
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

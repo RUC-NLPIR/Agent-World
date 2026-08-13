@@ -1,0 +1,429 @@
+{
+  "index": 383,
+  "local_files_dir": "./environment_mix/0383000",
+  "file_list": [
+    "./environment_mix/0383000/README.md",
+    "./environment_mix/0383000/diagram_requests.json",
+    "./environment_mix/0383000/diagram_types.json",
+    "./environment_mix/0383000/download_jobs.json",
+    "./environment_mix/0383000/render_cache.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "diagram_types.json": "25 rows",
+        "diagram_requests.json": "36 rows",
+        "download_jobs.json": "33 rows",
+        "render_cache.json": "36 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "generate_diagram_url",
+          "description": "Creates (or reuses) a render request for the provided diagram type and source content and returns the deterministic Kroki render URL for the requested outputFormat (defaulting to SVG when omitted). Raises VALIDATION_ERROR if type or content is missing/empty or if outputFormat is not supported for URL generation, and raises UNAUTHORIZED/FORBIDDEN when the caller is not permitted to create or read render requests. Raises QUOTA_EXCEEDED when request creation exceeds configured rate or storage limits.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "description": "Diagram type (e.g., \"mermaid\" for Mermaid diagrams, \"plantuml\" for PlantUML, \"graphviz\" for GraphViz DOT, \"c4plantuml\" for C4 architecture diagrams, and many more). See Kroki.io documentation for all supported formats."
+              },
+              "content": {
+                "type": "string",
+                "description": "The diagram content in the specified format. For Mermaid diagrams, this would be the Mermaid syntax code (e.g., \"graph TD; A-->B; B-->C;\")."
+              },
+              "outputFormat": {
+                "type": "string",
+                "description": "The format of the output image. Options are: \"svg\" (vector graphics, default), \"png\" (raster image), \"pdf\" (document format), \"jpeg\" (compressed raster image), or \"base64\" (base64-encoded SVG for direct embedding in HTML)."
+              }
+            },
+            "required": [
+              "type",
+              "content"
+            ]
+          },
+          "implementation": "def generate_diagram_url(type, content, outputFormat=None, **_extra):\n    import json, os, datetime\n    import hashlib, zlib, base64, time, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0383000\" if __import__(\"os\").path.isdir(\"./environment_mix/0383000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # Quota / rate limit: not defined in schema (no usage/audit collection). Nothing to enforce.\n\n    # Validate inputs\n    if not isinstance(type, str) or not type.strip():\n        return _err(\"VALIDATION_ERROR\", \"type is required and must be a non-empty string\")\n    if not isinstance(content, str) or not content:\n        return _err(\"VALIDATION_ERROR\", \"content is required and must be a non-empty string\")\n    if len(content) < 1 or len(content) > 500000:\n        return _err(\"VALIDATION_ERROR\", \"content length must be between 1 and 500000\")\n    if outputFormat is not None and (not isinstance(outputFormat, str) or not outputFormat.strip()):\n        return _err(\"VALIDATION_ERROR\", \"outputFormat must be a non-empty string when provided\")\n\n    diagram_types = _load(\"diagram_types.json\")\n    dt = None\n    for row in diagram_types:\n        if isinstance(row, dict) and row.get(\"type_key\") == type:\n            dt = row\n            break\n    if not dt:\n        return _err(\"NOT_FOUND\", \"diagram type not found\", type=type)\n\n    if dt.get(\"enabled\") is not True:\n        return _err(\"UNAUTHORIZED\", \"diagram type is disabled\", type=type)\n\n    fmt = outputFormat or dt.get(\"default_output_format\")\n    allowed_enum = {\"svg\", \"png\", \"pdf\", \"jpeg\", \"base64\"}\n    if fmt not in allowed_enum:\n        return _err(\"VALIDATION_ERROR\", \"outputFormat must be one of svg, png, pdf, jpeg, base64\")\n    allowed_for_type = dt.get(\"allowed_output_formats\") or []\n    if not isinstance(allowed_for_type, list) or not allowed_for_type:\n        return _err(\"CONFLICT\", \"diagram type has no allowed output formats configured\", type=type)\n    if fmt not in allowed_for_type:\n        return _err(\"VALIDATION_ERROR\", \"outputFormat not allowed for this diagram type\", type=type, outputFormat=fmt)\n\n    # Base URL (no collection for config; use kroki.io as conventional default)\n    kroki_base_url = \"https://kroki.io\"\n\n    # Compute cache key fields\n    content_sha256 = hashlib.sha256(content.encode(\"utf-8\")).hexdigest()\n\n    # \"encoded_payload\": Kroki uses deflate+base64url for some clients; implement deterministic deflate+urlsafe b64 without padding.\n    compressed = zlib.compress(content.encode(\"utf-8\"))\n    encoded_payload = base64.urlsafe_b64encode(compressed).decode(\"ascii\").rstrip(\"=\")\n\n    render_url = f\"{kroki_base_url.rstrip('/')}/{dt['type_key']}/{fmt}/{encoded_payload}\"\n    if len(render_url) > 4096:\n        return _err(\"VALIDATION_ERROR\", \"render_url exceeds maximum length\", max_length=4096)\n\n    diagram_requests = _load(\"diagram_requests.json\")\n\n    # Try reuse via unique(type_key, output_format, content_sha256, kroki_base_url)\n    existing = None\n    for r in diagram_requests:\n        if not isinstance(r, dict):\n            continue\n        if (\n            r.get(\"type_key\") == dt[\"type_key\"]\n            and r.get(\"output_format\") == fmt\n            and r.get(\"content_sha256\") == content_sha256\n            and r.get(\"kroki_base_url\") == kroki_base_url\n        ):\n            existing = r\n            break\n\n    if existing is None:\n        # Create new request, then transition created -> url_generated\n        req_id = \"req_\" + secrets.token_hex(12)\n        row = {\n            \"id\": req_id,\n            \"diagram_type_id\": dt[\"id\"],\n            \"type_key\": dt[\"type_key\"],\n            \"content\": content,\n            \"content_sha256\": content_sha256,\n            \"output_format\": fmt,\n            \"kroki_base_url\": kroki_base_url,\n            \"encoded_payload\": encoded_payload,\n            \"render_url\": render_url,\n            \"status\": \"created\",\n            \"last_error\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        # Transition\n        row[\"status\"] = \"url_generated\"\n        row[\"updated_at\"] = now\n        diagram_requests.append(row)\n        _save(\"diagram_requests.json\", diagram_requests)\n        existing = row\n    else:\n        # Ensure it has url_generated or later; if still created, transition to url_generated.\n        status = existing.get(\"status\")\n        if status == \"created\":\n            existing[\"status\"] = \"url_generated\"\n            existing[\"updated_at\"] = now\n            _save(\"diagram_requests.json\", diagram_requests)\n        elif status in (\"url_generated\", \"rendered\", \"failed\"):\n            # no-op\n            pass\n        else:\n            return _err(\"CONFLICT\", \"diagram request has invalid status in store\", status=status)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"renderUrl\": existing.get(\"render_url\"),\n        \"diagramRequest\": {\n            \"id\": existing.get(\"id\"),\n            \"diagramTypeId\": existing.get(\"diagram_type_id\"),\n            \"typeKey\": existing.get(\"type_key\"),\n            \"outputFormat\": existing.get(\"output_format\"),\n            \"status\": existing.get(\"status\"),\n            \"createdAt\": existing.get(\"created_at\"),\n            \"updatedAt\": existing.get(\"updated_at\"),\n        },\n        \"meta\": {\"latency_ms\": latency_ms},\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "download_diagram",
+          "description": "Renders a diagram from the provided type and source content, persists the rendered artifact for later download/export, and returns the stored artifact metadata along with the resolved render URL; when outputFormat is SVG and scale is provided, we apply scaling to the SVG dimensions before persisting. Raises VALIDATION_ERROR if type/content/outputPath is missing/empty, if scale is below the minimum, or if outputFormat is unsupported or conflicts with the outputPath extension when one is implied. Raises UNAUTHORIZED/FORBIDDEN when the caller is not permitted to render or store artifacts, QUOTA_EXCEEDED when rendering/storage limits are exceeded, and CONFLICT when an artifact for the same request and output settings already exists and cannot be overwritten.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "description": "Diagram type (e.g., \"mermaid\", \"plantuml\", \"graphviz\"). Supports the same diagram types as Kroki.io."
+              },
+              "content": {
+                "type": "string",
+                "description": "The diagram content in the specified format."
+              },
+              "outputPath": {
+                "type": "string",
+                "description": "The complete file path where the diagram image should be saved (e.g., \"/Users/username/Documents/diagram.svg\")."
+              },
+              "outputFormat": {
+                "type": "string",
+                "description": "Output image format. If unspecified, derived from outputPath extension. Options: \"svg\", \"png\", \"pdf\", \"jpeg\"."
+              },
+              "scale": {
+                "type": "number",
+                "description": "Optional scaling factor to apply to the diagram dimensions. Default is 1.0 (no scaling). This currently only affects SVG output format by attempting to modify width/height attributes.",
+                "default": 1,
+                "minimum": 0.1
+              }
+            },
+            "required": [
+              "type",
+              "content",
+              "outputPath"
+            ]
+          },
+          "implementation": "def download_diagram(type, content, outputPath, outputFormat=None, scale=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0383000\" if __import__(\"os\").path.isdir(\"./environment_mix/0383000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    import time, hashlib, base64, zlib, mimetypes, re\n\n    start_dt = datetime.datetime.utcnow()\n    t0 = time.time()\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _audit(endpoint, status_code, message=None, credential_id=None, extra=None):\n        # Best-effort audit; must not crash tool\n        try:\n            for fname in (\"request_logs.json\", \"audit_logs.json\", \"usage_logs.json\", \"api_requests.json\"):\n                path = os.path.join(_DB, fname)\n                if os.path.exists(path):\n                    rows = _load(fname)\n                    latency_ms = int((datetime.datetime.utcnow() - start_dt).total_seconds() * 1000)\n                    row = {\n                        \"id\": f\"req_{int(datetime.datetime.utcnow().timestamp()*1000)}_{os.getpid()}\",\n                        \"endpoint\": endpoint,\n                        \"credential_id\": credential_id,\n                        \"status\": status_code,\n                        \"message\": message,\n                        \"latency_ms\": latency_ms,\n                        \"created_at\": _now_iso(),\n                    }\n                    if isinstance(extra, dict):\n                        row.update(extra)\n                    rows.append(row)\n                    _save(fname, rows)\n                    break\n        except Exception:\n            return\n\n    def _gen_id(prefix):\n        # ULID-like enough for local store; uniqueness is what matters here\n        ts = int(datetime.datetime.utcnow().timestamp() * 1000)\n        rand = os.urandom(6).hex()\n        return f\"{prefix}_{ts}_{rand}\"\n\n    def _as_bool(v):\n        if isinstance(v, bool):\n            return v\n        if isinstance(v, str):\n            if v.lower() in (\"true\", \"1\", \"yes\", \"y\", \"t\"): return True\n            if v.lower() in (\"false\", \"0\", \"no\", \"n\", \"f\"): return False\n        return bool(v)\n\n    # ---- Validate inputs (relax: accept any string for outputFormat; only enforce enum if it is meant to be used)\n    if not isinstance(type, str) or not type.strip():\n        _audit(\"download_diagram\", \"VALIDATION_ERROR\", message=\"type invalid\")\n        return _err(\"VALIDATION_ERROR\", \"type is required and must be a non-empty string\", field=\"type\")\n    if not isinstance(content, str) or not content:\n        _audit(\"download_diagram\", \"VALIDATION_ERROR\", message=\"content invalid\")\n        return _err(\"VALIDATION_ERROR\", \"content is required and must be a non-empty string\", field=\"content\")\n    if not isinstance(outputPath, str) or not outputPath.strip():\n        _audit(\"download_diagram\", \"VALIDATION_ERROR\", message=\"outputPath invalid\")\n        return _err(\"VALIDATION_ERROR\", \"outputPath is required and must be a non-empty string\", field=\"outputPath\")\n\n    if len(content) < 1 or len(content) > 500000:\n        _audit(\"download_diagram\", \"VALIDATION_ERROR\", message=\"content length out of range\")\n        return _err(\"VALIDATION_ERROR\", \"content length must be between 1 and 500000\", field=\"content\")\n    if len(outputPath) < 1 or len(outputPath) > 4096:\n        _audit(\"download_diagram\", \"VALIDATION_ERROR\", message=\"outputPath length out of range\")\n        return _err(\"VALIDATION_ERROR\", \"outputPath length must be between 1 and 4096\", field=\"outputPath\")\n\n    if scale is None:\n        scale_val = 1.0\n    else:\n        if not isinstance(scale, (int, float)) or isinstance(scale, bool):\n            _audit(\"download_diagram\", \"VALIDATION_ERROR\", message=\"scale not numeric\")\n            return _err(\"VALIDATION_ERROR\", \"scale must be a number\", field=\"scale\")\n        scale_val = float(scale)\n    if scale_val < 0.1:\n        _audit(\"download_diagram\", \"VALIDATION_ERROR\", message=\"scale below minimum\")\n        return _err(\"VALIDATION_ERROR\", \"scale must be >= 0.1\", field=\"scale\", minimum=0.1)\n\n    # ---- Load collections\n    diagram_types = _load(\"diagram_types.json\")\n    diagram_requests = _load(\"diagram_requests.json\")\n    download_jobs = _load(\"download_jobs.json\")\n    render_cache = _load(\"render_cache.json\")\n\n    # ---- Resolve diagram type (must be enabled)\n    type_key = type.strip()\n    dt = None\n    for row in diagram_types:\n        if isinstance(row, dict) and row.get(\"type_key\") == type_key:\n            if _as_bool(row.get(\"enabled\", False)):\n                dt = row\n                break\n    if not dt:\n        # If found but disabled, return CONFLICT; otherwise NOT_FOUND\n        disabled = False\n        for row in diagram_types:\n            if isinstance(row, dict) and row.get(\"type_key\") == type_key:\n                disabled = True\n                break\n        if disabled:\n            _audit(\"download_diagram\", \"CONFLICT\", message=\"diagram type disabled\")\n            return _err(\"CONFLICT\", \"diagram type is disabled\", type=type_key)\n        _audit(\"download_diagram\", \"NOT_FOUND\", message=\"diagram type not found\")\n        return _err(\"NOT_FOUND\", \"diagram type not found\", type=type_key)\n\n    allowed_formats = dt.get(\"allowed_output_formats\") if isinstance(dt.get(\"allowed_output_formats\"), list) else []\n    default_fmt = dt.get(\"default_output_format\")\n    # Derive output format\n    derived_fmt = None\n    # If caller passes outputFormat but it's garbage, fall back to deriving from outputPath; do not hard-fail early.\n    if isinstance(outputFormat, str) and outputFormat.strip():\n        derived_fmt = outputFormat.strip().lower()\n    if not derived_fmt:\n        _, ext = os.path.splitext(outputPath.strip())\n        ext = (ext or \"\").lower().lstrip(\".\")\n        if ext in (\"svg\", \"png\", \"pdf\", \"jpeg\", \"jpg\"):\n            derived_fmt = \"jpeg\" if ext == \"jpg\" else ext\n    if not derived_fmt:\n        derived_fmt = default_fmt\n\n    # For download jobs, output_format cannot be base64\n    if derived_fmt not in (\"svg\", \"png\", \"pdf\", \"jpeg\"):\n        # If it's base64 or anything else, try default format if valid for downloads\n        if default_fmt in (\"svg\", \"png\", \"pdf\", \"jpeg\"):\n            derived_fmt = default_fmt\n        else:\n            _audit(\"download_diagram\", \"VALIDATION_ERROR\", message=\"outputFormat invalid and no usable default\")\n            return _err(\"VALIDATION_ERROR\", \"outputFormat must be one of svg, png, pdf, jpeg\", field=\"outputFormat\", allowed=[\"svg\", \"png\", \"pdf\", \"jpeg\"])\n\n    # Must be allowed for this diagram type\n    if derived_fmt not in allowed_formats:\n        _audit(\"download_diagram\", \"VALIDATION_ERROR\", message=\"output format not allowed for type\")\n        return _err(\n            \"VALIDATION_ERROR\",\n            \"outputFormat not allowed for this diagram type\",\n            field=\"outputFormat\",\n            outputFormat=derived_fmt,\n            allowed=allowed_formats,\n            type=type_key,\n        )\n\n    # ---- Create or reuse diagram_request by cache key unique(type_key, output_format, content_sha256, kroki_base_url)\n    kroki_base_url = None\n    # Try to infer a base URL from existing requests for the same type_key, else use kroki.io\n    for r in diagram_requests:\n        if isinstance(r, dict) and r.get(\"type_key\") == type_key and isinstance(r.get(\"kroki_base_url\"), str) and r.get(\"kroki_base_url\"):\n            kroki_base_url = r[\"kroki_base_url\"]\n            break\n    if not kroki_base_url:\n        kroki_base_url = \"https://kroki.io\"\n\n    content_sha256 = hashlib.sha256(content.encode(\"utf-8\")).hexdigest()\n\n    existing_req = None\n    for r in diagram_requests:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"type_key\") == type_key and r.get(\"output_format\") == derived_fmt and r.get(\"content_sha256\") == content_sha256 and r.get(\"kroki_base_url\") == kroki_base_url:\n            existing_req = r\n            break\n\n    now = _now_iso()\n\n    def _encode_payload(s):\n        # kroki commonly uses deflate + base64-url without padding\n        comp = zlib.compress(s.encode(\"utf-8\"))\n        b64 = base64.urlsafe_b64encode(comp).decode(\"ascii\").rstrip(\"=\")\n        return b64\n\n    if existing_req:\n        req_row = existing_req\n        # Ensure it has url_generated; if still created, transition to url_generated\n        if req_row.get(\"status\") == \"created\":\n            req_row[\"status\"] = \"url_generated\"\n            req_row[\"updated_at\"] = now\n            # must have URL fields; compute if missing\n            if not req_row.get(\"encoded_payload\") or not req_row.get(\"render_url\"):\n                enc = _encode_payload(content)\n                req_row[\"encoded_payload\"] = enc\n                req_row[\"render_url\"] = f\"{kroki_base_url.rstrip('/')}/{type_key}/{derived_fmt}/{enc}\"\n        elif req_row.get(\"status\") in (\"failed\", \"rendered\", \"url_generated\"):\n            # keep as-is; do not attempt illegal transition\n            pass\n        else:\n            # unknown status: fail safely\n            _audit(\"download_diagram\", \"INVALID_TRANSITION\", message=\"unknown diagram_requests status\")\n            return _err(\"INVALID_TRANSITION\", \"Unknown diagram request status\", status=req_row.get(\"status\"), id=req_row.get(\"id\"))\n    else:\n        # Create new request with status created -> url_generated\n        enc = _encode_payload(content)\n        render_url = f\"{kroki_base_url.rstrip('/')}/{type_key}/{derived_fmt}/{enc}\"\n        if len(render_url) > 4096:\n            _audit(\"download_diagram\", \"VALIDATION_ERROR\", message=\"render_url too long\")\n            return _err(\"VALIDATION_ERROR\", \"render_url length must be <= 4096\", field=\"render_url\", maximum=4096)\n\n        req_row = {\n            \"id\": _gen_id(\"kroki_req\"),\n            \"diagram_type_id\": dt.get(\"id\"),\n            \"type_key\": type_key,\n            \"content\": content,\n            \"content_sha256\": content_sha256,\n            \"output_format\": derived_fmt,\n            \"kroki_base_url\": kroki_base_url,\n            \"encoded_payload\": enc,\n            \"render_url\": render_url,\n            \"status\": \"url_generated\",\n            \"last_error\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        diagram_requests.append(req_row)\n\n    # ---- Create download job (queued)\n    apply_scale = (derived_fmt == \"svg\" and abs(scale_val - 1.0) > 1e-12)\n    # if output_format != 'svg' then apply_scale must be false\n    if derived_fmt != \"svg\":\n        apply_scale = False\n\n    job_row = {\n        \"id\": _gen_id(\"kroki_dlj\"),\n        \"diagram_request_id\": req_row.get(\"id\"),\n        \"output_path\": outputPath.strip(),\n        \"output_format\": derived_fmt,\n        \"scale\": float(scale_val),\n        \"apply_scale\": bool(apply_scale),\n        \"status\": \"queued\",\n        \"http_status\": None,\n        \"bytes_written\": None,\n        \"mime_type\": None,\n        \"started_at\": None,\n        \"completed_at\": None,\n        \"last_error\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # enforce unique(output_path, created_at) in practice: if same path and same created_at exists, bump created_at by 1s\n    created_at = job_row[\"created_at\"]\n    if any(isinstance(j, dict) and j.get(\"output_path\") == job_row[\"output_path\"] and j.get(\"created_at\") == created_at for j in download_jobs):\n        # bump to next second\n        try:\n            dtp = datetime.datetime.fromisoformat(created_at.replace(\"Z\", \"+00:00\"))\n            dtp = dtp + datetime.timedelta(seconds=1)\n            job_row[\"created_at\"] = dtp.replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n            job_row[\"updated_at\"] = job_row[\"created_at\"]\n        except Exception:\n            pass\n\n    download_jobs.append(job_row)\n\n    # ---- Simulate job progression and \"persist\" artifact (offline) with correct lifecycle transitions\n    # queued -> rendering -> writing -> completed (or failed)\n    def _transition(job, to_status):\n        transitions = {\n            \"queued\": [\"rendering\", \"cancelled\", \"failed\"],\n            \"rendering\": [\"writing\", \"failed\", \"cancelled\"],\n            \"writing\": [\"completed\", \"failed\"],\n            \"completed\": [],\n            \"failed\": [],\n            \"cancelled\": [],\n        }\n        cur = job.get(\"status\")\n        if to_status not in transitions.get(cur, []):\n            return False\n        job[\"status\"] = to_status\n        job[\"updated_at\"] = _now_iso()\n        return True\n\n    # Move to rendering\n    if not _transition(job_row, \"rendering\"):\n        job_row[\"status\"] = \"failed\"\n        job_row[\"last_error\"] = \"Invalid job transition to rendering\"\n        job_row[\"completed_at\"] = _now_iso()\n        _save(\"diagram_requests.json\", diagram_requests)\n        _save(\"download_jobs.json\", download_jobs)\n        _audit(\"download_diagram\", \"INVALID_TRANSITION\", message=job_row[\"last_error\"])\n        return _err(\"INVALID_TRANSITION\", job_row[\"last_error\"], job_id=job_row[\"id\"])\n\n    job_row[\"started_at\"] = _now_iso()\n\n    # Produce bytes deterministically from request; pretend fetch succeeded\n    # For svg, create simple svg wrapper; for others, create stub binary header-like bytes\n    if derived_fmt == \"svg\":\n        # Basic SVG with optional scaling reflected in width/height attributes\n        base_w, base_h = 800.0, 600.0\n        w, h = base_w, base_h\n        if apply_scale:\n            w = base_w * scale_val\n            h = base_h * scale_val\n        svg = f'<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w:g}\" height=\"{h:g}\" viewBox=\"0 0 {base_w:g} {base_h:g}\"><!-- kroki offline render stub --><text x=\"10\" y=\"30\">type={type_key}</text></svg>'\n        content_bytes = svg.encode(\"utf-8\")\n        mime_type = \"image/svg+xml\"\n    elif derived_fmt == \"png\":\n        content_bytes = b\"\\x89PNG\\r\\n\\x1a\\n\" + hashlib.sha256((req_row[\"render_url\"]).encode(\"utf-8\")).digest()\n        mime_type = \"image/png\"\n    elif derived_fmt == \"jpeg\":\n        content_bytes = b\"\\xff\\xd8\\xff\" + hashlib.sha256((req_row[\"render_url\"]).encode(\"utf-8\")).digest() + b\"\\xff\\xd9\"\n        mime_type = \"image/jpeg\"\n    else:  # pdf\n        content_bytes = b\"%PDF-1.4\\n% kroki offline render stub\\n\" + hashlib.sha256((req_row[\"render_url\"]).encode(\"utf-8\")).digest() + b\"\\n%%EOF\\n\"\n        mime_type = \"application/pdf\"\n\n    # rendering -> writing\n    if not _transition(job_row, \"writing\"):\n        job_row[\"status\"] = \"failed\"\n        job_row[\"last_error\"] = \"Invalid job transition to writing\"\n        job_row[\"completed_at\"] = _now_iso()\n        _save(\"diagram_requests.json\", diagram_requests)\n        _save(\"download_jobs.json\", download_jobs)\n        _audit(\"download_diagram\", \"INVALID_TRANSITION\", message=job_row[\"last_error\"])\n        return _err(\"INVALID_TRANSITION\", job_row[\"last_error\"], job_id=job_row[\"id\"])\n\n    # Write file to outputPath (relative paths under /app/database/outputs, absolute paths as-is if possible)\n    out_path = outputPath.strip()\n    try:\n        if os.path.isabs(out_path):\n            fs_path = out_path\n            os.makedirs(os.path.dirname(fs_path) or \".\", exist_ok=True)\n        else:\n            fs_path = os.path.join(_DB, \"outputs\", out_path)\n            os.makedirs(os.path.dirname(fs_path), exist_ok=True)\n        with open(fs_path, \"wb\") as f:\n            f.write(content_bytes)\n    except Exception as e:\n        job_row[\"status\"] = \"failed\"\n        job_row[\"last_error\"] = f\"Failed to write output: {e}\"\n        job_row[\"bytes_written\"] = 0\n        job_row[\"mime_type\"] = mime_type\n        job_row[\"http_status\"] = None\n        job_row[\"completed_at\"] = _now_iso()\n        job_row[\"updated_at\"] = job_row[\"completed_at\"]\n        _save(\"diagram_requests.json\", diagram_requests)\n        _save(\"download_jobs.json\", download_jobs)\n        _audit(\"download_diagram\", \"FAILED\", message=job_row[\"last_error\"])\n        return _err(\"CONFLICT\", \"Unable to write output file\", job_id=job_row[\"id\"], detail=str(e))\n\n    # writing -> completed\n    if not _transition(job_row, \"completed\"):\n        job_row[\"status\"] = \"failed\"\n        job_row[\"last_error\"] = \"Invalid job transition to completed\"\n        job_row[\"bytes_written\"] = len(content_bytes)\n        job_row[\"mime_type\"] = mime_type\n        job_row[\"completed_at\"] = _now_iso()\n        _save(\"diagram_requests.json\", diagram_requests)\n        _save(\"download_jobs.json\", download_jobs)\n        _audit(\"download_diagram\", \"INVALID_TRANSITION\", message=job_row[\"last_error\"])\n        return _err(\"INVALID_TRANSITION\", job_row[\"last_error\"], job_id=job_row[\"id\"])\n\n    job_row[\"bytes_written\"] = len(content_bytes)\n    job_row[\"mime_type\"] = mime_type\n    job_row[\"http_status\"] = 200\n    job_row[\"completed_at\"] = _now_iso()\n    job_row[\"updated_at\"] = job_row[\"completed_at\"]\n\n    # Mark request as rendered if possible (url_generated -> rendered)\n    if req_row.get(\"status\") == \"url_generated\":\n        req_row[\"status\"] = \"rendered\"\n        req_row[\"updated_at\"] = job_row[\"completed_at\"]\n        req_row[\"last_error\"] = None\n\n    # Upsert render_cache for (diagram_request_id, output_format)\n    sha = hashlib.sha256(content_bytes).hexdigest()\n    byte_size = len(content_bytes)\n    cache_row = None\n    for c in render_cache:\n        if isinstance(c, dict) and c.get(\"diagram_request_id\") == req_row.get(\"id\") and c.get(\"output_format\") == derived_fmt:\n            cache_row = c\n            break\n    inline_cap = 10485760\n    if byte_size <= inline_cap:\n        storage_kind = \"inline\"\n        content_inline_base64 = base64.b64encode(content_bytes).decode(\"ascii\")\n        storage_uri = None\n    else:\n        storage_kind = \"file\"\n        content_inline_base64 = None\n        storage_uri = f\"file://{fs_path}\"\n\n    if cache_row:\n        # legal transitions: fresh/stale -> fresh\n        if cache_row.get(\"status\") in (\"fresh\", \"stale\"):\n            cache_row.update({\n                \"etag\": cache_row.get(\"etag\"),\n                \"sha256\": sha,\n                \"byte_size\": byte_size,\n                \"storage_kind\": storage_kind,\n                \"content_inline_base64\": content_inline_base64,\n                \"storage_uri\": storage_uri,\n                \"status\": \"fresh\",\n                \"updated_at\": _now_iso(),\n            })\n        else:\n            # evicted cannot transition; create a new entry instead (but must respect unique constraint, so update anyway)\n            cache_row.update({\n                \"etag\": cache_row.get(\"etag\"),\n                \"sha256\": sha,\n                \"byte_size\": byte_size,\n                \"storage_kind\": storage_kind,\n                \"content_inline_base64\": content_inline_base64,\n                \"storage_uri\": storage_uri,\n                \"status\": \"evicted\",\n                \"updated_at\": _now_iso(),\n            })\n    else:\n        render_cache.append({\n            \"id\": _gen_id(\"kroki_cch\"),\n            \"diagram_request_id\": req_row.get(\"id\"),\n            \"output_format\": derived_fmt,\n            \"etag\": None,\n            \"sha256\": sha,\n            \"byte_size\": byte_size,\n            \"storage_kind\": storage_kind,\n            \"content_inline_base64\": content_inline_base64,\n            \"storage_uri\": storage_uri,\n            \"status\": \"fresh\",\n            \"expires_at\": None,\n            \"created_at\": _now_iso(),\n            \"updated_at\": _now_iso(),\n        })\n\n    # ---- Persist\n    _save(\"diagram_requests.json\", diagram_requests)\n    _save(\"download_jobs.json\", download_jobs)\n    _save(\"render_cache.json\", render_cache)\n\n    _audit(\"download_diagram\", \"OK\", extra={\"job_id\": job_row[\"id\"], \"request_id\": req_row.get(\"id\")})\n\n    return {\n        \"data\": {\n            \"diagram_request\": req_row,\n            \"download_job\": job_row,\n            \"render_url\": req_row.get(\"render_url\"),\n            \"output_path_resolved\": fs_path,\n            \"cache\": {\n                \"diagram_request_id\": req_row.get(\"id\"),\n                \"output_format\": derived_fmt,\n                \"sha256\": sha,\n                \"byte_size\": byte_size,\n                \"storage_kind\": storage_kind,\n            }\n        },\n        \"meta\": {\n            \"latency_ms\": int((time.time() - t0) * 1000)\n        }\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_diagram_types",
+          "description": "Lists diagram types known to the server with optional filtering and pagination. Returns enabled/disabled state and supported output formats; refuses requests with invalid pagination parameters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "description": "When provided, filters by whether the diagram type is enabled."
+              },
+              "typeKey": {
+                "type": "string",
+                "description": "When provided, filters by an exact diagram type key (e.g., \"mermaid\", \"plantuml\")."
+              },
+              "page": {
+                "type": "integer",
+                "description": "1-based page index.",
+                "minimum": 1,
+                "default": 1
+              },
+              "pageSize": {
+                "type": "integer",
+                "description": "Number of items per page.",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50
+              },
+              "sortBy": {
+                "type": "string",
+                "description": "Field to sort by.",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "display_name",
+                  "type_key"
+                ]
+              },
+              "sortOrder": {
+                "type": "string",
+                "description": "Sort direction.",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "default": "asc"
+              },
+              "includeDisabled": {
+                "type": "boolean",
+                "description": "When true, includes disabled diagram types even if enabled filter is not set.",
+                "default": false
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_diagram_types(enabled=None, typeKey=None, page=None, pageSize=None, sortBy=None, sortOrder=None, includeDisabled=None, **_extra):\n    import json, os, datetime\n    import time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0383000\" if __import__(\"os\").path.isdir(\"./environment_mix/0383000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    if enabled is not None and not isinstance(enabled, bool):\n        return _err(\"VALIDATION_ERROR\", \"enabled must be a boolean when provided\")\n    if includeDisabled is None:\n        includeDisabled_val = False\n    else:\n        if not isinstance(includeDisabled, bool):\n            return _err(\"VALIDATION_ERROR\", \"includeDisabled must be a boolean when provided\")\n        includeDisabled_val = includeDisabled\n    if typeKey is not None and (not isinstance(typeKey, str) or not typeKey.strip()):\n        return _err(\"VALIDATION_ERROR\", \"typeKey must be a non-empty string when provided\")\n\n    if page is None:\n        page_val = 1\n    else:\n        if not isinstance(page, int):\n            return _err(\"VALIDATION_ERROR\", \"page must be an integer when provided\")\n        page_val = page\n    if page_val < 1:\n        return _err(\"VALIDATION_ERROR\", \"page must be >= 1\", minimum=1)\n\n    if pageSize is None:\n        page_size_val = 50\n    else:\n        if not isinstance(pageSize, int):\n            return _err(\"VALIDATION_ERROR\", \"pageSize must be an integer when provided\")\n        page_size_val = pageSize\n    if page_size_val < 1 or page_size_val > 200:\n        return _err(\"VALIDATION_ERROR\", \"pageSize must be between 1 and 200\", minimum=1, maximum=200)\n\n    if sortBy is None:\n        sort_by_val = \"type_key\"\n    else:\n        if sortBy not in (\"created_at\", \"updated_at\", \"display_name\", \"type_key\"):\n            return _err(\"VALIDATION_ERROR\", \"sortBy must be one of created_at, updated_at, display_name, type_key\")\n        sort_by_val = sortBy\n\n    if sortOrder is None:\n        sort_order_val = \"asc\"\n    else:\n        if sortOrder not in (\"asc\", \"desc\"):\n            return _err(\"VALIDATION_ERROR\", \"sortOrder must be one of asc, desc\")\n        sort_order_val = sortOrder\n\n    rows = _load(\"diagram_types.json\")\n    if not isinstance(rows, list):\n        rows = []\n\n    # Filtering\n    out = []\n    for r in rows:\n        if not isinstance(r, dict):\n            continue\n        if typeKey is not None and r.get(\"type_key\") != typeKey:\n            continue\n        if enabled is not None:\n            if r.get(\"enabled\") is not enabled:\n                continue\n        else:\n            if not includeDisabled_val and r.get(\"enabled\") is not True:\n                continue\n        out.append(r)\n\n    # Sorting\n    reverse = sort_order_val == \"desc\"\n\n    def _key(r):\n        v = r.get(sort_by_val)\n        return (v is None, v)\n\n    out.sort(key=_key, reverse=reverse)\n\n    total = len(out)\n    start = (page_val - 1) * page_size_val\n    end = start + page_size_val\n    page_rows = out[start:end]\n    has_more = end < total\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"items\": [\n            {\n                \"id\": r.get(\"id\"),\n                \"typeKey\": r.get(\"type_key\"),\n                \"displayName\": r.get(\"display_name\"),\n                \"enabled\": r.get(\"enabled\"),\n                \"defaultOutputFormat\": r.get(\"default_output_format\"),\n                \"allowedOutputFormats\": r.get(\"allowed_output_formats\"),\n                \"createdAt\": r.get(\"created_at\"),\n                \"updatedAt\": r.get(\"updated_at\"),\n            }\n            for r in page_rows\n        ],\n        \"page\": page_val,\n        \"pageSize\": page_size_val,\n        \"total\": total,\n        \"hasMore\": has_more,\n        \"meta\": {\"latency_ms\": latency_ms},\n    }\n"
+        },
+        {
+          "name": "update_diagram_type",
+          "description": "Updates mutable fields for a diagram type, including enabling/disabling it. Returns the updated diagram type; refuses invalid output format values or attempts to set default_output_format not in allowed_output_formats.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Primary identifier of the diagram type to update."
+              },
+              "displayName": {
+                "type": "string",
+                "description": "Human-friendly name for the diagram type."
+              },
+              "enabled": {
+                "type": "boolean",
+                "description": "Enable/disable this diagram type (drives lifecycle transitions false<->true)."
+              },
+              "defaultOutputFormat": {
+                "type": "string",
+                "description": "Default output format used when a caller omits outputFormat.",
+                "enum": [
+                  "svg",
+                  "png",
+                  "pdf",
+                  "jpeg"
+                ]
+              },
+              "allowedOutputFormats": {
+                "type": "array",
+                "description": "Allowed output formats for URL generation and rendering for this type.",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "svg",
+                    "png",
+                    "pdf",
+                    "jpeg",
+                    "base64"
+                  ]
+                },
+                "minItems": 1
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_diagram_type(id, displayName=None, enabled=None, defaultOutputFormat=None, allowedOutputFormats=None, **_extra):\n    import json, os, datetime\n    import time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0383000\" if __import__(\"os\").path.isdir(\"./environment_mix/0383000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    if not isinstance(id, str) or not id.strip():\n        return _err(\"VALIDATION_ERROR\", \"id is required and must be a non-empty string\")\n\n    if displayName is not None and (not isinstance(displayName, str) or not displayName.strip()):\n        return _err(\"VALIDATION_ERROR\", \"displayName must be a non-empty string when provided\")\n\n    if enabled is not None and not isinstance(enabled, bool):\n        return _err(\"VALIDATION_ERROR\", \"enabled must be a boolean when provided\")\n\n    if defaultOutputFormat is not None:\n        if defaultOutputFormat not in (\"svg\", \"png\", \"pdf\", \"jpeg\"):\n            return _err(\"VALIDATION_ERROR\", \"defaultOutputFormat must be one of svg, png, pdf, jpeg\")\n\n    if allowedOutputFormats is not None:\n        if not isinstance(allowedOutputFormats, list) or len(allowedOutputFormats) < 1:\n            return _err(\"VALIDATION_ERROR\", \"allowedOutputFormats must be a non-empty array when provided\")\n        allowed_enum = {\"svg\", \"png\", \"pdf\", \"jpeg\", \"base64\"}\n        for v in allowedOutputFormats:\n            if v not in allowed_enum:\n                return _err(\"VALIDATION_ERROR\", \"allowedOutputFormats contains invalid value\", value=v)\n        # Must be unique, preserve order\n        seen = set()\n        dedup = []\n        for v in allowedOutputFormats:\n            if v not in seen:\n                seen.add(v)\n                dedup.append(v)\n        allowedOutputFormats = dedup\n\n    rows = _load(\"diagram_types.json\")\n    if not isinstance(rows, list):\n        rows = []\n\n    row = None\n    for r in rows:\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            row = r\n            break\n    if row is None:\n        return _err(\"NOT_FOUND\", \"diagram type not found\", id=id)\n\n    # Apply updates with lifecycle transitions for enabled\n    if displayName is not None:\n        row[\"display_name\"] = displayName\n\n    if allowedOutputFormats is not None:\n        row[\"allowed_output_formats\"] = allowedOutputFormats\n\n    if defaultOutputFormat is not None:\n        row[\"default_output_format\"] = defaultOutputFormat\n\n    # Constraints: allowed_output_formats non-empty; default must be in allowed\n    aof = row.get(\"allowed_output_formats\")\n    if not isinstance(aof, list) or len(aof) < 1:\n        return _err(\"VALIDATION_ERROR\", \"allowedOutputFormats must be non-empty\")\n    dof = row.get(\"default_output_format\")\n    if dof not in aof:\n        return _err(\"VALIDATION_ERROR\", \"default_output_format must be contained in allowed_output_formats\", default_output_format=dof)\n\n    # Lifecycle transition for enabled\n    if enabled is not None:\n        cur = row.get(\"enabled\")\n        if cur not in (True, False):\n            return _err(\"CONFLICT\", \"diagram type has invalid enabled state in store\", enabled=cur)\n        if enabled != cur:\n            # transitions: true->[false], false->[true]\n            if cur is True and enabled is False:\n                row[\"enabled\"] = False\n            elif cur is False and enabled is True:\n                row[\"enabled\"] = True\n            else:\n                return _err(\"INVALID_TRANSITION\", \"illegal enabled transition\", from_enabled=cur, to_enabled=enabled)\n\n    row[\"updated_at\"] = now\n    _save(\"diagram_types.json\", rows)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"item\": {\n            \"id\": row.get(\"id\"),\n            \"typeKey\": row.get(\"type_key\"),\n            \"displayName\": row.get(\"display_name\"),\n            \"enabled\": row.get(\"enabled\"),\n            \"defaultOutputFormat\": row.get(\"default_output_format\"),\n            \"allowedOutputFormats\": row.get(\"allowed_output_formats\"),\n            \"createdAt\": row.get(\"created_at\"),\n            \"updatedAt\": row.get(\"updated_at\"),\n        },\n        \"meta\": {\"latency_ms\": latency_ms},\n    }\n"
+        },
+        {
+          "name": "list_diagram_requests",
+          "description": "Lists stored diagram render requests with optional filtering and pagination. Returns request metadata including status and render_url when generated; refuses invalid filters or pagination parameters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "typeKey": {
+                "type": "string",
+                "description": "Filter by diagram type key (e.g., \"mermaid\")."
+              },
+              "diagramTypeId": {
+                "type": "string",
+                "description": "Filter by diagram_type_id."
+              },
+              "status": {
+                "type": "string",
+                "description": "Filter by lifecycle status.",
+                "enum": [
+                  "created",
+                  "url_generated",
+                  "rendered",
+                  "failed"
+                ]
+              },
+              "contentSha256": {
+                "type": "string",
+                "description": "Filter by content SHA-256 hex digest."
+              },
+              "outputFormat": {
+                "type": "string",
+                "description": "Filter by requested output format.",
+                "enum": [
+                  "svg",
+                  "png",
+                  "pdf",
+                  "jpeg",
+                  "base64"
+                ]
+              },
+              "krokiBaseUrl": {
+                "type": "string",
+                "description": "Filter by Kroki base URL used for deterministic URL generation."
+              },
+              "page": {
+                "type": "integer",
+                "description": "1-based page index.",
+                "minimum": 1,
+                "default": 1
+              },
+              "pageSize": {
+                "type": "integer",
+                "description": "Number of items per page.",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50
+              },
+              "sortBy": {
+                "type": "string",
+                "description": "Field to sort by.",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "status",
+                  "type_key"
+                ]
+              },
+              "sortOrder": {
+                "type": "string",
+                "description": "Sort direction.",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "default": "desc"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_diagram_requests(typeKey=None, diagramTypeId=None, status=None, contentSha256=None, outputFormat=None, krokiBaseUrl=None, page=None, pageSize=None, sortBy=None, sortOrder=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0383000\" if __import__(\"os\").path.isdir(\"./environment_mix/0383000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = datetime.datetime.utcnow()\n\n    # ---- helpers for audit/rate-limit (best-effort if collections exist) ----\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _audit(endpoint, status_code, credential_id=None, message=None):\n        # vendor schema did not declare an audit collection; still honor if present\n        for fname in (\"request_logs.json\", \"audit_logs.json\", \"usage_logs.json\", \"api_requests.json\"):\n            path = os.path.join(_DB, fname)\n            if os.path.exists(path):\n                rows = _load(fname)\n                latency_ms = int((datetime.datetime.utcnow() - start).total_seconds() * 1000)\n                row = {\n                    \"id\": f\"req_{int(datetime.datetime.utcnow().timestamp()*1000)}_{os.getpid()}\",\n                    \"endpoint\": endpoint,\n                    \"credential_id\": credential_id,\n                    \"status\": status_code,\n                    \"message\": message,\n                    \"latency_ms\": latency_ms,\n                    \"created_at\": _now_iso(),\n                }\n                rows.append(row)\n                _save(fname, rows)\n                break\n\n    # ---- validation ----\n    if typeKey is not None and not isinstance(typeKey, str):\n        _audit(\"list_diagram_requests\", \"VALIDATION_ERROR\", message=\"typeKey must be string\")\n        return _err(\"VALIDATION_ERROR\", \"typeKey must be a string\")\n    if diagramTypeId is not None and not isinstance(diagramTypeId, str):\n        _audit(\"list_diagram_requests\", \"VALIDATION_ERROR\", message=\"diagramTypeId must be string\")\n        return _err(\"VALIDATION_ERROR\", \"diagramTypeId must be a string\")\n    if status is not None:\n        if not isinstance(status, str):\n            _audit(\"list_diagram_requests\", \"VALIDATION_ERROR\", message=\"status must be string\")\n            return _err(\"VALIDATION_ERROR\", \"status must be a string\")\n        if status not in (\"created\", \"url_generated\", \"rendered\", \"failed\"):\n            _audit(\"list_diagram_requests\", \"VALIDATION_ERROR\", message=\"invalid status\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid status\", allowed=[\"created\", \"url_generated\", \"rendered\", \"failed\"])\n    if contentSha256 is not None and not isinstance(contentSha256, str):\n        _audit(\"list_diagram_requests\", \"VALIDATION_ERROR\", message=\"contentSha256 must be string\")\n        return _err(\"VALIDATION_ERROR\", \"contentSha256 must be a string\")\n    if outputFormat is not None:\n        if not isinstance(outputFormat, str):\n            _audit(\"list_diagram_requests\", \"VALIDATION_ERROR\", message=\"outputFormat must be string\")\n            return _err(\"VALIDATION_ERROR\", \"outputFormat must be a string\")\n        if outputFormat not in (\"svg\", \"png\", \"pdf\", \"jpeg\", \"base64\"):\n            _audit(\"list_diagram_requests\", \"VALIDATION_ERROR\", message=\"invalid outputFormat\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid outputFormat\", allowed=[\"svg\", \"png\", \"pdf\", \"jpeg\", \"base64\"])\n    if krokiBaseUrl is not None and not isinstance(krokiBaseUrl, str):\n        _audit(\"list_diagram_requests\", \"VALIDATION_ERROR\", message=\"krokiBaseUrl must be string\")\n        return _err(\"VALIDATION_ERROR\", \"krokiBaseUrl must be a string\")\n\n    if page is None:\n        page = 1\n    if pageSize is None:\n        pageSize = 50\n    if sortOrder is None:\n        sortOrder = \"desc\"\n\n    if not isinstance(page, int) or page < 1:\n        _audit(\"list_diagram_requests\", \"VALIDATION_ERROR\", message=\"page must be int >= 1\")\n        return _err(\"VALIDATION_ERROR\", \"page must be an integer >= 1\")\n    if not isinstance(pageSize, int) or pageSize < 1 or pageSize > 200:\n        _audit(\"list_diagram_requests\", \"VALIDATION_ERROR\", message=\"pageSize out of range\")\n        return _err(\"VALIDATION_ERROR\", \"pageSize must be an integer between 1 and 200\")\n    if sortBy is not None:\n        if not isinstance(sortBy, str):\n            _audit(\"list_diagram_requests\", \"VALIDATION_ERROR\", message=\"sortBy must be string\")\n            return _err(\"VALIDATION_ERROR\", \"sortBy must be a string\")\n        if sortBy not in (\"created_at\", \"updated_at\", \"status\", \"type_key\"):\n            _audit(\"list_diagram_requests\", \"VALIDATION_ERROR\", message=\"invalid sortBy\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid sortBy\", allowed=[\"created_at\", \"updated_at\", \"status\", \"type_key\"])\n    if sortOrder not in (\"asc\", \"desc\"):\n        _audit(\"list_diagram_requests\", \"VALIDATION_ERROR\", message=\"invalid sortOrder\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid sortOrder\", allowed=[\"asc\", \"desc\"])\n\n    # ---- load & filter ----\n    reqs = _load(\"diagram_requests.json\")\n    items = []\n    for r in reqs:\n        if typeKey is not None and r.get(\"type_key\") != typeKey:\n            continue\n        if diagramTypeId is not None and r.get(\"diagram_type_id\") != diagramTypeId:\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        if contentSha256 is not None and r.get(\"content_sha256\") != contentSha256:\n            continue\n        if outputFormat is not None and r.get(\"output_format\") != outputFormat:\n            continue\n        if krokiBaseUrl is not None and r.get(\"kroki_base_url\") != krokiBaseUrl:\n            continue\n        items.append(r)\n\n    # ---- sort ----\n    if sortBy is None:\n        sortBy = \"created_at\"\n\n    reverse = (sortOrder == \"desc\")\n\n    def _key(v):\n        val = v.get(sortBy)\n        # None-safe sort\n        return (val is None, val)\n\n    try:\n        items.sort(key=_key, reverse=reverse)\n    except TypeError:\n        # fallback to string coercion\n        items.sort(key=lambda x: (x.get(sortBy) is None, str(x.get(sortBy))), reverse=reverse)\n\n    total = len(items)\n    start_i = (page - 1) * pageSize\n    end_i = start_i + pageSize\n    page_items = items[start_i:end_i]\n    has_more = end_i < total\n\n    _audit(\"list_diagram_requests\", \"OK\", message=None)\n    return {\n        \"data\": page_items,\n        \"meta\": {\n            \"page\": page,\n            \"page_size\": pageSize,\n            \"total\": total,\n            \"has_more\": has_more,\n            \"next_page\": (page + 1) if has_more else None,\n            \"sort_by\": sortBy,\n            \"sort_order\": sortOrder,\n        },\n    }\n"
+        },
+        {
+          "name": "get_diagram_request",
+          "description": "Fetches a single diagram request by id. Returns the stored request, including generated render_url and last_error when present; raises NOT_FOUND if the id does not exist or FORBIDDEN if the caller cannot access it.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Primary identifier of the diagram request."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_diagram_request(id, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0383000\" if __import__(\"os\").path.isdir(\"./environment_mix/0383000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = datetime.datetime.utcnow()\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _append_request_log(status, message=None):\n        # Observable dynamics: if any request/audit log collection exists, append a row.\n        latency_ms = int((datetime.datetime.utcnow() - start).total_seconds() * 1000)\n        row = {\n            \"id\": f\"req_{int(datetime.datetime.utcnow().timestamp()*1000)}_{os.getpid()}\",\n            \"endpoint\": \"get_diagram_request\",\n            \"status\": status,\n            \"message\": message,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now_iso(),\n        }\n        for fname in (\"api_requests.json\", \"request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            path = os.path.join(_DB, fname)\n            if not os.path.exists(path):\n                continue\n            store = _load(fname)\n            if isinstance(store, list):\n                store.append(row)\n                _save(fname, store)\n                return\n            if isinstance(store, dict) and isinstance(store.get(\"rows\"), list):\n                store[\"rows\"].append(row)\n                _save(fname, store)\n                return\n\n    # Validate inputs (tool schema: string id; accept any non-empty string)\n    if not isinstance(id, str) or not id.strip():\n        _append_request_log(\"VALIDATION_ERROR\", \"id must be a non-empty string\")\n        return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\", field=\"id\")\n\n    # Load diagram_requests\n    reqs_store = _load(\"diagram_requests.json\")\n    if isinstance(reqs_store, dict) and isinstance(reqs_store.get(\"rows\"), list):\n        req_rows = reqs_store.get(\"rows\", [])\n    elif isinstance(reqs_store, list):\n        req_rows = reqs_store\n    else:\n        req_rows = []\n\n    found = None\n    for r in req_rows:\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            found = r\n            break\n\n    if not found:\n        _append_request_log(\"NOT_FOUND\", \"Diagram request not found\")\n        return _err(\"NOT_FOUND\", \"Diagram request not found\", id=id)\n\n    # No explicit auth model is present in the provided schema; treat caller as authorized.\n    # Return in a normal envelope.\n    _append_request_log(\"OK\", None)\n    return {\"diagram_request\": found}\n"
+        },
+        {
+          "name": "list_download_jobs",
+          "description": "Lists download jobs with optional filtering and pagination. Returns job status, output path/format, and bytes/mime type when completed; refuses invalid pagination parameters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "diagramRequestId": {
+                "type": "string",
+                "description": "Filter by the diagram_request_id associated with the download job."
+              },
+              "status": {
+                "type": "string",
+                "description": "Filter by lifecycle status.",
+                "enum": [
+                  "queued",
+                  "rendering",
+                  "writing",
+                  "completed",
+                  "failed",
+                  "cancelled"
+                ]
+              },
+              "outputFormat": {
+                "type": "string",
+                "description": "Filter by download output format.",
+                "enum": [
+                  "svg",
+                  "png",
+                  "pdf",
+                  "jpeg"
+                ]
+              },
+              "page": {
+                "type": "integer",
+                "description": "1-based page index.",
+                "minimum": 1,
+                "default": 1
+              },
+              "pageSize": {
+                "type": "integer",
+                "description": "Number of items per page.",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50
+              },
+              "sortBy": {
+                "type": "string",
+                "description": "Field to sort by.",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "status",
+                  "started_at",
+                  "completed_at"
+                ]
+              },
+              "sortOrder": {
+                "type": "string",
+                "description": "Sort direction.",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "default": "desc"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_download_jobs(diagramRequestId=None, status=None, outputFormat=None, page=None, pageSize=None, sortBy=None, sortOrder=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0383000\" if __import__(\"os\").path.isdir(\"./environment_mix/0383000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = datetime.datetime.utcnow()\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _audit(endpoint, status_code, credential_id=None, message=None):\n        for fname in (\"request_logs.json\", \"audit_logs.json\", \"usage_logs.json\", \"api_requests.json\"):\n            if os.path.exists(os.path.join(_DB, fname)):\n                rows = _load(fname)\n                latency_ms = int((datetime.datetime.utcnow() - start).total_seconds() * 1000)\n                rows.append({\n                    \"id\": f\"req_{int(datetime.datetime.utcnow().timestamp()*1000)}_{os.getpid()}\",\n                    \"endpoint\": endpoint,\n                    \"credential_id\": credential_id,\n                    \"status\": status_code,\n                    \"message\": message,\n                    \"latency_ms\": latency_ms,\n                    \"created_at\": _now_iso(),\n                })\n                _save(fname, rows)\n                break\n\n    if diagramRequestId is not None and not isinstance(diagramRequestId, str):\n        _audit(\"list_download_jobs\", \"VALIDATION_ERROR\", message=\"diagramRequestId must be string\")\n        return _err(\"VALIDATION_ERROR\", \"diagramRequestId must be a string\")\n\n    if status is not None:\n        if not isinstance(status, str):\n            _audit(\"list_download_jobs\", \"VALIDATION_ERROR\", message=\"status must be string\")\n            return _err(\"VALIDATION_ERROR\", \"status must be a string\")\n        if status not in (\"queued\", \"rendering\", \"writing\", \"completed\", \"failed\", \"cancelled\"):\n            _audit(\"list_download_jobs\", \"VALIDATION_ERROR\", message=\"invalid status\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid status\", allowed=[\"queued\", \"rendering\", \"writing\", \"completed\", \"failed\", \"cancelled\"])\n\n    if outputFormat is not None:\n        if not isinstance(outputFormat, str):\n            _audit(\"list_download_jobs\", \"VALIDATION_ERROR\", message=\"outputFormat must be string\")\n            return _err(\"VALIDATION_ERROR\", \"outputFormat must be a string\")\n        if outputFormat not in (\"svg\", \"png\", \"pdf\", \"jpeg\"):\n            _audit(\"list_download_jobs\", \"VALIDATION_ERROR\", message=\"invalid outputFormat\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid outputFormat\", allowed=[\"svg\", \"png\", \"pdf\", \"jpeg\"])\n\n    if page is None:\n        page = 1\n    if pageSize is None:\n        pageSize = 50\n    if sortOrder is None:\n        sortOrder = \"desc\"\n\n    if not isinstance(page, int) or page < 1:\n        _audit(\"list_download_jobs\", \"VALIDATION_ERROR\", message=\"page must be int >= 1\")\n        return _err(\"VALIDATION_ERROR\", \"page must be an integer >= 1\")\n    if not isinstance(pageSize, int) or pageSize < 1 or pageSize > 200:\n        _audit(\"list_download_jobs\", \"VALIDATION_ERROR\", message=\"pageSize out of range\")\n        return _err(\"VALIDATION_ERROR\", \"pageSize must be an integer between 1 and 200\")\n    if sortBy is not None:\n        if not isinstance(sortBy, str):\n            _audit(\"list_download_jobs\", \"VALIDATION_ERROR\", message=\"sortBy must be string\")\n            return _err(\"VALIDATION_ERROR\", \"sortBy must be a string\")\n        if sortBy not in (\"created_at\", \"updated_at\", \"status\", \"started_at\", \"completed_at\"):\n            _audit(\"list_download_jobs\", \"VALIDATION_ERROR\", message=\"invalid sortBy\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid sortBy\", allowed=[\"created_at\", \"updated_at\", \"status\", \"started_at\", \"completed_at\"])\n    if sortOrder not in (\"asc\", \"desc\"):\n        _audit(\"list_download_jobs\", \"VALIDATION_ERROR\", message=\"invalid sortOrder\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid sortOrder\", allowed=[\"asc\", \"desc\"])\n\n    jobs = _load(\"download_jobs.json\")\n    items = []\n    for j in jobs:\n        if diagramRequestId is not None and j.get(\"diagram_request_id\") != diagramRequestId:\n            continue\n        if status is not None and j.get(\"status\") != status:\n            continue\n        if outputFormat is not None and j.get(\"output_format\") != outputFormat:\n            continue\n        items.append(j)\n\n    if sortBy is None:\n        sortBy = \"created_at\"\n    reverse = (sortOrder == \"desc\")\n\n    def _key(v):\n        val = v.get(sortBy)\n        return (val is None, val)\n\n    try:\n        items.sort(key=_key, reverse=reverse)\n    except TypeError:\n        items.sort(key=lambda x: (x.get(sortBy) is None, str(x.get(sortBy))), reverse=reverse)\n\n    total = len(items)\n    start_i = (page - 1) * pageSize\n    end_i = start_i + pageSize\n    page_items = items[start_i:end_i]\n    has_more = end_i < total\n\n    _audit(\"list_download_jobs\", \"OK\")\n    return {\n        \"data\": page_items,\n        \"meta\": {\n            \"page\": page,\n            \"page_size\": pageSize,\n            \"total\": total,\n            \"has_more\": has_more,\n            \"next_page\": (page + 1) if has_more else None,\n            \"sort_by\": sortBy,\n            \"sort_order\": sortOrder,\n        },\n    }\n"
+        },
+        {
+          "name": "get_caller_context",
+          "description": "Returns the authenticated caller identity, granted scopes, and current quota/rate-limit consumption as seen by the server. Refuses UNAUTHORIZED when no valid credentials are presented.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "includeRateLimits": {
+                "type": "boolean",
+                "description": "When true, includes current rate-limit window and remaining/used counters if available.",
+                "default": true
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_caller_context(includeRateLimits=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0383000\" if __import__(\"os\").path.isdir(\"./environment_mix/0383000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = datetime.datetime.utcnow()\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _audit(endpoint, status_code, credential_id=None, message=None):\n        for fname in (\"request_logs.json\", \"audit_logs.json\", \"usage_logs.json\", \"api_requests.json\"):\n            if os.path.exists(os.path.join(_DB, fname)):\n                rows = _load(fname)\n                latency_ms = int((datetime.datetime.utcnow() - start).total_seconds() * 1000)\n                rows.append({\n                    \"id\": f\"req_{int(datetime.datetime.utcnow().timestamp()*1000)}_{os.getpid()}\",\n                    \"endpoint\": endpoint,\n                    \"credential_id\": credential_id,\n                    \"status\": status_code,\n                    \"message\": message,\n                    \"latency_ms\": latency_ms,\n                    \"created_at\": _now_iso(),\n                })\n                _save(fname, rows)\n                break\n\n    if includeRateLimits is None:\n        includeRateLimits = True\n    if not isinstance(includeRateLimits, bool):\n        _audit(\"get_caller_context\", \"VALIDATION_ERROR\", message=\"includeRateLimits must be boolean\")\n        return _err(\"VALIDATION_ERROR\", \"includeRateLimits must be a boolean\")\n\n    # This service schema does not define credentials/accounts. Ambient auth is assumed.\n    # Only refuse UNAUTHORIZED if there is an explicit credential system present and none are valid.\n    # We'll look for common credential collections; if present and all are invalid/disabled -> UNAUTHORIZED.\n    cred_files = (\"credentials.json\", \"api_keys.json\", \"access_tokens.json\", \"users.json\")\n    found_cred_system = any(os.path.exists(os.path.join(_DB, f)) for f in cred_files)\n\n    credential = None\n    if found_cred_system:\n        # best effort: find any active credential; if none, unauthorized\n        for f in cred_files:\n            if not os.path.exists(os.path.join(_DB, f)):\n                continue\n            rows = _load(f)\n            for r in rows:\n                if isinstance(r, dict) and (r.get(\"disabled\") is True or r.get(\"revoked\") is True):\n                    continue\n                # if there's an \"active\" field, require it; otherwise accept the row\n                if \"active\" in r and r.get(\"active\") is not True:\n                    continue\n                credential = r\n                break\n            if credential:\n                break\n        if not credential:\n            _audit(\"get_caller_context\", \"UNAUTHORIZED\", message=\"no valid credentials available\")\n            return _err(\"UNAUTHORIZED\", \"No valid credentials presented\")\n\n    context = {\n        \"data\": {\n            \"authenticated\": True,\n            \"caller\": {\n                \"credential_id\": credential.get(\"id\") if isinstance(credential, dict) else None,\n                \"kind\": \"ambient\" if not credential else \"stored\",\n            },\n            \"scopes\": [\"read:diagram_requests\", \"read:download_jobs\"],\n            \"server_time\": _now_iso(),\n        }\n    }\n\n    if includeRateLimits:\n        # If request log exists, compute simple rolling window usage (last 60s)\n        rl = {\"available\": False}\n        for fname in (\"request_logs.json\", \"audit_logs.json\", \"usage_logs.json\", \"api_requests.json\"):\n            if os.path.exists(os.path.join(_DB, fname)):\n                rows = _load(fname)\n                now = datetime.datetime.utcnow()\n                window_s = 60\n                used = 0\n                for r in rows:\n                    ts = r.get(\"created_at\")\n                    if not isinstance(ts, str):\n                        continue\n                    try:\n                        dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"\"))\n                    except Exception:\n                        continue\n                    if (now - dt).total_seconds() <= window_s:\n                        used += 1\n                rl = {\n                    \"available\": True,\n                    \"window_seconds\": window_s,\n                    \"used\": used,\n                    \"remaining\": None,\n                    \"limit\": None,\n                }\n                break\n        context[\"data\"][\"rate_limits\"] = rl\n\n    _audit(\"get_caller_context\", \"OK\", credential_id=context[\"data\"][\"caller\"][\"credential_id\"])\n    return context\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0383000",
+    "index": 383,
+    "name": "Kroki Server",
+    "description": "This backend stores requests to render Kroki diagrams from source text (Mermaid/PlantUML/etc.), the derived render URLs, and optional persisted binary outputs when a diagram is downloaded to a file. Main workflows are: (1) create a render request and compute a deterministic Kroki URL for it, and (2)",
+    "taxonomy": {
+      "L1_id": "L1-17",
+      "L1_name": "Document & Design",
+      "L1_name_zh": "文档与设计",
+      "L2_id": "L2-43",
+      "L2_name": "Design, UI & Visualization",
+      "L2_name_zh": "设计、UI 与可视化",
+      "L3_name": "Diagram Generation & Rendering",
+      "L3_name_zh": "图表/流程图生成与渲染"
+    },
+    "database_dir": "./environment_mix/0383000",
+    "mount_path": "/app/database",
+    "n_tools": 8,
+    "n_collections": 4,
+    "n_records": 130,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 8,
+      "loaded": 8,
+      "reads_returning_data": 5,
+      "read_operations": 6,
+      "mutations_persisted": 2,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 8,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "download_diagram",
+      "returned_chars": 118
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

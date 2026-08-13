@@ -1,0 +1,539 @@
+{
+  "index": 227,
+  "local_files_dir": "./environment_mix/0227000",
+  "file_list": [
+    "./environment_mix/0227000/README.md",
+    "./environment_mix/0227000/api_keys.json",
+    "./environment_mix/0227000/query_result_chunks.json",
+    "./environment_mix/0227000/query_runs.json",
+    "./environment_mix/0227000/usage_counters.json",
+    "./environment_mix/0227000/workspaces.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "workspaces.json": "12 rows",
+        "api_keys.json": "12 rows",
+        "query_runs.json": "18 rows",
+        "query_result_chunks.json": "19 rows",
+        "usage_counters.json": "17 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "execute_query",
+          "description": "Executes the provided SQL against the specified Snowflake workspace using the caller’s API key, records a query-run ledger entry (status, timings, errors, and result metadata), and returns the run details plus results according to result_format (inline_json returns up to max_rows rows inline, chunked returns a reference to stored result chunks, none returns no row data). Raises VALIDATION_ERROR if workspace_id format is invalid, sql is empty, unknown fields are provided, or max_rows/max_runtime_ms are < 1; raises UNAUTHORIZED if api_key is missing/invalid and FORBIDDEN if the key is not permitted to use the workspace. Raises QUOTA_EXCEEDED if the request exceeds the API key’s row/runtime/cost limits, NOT_FOUND if the workspace_id does not exist, and EXECUTION_ERROR when Snowflake rejects the statement or the runtime limit is exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^sfw_[0-9A-HJKMNP-TV-Z]{16,}$",
+                "description": "Workspace ULID (Snowflake connection profile) to execute the SQL against."
+              },
+              "api_key": {
+                "type": "string",
+                "minLength": 8,
+                "description": "API key presented by the caller for authentication and quota enforcement."
+              },
+              "sql": {
+                "type": "string",
+                "minLength": 1,
+                "description": "SQL text to execute on Snowflake."
+              },
+              "parameters": {
+                "type": "object",
+                "description": "Named bind parameters for the SQL statement (key/value pairs)."
+              },
+              "result_format": {
+                "type": "string",
+                "enum": [
+                  "inline_json",
+                  "chunked",
+                  "none"
+                ],
+                "description": "How to return results: inline JSON, chunked via stored chunks, or none for non-result statements."
+              },
+              "max_rows": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum number of rows to return (also constrained by the API key policy)."
+              },
+              "max_runtime_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum allowed runtime in milliseconds (also constrained by the API key policy)."
+              },
+              "request_context": {
+                "type": "object",
+                "description": "Arbitrary request metadata persisted with the query run for auditing (e.g., caller, trace id)."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "api_key",
+              "sql"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def execute_query(workspace_id, api_key, sql, parameters=None, result_format=None, max_rows=None, max_runtime_ms=None, request_context=None, **_extra):\n    import json, os, datetime, time, re, uuid, math\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0227000\" if __import__(\"os\").path.isdir(\"./environment_mix/0227000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n    now_iso = now.isoformat()\n\n    # helpers\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if not isinstance(v, str):\n            return None\n        try:\n            dt = datetime.datetime.fromisoformat(v.replace(\"Z\", \"+00:00\"))\n            return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _minute_window_start(dt):\n        return dt.replace(second=0, microsecond=0)\n\n    def _month_window_start(dt):\n        return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)\n\n    def _new_id(prefix):\n        # ULID-like base32, enough for schema patterns\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        # 48 bits timestamp (ms) + 80 bits randomness => 26 chars; we will output 18+ chars\n        ms = int(now.timestamp() * 1000)\n        ts = ms & ((1 << 48) - 1)\n        rnd = uuid.uuid4().int & ((1 << 80) - 1)\n        val = (ts << 80) | rnd\n        out = []\n        for _ in range(26):\n            out.append(alphabet[val & 31])\n            val >>= 5\n        return prefix + \"\".join(reversed(out)).rstrip(\"=\")\n\n    def _classify_sql(s):\n        # remove leading whitespace and comments\n        if not isinstance(s, str):\n            return \"UNKNOWN\"\n        x = s.lstrip()\n        # strip SQL comments at start: -- ... \\n or /* ... */\n        while True:\n            if x.startswith(\"--\"):\n                nl = x.find(\"\\n\")\n                x = \"\" if nl == -1 else x[nl+1:].lstrip()\n                continue\n            if x.startswith(\"/*\"):\n                end = x.find(\"*/\")\n                x = \"\" if end == -1 else x[end+2:].lstrip()\n                continue\n            break\n        m = re.match(r\"(?is)^([a-z_]+)\", x)\n        if not m:\n            return \"UNKNOWN\"\n        kw = m.group(1).upper()\n        if kw == \"SELECT\":\n            return \"SELECT\"\n        if kw == \"INSERT\":\n            return \"INSERT\"\n        if kw == \"UPDATE\":\n            return \"UPDATE\"\n        if kw == \"DELETE\":\n            return \"DELETE\"\n        if kw == \"MERGE\":\n            return \"MERGE\"\n        if kw in (\"CREATE\", \"ALTER\", \"DROP\", \"TRUNCATE\", \"RENAME\", \"GRANT\", \"REVOKE\", \"COMMENT\", \"USE\"):\n            return \"DDL\"\n        if kw == \"CALL\":\n            return \"CALL\"\n        return \"UNKNOWN\"\n\n    # Load datastore\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    query_runs = _load(\"query_runs.json\")\n    chunks = _load(\"query_result_chunks.json\")\n    counters = _load(\"usage_counters.json\")\n\n    # Basic validation\n    if not isinstance(workspace_id, str) or not re.match(r\"^sfw_[0-9A-HJKMNP-TV-Z]{16,}$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if not isinstance(api_key, str) or len(api_key) < 8:\n        return _err(\"VALIDATION_ERROR\", \"Invalid api_key.\")\n    if not isinstance(sql, str) or len(sql) < 1:\n        return _err(\"VALIDATION_ERROR\", \"Invalid sql.\")\n    if parameters is not None and not isinstance(parameters, dict):\n        return _err(\"VALIDATION_ERROR\", \"parameters must be an object.\")\n    if request_context is not None and not isinstance(request_context, dict):\n        return _err(\"VALIDATION_ERROR\", \"request_context must be an object.\")\n    if result_format is None:\n        result_format = \"inline_json\"\n    if result_format not in (\"inline_json\", \"chunked\", \"none\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid result_format.\")\n    if max_rows is not None and (not isinstance(max_rows, int) or max_rows < 1):\n        return _err(\"VALIDATION_ERROR\", \"max_rows must be an integer >= 1.\")\n    if max_runtime_ms is not None and (not isinstance(max_runtime_ms, int) or max_runtime_ms < 1):\n        return _err(\"VALIDATION_ERROR\", \"max_runtime_ms must be an integer >= 1.\")\n\n    # Authenticate by matching client-visible value: accept either id, key_prefix, or full key material.\n    # Note: store only has key_hash/prefix, but contract says never check hashes; thus authenticate via id/prefix.\n    key_row = None\n    for k in api_keys:\n        if not isinstance(k, dict):\n            continue\n        if k.get(\"id\") == api_key or k.get(\"key_prefix\") == api_key:\n            key_row = k\n            break\n    if key_row is None:\n        # try \"prefix...\" from full key: use first segment before \"_\" or first 8 chars as prefix\n        candidate_prefixes = []\n        if isinstance(api_key, str):\n            if \"_\" in api_key:\n                candidate_prefixes.append(api_key.split(\"_\", 1)[0])\n            candidate_prefixes.append(api_key[:8])\n        for pref in candidate_prefixes:\n            for k in api_keys:\n                if isinstance(k, dict) and k.get(\"key_prefix\") == pref:\n                    key_row = k\n                    break\n            if key_row:\n                break\n    if key_row is None:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key.\")\n\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"API key revoked.\")\n\n    if key_row.get(\"workspace_id\") != workspace_id:\n        return _err(\"UNAUTHORIZED\", \"API key not authorized for this workspace.\")\n\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if ws is None:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\")\n    if ws.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"Workspace is not active.\")\n\n    # Enforce rate limit per minute (atomic-ish by reserving in usage_counters before creating run)\n    minute_start = _minute_window_start(now)\n    minute_start_iso = minute_start.isoformat()\n\n    counter_min = None\n    for c in counters:\n        if not isinstance(c, dict):\n            continue\n        if c.get(\"api_key_id\") == key_row.get(\"id\") and c.get(\"window_type\") == \"minute\" and c.get(\"window_start\") == minute_start_iso:\n            counter_min = c\n            break\n    if counter_min is None:\n        counter_min = {\n            \"id\": _new_id(\"usc_\"),\n            \"api_key_id\": key_row.get(\"id\"),\n            \"window_type\": \"minute\",\n            \"window_start\": minute_start_iso,\n            \"request_count\": 0,\n            \"credits_total\": 0.0,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n            \"status\": \"open\"\n        }\n        counters.append(counter_min)\n\n    rate_limit = key_row.get(\"rate_limit_per_minute\")\n    if not isinstance(rate_limit, int):\n        return _err(\"VALIDATION_ERROR\", \"API key rate limit misconfigured.\")\n    if counter_min.get(\"request_count\", 0) + 1 > rate_limit:\n        # record attempt as a request? Realistic: do not consume quota on rejected rate-limit here.\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit=rate_limit, window=\"minute\", retry_after_seconds=60 - now.second, latency_ms=latency_ms)\n\n    # monthly query limit check (based on query_runs created_at in current month)\n    month_start = _month_window_start(now)\n    month_start_dt = month_start\n    monthly_limit = key_row.get(\"monthly_query_limit\")\n    if monthly_limit is not None:\n        if not isinstance(monthly_limit, int) or monthly_limit < 1:\n            return _err(\"VALIDATION_ERROR\", \"API key monthly_query_limit misconfigured.\")\n        count_month = 0\n        for r in query_runs:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"api_key_id\") != key_row.get(\"id\"):\n                continue\n            rdt = _parse_dt(r.get(\"created_at\"))\n            if rdt and rdt >= month_start_dt and rdt <= now:\n                count_month += 1\n        if count_month + 1 > monthly_limit:\n            return _err(\"QUOTA_EXCEEDED\", \"Monthly query limit exceeded.\", limit=monthly_limit, window=\"month\")\n\n    # Estimate credits (offline): simple heuristic\n    sql_type = _classify_sql(sql)\n    est_credits = 0.0\n    if sql_type == \"SELECT\":\n        est_credits = 0.01\n    elif sql_type in (\"INSERT\", \"UPDATE\", \"DELETE\", \"MERGE\", \"CALL\"):\n        est_credits = 0.02\n    elif sql_type == \"DDL\":\n        est_credits = 0.005\n    else:\n        est_credits = 0.01\n\n    # monthly credits limit check via usage_counters month window\n    credits_limit = key_row.get(\"monthly_credits_limit\")\n    if credits_limit is not None:\n        if not (isinstance(credits_limit, int) or isinstance(credits_limit, float)) or credits_limit < 0:\n            return _err(\"VALIDATION_ERROR\", \"API key monthly_credits_limit misconfigured.\")\n        month_start_iso = month_start.isoformat()\n        counter_month = None\n        for c in counters:\n            if not isinstance(c, dict):\n                continue\n            if c.get(\"api_key_id\") == key_row.get(\"id\") and c.get(\"window_type\") == \"month\" and c.get(\"window_start\") == month_start_iso:\n                counter_month = c\n                break\n        if counter_month is None:\n            counter_month = {\n                \"id\": _new_id(\"usc_\"),\n                \"api_key_id\": key_row.get(\"id\"),\n                \"window_type\": \"month\",\n                \"window_start\": month_start_iso,\n                \"request_count\": 0,\n                \"credits_total\": 0.0,\n                \"created_at\": now_iso,\n                \"updated_at\": now_iso,\n                \"status\": \"open\"\n            }\n            counters.append(counter_month)\n        if float(counter_month.get(\"credits_total\", 0.0)) + float(est_credits) > float(credits_limit):\n            return _err(\"QUOTA_EXCEEDED\", \"Monthly credits limit exceeded.\", limit=credits_limit, window=\"month\")\n\n    # Reserve capacity: increment per-minute request_count and per-month request_count pre-run\n    counter_min[\"request_count\"] = int(counter_min.get(\"request_count\", 0)) + 1\n    counter_min[\"updated_at\"] = now_iso\n    month_start_iso = month_start.isoformat()\n    counter_month = None\n    for c in counters:\n        if isinstance(c, dict) and c.get(\"api_key_id\") == key_row.get(\"id\") and c.get(\"window_type\") == \"month\" and c.get(\"window_start\") == month_start_iso:\n            counter_month = c\n            break\n    if counter_month is None:\n        counter_month = {\n            \"id\": _new_id(\"usc_\"),\n            \"api_key_id\": key_row.get(\"id\"),\n            \"window_type\": \"month\",\n            \"window_start\": month_start_iso,\n            \"request_count\": 0,\n            \"credits_total\": 0.0,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n            \"status\": \"open\"\n        }\n        counters.append(counter_month)\n    counter_month[\"request_count\"] = int(counter_month.get(\"request_count\", 0)) + 1\n    counter_month[\"updated_at\"] = now_iso\n    _save(\"usage_counters.json\", counters)\n\n    # Create query run row in queued\n    run_id = _new_id(\"qrr_\")\n    run = {\n        \"id\": run_id,\n        \"workspace_id\": workspace_id,\n        \"api_key_id\": key_row.get(\"id\"),\n        \"status\": \"queued\",\n        \"submitted_sql\": sql,\n        \"sql_statement_type\": sql_type,\n        \"request_context\": request_context,\n        \"snowflake_query_id\": None,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"duration_ms\": None,\n        \"rows_returned\": None,\n        \"bytes_scanned\": None,\n        \"credits_attributed\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"result_format\": result_format,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso\n    }\n    query_runs.append(run)\n    _save(\"query_runs.json\", query_runs)\n\n    # Enforce allowed SQL types; if not allowed -> fail run\n    allowed = key_row.get(\"allowed_sql_types\")\n    if not isinstance(allowed, list):\n        run[\"status\"] = \"failed\"\n        run[\"error_code\"] = \"POLICY_MISCONFIGURED\"\n        run[\"error_message\"] = \"allowed_sql_types misconfigured.\"\n        run[\"finished_at\"] = now_iso\n        run[\"duration_ms\"] = 0\n        run[\"updated_at\"] = now_iso\n        _save(\"query_runs.json\", query_runs)\n        latency_ms = int((time.time() - t0) * 1000)\n        return {\"query_run\": run, \"result\": None, \"latency_ms\": latency_ms}\n\n    if sql_type not in allowed:\n        run[\"status\"] = \"failed\"  # queued->failed allowed\n        run[\"error_code\"] = \"NOT_ALLOWED\"\n        run[\"error_message\"] = f\"SQL statement type {sql_type} is not allowed for this API key.\"\n        run[\"finished_at\"] = now_iso\n        run[\"duration_ms\"] = 0\n        run[\"updated_at\"] = now_iso\n        _save(\"query_runs.json\", query_runs)\n        latency_ms = int((time.time() - t0) * 1000)\n        return {\"query_run\": run, \"result\": None, \"latency_ms\": latency_ms}\n\n    # Determine effective caps\n    eff_max_rows = key_row.get(\"max_rows\")\n    if not isinstance(eff_max_rows, int) or eff_max_rows < 1 or eff_max_rows > 1000000:\n        run[\"status\"] = \"failed\"\n        run[\"error_code\"] = \"POLICY_MISCONFIGURED\"\n        run[\"error_message\"] = \"max_rows misconfigured.\"\n        run[\"finished_at\"] = now_iso\n        run[\"duration_ms\"] = 0\n        run[\"updated_at\"] = now_iso\n        _save(\"query_runs.json\", query_runs)\n        latency_ms = int((time.time() - t0) * 1000)\n        return {\"query_run\": run, \"result\": None, \"latency_ms\": latency_ms}\n\n    if max_rows is not None:\n        eff_max_rows = min(eff_max_rows, max_rows)\n\n    eff_max_runtime = key_row.get(\"max_runtime_ms\")\n    if not isinstance(eff_max_runtime, int) or eff_max_runtime < 1000 or eff_max_runtime > 3600000:\n        run[\"status\"] = \"failed\"\n        run[\"error_code\"] = \"POLICY_MISCONFIGURED\"\n        run[\"error_message\"] = \"max_runtime_ms misconfigured.\"\n        run[\"finished_at\"] = now_iso\n        run[\"duration_ms\"] = 0\n        run[\"updated_at\"] = now_iso\n        _save(\"query_runs.json\", query_runs)\n        latency_ms = int((time.time() - t0) * 1000)\n        return {\"query_run\": run, \"result\": None, \"latency_ms\": latency_ms}\n\n    if max_runtime_ms is not None:\n        eff_max_runtime = min(eff_max_runtime, max_runtime_ms)\n\n    # Transition queued->running\n    start = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n    run[\"status\"] = \"running\"\n    run[\"started_at\"] = start.isoformat()\n    run[\"updated_at\"] = run[\"started_at\"]\n    # simulated snowflake query id\n    run[\"snowflake_query_id\"] = \"SFQ_\" + uuid.uuid4().hex[:20].upper()\n    _save(\"query_runs.json\", query_runs)\n\n    # Simulated execution respecting max_runtime_ms\n    # We do NOT execute SQL; we simulate deterministic results and enforce policies.\n    exec_begin = time.time()\n\n    # simulate runtime cost proportional to sql length with floor and cap checks\n    simulated_ms = min(50 + int(len(sql) * 2), 5000)\n    if simulated_ms > eff_max_runtime:\n        # running->cancelled allowed\n        finish = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n        run[\"status\"] = \"cancelled\"\n        run[\"finished_at\"] = finish.isoformat()\n        run[\"duration_ms\"] = int((finish - start).total_seconds() * 1000)\n        run[\"error_code\"] = \"TIMEOUT\"\n        run[\"error_message\"] = \"Query exceeded max_runtime_ms and was cancelled.\"\n        run[\"updated_at\"] = run[\"finished_at\"]\n        run[\"credits_attributed\"] = float(est_credits)\n        _save(\"query_runs.json\", query_runs)\n        # attribute credits into monthly counter even if cancelled? attribute small\n        for c in counters:\n            if isinstance(c, dict) and c.get(\"api_key_id\") == key_row.get(\"id\") and c.get(\"window_type\") == \"month\" and c.get(\"window_start\") == month_start_iso:\n                c[\"credits_total\"] = float(c.get(\"credits_total\", 0.0)) + float(est_credits)\n                c[\"updated_at\"] = run[\"updated_at\"]\n                break\n        _save(\"usage_counters.json\", counters)\n        latency_ms = int((time.time() - t0) * 1000)\n        return {\"query_run\": run, \"result\": None, \"latency_ms\": latency_ms}\n\n    # \"sleep\" a tiny amount to show latency without blocking too long\n    time.sleep(min(simulated_ms / 1000.0, 0.05))\n\n    # produce simulated results\n    rows = []\n    rows_returned = 0\n    if sql_type == \"SELECT\":\n        # determine desired rows from parameters: {\"_rows\": N} if present\n        desired = None\n        if isinstance(parameters, dict):\n            v = parameters.get(\"_rows\")\n            if isinstance(v, int) and v >= 0:\n                desired = v\n        if desired is None:\n            desired = min(10, eff_max_rows)\n        if desired > eff_max_rows:\n            # policy failure: would exceed max_rows\n            finish = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n            run[\"status\"] = \"failed\"  # running->failed allowed\n            run[\"finished_at\"] = finish.isoformat()\n            run[\"duration_ms\"] = int((finish - start).total_seconds() * 1000)\n            run[\"error_code\"] = \"MAX_ROWS_EXCEEDED\"\n            run[\"error_message\"] = f\"Query would return {desired} rows, exceeding max_rows={eff_max_rows}.\"\n            run[\"rows_returned\"] = eff_max_rows\n            run[\"credits_attributed\"] = float(est_credits)\n            run[\"updated_at\"] = run[\"finished_at\"]\n            _save(\"query_runs.json\", query_runs)\n            for c in counters:\n                if isinstance(c, dict) and c.get(\"api_key_id\") == key_row.get(\"id\") and c.get(\"window_type\") == \"month\" and c.get(\"window_start\") == month_start_iso:\n                    c[\"credits_total\"] = float(c.get(\"credits_total\", 0.0)) + float(est_credits)\n                    c[\"updated_at\"] = run[\"updated_at\"]\n                    break\n            _save(\"usage_counters.json\", counters)\n            latency_ms = int((time.time() - t0) * 1000)\n            return {\"query_run\": run, \"result\": None, \"latency_ms\": latency_ms}\n\n        rows_returned = int(desired)\n        # deterministic payload\n        for i in range(rows_returned):\n            rows.append({\"row_number\": i + 1, \"workspace_id\": workspace_id, \"statement_type\": sql_type})\n\n    # Persist results based on format\n    result = None\n    if result_format == \"inline_json\":\n        if sql_type == \"SELECT\":\n            result = {\"rows\": rows, \"row_count\": rows_returned}\n        else:\n            result = {\"rows\": [], \"row_count\": 0}\n    elif result_format == \"chunked\":\n        if sql_type == \"SELECT\" and rows_returned > 0:\n            # chunk size 1000\n            chunk_size = 1000\n            chunk_index = 0\n            for i in range(0, rows_returned, chunk_size):\n                payload = rows[i:i + chunk_size]\n                ch = {\n                    \"id\": _new_id(\"qrc_\"),\n                    \"query_run_id\": run_id,\n                    \"chunk_index\": chunk_index,\n                    \"row_count\": len(payload),\n                    \"payload_json\": payload,\n                    \"external_uri\": None,\n                    \"content_sha256\": None,\n                    \"created_at\": now_iso,\n                    \"updated_at\": now_iso,\n                    \"status\": \"available\"\n                }\n                # enforce uniqueness (query_run_id, chunk_index)\n                if any(isinstance(existing, dict) and existing.get(\"query_run_id\") == run_id and existing.get(\"chunk_index\") == chunk_index for existing in chunks):\n                    run[\"status\"] = \"failed\"\n                    run[\"error_code\"] = \"CHUNK_CONFLICT\"\n                    run[\"error_message\"] = \"Result chunk conflict.\"\n                    break\n                chunks.append(ch)\n                chunk_index += 1\n            _save(\"query_result_chunks.json\", chunks)\n            result = {\"chunked\": True, \"query_run_id\": run_id, \"chunks\": [{\"id\": c[\"id\"], \"chunk_index\": c[\"chunk_index\"], \"row_count\": c[\"row_count\"]} for c in chunks if c.get(\"query_run_id\") == run_id and c.get(\"status\") == \"available\"]}\n        else:\n            result = {\"chunked\": True, \"query_run_id\": run_id, \"chunks\": []}\n    else:  # none\n        result = None\n\n    # Finish run (running->succeeded or ->failed if chunk conflict)\n    finish = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n    if run[\"status\"] == \"running\":\n        run[\"status\"] = \"succeeded\"\n        run[\"error_code\"] = None\n        run[\"error_message\"] = None\n    run[\"finished_at\"] = finish.isoformat()\n    run[\"duration_ms\"] = int((finish - start).total_seconds() * 1000)\n    run[\"rows_returned\"] = rows_returned if sql_type == \"SELECT\" else 0\n    run[\"credits_attributed\"] = float(est_credits)\n    run[\"updated_at\"] = run[\"finished_at\"]\n\n    # update api key last_used_at\n    key_row[\"last_used_at\"] = run[\"finished_at\"]\n    key_row[\"updated_at\"] = run[\"finished_at\"]\n\n    # attribute credits to month counter\n    for c in counters:\n        if isinstance(c, dict) and c.get(\"api_key_id\") == key_row.get(\"id\") and c.get(\"window_type\") == \"month\" and c.get(\"window_start\") == month_start_iso:\n            c[\"credits_total\"] = float(c.get(\"credits_total\", 0.0)) + float(est_credits)\n            c[\"updated_at\"] = run[\"updated_at\"]\n            break\n\n    _save(\"query_runs.json\", query_runs)\n    _save(\"api_keys.json\", api_keys)\n    _save(\"usage_counters.json\", counters)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\"query_run\": run, \"result\": result, \"latency_ms\": latency_ms}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_workspaces",
+          "description": "Lists Snowflake workspaces (connection profiles) visible to the caller, with optional filtering by status. Returns a paginated list ordered by created_at descending. Refuses requests with invalid pagination parameters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "minLength": 8,
+                "description": "API key used to authenticate the caller and authorize access to workspaces."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "suspended",
+                  "deleted"
+                ],
+                "description": "Filter workspaces by lifecycle status."
+              },
+              "name_prefix": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Filter workspaces whose name starts with this prefix (case-insensitive)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of workspaces to return."
+              },
+              "cursor": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Opaque pagination cursor from a previous list_workspaces response."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_workspaces(api_key, status=None, name_prefix=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0227000\" if __import__(\"os\").path.isdir(\"./environment_mix/0227000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()\n\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    query_runs = _load(\"query_runs.json\")  # for audit dynamics\n\n    # validate\n    if not isinstance(api_key, str) or len(api_key) < 8:\n        return _err(\"VALIDATION_ERROR\", \"Invalid api_key.\")\n    if status is not None and status not in (\"active\", \"suspended\", \"deleted\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid status filter.\")\n    if name_prefix is not None and (not isinstance(name_prefix, str) or len(name_prefix) < 1):\n        return _err(\"VALIDATION_ERROR\", \"Invalid name_prefix.\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"Invalid limit.\")\n    if cursor is not None and (not isinstance(cursor, str) or len(cursor) < 1):\n        return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n    # authenticate: accept id or key_prefix\n    key_row = None\n    for k in api_keys:\n        if isinstance(k, dict) and (k.get(\"id\") == api_key or k.get(\"key_prefix\") == api_key):\n            key_row = k\n            break\n    if key_row is None:\n        # best effort prefix\n        pref = api_key.split(\"_\", 1)[0] if \"_\" in api_key else api_key[:8]\n        for k in api_keys:\n            if isinstance(k, dict) and k.get(\"key_prefix\") == pref:\n                key_row = k\n                break\n    if key_row is None or key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"Invalid or revoked API key.\")\n\n    # visible scope: only the workspace attached to this api key (no org model in schema)\n    ws_id = key_row.get(\"workspace_id\")\n    visible = [w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == ws_id]\n\n    # filter\n    if status is not None:\n        visible = [w for w in visible if w.get(\"status\") == status]\n    if name_prefix is not None:\n        p = name_prefix.lower()\n        visible = [w for w in visible if isinstance(w.get(\"name\"), str) and w[\"name\"].lower().startswith(p)]\n\n    # order by created_at desc\n    def _dt_key(w):\n        v = w.get(\"created_at\")\n        try:\n            return datetime.datetime.fromisoformat(v.replace(\"Z\", \"+00:00\")) if isinstance(v, str) else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n        except Exception:\n            return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n\n    visible.sort(key=_dt_key, reverse=True)\n\n    # cursor is base64 of integer offset\n    offset = 0\n    if cursor is not None:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            offset = int(raw.decode(\"utf-8\"))\n            if offset < 0:\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n    total = len(visible)\n    page = visible[offset:offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(str(next_offset).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    # Observable dynamics: record a read as a query_run ledger entry (system/internal, no api_key_id)\n    # This schema has no request log; query_runs exists, so append an audit row with result_format='none'.\n    run = {\n        \"id\": \"qrr_read_\" + str(int(time.time() * 1000)),\n        \"workspace_id\": ws_id,\n        \"api_key_id\": key_row.get(\"id\"),\n        \"status\": \"succeeded\",\n        \"submitted_sql\": \"/* list_workspaces */\",\n        \"sql_statement_type\": \"UNKNOWN\",\n        \"request_context\": {\"endpoint\": \"list_workspaces\"},\n        \"snowflake_query_id\": None,\n        \"started_at\": now,\n        \"finished_at\": now,\n        \"duration_ms\": 0,\n        \"rows_returned\": len(page),\n        \"bytes_scanned\": 0,\n        \"credits_attributed\": 0.0,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"result_format\": \"none\",\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n    query_runs.append(run)\n    _save(\"query_runs.json\", query_runs)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"workspaces\": page,\n        \"pagination\": {\"total\": total, \"limit\": limit, \"cursor\": cursor, \"next_cursor\": next_cursor, \"has_more\": has_more},\n        \"latency_ms\": latency_ms\n    }\n"
+        },
+        {
+          "name": "create_workspace",
+          "description": "Creates a new Snowflake workspace (connection profile) and returns the created workspace. The workspace is created in status='active' unless explicitly set to 'suspended'. Refuses invalid Snowflake connection fields or unsupported auth_method.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "minLength": 8,
+                "description": "API key used to authenticate the caller and authorize workspace creation."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "Human-readable name for the workspace."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "suspended"
+                ],
+                "description": "Initial lifecycle status (deleted is not allowed on create)."
+              },
+              "snowflake_account": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Snowflake account identifier (as used in the Snowflake connection URL)."
+              },
+              "snowflake_region": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Snowflake region/locator for the account."
+              },
+              "default_warehouse": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Default warehouse to use when executing queries."
+              },
+              "default_database": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Default database to use when executing queries."
+              },
+              "default_schema": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Default schema to use when executing queries."
+              },
+              "auth_method": {
+                "type": "string",
+                "enum": [
+                  "password",
+                  "key_pair",
+                  "oauth"
+                ],
+                "description": "Authentication method used to connect to Snowflake."
+              },
+              "auth_secret_ref": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Reference to stored secret material (e.g., password, private key, OAuth refresh token). Secret value is never returned."
+              },
+              "network_policy": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Optional network policy identifier/name to apply to Snowflake sessions for this workspace."
+              }
+            },
+            "required": [
+              "api_key",
+              "name",
+              "snowflake_account",
+              "snowflake_region",
+              "default_warehouse",
+              "default_database",
+              "default_schema",
+              "auth_method",
+              "auth_secret_ref"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_workspace(api_key, name, snowflake_account, snowflake_region, default_warehouse, default_database, default_schema, auth_method, auth_secret_ref, status=None, network_policy=None, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0227000\" if __import__(\"os\").path.isdir(\"./environment_mix/0227000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n    now_iso = now.isoformat()\n\n    def _lat_ms():\n        return int((time.time() - t0) * 1000)\n\n    # ------------------------- Validation -------------------------\n    if not isinstance(api_key, str) or len(api_key) < 8:\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a string with minLength 8\", field=\"api_key\")\n    if not isinstance(name, str) or not (1 <= len(name) <= 200):\n        return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string with maxLength 200\", field=\"name\")\n\n    def _req_str(field, v):\n        if not isinstance(v, str) or len(v) < 1:\n            return _err(\"VALIDATION_ERROR\", f\"{field} must be a non-empty string\", field=field)\n        return None\n\n    for field, v in [\n        (\"snowflake_account\", snowflake_account),\n        (\"snowflake_region\", snowflake_region),\n        (\"default_warehouse\", default_warehouse),\n        (\"default_database\", default_database),\n        (\"default_schema\", default_schema),\n        (\"auth_secret_ref\", auth_secret_ref),\n    ]:\n        e = _req_str(field, v)\n        if e:\n            return e\n\n    if auth_method not in (\"password\", \"key_pair\", \"oauth\"):\n        return _err(\"VALIDATION_ERROR\", \"auth_method must be one of: password, key_pair, oauth\", field=\"auth_method\")\n\n    if status is None:\n        status = \"active\"\n    if status not in (\"active\", \"suspended\"):\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: active, suspended\", field=\"status\")\n\n    if network_policy is not None and (not isinstance(network_policy, str) or len(network_policy) < 1):\n        return _err(\"VALIDATION_ERROR\", \"network_policy must be a non-empty string when provided\", field=\"network_policy\")\n\n    # Reject obvious control chars/newlines in key string fields\n    _ctl = re.compile(r\"[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F]\")\n    for field, v in [\n        (\"name\", name),\n        (\"snowflake_account\", snowflake_account),\n        (\"snowflake_region\", snowflake_region),\n        (\"default_warehouse\", default_warehouse),\n        (\"default_database\", default_database),\n        (\"default_schema\", default_schema),\n        (\"auth_secret_ref\", auth_secret_ref),\n    ] + ([(\"network_policy\", network_policy)] if network_policy is not None else []):\n        if isinstance(v, str) and (_ctl.search(v) or \"\\n\" in v or \"\\r\" in v):\n            return _err(\"VALIDATION_ERROR\", f\"{field} contains invalid control characters\", field=field)\n\n    # ------------------------- Load store -------------------------\n    api_keys = _load(\"api_keys.json\")\n    workspaces = _load(\"workspaces.json\")\n\n    if not isinstance(api_keys, list):\n        api_keys = []\n    if not isinstance(workspaces, list):\n        workspaces = []\n\n    # ------------------------- Authenticate (explicit credential param) -------------------------\n    # Per contract: match credential by client-visible value or id; never compare to key_hash.\n    # In this datastore, the only client-visible \"value\" we can accept is the api_keys.id itself.\n    key_row = None\n    for r in api_keys:\n        if isinstance(r, dict) and r.get(\"id\") == api_key:\n            key_row = r\n            break\n\n    if key_row is None:\n        # No valid credential to authorize workspace creation\n        # (There is no \"internal trusted caller\" path for this endpoint in the rules/schema.)\n        # Still record the request if a request log existed; schema does not declare one.\n        return _err(\"UNAUTHORIZED\", \"Invalid API key.\")\n\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"API key is revoked; authentication rejected.\", api_key_status=key_row.get(\"status\"))\n\n    # Workspace referenced by the key (authorization context); must exist and be active\n    parent_ws_id = key_row.get(\"workspace_id\")\n    parent_ws = None\n    for w in workspaces:\n        if isinstance(w, dict) and w.get(\"id\") == parent_ws_id:\n            parent_ws = w\n            break\n    if parent_ws is None:\n        return _err(\"UNAUTHORIZED\", \"API key is not associated with a valid workspace.\", workspace_id=parent_ws_id)\n    if parent_ws.get(\"status\") != \"active\":\n        return _err(\n            \"UNAUTHORIZED\",\n            \"Workspace is not active for this API key; operation not permitted.\",\n            workspace_status=parent_ws.get(\"status\"),\n            rule=\"Caller API key must belong to an active workspace.\"\n        )\n\n    # ------------------------- Constraints -------------------------\n    # unique(name)\n    for w in workspaces:\n        if isinstance(w, dict) and w.get(\"name\") == name:\n            return _err(\"CONFLICT\", \"Workspace name must be unique.\", field=\"name\")\n\n    # auth_secret_ref non-empty already validated\n\n    # ------------------------- Create workspace row -------------------------\n    def _new_id(prefix):\n        # ULID-like (not strictly ULID) but stable prefix as in store examples\n        # Use time component + hex randomness\n        ts = int(now.timestamp() * 1000)\n        rnd = os.urandom(10).hex()\n        return f\"{prefix}_{ts:x}{rnd}\"[:30]  # keep reasonably short; store uses ~26-30 chars\n\n    ws_id = _new_id(\"sfw\")\n\n    ws_row = {\n        \"id\": ws_id,\n        \"name\": name,\n        \"status\": status,\n        \"snowflake_account\": snowflake_account,\n        \"snowflake_region\": snowflake_region,\n        \"default_warehouse\": default_warehouse,\n        \"default_database\": default_database,\n        \"default_schema\": default_schema,\n        \"auth_method\": auth_method,\n        \"auth_secret_ref\": auth_secret_ref,\n        \"network_policy\": network_policy if network_policy is not None else None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n    }\n\n    # Persist\n    workspaces.append(ws_row)\n    _save(\"workspaces.json\", workspaces)\n\n    # Update key last_used_at / updated_at since it successfully authenticated for a privileged action\n    key_row[\"last_used_at\"] = now_iso\n    key_row[\"updated_at\"] = now_iso\n    # write-through\n    for i, r in enumerate(api_keys):\n        if isinstance(r, dict) and r.get(\"id\") == key_row.get(\"id\"):\n            api_keys[i] = key_row\n            break\n    _save(\"api_keys.json\", api_keys)\n\n    # No request/audit log collection declared in schema; nothing else to persist.\n\n    return {\n        \"workspace\": ws_row,\n        \"meta\": {\n            \"latency_ms\": _lat_ms(),\n            \"authenticated_api_key_id\": key_row.get(\"id\"),\n            \"authorization_workspace_id\": parent_ws.get(\"id\"),\n        },\n    }\n"
+        },
+        {
+          "name": "update_workspace",
+          "description": "Updates fields on an existing workspace and/or performs allowed lifecycle transitions via status. Returns the updated workspace. Refuses transitions not permitted by the workspace lifecycle (active<->suspended, active|suspended->deleted) and refuses updates to deleted workspaces except no-op reads.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "minLength": 8,
+                "description": "API key used to authenticate the caller and authorize workspace updates."
+              },
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^sfw_[0-9A-HJKMNP-TV-Z]{16,}$",
+                "description": "Workspace ULID to update."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "New workspace name."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "suspended",
+                  "deleted"
+                ],
+                "description": "New lifecycle status. Only allowed transitions are enforced."
+              },
+              "snowflake_account": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Updated Snowflake account identifier."
+              },
+              "snowflake_region": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Updated Snowflake region/locator."
+              },
+              "default_warehouse": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Updated default warehouse."
+              },
+              "default_database": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Updated default database."
+              },
+              "default_schema": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Updated default schema."
+              },
+              "auth_method": {
+                "type": "string",
+                "enum": [
+                  "password",
+                  "key_pair",
+                  "oauth"
+                ],
+                "description": "Updated authentication method."
+              },
+              "auth_secret_ref": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Updated reference to stored secret material. Secret value is never returned."
+              },
+              "network_policy": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Updated network policy identifier/name."
+              }
+            },
+            "required": [
+              "api_key",
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_workspace(api_key, workspace_id, name=None, status=None, snowflake_account=None, snowflake_region=None, default_warehouse=None, default_database=None, default_schema=None, auth_method=None, auth_secret_ref=None, network_policy=None, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0227000\" if __import__(\"os\").path.isdir(\"./environment_mix/0227000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n    now = now_dt.isoformat()\n\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n    query_runs = _load(\"query_runs.json\")\n\n    # validate\n    if not isinstance(api_key, str) or len(api_key) < 8:\n        return _err(\"VALIDATION_ERROR\", \"Invalid api_key.\")\n    if not isinstance(workspace_id, str) or not re.match(r\"^sfw_[0-9A-HJKMNP-TV-Z]{16,}$\", workspace_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid workspace_id.\")\n    if name is not None and (not isinstance(name, str) or len(name) < 1 or len(name) > 200):\n        return _err(\"VALIDATION_ERROR\", \"Invalid name.\")\n    if status is not None and status not in (\"active\", \"suspended\", \"deleted\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid status.\")\n    for fld, val in [(\"snowflake_account\", snowflake_account), (\"snowflake_region\", snowflake_region),\n                     (\"default_warehouse\", default_warehouse), (\"default_database\", default_database),\n                     (\"default_schema\", default_schema), (\"auth_secret_ref\", auth_secret_ref)]:\n        if val is not None and (not isinstance(val, str) or len(val) < 1):\n            return _err(\"VALIDATION_ERROR\", f\"Invalid {fld}.\")\n    if auth_method is not None and auth_method not in (\"password\", \"key_pair\", \"oauth\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid auth_method.\")\n    if network_policy is not None and (not isinstance(network_policy, str) or len(network_policy) < 1):\n        return _err(\"VALIDATION_ERROR\", \"Invalid network_policy.\")\n\n    # authenticate\n    key_row = None\n    for k in api_keys:\n        if isinstance(k, dict) and (k.get(\"id\") == api_key or k.get(\"key_prefix\") == api_key):\n            key_row = k\n            break\n    if key_row is None:\n        pref = api_key.split(\"_\", 1)[0] if \"_\" in api_key else api_key[:8]\n        for k in api_keys:\n            if isinstance(k, dict) and k.get(\"key_prefix\") == pref:\n                key_row = k\n                break\n    if key_row is None or key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"Invalid or revoked API key.\")\n\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if ws is None:\n        return _err(\"NOT_FOUND\", \"Workspace not found.\")\n\n    # authorization scope: only update workspaces visible to the key (same workspace)\n    if key_row.get(\"workspace_id\") != workspace_id:\n        return _err(\"UNAUTHORIZED\", \"Not authorized for this workspace.\")\n\n    # refuse updates to deleted workspaces\n    if ws.get(\"status\") == \"deleted\":\n        # if no fields provided, allow a no-op \"read\"\n        if all(v is None for v in [name, status, snowflake_account, snowflake_region, default_warehouse, default_database, default_schema, auth_method, auth_secret_ref, network_policy]):\n            latency_ms = int((time.time() - t0) * 1000)\n            return {\"workspace\": ws, \"latency_ms\": latency_ms}\n        return _err(\"INVALID_TRANSITION\", \"Cannot update a deleted workspace.\")\n\n    # unique(name) if changed\n    if name is not None and name != ws.get(\"name\"):\n        for w in workspaces:\n            if isinstance(w, dict) and w.get(\"name\") == name:\n                return _err(\"CONFLICT\", \"Workspace name already exists.\", field=\"name\")\n\n    # lifecycle transitions\n    allowed_transitions = {\n        \"active\": set([\"suspended\", \"deleted\"]),\n        \"suspended\": set([\"active\", \"deleted\"]),\n        \"deleted\": set([])\n    }\n    if status is not None and status != ws.get(\"status\"):\n        cur = ws.get(\"status\")\n        if cur not in allowed_transitions or status not in allowed_transitions[cur]:\n            return _err(\"INVALID_TRANSITION\", f\"Transition {cur} -> {status} is not permitted.\")\n        ws[\"status\"] = status\n        # soft delete should revoke associated api_keys\n        if status == \"deleted\":\n            for k in api_keys:\n                if isinstance(k, dict) and k.get(\"workspace_id\") == workspace_id and k.get(\"status\") == \"active\":\n                    k[\"status\"] = \"revoked\"\n                    k[\"updated_at\"] = now\n\n    # field updates\n    if snowflake_account is not None:\n        ws[\"snowflake_account\"] = snowflake_account\n    if snowflake_region is not None:\n        ws[\"snowflake_region\"] = snowflake_region\n    if default_warehouse is not None:\n        ws[\"default_warehouse\"] = default_warehouse\n    if default_database is not None:\n        ws[\"default_database\"] = default_database\n    if default_schema is not None:\n        ws[\"default_schema\"] = default_schema\n    if auth_method is not None:\n        ws[\"auth_method\"] = auth_method\n    if auth_secret_ref is not None:\n        ws[\"auth_secret_ref\"] = auth_secret_ref\n    if network_policy is not None:\n        ws[\"network_policy\"] = {\"id\": network_policy}\n    if name is not None:\n        ws[\"name\"] = name\n\n    if not isinstance(ws.get(\"auth_secret_ref\"), str) or len(ws[\"auth_secret_ref\"]) < 1:\n        return _err(\"VALIDATION_ERROR\", \"auth_secret_ref must be non-empty.\")\n\n    ws[\"updated_at\"] = now\n    _save(\"workspaces.json\", workspaces)\n    _save(\"api_keys.json\", api_keys)\n\n    # Observable dynamics: append audit row\n    audit = {\n        \"id\": \"qrr_audit_\" + str(int(time.time() * 1000)),\n        \"workspace_id\": workspace_id,\n        \"api_key_id\": key_row.get(\"id\"),\n        \"status\": \"succeeded\",\n        \"submitted_sql\": \"/* update_workspace */\",\n        \"sql_statement_type\": \"UNKNOWN\",\n        \"request_context\": {\"endpoint\": \"update_workspace\"},\n        \"snowflake_query_id\": None,\n        \"started_at\": now,\n        \"finished_at\": now,\n        \"duration_ms\": 0,\n        \"rows_returned\": 1,\n        \"bytes_scanned\": 0,\n        \"credits_attributed\": 0.0,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"result_format\": \"none\",\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n    query_runs.append(audit)\n    _save(\"query_runs.json\", query_runs)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\"workspace\": ws, \"latency_ms\": latency_ms}\n"
+        },
+        {
+          "name": "create_api_key",
+          "description": "Creates a new API key for a workspace and returns the API key record plus the one-time plaintext key. The returned plaintext key is shown only once and is never retrievable again. Refuses creation for suspended/deleted workspaces.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "minLength": 8,
+                "description": "API key used to authenticate the caller and authorize API key management."
+              },
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^sfw_[0-9A-HJKMNP-TV-Z]{16,}$",
+                "description": "Workspace ULID to create the API key under."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "Human-readable name/label for the API key."
+              },
+              "allowed_sql_types": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "SELECT",
+                    "INSERT",
+                    "UPDATE",
+                    "DELETE",
+                    "MERGE",
+                    "CREATE",
+                    "ALTER",
+                    "DROP",
+                    "TRUNCATE",
+                    "CALL",
+                    "EXPLAIN",
+                    "DESCRIBE",
+                    "SHOW",
+                    "USE",
+                    "OTHER"
+                  ]
+                },
+                "minItems": 1,
+                "description": "Allowed SQL statement types for this key. The service classifies each submitted statement and enforces membership."
+              },
+              "max_rows": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum rows that may be returned for queries executed by this key."
+              },
+              "max_runtime_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum runtime allowed for queries executed by this key, in milliseconds."
+              },
+              "rate_limit_per_minute": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum number of execute_query calls per minute for this key."
+              },
+              "monthly_query_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional maximum number of query runs per calendar month for this key."
+              },
+              "monthly_credits_limit": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Optional maximum Snowflake credits attributable to this key per calendar month."
+              }
+            },
+            "required": [
+              "api_key",
+              "workspace_id",
+              "name",
+              "allowed_sql_types",
+              "max_rows",
+              "max_runtime_ms",
+              "rate_limit_per_minute"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_api_key(api_key, workspace_id, name, allowed_sql_types, max_rows, max_runtime_ms, rate_limit_per_minute, monthly_query_limit=None, monthly_credits_limit=None, **_extra):\n    import json, os, datetime, time, re, secrets, hashlib\n\n    _t0 = time.time()\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0227000\" if __import__(\"os\").path.isdir(\"./environment_mix/0227000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, credential_id, status, error_code=None):\n        # No request-log/audit collection defined in schema; nothing to persist.\n\n        return\n\n    def _is_str(x):\n        return isinstance(x, str)\n\n    def _is_num(x):\n        return isinstance(x, (int, float)) and not isinstance(x, bool)\n\n    def _ulid_like(prefix, nmin=16):\n        if not _is_str(prefix):\n            return False\n        pat = r\"^[0-9A-HJKMNP-TV-Z]{%d,}$\" % nmin\n        return re.match(pat, prefix) is not None\n\n    def _gen_ulid(prefix):\n        # Vendor says ULID-like; implement as prefix + random Crockford base32.\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return prefix + \"\".join(secrets.choice(alphabet) for _ in range(26))\n\n    def _hash_key_material(plain):\n        # Not used for auth comparison; stored as hash for realism.\n        return hashlib.sha256(plain.encode(\"utf-8\")).hexdigest()\n\n    # Validate inputs\n    if not _is_str(api_key) or len(api_key) < 8:\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a string of length >= 8\")\n    if not _is_str(workspace_id) or re.match(r\"^sfw_[0-9A-HJKMNP-TV-Z]{16,}$\", workspace_id) is None:\n        return _err(\"VALIDATION_ERROR\", \"workspace_id is invalid\")\n    if not _is_str(name) or not (1 <= len(name) <= 200):\n        return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string up to 200 chars\")\n    if not isinstance(allowed_sql_types, list) or len(allowed_sql_types) < 1 or not all(isinstance(x, str) for x in allowed_sql_types):\n        return _err(\"VALIDATION_ERROR\", \"allowed_sql_types must be a non-empty array of strings\")\n    allowed_enum_tool = {\"SELECT\", \"INSERT\", \"UPDATE\", \"DELETE\", \"MERGE\", \"CREATE\", \"ALTER\", \"DROP\", \"TRUNCATE\", \"CALL\", \"EXPLAIN\", \"DESCRIBE\", \"SHOW\", \"USE\", \"OTHER\"}\n    if any(x not in allowed_enum_tool for x in allowed_sql_types):\n        return _err(\"VALIDATION_ERROR\", \"allowed_sql_types contains invalid value(s)\", allowed=list(sorted(allowed_enum_tool)))\n    if not isinstance(max_rows, int) or isinstance(max_rows, bool) or max_rows < 1:\n        return _err(\"VALIDATION_ERROR\", \"max_rows must be an integer >= 1\")\n    # Schema constraint max_rows between 1 and 1000000\n    if max_rows > 1000000:\n        return _err(\"VALIDATION_ERROR\", \"max_rows must be <= 1000000\")\n    if not isinstance(max_runtime_ms, int) or isinstance(max_runtime_ms, bool) or max_runtime_ms < 1:\n        return _err(\"VALIDATION_ERROR\", \"max_runtime_ms must be an integer >= 1\")\n    if max_runtime_ms < 1000 or max_runtime_ms > 3600000:\n        return _err(\"VALIDATION_ERROR\", \"max_runtime_ms must be between 1000 and 3600000\")\n    if not isinstance(rate_limit_per_minute, int) or isinstance(rate_limit_per_minute, bool) or rate_limit_per_minute < 1:\n        return _err(\"VALIDATION_ERROR\", \"rate_limit_per_minute must be an integer >= 1\")\n    if rate_limit_per_minute < 1 or rate_limit_per_minute > 6000:\n        return _err(\"VALIDATION_ERROR\", \"rate_limit_per_minute must be between 1 and 6000\")\n    if monthly_query_limit is not None:\n        if not isinstance(monthly_query_limit, int) or isinstance(monthly_query_limit, bool) or monthly_query_limit < 1:\n            return _err(\"VALIDATION_ERROR\", \"monthly_query_limit must be an integer >= 1 or null\")\n    if monthly_credits_limit is not None:\n        if not _is_num(monthly_credits_limit) or monthly_credits_limit < 0:\n            return _err(\"VALIDATION_ERROR\", \"monthly_credits_limit must be a number >= 0 or null\")\n\n    # Load datastore\n    workspaces = _load(\"workspaces.json\")\n    api_keys = _load(\"api_keys.json\")\n\n    # Authenticate provided api_key: match by client-visible value OR id.\n    # Since store only has key_prefix and key_hash, we authenticate by:\n    # - exact match on id, OR\n    # - match on key_prefix (common pattern: prefix is visible), OR\n    # - match on full plaintext key prefix before \"_\" if caller passed such a token.\n    presented = api_key\n    presented_prefix = None\n    if _is_str(presented):\n        # Common shape: \"<prefix>_<secret>\" or \"sfk_<...>\" etc.\n        if \"_\" in presented:\n            presented_prefix = presented.split(\"_\", 1)[0]\n        else:\n            presented_prefix = presented[:8]\n\n    caller_key = None\n    for k in api_keys:\n        if not isinstance(k, dict):\n            continue\n        if k.get(\"id\") == presented:\n            caller_key = k\n            break\n        if presented_prefix and k.get(\"key_prefix\") == presented_prefix:\n            caller_key = k\n            break\n        if k.get(\"key_prefix\") == presented:\n            caller_key = k\n            break\n\n    if caller_key is None or caller_key.get(\"status\") != \"active\":\n        _log(\"create_api_key\", None, \"error\", error_code=\"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Invalid or revoked API key\")\n\n    # Authorize against workspace_id: must match caller_key.workspace_id\n    if caller_key.get(\"workspace_id\") != workspace_id:\n        _log(\"create_api_key\", caller_key.get(\"id\"), \"error\", error_code=\"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"API key not authorized for this workspace\")\n\n    # Workspace must exist and be active (refuse suspended/deleted)\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if ws is None:\n        _log(\"create_api_key\", caller_key.get(\"id\"), \"error\", error_code=\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Workspace not found\")\n    if ws.get(\"status\") != \"active\":\n        _log(\"create_api_key\", caller_key.get(\"id\"), \"error\", error_code=\"INVALID_TRANSITION\")\n        return _err(\"INVALID_TRANSITION\", \"Workspace is not active; cannot create API keys\", workspace_status=ws.get(\"status\"))\n\n    # Enforce unique(workspace_id, key_prefix)\n    # Generate a plaintext key: prefix identifies it for logs. Use \"sk_\" prefix token.\n    # Ensure generated key_prefix unique within workspace.\n    tries = 0\n    new_prefix = None\n    while tries < 50:\n        tries += 1\n        # 8 chars is plenty; keep alnum for prefix\n        new_prefix = secrets.token_hex(4)  # 8 hex chars\n        if not any(isinstance(r, dict) and r.get(\"workspace_id\") == workspace_id and r.get(\"key_prefix\") == new_prefix for r in api_keys):\n            break\n        new_prefix = None\n    if new_prefix is None:\n        _log(\"create_api_key\", caller_key.get(\"id\"), \"error\", error_code=\"CONFLICT\")\n        return _err(\"CONFLICT\", \"Could not allocate a unique key_prefix for this workspace\")\n\n    # Create new api key record\n    now = _now()\n    new_id = _gen_ulid(\"sfk_\")\n    # Ensure id uniqueness\n    while any(isinstance(r, dict) and r.get(\"id\") == new_id for r in api_keys):\n        new_id = _gen_ulid(\"sfk_\")\n\n    plaintext_key = f\"{new_prefix}_{secrets.token_urlsafe(24)}\"\n    new_row = {\n        \"id\": new_id,\n        \"workspace_id\": workspace_id,\n        \"key_hash\": _hash_key_material(plaintext_key),\n        \"key_prefix\": new_prefix,\n        \"name\": name,\n        \"status\": \"active\",\n        # Map tool enums to schema enums (DDL vs CREATE/ALTER/DROP/TRUNCATE/etc, OTHER->UNKNOWN unsupported)\n        \"allowed_sql_types\": None,\n        \"max_rows\": int(max_rows),\n        \"max_runtime_ms\": int(max_runtime_ms),\n        \"rate_limit_per_minute\": int(rate_limit_per_minute),\n        \"monthly_query_limit\": int(monthly_query_limit) if monthly_query_limit is not None else None,\n        \"monthly_credits_limit\": float(monthly_credits_limit) if monthly_credits_limit is not None else None,\n        \"last_used_at\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # Translate allowed_sql_types to schema enum set: SELECT/INSERT/UPDATE/DELETE/MERGE/DDL/CALL\n    # Tool allows many DDL-ish verbs; collapse to DDL. OTHER not representable -> reject.\n    schema_allowed = set()\n    for t in allowed_sql_types:\n        if t in {\"SELECT\", \"INSERT\", \"UPDATE\", \"DELETE\", \"MERGE\", \"CALL\"}:\n            schema_allowed.add(t)\n        elif t in {\"CREATE\", \"ALTER\", \"DROP\", \"TRUNCATE\", \"EXPLAIN\", \"DESCRIBE\", \"SHOW\", \"USE\"}:\n            schema_allowed.add(\"DDL\")\n        elif t == \"OTHER\":\n            return _err(\"VALIDATION_ERROR\", \"allowed_sql_types contains OTHER, which is not supported by this backend schema\")\n        else:\n            return _err(\"VALIDATION_ERROR\", \"allowed_sql_types contains invalid value\")\n    new_row[\"allowed_sql_types\"] = sorted(schema_allowed)\n\n    api_keys.append(new_row)\n    _save(\"api_keys.json\", api_keys)\n\n    # Update caller last_used_at? This is management call; record only on success.\n    caller_key[\"last_used_at\"] = now\n    caller_key[\"updated_at\"] = now\n    _save(\"api_keys.json\", api_keys)\n\n    _log(\"create_api_key\", caller_key.get(\"id\"), \"success\")\n    return {\n        \"api_key\": new_row,\n        \"plaintext_api_key\": plaintext_key,\n        \"warning\": \"The plaintext_api_key is shown only once and cannot be retrieved later.\"\n    }\n"
+        },
+        {
+          "name": "update_api_key",
+          "description": "Updates an API key’s metadata/policy and/or performs allowed lifecycle transitions via status (active->revoked). Returns the updated API key record. Refuses any attempt to reactivate a revoked key or to set invalid policy values.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "minLength": 8,
+                "description": "API key used to authenticate the caller and authorize API key management."
+              },
+              "api_key_id": {
+                "type": "string",
+                "pattern": "^sfk_[0-9A-HJKMNP-TV-Z]{16,}$",
+                "description": "API key ULID to update."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "Updated human-readable name/label for the API key."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "revoked"
+                ],
+                "description": "Lifecycle status. Only active->revoked is permitted."
+              },
+              "allowed_sql_types": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "SELECT",
+                    "INSERT",
+                    "UPDATE",
+                    "DELETE",
+                    "MERGE",
+                    "CREATE",
+                    "ALTER",
+                    "DROP",
+                    "TRUNCATE",
+                    "CALL",
+                    "EXPLAIN",
+                    "DESCRIBE",
+                    "SHOW",
+                    "USE",
+                    "OTHER"
+                  ]
+                },
+                "minItems": 1,
+                "description": "Updated allowed SQL statement types for this key."
+              },
+              "max_rows": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Updated maximum rows return cap."
+              },
+              "max_runtime_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Updated maximum runtime cap in milliseconds."
+              },
+              "rate_limit_per_minute": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Updated per-minute rate limit."
+              },
+              "monthly_query_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Updated optional monthly query limit. Omit to keep unchanged; set to null to clear (if supported by the backend)."
+              },
+              "monthly_credits_limit": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Updated optional monthly credits limit. Omit to keep unchanged; set to null to clear (if supported by the backend)."
+              }
+            },
+            "required": [
+              "api_key",
+              "api_key_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_api_key(api_key, api_key_id, name=None, status=None, allowed_sql_types=None, max_rows=None, max_runtime_ms=None, rate_limit_per_minute=None, monthly_query_limit=None, monthly_credits_limit=None, **_extra):\n    import json, os, datetime, time, re\n\n    _t0 = time.time()\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0227000\" if __import__(\"os\").path.isdir(\"./environment_mix/0227000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    now_dt = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n    now_iso = now_dt.isoformat()\n\n    # Validate required\n    if not isinstance(api_key, str) or len(api_key) < 8:\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a string of length >= 8\", field=\"api_key\")\n    if not isinstance(api_key_id, str) or re.match(r\"^sfk_[0-9A-HJKMNP-TV-Z]{16,}$\", api_key_id) is None:\n        return _err(\"VALIDATION_ERROR\", \"api_key_id is invalid\", field=\"api_key_id\")\n\n    # Validate optionals\n    if name is not None and (not isinstance(name, str) or not (1 <= len(name) <= 200)):\n        return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string up to 200 chars\", field=\"name\")\n\n    if status is not None and status not in (\"active\", \"revoked\"):\n        return _err(\"VALIDATION_ERROR\", \"status must be 'active' or 'revoked'\", field=\"status\")\n\n    # Tool's enum differs from backend; map tool values to backend allowed_sql_types\n    # Backend allowed_sql_types enum: SELECT, INSERT, UPDATE, DELETE, MERGE, DDL, CALL\n    # Tool allows many granular tokens -> map DDL-ish and other introspection into DDL; unknowns into DDL/SELECT is unsafe; use DDL for DDL tokens; reject OTHER.\n    map_to_backend = {\n        \"SELECT\": \"SELECT\",\n        \"INSERT\": \"INSERT\",\n        \"UPDATE\": \"UPDATE\",\n        \"DELETE\": \"DELETE\",\n        \"MERGE\": \"MERGE\",\n        \"CALL\": \"CALL\",\n        \"CREATE\": \"DDL\",\n        \"ALTER\": \"DDL\",\n        \"DROP\": \"DDL\",\n        \"TRUNCATE\": \"DDL\",\n        \"EXPLAIN\": \"DDL\",\n        \"DESCRIBE\": \"DDL\",\n        \"SHOW\": \"DDL\",\n        \"USE\": \"DDL\",\n    }\n    tool_allowed_enum = set(map_to_backend.keys()) | {\"OTHER\"}\n\n    if allowed_sql_types is not None:\n        if not isinstance(allowed_sql_types, list) or len(allowed_sql_types) < 1 or not all(isinstance(x, str) for x in allowed_sql_types):\n            return _err(\"VALIDATION_ERROR\", \"allowed_sql_types must be a non-empty array of strings\", field=\"allowed_sql_types\")\n        bad = [x for x in allowed_sql_types if x not in tool_allowed_enum]\n        if bad:\n            return _err(\"VALIDATION_ERROR\", \"allowed_sql_types contains invalid value(s)\", field=\"allowed_sql_types\", invalid=bad, allowed=sorted(tool_allowed_enum))\n        if \"OTHER\" in allowed_sql_types:\n            return _err(\"VALIDATION_ERROR\", \"allowed_sql_types cannot include OTHER for this backend\", field=\"allowed_sql_types\")\n\n    if max_rows is not None:\n        if not isinstance(max_rows, int) or isinstance(max_rows, bool) or not (1 <= max_rows <= 1000000):\n            return _err(\"VALIDATION_ERROR\", \"max_rows must be an integer between 1 and 1000000\", field=\"max_rows\")\n\n    if max_runtime_ms is not None:\n        if (not isinstance(max_runtime_ms, int)) or isinstance(max_runtime_ms, bool) or not (1000 <= max_runtime_ms <= 3600000):\n            return _err(\"VALIDATION_ERROR\", \"max_runtime_ms must be an integer between 1000 and 3600000\", field=\"max_runtime_ms\")\n\n    if rate_limit_per_minute is not None:\n        if (not isinstance(rate_limit_per_minute, int)) or isinstance(rate_limit_per_minute, bool) or not (1 <= rate_limit_per_minute <= 6000):\n            return _err(\"VALIDATION_ERROR\", \"rate_limit_per_minute must be an integer between 1 and 6000\", field=\"rate_limit_per_minute\")\n\n    if monthly_query_limit is not None:\n        if monthly_query_limit is not None and ((not isinstance(monthly_query_limit, int)) or isinstance(monthly_query_limit, bool) or monthly_query_limit < 1):\n            return _err(\"VALIDATION_ERROR\", \"monthly_query_limit must be null or an integer >= 1\", field=\"monthly_query_limit\")\n\n    if monthly_credits_limit is not None:\n        if monthly_credits_limit is not None and ((not isinstance(monthly_credits_limit, (int, float))) or isinstance(monthly_credits_limit, bool) or monthly_credits_limit < 0):\n            return _err(\"VALIDATION_ERROR\", \"monthly_credits_limit must be null or a number >= 0\", field=\"monthly_credits_limit\")\n\n    # Authenticate caller key (explicit credential param): match by id or key_prefix; must be active\n    api_keys = _load(\"api_keys.json\")\n    if not isinstance(api_keys, list):\n        api_keys = []\n\n    caller = None\n    for k in api_keys:\n        if not isinstance(k, dict):\n            continue\n        if k.get(\"id\") == api_key or k.get(\"key_prefix\") == api_key:\n            caller = k\n            break\n    if caller is None:\n        for k in api_keys:\n            if not isinstance(k, dict):\n                continue\n            kp = k.get(\"key_prefix\")\n            if isinstance(kp, str) and api_key.startswith(kp):\n                caller = k\n                break\n    if caller is None:\n        return _err(\"UNAUTHORIZED\", \"API key not recognized.\", field=\"api_key\")\n    if caller.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"API key is not active.\", field=\"api_key\", key_status=caller.get(\"status\"))\n\n    # Locate target key\n    target_idx = None\n    for i, k in enumerate(api_keys):\n        if isinstance(k, dict) and k.get(\"id\") == api_key_id:\n            target_idx = i\n            break\n    if target_idx is None:\n        return _err(\"NOT_FOUND\", \"API key not found.\", api_key_id=api_key_id)\n\n    target = api_keys[target_idx]\n\n    # Authorization: allow management within same workspace only\n    if caller.get(\"workspace_id\") != target.get(\"workspace_id\"):\n        return _err(\"UNAUTHORIZED\", \"Caller is not authorized to manage this API key.\", api_key_id=api_key_id)\n\n    # Enforce lifecycle transitions\n    if status is not None:\n        cur = target.get(\"status\")\n        if cur == \"revoked\" and status == \"active\":\n            return _err(\"INVALID_TRANSITION\", \"Cannot reactivate a revoked key (revoked -> active not permitted).\", from_status=cur, to_status=status)\n        if cur == \"active\" and status == \"revoked\":\n            pass\n        elif cur == status:\n            # idempotent; ok\n            pass\n        else:\n            return _err(\"INVALID_TRANSITION\", \"Invalid status transition.\", from_status=cur, to_status=status)\n\n    # Apply mutations (NO SUCCESS WITHOUT EFFECT: if nothing changes, treat as no-op but still return updated record;\n    # however a mutation request with no fields besides required should be validation error)\n    any_field_provided = any(v is not None for v in [name, status, allowed_sql_types, max_rows, max_runtime_ms, rate_limit_per_minute, monthly_query_limit, monthly_credits_limit])\n    if not any_field_provided:\n        return _err(\"VALIDATION_ERROR\", \"No updatable fields provided.\", field=\"body\")\n\n    changed = False\n\n    if name is not None and name != target.get(\"name\"):\n        target[\"name\"] = name\n        changed = True\n\n    if status is not None and status != target.get(\"status\"):\n        target[\"status\"] = status\n        changed = True\n\n    if allowed_sql_types is not None:\n        mapped = []\n        for x in allowed_sql_types:\n            mapped.append(map_to_backend.get(x))\n        # dedupe while preserving order\n        dedup = []\n        seen = set()\n        for x in mapped:\n            if x not in seen:\n                seen.add(x)\n                dedup.append(x)\n        if dedup != target.get(\"allowed_sql_types\"):\n            target[\"allowed_sql_types\"] = dedup\n            changed = True\n\n    if max_rows is not None and max_rows != target.get(\"max_rows\"):\n        target[\"max_rows\"] = max_rows\n        changed = True\n\n    if max_runtime_ms is not None and max_runtime_ms != target.get(\"max_runtime_ms\"):\n        target[\"max_runtime_ms\"] = max_runtime_ms\n        changed = True\n\n    if rate_limit_per_minute is not None and rate_limit_per_minute != target.get(\"rate_limit_per_minute\"):\n        target[\"rate_limit_per_minute\"] = rate_limit_per_minute\n        changed = True\n\n    # Allow clearing limits by explicit null (None) for these optional fields (tool description says supported \"if supported by backend\"; backend schema allows null)\n    if monthly_query_limit is not None or monthly_query_limit is None:\n        # Only apply if caller explicitly passed it: but in Python signature, default is None; can't distinguish omitted vs null.\n        # Here: treat explicit None as \"clear\" only if _extra indicates it, otherwise avoid unintended clearing.\n        # However tool contract uses JSON; passing null will arrive as None, indistinguishable from omission.\n        # To stay safe and consistent: only update these if provided via _extra flag \"__provided_fields\".\n        provided = _extra.get(\"__provided_fields\")\n        if isinstance(provided, list) and \"monthly_query_limit\" in provided:\n            if monthly_query_limit != target.get(\"monthly_query_limit\"):\n                target[\"monthly_query_limit\"] = monthly_query_limit\n                changed = True\n\n    if monthly_credits_limit is not None or monthly_credits_limit is None:\n        provided = _extra.get(\"__provided_fields\")\n        if isinstance(provided, list) and \"monthly_credits_limit\" in provided:\n            if monthly_credits_limit != target.get(\"monthly_credits_limit\"):\n                target[\"monthly_credits_limit\"] = monthly_credits_limit\n                changed = True\n\n    if changed:\n        target[\"updated_at\"] = now_iso\n        # Update caller last_used_at as successful management action\n        caller_id = caller.get(\"id\")\n        for k in api_keys:\n            if isinstance(k, dict) and k.get(\"id\") == caller_id:\n                k[\"last_used_at\"] = now_iso\n                k[\"updated_at\"] = now_iso if isinstance(k.get(\"updated_at\"), str) else now_iso\n                break\n        try:\n            _save(\"api_keys.json\", api_keys)\n        except Exception:\n            return _err(\"CONFLICT\", \"Failed to persist API key update (datastore write error).\")\n    else:\n        # No actual changes requested (values identical); return current row (idempotent update)\n        pass\n\n    return {\n        \"api_key\": api_keys[target_idx],\n        \"meta\": {\n            \"latency_ms\": int((time.time() - _t0) * 1000),\n            \"updated\": changed,\n        },\n    }\n"
+        },
+        {
+          "name": "get_current_identity",
+          "description": "Returns the authenticated caller identity for the provided API key, including key status, effective scopes/policies, and current quota/rate-limit consumption snapshots. Refuses revoked or unknown keys.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "minLength": 8,
+                "description": "API key presented by the caller."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_current_identity(api_key, **_extra):\n    import json, os, datetime, time\n\n    _t0 = time.time()\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0227000\" if __import__(\"os\").path.isdir(\"./environment_mix/0227000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_dt():\n        return datetime.datetime.utcnow().replace(microsecond=0)\n\n    def _now_iso():\n        return _now_dt().isoformat() + \"Z\"\n\n    def _log(endpoint, credential_id, status_s, error_code=None):\n        return\n\n    if not isinstance(api_key, str) or len(api_key) < 8:\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a string of length >= 8\")\n\n    api_keys = _load(\"api_keys.json\")\n    workspaces = _load(\"workspaces.json\")\n    usage = _load(\"usage_counters.json\")\n    query_runs = _load(\"query_runs.json\")\n\n    presented = api_key\n    presented_prefix = presented.split(\"_\", 1)[0] if \"_\" in presented else presented[:8]\n\n    key = None\n    for k in api_keys:\n        if not isinstance(k, dict):\n            continue\n        if k.get(\"id\") == presented or k.get(\"key_prefix\") == presented or k.get(\"key_prefix\") == presented_prefix:\n            key = k\n            break\n\n    if key is None:\n        _log(\"get_current_identity\", None, \"error\", error_code=\"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Unknown API key\")\n\n    if key.get(\"status\") != \"active\":\n        _log(\"get_current_identity\", key.get(\"id\"), \"error\", error_code=\"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Revoked API key\")\n\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == key.get(\"workspace_id\")), None)\n    if ws is None:\n        _log(\"get_current_identity\", key.get(\"id\"), \"error\", error_code=\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Workspace not found\")\n\n    now = _now_dt()\n    minute_start = now.replace(second=0, microsecond=0)\n    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)\n\n    def _parse_iso_z(s):\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1]\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    # Rate-limit consumption snapshot: use usage_counters minute window if exists, else compute from query_runs.\n    minute_row = None\n    for r in usage:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"api_key_id\") == key.get(\"id\") and r.get(\"window_type\") == \"minute\":\n            ts = _parse_iso_z(r.get(\"window_start\"))\n            if ts == minute_start:\n                minute_row = r\n                break\n    if minute_row is None:\n        # fallback compute from query_runs\n        cnt = 0\n        for qr in query_runs:\n            if not isinstance(qr, dict):\n                continue\n            if qr.get(\"api_key_id\") != key.get(\"id\"):\n                continue\n            t = _parse_iso_z(qr.get(\"created_at\"))\n            if t is not None and t >= minute_start and t < (minute_start + datetime.timedelta(minutes=1)):\n                cnt += 1\n        minute_used = cnt\n    else:\n        minute_used = int(minute_row.get(\"request_count\") or 0)\n\n    # Monthly usage snapshot\n    month_row = None\n    for r in usage:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"api_key_id\") == key.get(\"id\") and r.get(\"window_type\") == \"month\":\n            ts = _parse_iso_z(r.get(\"window_start\"))\n            if ts == month_start:\n                month_row = r\n                break\n    if month_row is None:\n        # fallback compute\n        mcnt = 0\n        credits = 0.0\n        for qr in query_runs:\n            if not isinstance(qr, dict):\n                continue\n            if qr.get(\"api_key_id\") != key.get(\"id\"):\n                continue\n            t = _parse_iso_z(qr.get(\"created_at\"))\n            if t is not None and t >= month_start and t < (month_start + datetime.timedelta(days=32)):\n                if t.month == month_start.month and t.year == month_start.year:\n                    mcnt += 1\n                    c = qr.get(\"credits_attributed\")\n                    if isinstance(c, (int, float)) and not isinstance(c, bool):\n                        credits += float(c)\n        month_used = mcnt\n        credits_used = credits\n    else:\n        month_used = int(month_row.get(\"request_count\") or 0)\n        credits_used = float(month_row.get(\"credits_total\") or 0.0)\n\n    # Update last_used_at for successful identity lookups\n    now_iso = _now_iso()\n    key[\"last_used_at\"] = now_iso\n    key[\"updated_at\"] = now_iso\n    _save(\"api_keys.json\", api_keys)\n\n    identity = {\n        \"api_key\": {\n            \"id\": key.get(\"id\"),\n            \"workspace_id\": key.get(\"workspace_id\"),\n            \"key_prefix\": key.get(\"key_prefix\"),\n            \"name\": key.get(\"name\"),\n            \"status\": key.get(\"status\"),\n            \"allowed_sql_types\": key.get(\"allowed_sql_types\"),\n            \"max_rows\": key.get(\"max_rows\"),\n            \"max_runtime_ms\": key.get(\"max_runtime_ms\"),\n            \"rate_limit_per_minute\": key.get(\"rate_limit_per_minute\"),\n            \"monthly_query_limit\": key.get(\"monthly_query_limit\"),\n            \"monthly_credits_limit\": key.get(\"monthly_credits_limit\"),\n            \"last_used_at\": key.get(\"last_used_at\"),\n            \"created_at\": key.get(\"created_at\"),\n            \"updated_at\": key.get(\"updated_at\"),\n        },\n        \"workspace\": {\n            \"id\": ws.get(\"id\"),\n            \"name\": ws.get(\"name\"),\n            \"status\": ws.get(\"status\"),\n            \"snowflake_account\": ws.get(\"snowflake_account\"),\n            \"snowflake_region\": ws.get(\"snowflake_region\"),\n            \"default_warehouse\": ws.get(\"default_warehouse\"),\n            \"default_database\": ws.get(\"default_database\"),\n            \"default_schema\": ws.get(\"default_schema\"),\n            \"auth_method\": ws.get(\"auth_method\"),\n            \"created_at\": ws.get(\"created_at\"),\n            \"updated_at\": ws.get(\"updated_at\"),\n        },\n        \"consumption\": {\n            \"minute\": {\n                \"window_start\": minute_start.isoformat() + \"Z\",\n                \"used\": minute_used,\n                \"limit\": key.get(\"rate_limit_per_minute\"),\n                \"remaining\": max(0, int(key.get(\"rate_limit_per_minute\") or 0) - int(minute_used)),\n            },\n            \"month\": {\n                \"window_start\": month_start.isoformat() + \"Z\",\n                \"queries_used\": month_used,\n                \"queries_limit\": key.get(\"monthly_query_limit\"),\n                \"credits_used\": credits_used,\n                \"credits_limit\": key.get(\"monthly_credits_limit\"),\n            },\n        },\n    }\n\n    _log(\"get_current_identity\", key.get(\"id\"), \"success\")\n    return {\"identity\": identity}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0227000",
+    "index": 227,
+    "name": "Snowflake Database Access Server",
+    "description": "This backend powers an API service that executes SQL against Snowflake and returns results to callers. It stores workspaces (Snowflake connection profiles), API keys for authentication/quotas, and an execution ledger of query runs including status, timing, errors, and result metadata for auditing an",
+    "taxonomy": {
+      "L1_id": "L1-10",
+      "L1_name": "Data Storage & Databases",
+      "L1_name_zh": "数据存储与数据库",
+      "L2_id": "L2-25",
+      "L2_name": "Relational Databases",
+      "L2_name_zh": "关系型数据库",
+      "L3_name": "Database SQL Access & Query Execution Gateways",
+      "L3_name_zh": "数据库SQL访问与查询执行网关"
+    },
+    "database_dir": "./environment_mix/0227000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 5,
+    "n_records": 78,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 3,
+      "read_operations": 3,
+      "mutations_persisted": 3,
+      "mutations_attempted": 4
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "execute_query",
+      "returned_chars": 1867
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

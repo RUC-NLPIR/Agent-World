@@ -1,0 +1,153 @@
+{
+  "index": 310,
+  "local_files_dir": "./environment_mix/0310000",
+  "file_list": [
+    "./environment_mix/0310000/README.md",
+    "./environment_mix/0310000/mock_db.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "mock_db.json": "",
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "create_task",
+          "description": "Creates a new task owned by the specified user and returns the created task record. It refuses requests that omit the user_id or title, or that provide empty/invalid values for those fields. It also refuses creation when the referenced user_id does not exist, because a task must be associated with an existing user.",
+          "parameters": {
+            "properties": {
+              "user_id": {
+                "description": "The ID of the user creating the task",
+                "title": "User Id",
+                "type": "string"
+              },
+              "title": {
+                "description": "The title of the task",
+                "title": "Title",
+                "type": "string"
+              },
+              "description": {
+                "default": null,
+                "description": "Optional description of the task",
+                "title": "Description",
+                "type": "string"
+              }
+            },
+            "required": [
+              "user_id",
+              "title"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "def create_task(user_id, title, description=None, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0310000\" if __import__(\"os\").path.isdir(\"./environment_mix/0310000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    ts = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    endpoint = \"create_task\"\n\n    def _normalize_db(raw):\n        # Store may be [], {} or other; normalize to a dict with users/tasks plus audit log.\n        db = raw if isinstance(raw, dict) else {}\n        users = db.get(\"users\")\n        tasks = db.get(\"tasks\")\n        if not isinstance(users, dict):\n            users = {}\n        if not isinstance(tasks, dict):\n            tasks = {}\n        audit = db.get(\"_audit_log\")\n        if not isinstance(audit, list):\n            audit = []\n        rate = db.get(\"_rate_limits\")\n        if not isinstance(rate, dict):\n            rate = {}\n        if \"requests_per_minute\" not in rate or not isinstance(rate.get(\"requests_per_minute\"), int):\n            rate[\"requests_per_minute\"] = 120\n        if \"requests_per_day\" not in rate or not isinstance(rate.get(\"requests_per_day\"), int):\n            rate[\"requests_per_day\"] = 5000\n        db[\"users\"] = users\n        db[\"tasks\"] = tasks\n        db[\"_audit_log\"] = audit\n        db[\"_rate_limits\"] = rate\n        if \"_counters\" not in db or not isinstance(db.get(\"_counters\"), dict):\n            db[\"_counters\"] = {\"total_requests\": 0, \"total_errors\": 0}\n        return db\n\n    def _prune_old(audit_rows, now_dt):\n        # Keep last 7 days for size control; safe even if timestamps are malformed.\n        cutoff = now_dt - datetime.timedelta(days=7)\n        kept = []\n        for r in audit_rows:\n            try:\n                rts = r.get(\"timestamp\")\n                if isinstance(rts, str) and rts.endswith(\"Z\"):\n                    rdt = datetime.datetime.fromisoformat(rts[:-1])\n                    if rdt >= cutoff:\n                        kept.append(r)\n                else:\n                    kept.append(r)\n            except Exception:\n                kept.append(r)\n        return kept\n\n    def _check_rate_and_log(db, status, error_code=None, error_message=None, details=None):\n        # Enforce simplistic global rate limits from audit log.\n        now = datetime.datetime.utcnow()\n        audit = db[\"_audit_log\"]\n        rpm = db[\"_rate_limits\"][\"requests_per_minute\"]\n        rpd = db[\"_rate_limits\"][\"requests_per_day\"]\n\n        # Count recent requests (all endpoints) in rolling windows.\n        one_min_ago = now - datetime.timedelta(minutes=1)\n        one_day_ago = now - datetime.timedelta(days=1)\n        c_min = 0\n        c_day = 0\n        for r in audit:\n            try:\n                rts = r.get(\"timestamp\")\n                if not (isinstance(rts, str) and rts.endswith(\"Z\")):\n                    continue\n                rdt = datetime.datetime.fromisoformat(rts[:-1])\n                if rdt >= one_min_ago:\n                    c_min += 1\n                if rdt >= one_day_ago:\n                    c_day += 1\n            except Exception:\n                continue\n\n        # If we are about to return success, rate limit must be checked before logging this request.\n        # For errors, still enforce rate limit (real backends often do).\n        if c_min >= rpm:\n            # log the rate-limited request\n            row = {\n                \"timestamp\": ts,\n                \"endpoint\": endpoint,\n                \"status\": \"error\",\n                \"error_code\": \"RATE_LIMIT\",\n                \"message\": \"Rate limit exceeded (per-minute).\",\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            }\n            audit.append(row)\n            db[\"_counters\"][\"total_requests\"] = int(db[\"_counters\"].get(\"total_requests\", 0)) + 1\n            db[\"_counters\"][\"total_errors\"] = int(db[\"_counters\"].get(\"total_errors\", 0)) + 1\n            db[\"_audit_log\"] = _prune_old(audit, now)\n            _save(\"mock_db.json\", db)\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded (per-minute).\", limit=rpm, window_seconds=60)\n        if c_day >= rpd:\n            row = {\n                \"timestamp\": ts,\n                \"endpoint\": endpoint,\n                \"status\": \"error\",\n                \"error_code\": \"QUOTA_EXCEEDED\",\n                \"message\": \"Daily request quota exceeded.\",\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            }\n            audit.append(row)\n            db[\"_counters\"][\"total_requests\"] = int(db[\"_counters\"].get(\"total_requests\", 0)) + 1\n            db[\"_counters\"][\"total_errors\"] = int(db[\"_counters\"].get(\"total_errors\", 0)) + 1\n            db[\"_audit_log\"] = _prune_old(audit, now)\n            _save(\"mock_db.json\", db)\n            return _err(\"QUOTA_EXCEEDED\", \"Daily request quota exceeded.\", limit=rpd, window_seconds=86400)\n\n        row = {\n            \"timestamp\": ts,\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if status != \"ok\":\n            row[\"error_code\"] = error_code\n            row[\"message\"] = error_message\n            if details is not None:\n                row[\"details\"] = details\n            db[\"_counters\"][\"total_errors\"] = int(db[\"_counters\"].get(\"total_errors\", 0)) + 1\n        audit.append(row)\n        db[\"_counters\"][\"total_requests\"] = int(db[\"_counters\"].get(\"total_requests\", 0)) + 1\n        db[\"_audit_log\"] = _prune_old(audit, now)\n        _save(\"mock_db.json\", db)\n        return None\n\n    # Load + normalize\n    raw = _load(\"mock_db.json\")\n    db = _normalize_db(raw)\n\n    # Validate inputs\n    if not isinstance(user_id, str) or not user_id.strip():\n        rl = _check_rate_and_log(db, \"error\", \"VALIDATION_ERROR\", \"user_id is required and must be a non-empty string.\")\n        if rl:\n            return rl\n        return _err(\"VALIDATION_ERROR\", \"user_id is required and must be a non-empty string.\")\n    if not isinstance(title, str) or not title.strip():\n        rl = _check_rate_and_log(db, \"error\", \"VALIDATION_ERROR\", \"title is required and must be a non-empty string.\")\n        if rl:\n            return rl\n        return _err(\"VALIDATION_ERROR\", \"title is required and must be a non-empty string.\")\n    if description is not None and not isinstance(description, str):\n        rl = _check_rate_and_log(db, \"error\", \"VALIDATION_ERROR\", \"description must be a string when provided.\")\n        if rl:\n            return rl\n        return _err(\"VALIDATION_ERROR\", \"description must be a string when provided.\")\n\n    uid = user_id.strip()\n    ttl = title.strip()\n    desc = description if description is None else description\n\n    # Must reference existing user\n    user = db[\"users\"].get(uid)\n    if not isinstance(user, dict):\n        rl = _check_rate_and_log(db, \"error\", \"NOT_FOUND\", \"Referenced user_id does not exist.\", user_id=uid)\n        if rl:\n            return rl\n        return _err(\"NOT_FOUND\", \"Referenced user_id does not exist.\", user_id=uid)\n\n    # Ensure user's tasks list exists\n    if \"tasks\" not in user or not isinstance(user.get(\"tasks\"), list):\n        user[\"tasks\"] = []\n\n    # Generate unique task_id\n    existing = set(db[\"tasks\"].keys())\n    n = len(existing) + 1\n    while True:\n        task_id = f\"task_{n}\"\n        if task_id not in existing:\n            break\n        n += 1\n\n    task = {\"task_id\": task_id, \"title\": ttl, \"description\": desc, \"status\": \"pending\"}\n    db[\"tasks\"][task_id] = task\n    user[\"tasks\"].append(task_id)\n    db[\"users\"][uid] = user\n\n    # Log and persist (must persist mutation + audit)\n    rl = _check_rate_and_log(db, \"ok\")\n    if rl:\n        return rl\n\n    return {\"task\": task}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "get_users",
+          "description": "Returns the list of all users currently known to the service. It refuses requests that include unexpected parameters, since this endpoint does not accept any inputs. It also refuses requests that cannot be authorized to view users when the caller is not permitted to access the user list.",
+          "parameters": {
+            "properties": {},
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0310000\" if __import__(\"os\").path.isdir(\"./environment_mix/0310000\") else \"/app/database\")\ndef get_users():\n    import json, os\n    db = json.load(open(os.path.join(_DB, \"mock_db.json\"), encoding=\"utf-8\"))\n    return list(db[\"users\"].values())\n",
+          "description_restored": true
+        },
+        {
+          "name": "update_task_status",
+          "description": "Updates a single task’s status to the provided value and returns the updated task record. It refuses requests missing task_id or status, or where status is not one of the allowed values (\"pending\" or \"completed\"). It also refuses updates when the task_id does not exist or when the caller does not have permission to modify that task.",
+          "parameters": {
+            "properties": {
+              "task_id": {
+                "description": "The ID of the task to update",
+                "title": "Task Id",
+                "type": "string"
+              },
+              "status": {
+                "description": "The new status of the task",
+                "enum": [
+                  "pending",
+                  "completed"
+                ],
+                "title": "Status",
+                "type": "string"
+              }
+            },
+            "required": [
+              "task_id",
+              "status"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "def update_task_status(task_id, status, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0310000\" if __import__(\"os\").path.isdir(\"./environment_mix/0310000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    ts = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    endpoint = \"update_task_status\"\n\n    def _normalize_db(raw):\n        db = raw if isinstance(raw, dict) else {}\n        users = db.get(\"users\")\n        tasks = db.get(\"tasks\")\n        if not isinstance(users, dict):\n            users = {}\n        if not isinstance(tasks, dict):\n            tasks = {}\n        audit = db.get(\"_audit_log\")\n        if not isinstance(audit, list):\n            audit = []\n        rate = db.get(\"_rate_limits\")\n        if not isinstance(rate, dict):\n            rate = {}\n        if \"requests_per_minute\" not in rate or not isinstance(rate.get(\"requests_per_minute\"), int):\n            rate[\"requests_per_minute\"] = 120\n        if \"requests_per_day\" not in rate or not isinstance(rate.get(\"requests_per_day\"), int):\n            rate[\"requests_per_day\"] = 5000\n        db[\"users\"] = users\n        db[\"tasks\"] = tasks\n        db[\"_audit_log\"] = audit\n        db[\"_rate_limits\"] = rate\n        if \"_counters\" not in db or not isinstance(db.get(\"_counters\"), dict):\n            db[\"_counters\"] = {\"total_requests\": 0, \"total_errors\": 0}\n        return db\n\n    def _prune_old(audit_rows, now_dt):\n        cutoff = now_dt - datetime.timedelta(days=7)\n        kept = []\n        for r in audit_rows:\n            try:\n                rts = r.get(\"timestamp\")\n                if isinstance(rts, str) and rts.endswith(\"Z\"):\n                    rdt = datetime.datetime.fromisoformat(rts[:-1])\n                    if rdt >= cutoff:\n                        kept.append(r)\n                else:\n                    kept.append(r)\n            except Exception:\n                kept.append(r)\n        return kept\n\n    def _check_rate_and_log(db, status_str, error_code=None, error_message=None, details=None):\n        now = datetime.datetime.utcnow()\n        audit = db[\"_audit_log\"]\n        rpm = db[\"_rate_limits\"][\"requests_per_minute\"]\n        rpd = db[\"_rate_limits\"][\"requests_per_day\"]\n\n        one_min_ago = now - datetime.timedelta(minutes=1)\n        one_day_ago = now - datetime.timedelta(days=1)\n        c_min = 0\n        c_day = 0\n        for r in audit:\n            try:\n                rts = r.get(\"timestamp\")\n                if not (isinstance(rts, str) and rts.endswith(\"Z\")):\n                    continue\n                rdt = datetime.datetime.fromisoformat(rts[:-1])\n                if rdt >= one_min_ago:\n                    c_min += 1\n                if rdt >= one_day_ago:\n                    c_day += 1\n            except Exception:\n                continue\n\n        if c_min >= rpm:\n            row = {\n                \"timestamp\": ts,\n                \"endpoint\": endpoint,\n                \"status\": \"error\",\n                \"error_code\": \"RATE_LIMIT\",\n                \"message\": \"Rate limit exceeded (per-minute).\",\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            }\n            audit.append(row)\n            db[\"_counters\"][\"total_requests\"] = int(db[\"_counters\"].get(\"total_requests\", 0)) + 1\n            db[\"_counters\"][\"total_errors\"] = int(db[\"_counters\"].get(\"total_errors\", 0)) + 1\n            db[\"_audit_log\"] = _prune_old(audit, now)\n            _save(\"mock_db.json\", db)\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded (per-minute).\", limit=rpm, window_seconds=60)\n\n        if c_day >= rpd:\n            row = {\n                \"timestamp\": ts,\n                \"endpoint\": endpoint,\n                \"status\": \"error\",\n                \"error_code\": \"QUOTA_EXCEEDED\",\n                \"message\": \"Daily request quota exceeded.\",\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            }\n            audit.append(row)\n            db[\"_counters\"][\"total_requests\"] = int(db[\"_counters\"].get(\"total_requests\", 0)) + 1\n            db[\"_counters\"][\"total_errors\"] = int(db[\"_counters\"].get(\"total_errors\", 0)) + 1\n            db[\"_audit_log\"] = _prune_old(audit, now)\n            _save(\"mock_db.json\", db)\n            return _err(\"QUOTA_EXCEEDED\", \"Daily request quota exceeded.\", limit=rpd, window_seconds=86400)\n\n        row = {\n            \"timestamp\": ts,\n            \"endpoint\": endpoint,\n            \"status\": status_str,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if status_str != \"ok\":\n            row[\"error_code\"] = error_code\n            row[\"message\"] = error_message\n            if details is not None:\n                row[\"details\"] = details\n            db[\"_counters\"][\"total_errors\"] = int(db[\"_counters\"].get(\"total_errors\", 0)) + 1\n        audit.append(row)\n        db[\"_counters\"][\"total_requests\"] = int(db[\"_counters\"].get(\"total_requests\", 0)) + 1\n        db[\"_audit_log\"] = _prune_old(audit, now)\n        _save(\"mock_db.json\", db)\n        return None\n\n    raw = _load(\"mock_db.json\")\n    db = _normalize_db(raw)\n\n    # Validate inputs\n    if not isinstance(task_id, str) or not task_id.strip():\n        rl = _check_rate_and_log(db, \"error\", \"VALIDATION_ERROR\", \"task_id is required and must be a non-empty string.\")\n        if rl:\n            return rl\n        return _err(\"VALIDATION_ERROR\", \"task_id is required and must be a non-empty string.\")\n    if not isinstance(status, str) or status not in (\"pending\", \"completed\"):\n        rl = _check_rate_and_log(db, \"error\", \"VALIDATION_ERROR\", \"status must be one of: pending, completed.\")\n        if rl:\n            return rl\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: pending, completed.\", allowed=[\"pending\", \"completed\"])\n\n    tid = task_id.strip()\n\n    # Find task\n    task = db[\"tasks\"].get(tid)\n    if not isinstance(task, dict):\n        rl = _check_rate_and_log(db, \"error\", \"NOT_FOUND\", \"Task not found.\", task_id=tid)\n        if rl:\n            return rl\n        return _err(\"NOT_FOUND\", \"Task not found.\", task_id=tid)\n\n    # Permission check: ambient auth; pick any consistent \"caller\" that owns the task.\n    # If no user owns it, treat as unauthorized (cannot establish permission context).\n    owner_id = None\n    for uid, u in db[\"users\"].items():\n        if isinstance(u, dict) and isinstance(u.get(\"tasks\"), list) and tid in u.get(\"tasks\"):\n            owner_id = uid\n            break\n    if owner_id is None:\n        rl = _check_rate_and_log(db, \"error\", \"UNAUTHORIZED\", \"Caller does not have permission to modify that task.\")\n        if rl:\n            return rl\n        return _err(\"UNAUTHORIZED\", \"Caller does not have permission to modify that task.\")\n\n    # Apply update (idempotent allowed, but still a real write with audit log persisted)\n    task[\"status\"] = status\n    db[\"tasks\"][tid] = task\n\n    rl = _check_rate_and_log(db, \"ok\")\n    if rl:\n        return rl\n\n    return {\"task\": task}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "transfer_to_human_agents",
+          "description": "Escalates the conversation to a human agent and passes along the provided summary of the user’s issue. It refuses requests that do not include a summary, or where the summary is empty or unusable for handoff. It also refuses escalation when the user has not explicitly asked for a human or when the issue can be handled with the available tools and policy guidance.",
+          "parameters": {
+            "properties": {
+              "summary": {
+                "description": "A summary of the user's issue.",
+                "title": "Summary",
+                "type": "string"
+              }
+            },
+            "required": [
+              "summary"
+            ],
+            "title": "parameters",
+            "type": "object"
+          },
+          "implementation": "def transfer_to_human_agents(summary, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0310000\" if __import__(\"os\").path.isdir(\"./environment_mix/0310000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: \n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: \n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): \n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"transfer_to_human_agents\"\n    now_dt = datetime.datetime.utcnow()\n    ts = now_dt.replace(microsecond=0).isoformat() + \"Z\"\n\n    # ---- datastore normalize (mock_db.json may be [] in this benchmark) ----\n    raw = _load(\"mock_db.json\")\n    if isinstance(raw, dict):\n        db = raw\n    else:\n        db = {}\n\n    audit = db.get(\"_audit_log\")\n    if not isinstance(audit, list):\n        audit = []\n    db[\"_audit_log\"] = audit\n\n    rate = db.get(\"_rate_limits\")\n    if not isinstance(rate, dict):\n        rate = {}\n    if not isinstance(rate.get(\"requests_per_minute\"), int) or rate.get(\"requests_per_minute\") <= 0:\n        rate[\"requests_per_minute\"] = 120\n    if not isinstance(rate.get(\"requests_per_day\"), int) or rate.get(\"requests_per_day\") <= 0:\n        rate[\"requests_per_day\"] = 5000\n    db[\"_rate_limits\"] = rate\n\n    counters = db.get(\"_counters\")\n    if not isinstance(counters, dict):\n        counters = {\"total_requests\": 0, \"total_errors\": 0}\n    if not isinstance(counters.get(\"total_requests\"), int):\n        counters[\"total_requests\"] = 0\n    if not isinstance(counters.get(\"total_errors\"), int):\n        counters[\"total_errors\"] = 0\n    db[\"_counters\"] = counters\n\n    # ---- helpers ----\n    def _parse_ts(s):\n        if isinstance(s, str) and s.endswith(\"Z\"):\n            try:\n                return datetime.datetime.fromisoformat(s[:-1])\n            except ValueError:\n                return None\n        return None\n\n    def _prune_old(audit_rows, now_dt_local):\n        cutoff = now_dt_local - datetime.timedelta(days=7)\n        kept = []\n        for r in audit_rows:\n            rdt = _parse_ts(r.get(\"timestamp\"))\n            if rdt is None or rdt >= cutoff:\n                kept.append(r)\n        return kept\n\n    def _count_in_windows(audit_rows, now_dt_local):\n        minute_ago = now_dt_local - datetime.timedelta(minutes=1)\n        day_ago = now_dt_local - datetime.timedelta(days=1)\n        per_minute = 0\n        per_day = 0\n        for r in audit_rows:\n            rdt = _parse_ts(r.get(\"timestamp\"))\n            if rdt is None:\n                continue\n            if rdt >= day_ago:\n                per_day += 1\n                if rdt >= minute_ago:\n                    per_minute += 1\n        return per_minute, per_day\n\n    def _log_and_persist(status, error_obj=None):\n        db[\"_audit_log\"] = _prune_old(db[\"_audit_log\"], now_dt)\n        rpm_used, rpd_used = _count_in_windows(db[\"_audit_log\"], now_dt)\n\n        latency_ms = int(max(0.0, (time.time() - t0)) * 1000)\n        row = {\n            \"timestamp\": ts,\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"latency_ms\": latency_ms,\n        }\n        if error_obj:\n            row[\"error\"] = error_obj.get(\"error\", error_obj)\n        db[\"_audit_log\"].append(row)\n\n        db[\"_counters\"][\"total_requests\"] = int(db[\"_counters\"].get(\"total_requests\", 0)) + 1\n        if status != \"success\":\n            db[\"_counters\"][\"total_errors\"] = int(db[\"_counters\"].get(\"total_errors\", 0)) + 1\n\n        _save(\"mock_db.json\", db)\n\n    # ---- rate/quota enforcement (based on prior log rows) ----\n    # Count existing calls in windows BEFORE this one is appended.\n    db[\"_audit_log\"] = _prune_old(db[\"_audit_log\"], now_dt)\n    rpm_used, rpd_used = _count_in_windows(db[\"_audit_log\"], now_dt)\n    if rpm_used >= db[\"_rate_limits\"][\"requests_per_minute\"]:\n        err = _err(\"RATE_LIMIT\", \"Rate limit exceeded (requests_per_minute).\")\n        _log_and_persist(\"error\", err)\n        return err\n    if rpd_used >= db[\"_rate_limits\"][\"requests_per_day\"]:\n        err = _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded (requests_per_day).\")\n        _log_and_persist(\"error\", err)\n        return err\n\n    # ---- input validation ----\n    if not isinstance(summary, str):\n        err = _err(\"VALIDATION_ERROR\", \"summary must be a string.\", field=\"summary\")\n        _log_and_persist(\"error\", err)\n        return err\n\n    cleaned = \" \".join(summary.strip().split())\n    if not cleaned or len(cleaned) < 10:\n        err = _err(\"VALIDATION_ERROR\", \"summary is required and must be sufficiently informative for handoff.\", field=\"summary\")\n        _log_and_persist(\"error\", err)\n        return err\n\n    # ---- policy gating (no conversation context provided -> refuse escalation) ----\n    # The tool requires: user explicitly asked for a human OR the issue cannot be handled with tools/policies.\n    # With only `summary` available, we cannot verify these prerequisites; default to refusal.\n    err = _err(\n        \"UNAUTHORIZED\",\n        \"Escalation refused: no evidence the user requested a human agent, and no indication the issue cannot be handled with available tools/policy guidance.\",\n        reason=\"missing_prerequisites\",\n    )\n    _log_and_persist(\"error\", err)\n    return err\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0310000",
+    "index": 310,
+    "name": "Keystone Task Console",
+    "description": "A lightweight task-tracking service that lets users create tasks, view users, update task statuses, and escalate items to human agents when needed.",
+    "taxonomy": {
+      "L1_id": "L1-10",
+      "L1_name": "Data Storage & Databases",
+      "L1_name_zh": "数据存储与数据库",
+      "L2_id": "L2-27",
+      "L2_name": "Memory & Knowledge Management",
+      "L2_name_zh": "记忆与知识管理",
+      "L3_name": "Workspace Docs & Notes",
+      "L3_name_zh": "工作空间文档与笔记"
+    },
+    "database_dir": "./environment_mix/0310000",
+    "mount_path": "/app/database",
+    "n_tools": 4,
+    "n_collections": 1,
+    "n_records": 2,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 4,
+      "loaded": 4,
+      "reads_returning_data": 1,
+      "read_operations": 1,
+      "mutations_persisted": 2,
+      "mutations_attempted": 3
+    },
+    "tools_loadable_from_database_dir": 4,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_users",
+      "returned_chars": 65
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

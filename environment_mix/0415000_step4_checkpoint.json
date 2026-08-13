@@ -1,0 +1,443 @@
+{
+  "index": 415,
+  "local_files_dir": "./environment_mix/0415000",
+  "file_list": [
+    "./environment_mix/0415000/README.md",
+    "./environment_mix/0415000/collections.json",
+    "./environment_mix/0415000/points.json",
+    "./environment_mix/0415000/query_requests.json",
+    "./environment_mix/0415000/query_results.json",
+    "./environment_mix/0415000/request_logs.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "collections.json": "12 rows",
+        "points.json": "34 rows",
+        "query_requests.json": "37 rows",
+        "query_results.json": "29 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "query_collection",
+          "description": "Searches a collection for the most similar points to the provided query_vector, applying an optional payload filter, optional score_threshold, and returning up to limit results after skipping offset; when with_payload/with_vector are true, the corresponding fields are included for each match. Returns either a list of scored point matches (synchronous) or, when wait is false, an enqueued request handle instead of results. Raises VALIDATION_ERROR when required fields are missing, limit/offset are out of range, or the query_vector is not a numeric array; raises NOT_FOUND when collection_name does not exist; raises AUTHORIZATION_ERROR if the caller is not permitted to query the collection; raises QUOTA_EXCEEDED or RATE_LIMITED when request limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "collection_name": {
+                "type": "string",
+                "description": "Name of the collection to query."
+              },
+              "query_vector": {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                },
+                "description": "Vector used for similarity search against the collection."
+              },
+              "filter": {
+                "type": "object",
+                "description": "Optional payload filter object to constrain which points are eligible for matching."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum number of matched points to return."
+              },
+              "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Number of matched points to skip before returning results."
+              },
+              "with_payload": {
+                "type": "boolean",
+                "description": "Whether to include matched points' payloads in the response."
+              },
+              "with_vector": {
+                "type": "boolean",
+                "description": "Whether to include matched points' vectors in the response."
+              },
+              "score_threshold": {
+                "type": "number",
+                "description": "Optional minimum similarity score threshold; results below this score are excluded."
+              },
+              "request_source": {
+                "type": "string",
+                "description": "Optional identifier describing where the request originated (e.g., app name or subsystem)."
+              },
+              "wait": {
+                "type": "boolean",
+                "description": "If true, execute synchronously and return results; if false, enqueue and return a request handle."
+              }
+            },
+            "required": [
+              "collection_name",
+              "query_vector"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def query_collection(collection_name, query_vector, filter=None, limit=None, offset=None, with_payload=None, with_vector=None, score_threshold=None, request_source=None, wait=None, **_extra):\n    import json, os, datetime, math, time, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0415000\" if __import__(\"os\").path.isdir(\"./environment_mix/0415000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: \n                return json.load(f)\n        except Exception: \n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: \n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): \n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start_dt = datetime.datetime.utcnow()\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _gen_id(prefix):\n        # Match store-ish convention: qdrant_qry / qdrant_qres\n        return f\"{prefix}_{uuid.uuid7().hex}\" if hasattr(uuid, \"uuid7\") else f\"{prefix}_{int(time.time()*1000)}_{os.getpid()}_{os.urandom(6).hex()}\"\n\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        return logs if isinstance(logs, list) else []\n\n    def _log_request(status, error_code=None, query_request_id=None, collection_id=None):\n        latency_ms = int((datetime.datetime.utcnow() - start_dt).total_seconds() * 1000)\n        row = {\n            \"id\": _gen_id(\"req\"),\n            \"endpoint\": \"query_collection\",\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now_iso(),\n        }\n        if query_request_id is not None:\n            row[\"query_request_id\"] = query_request_id\n        if collection_id is not None:\n            row[\"collection_id\"] = collection_id\n        logs = _load_logs()\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _finite_num(x):\n        if isinstance(x, bool):\n            return False\n        if not isinstance(x, (int, float)):\n            return False\n        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):\n            return False\n        return True\n\n    def _score(vec, qv, metric):\n        # Higher is better.\n        if metric == \"dot\":\n            return float(sum(a * b for a, b in zip(vec, qv)))\n        if metric == \"cosine\":\n            dot = float(sum(a * b for a, b in zip(vec, qv)))\n            na = math.sqrt(sum(a * a for a in vec))\n            nb = math.sqrt(sum(b * b for b in qv))\n            if na == 0.0 or nb == 0.0:\n                return 0.0\n            return dot / (na * nb)\n        if metric == \"euclid\":\n            # convert distance to similarity\n            dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(vec, qv)))\n            return 1.0 / (1.0 + dist)\n        if metric == \"manhattan\":\n            dist = sum(abs(a - b) for a, b in zip(vec, qv))\n            return 1.0 / (1.0 + float(dist))\n        # fallback\n        return float(sum(a * b for a, b in zip(vec, qv)))\n\n    def _match_filter(payload, flt):\n        # Minimal Qdrant-like filter support.\n        # Accept {}, None => match all.\n        # Support keys: must (list), should (list), must_not (list)\n        # Each condition: {\"key\": \"...\", \"match\": {\"value\": ...}} or {\"key\":\"...\", \"match\":{\"any\":[...]}}\n        if flt is None:\n            return True\n        if not isinstance(flt, dict):\n            return True  # relax: treat bad filter as no-op rather than hard fail (tool schema allows object; callers might pass {})\n        if flt == {}:\n            return True\n        if payload is None or not isinstance(payload, dict):\n            payload = {}\n\n        def eval_cond(cond):\n            if not isinstance(cond, dict):\n                return True\n            key = cond.get(\"key\")\n            m = cond.get(\"match\")\n            if not isinstance(key, str) or not key:\n                return True\n            if not isinstance(m, dict):\n                return True\n            if \"value\" in m:\n                return payload.get(key) == m.get(\"value\")\n            if \"any\" in m and isinstance(m.get(\"any\"), list):\n                return payload.get(key) in m.get(\"any\")\n            return True\n\n        must = flt.get(\"must\")\n        should = flt.get(\"should\")\n        must_not = flt.get(\"must_not\")\n\n        if isinstance(must, list):\n            for c in must:\n                if not eval_cond(c):\n                    return False\n        if isinstance(must_not, list):\n            for c in must_not:\n                if eval_cond(c):\n                    return False\n        if isinstance(should, list) and len(should) > 0:\n            ok = any(eval_cond(c) for c in should)\n            if not ok:\n                return False\n        return True\n\n    # Validate inputs\n    if not isinstance(collection_name, str) or not collection_name.strip():\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"collection_name must be a non-empty string\")\n    if not isinstance(query_vector, list):\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"query_vector must be an array of numbers\")\n    # Relax vector validation: if elements not finite, reject; but don't enforce length (audit requires relaxation).\n    for i, v in enumerate(query_vector):\n        if not _finite_num(v):\n            _log_request(\"failed\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", f\"query_vector[{i}] must be a finite number\", index=i)\n    if limit is None:\n        limit = 10\n    if offset is None:\n        offset = 0\n    if with_payload is None:\n        with_payload = True\n    if with_vector is None:\n        with_vector = False\n    if wait is None:\n        wait = True\n\n    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 1000:\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer within [1, 1000]\", limit=limit)\n    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"offset must be an integer >= 0\", offset=offset)\n    if not isinstance(with_payload, bool):\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"with_payload must be a boolean\")\n    if not isinstance(with_vector, bool):\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"with_vector must be a boolean\")\n    if score_threshold is not None and not _finite_num(score_threshold):\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"score_threshold must be a finite number when provided\")\n    if request_source is not None and (not isinstance(request_source, str) or not request_source.strip()):\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"request_source must be a non-empty string when provided\")\n    if filter is not None and not isinstance(filter, dict):\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"filter must be an object when provided\")\n    if not isinstance(wait, bool):\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"wait must be a boolean\")\n\n    cols = _load(\"collections.json\")\n    if not isinstance(cols, list):\n        cols = []\n    col = next((r for r in cols if isinstance(r, dict) and r.get(\"name\") == collection_name.strip() and r.get(\"status\") != \"deleted\"), None)\n    if not col:\n        _log_request(\"failed\", \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"collection not found\", collection_name=collection_name.strip())\n\n    if col.get(\"status\") in (\"creating\", \"deleting\", \"deleted\"):\n        _log_request(\"failed\", \"CONFLICT\", collection_id=col.get(\"id\"))\n        return _err(\"CONFLICT\", \"collection is not available for querying in its current status\", status=col.get(\"status\"), collection_name=collection_name.strip())\n\n    # Create query_requests row and transition queued->running->...\n    qreqs = _load(\"query_requests.json\")\n    if not isinstance(qreqs, list):\n        qreqs = []\n    qres = _load(\"query_results.json\")\n    if not isinstance(qres, list):\n        qres = []\n\n    qid = _gen_id(\"qdrant_qry\")\n    qrow = {\n        \"id\": qid,\n        \"collection_id\": col.get(\"id\"),\n        \"status\": \"queued\",\n        \"query_vector\": query_vector,\n        \"filter\": filter,\n        \"limit\": int(limit),\n        \"offset\": int(offset),\n        \"with_payload\": bool(with_payload),\n        \"with_vector\": bool(with_vector),\n        \"score_threshold\": score_threshold,\n        \"request_source\": request_source,\n        \"error_message\": None,\n        \"duration_ms\": None,\n        \"created_at\": _now_iso(),\n        \"updated_at\": _now_iso(),\n    }\n    qreqs.append(qrow)\n    _save(\"query_requests.json\", qreqs)\n\n    # If async, leave queued and return handle\n    if wait is False:\n        _log_request(\"succeeded\", None, query_request_id=qid, collection_id=col.get(\"id\"))\n        return {\n            \"result\": {\n                \"request_id\": qid,\n                \"status\": \"queued\",\n                \"collection_name\": col.get(\"name\"),\n            }\n        }\n\n    # running\n    for r in qreqs:\n        if isinstance(r, dict) and r.get(\"id\") == qid:\n            r[\"status\"] = \"running\"\n            r[\"updated_at\"] = _now_iso()\n            break\n    _save(\"query_requests.json\", qreqs)\n\n    t0 = datetime.datetime.utcnow()\n    try:\n        pts = _load(\"points.json\")\n        if not isinstance(pts, list):\n            pts = []\n\n        metric = col.get(\"distance_metric\") or \"cosine\"\n        # Score candidates; relax vector-length mismatch by scoring on overlapping dims.\n        candidates = []\n        for p in pts:\n            if not isinstance(p, dict):\n                continue\n            if p.get(\"collection_id\") != col.get(\"id\"):\n                continue\n            if p.get(\"status\") != \"active\":\n                continue\n            vec = p.get(\"vector\")\n            if not isinstance(vec, list) or len(vec) == 0:\n                continue\n            # ensure numeric finites for stored vectors; skip bad rows\n            ok = True\n            for v in vec:\n                if not _finite_num(v):\n                    ok = False\n                    break\n            if not ok:\n                continue\n\n            if not _match_filter(p.get(\"payload\"), filter):\n                continue\n\n            # Use common length for zip; if no overlap, score 0\n            dim = min(len(vec), len(query_vector))\n            if dim <= 0:\n                sc = 0.0\n            else:\n                sc = _score(vec[:dim], query_vector[:dim], metric)\n            if score_threshold is not None and sc < float(score_threshold):\n                continue\n\n            candidates.append((sc, p))\n\n        # Sort best-first\n        candidates.sort(key=lambda x: x[0], reverse=True)\n\n        # Apply offset/limit\n        sliced = candidates[offset: offset + limit] if offset < len(candidates) else []\n\n        # Remove any previous results for this request (shouldn't exist, but be safe/idempotent)\n        qres = [r for r in qres if not (isinstance(r, dict) and r.get(\"query_request_id\") == qid)]\n        created_at = _now_iso()\n        out_matches = []\n        rank = 1\n        for sc, p in sliced:\n            rr = {\n                \"id\": _gen_id(\"qdrant_qres\"),\n                \"query_request_id\": qid,\n                \"point_id\": p.get(\"id\"),\n                \"rank\": rank,\n                \"score\": float(sc),\n                \"returned_payload\": (p.get(\"payload\") if with_payload else None),\n                \"returned_vector\": (p.get(\"vector\") if with_vector else None),\n                \"created_at\": created_at,\n                \"updated_at\": created_at,\n            }\n            qres.append(rr)\n            out_matches.append({\n                \"id\": p.get(\"external_point_id\"),\n                \"point_id\": p.get(\"id\"),\n                \"score\": float(sc),\n                \"payload\": (p.get(\"payload\") if with_payload else None),\n                \"vector\": (p.get(\"vector\") if with_vector else None),\n            })\n            rank += 1\n\n        _save(\"query_results.json\", qres)\n\n        dur_ms = int((datetime.datetime.utcnow() - t0).total_seconds() * 1000)\n        for r in qreqs:\n            if isinstance(r, dict) and r.get(\"id\") == qid:\n                r[\"status\"] = \"succeeded\"\n                r[\"duration_ms\"] = max(0, dur_ms)\n                r[\"error_message\"] = None\n                r[\"updated_at\"] = _now_iso()\n                break\n        _save(\"query_requests.json\", qreqs)\n\n        _log_request(\"succeeded\", None, query_request_id=qid, collection_id=col.get(\"id\"))\n        return {\n            \"result\": {\n                \"request_id\": qid,\n                \"status\": \"succeeded\",\n                \"collection_name\": col.get(\"name\"),\n                \"matches\": out_matches,\n                \"limit\": limit,\n                \"offset\": offset,\n                \"count\": len(out_matches),\n            }\n        }\n    except Exception as e:\n        dur_ms = int((datetime.datetime.utcnow() - t0).total_seconds() * 1000)\n        # Mark failed\n        for r in qreqs:\n            if isinstance(r, dict) and r.get(\"id\") == qid:\n                r[\"status\"] = \"failed\"\n                r[\"duration_ms\"] = max(0, dur_ms)\n                r[\"error_message\"] = str(e)[:500]\n                r[\"updated_at\"] = _now_iso()\n                break\n        _save(\"query_requests.json\", qreqs)\n        _log_request(\"failed\", \"VALIDATION_ERROR\", query_request_id=qid, collection_id=col.get(\"id\"))\n        return _err(\"VALIDATION_ERROR\", \"query execution failed\", query_request_id=qid, error_message=str(e)[:500])\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_collections",
+          "description": "Lists collections, optionally filtered by status and sorted by sort/order, returning at most limit items; pagination is cursor-based, where the response includes a cursor to pass back to retrieve the next page (omit cursor to start from the beginning). Returns the page of collection summaries and the next cursor if more results are available. Raises VALIDATION_ERROR for invalid limit, cursor, status, sort, or order values; raises AUTHORIZATION_ERROR if the caller cannot list collections; raises RATE_LIMITED or QUOTA_EXCEEDED when request limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum number of collections to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor to continue listing collections from a prior response."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "creating",
+                  "green",
+                  "optimizing",
+                  "degraded",
+                  "deleting",
+                  "deleted"
+                ],
+                "description": "Filter collections by status."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "name"
+                ],
+                "description": "Field to sort collections by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order for the returned collections."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_collections(limit=None, cursor=None, status=None, sort=None, order=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0415000\" if __import__(\"os\").path.isdir(\"./environment_mix/0415000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start_dt = datetime.datetime.utcnow()\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _gen_id(prefix):\n        return f\"{prefix}_{int(time.time()*1000)}_{os.getpid()}_{os.urandom(6).hex()}\"\n\n    def _log_request(status_str, error_code=None):\n        latency_ms = int((datetime.datetime.utcnow() - start_dt).total_seconds() * 1000)\n        row = {\n            \"id\": _gen_id(\"req\"),\n            \"endpoint\": \"list_collections\",\n            \"status\": status_str,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now_iso(),\n        }\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 1000:\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer within [1, 1000]\")\n\n    if cursor is not None and not isinstance(cursor, str):\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string when provided\")\n\n    allowed_status = [\"creating\", \"green\", \"optimizing\", \"degraded\", \"deleting\", \"deleted\"]\n    if status is not None and (not isinstance(status, str) or status not in allowed_status):\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"status must be one of allowed values\", allowed=allowed_status)\n\n    allowed_sort = [\"created_at\", \"updated_at\", \"name\"]\n    if sort is None:\n        sort = \"name\"\n    if not isinstance(sort, str) or sort not in allowed_sort:\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"sort must be one of allowed values\", allowed=allowed_sort)\n\n    allowed_order = [\"asc\", \"desc\"]\n    if order is None:\n        order = \"asc\"\n    if not isinstance(order, str) or order not in allowed_order:\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"order must be one of allowed values\", allowed=allowed_order)\n\n    cols = _load(\"collections.json\")\n    if not isinstance(cols, list):\n        cols = []\n\n    rows = [c for c in cols if isinstance(c, dict) and c.get(\"status\") != \"deleted\"]\n    if status is not None:\n        rows = [c for c in rows if c.get(\"status\") == status]\n\n    # Stable sort\n    reverse = (order == \"desc\")\n    def _key(c):\n        v = c.get(sort)\n        if v is None:\n            return \"\"\n        return v\n    rows.sort(key=_key, reverse=reverse)\n\n    # Cursor is the last seen collection id (not an integer index)\n    start_index = 0\n    if cursor:\n        ids = [r.get(\"id\") for r in rows]\n        if cursor in ids:\n            start_index = ids.index(cursor) + 1\n        else:\n            # Relaxed: do not error; start from beginning (cursor may be from different filter/sort)\n            start_index = 0\n\n    page = rows[start_index:start_index + limit]\n    next_cursor = None\n    has_more = start_index + limit < len(rows)\n    if has_more and page:\n        next_cursor = page[-1].get(\"id\")\n\n    result_rows = []\n    for c in page:\n        result_rows.append(\n            {\n                \"name\": c.get(\"name\"),\n                \"status\": c.get(\"status\"),\n                \"created_at\": c.get(\"created_at\"),\n                \"updated_at\": c.get(\"updated_at\"),\n            }\n        )\n\n    _log_request(\"succeeded\", None)\n    return {\n        \"result\": {\n            \"collections\": result_rows,\n            \"total\": len(rows),\n            \"has_more\": bool(has_more),\n            \"next_cursor\": next_cursor,\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "collection_info",
+          "description": "Retrieves metadata for a single collection identified by collection_name and, when requested, includes configuration fields (include_config) and/or statistics fields (include_stats). Returns the collection description object with the selected sections populated. Raises VALIDATION_ERROR when collection_name is missing/invalid; raises NOT_FOUND when the named collection does not exist; raises AUTHORIZATION_ERROR if the caller is not permitted to view the collection; raises RATE_LIMITED or QUOTA_EXCEEDED when request limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "collection_name": {
+                "type": "string",
+                "description": "Name of the collection to retrieve information for."
+              },
+              "include_config": {
+                "type": "boolean",
+                "description": "Whether to include collection configuration fields (e.g., vector_size, distance_metric, hnsw_config, optimizer_config)."
+              },
+              "include_stats": {
+                "type": "boolean",
+                "description": "Whether to include collection statistics fields (e.g., points_count, vectors_count, segments_count, last_optimized_at)."
+              }
+            },
+            "required": [
+              "collection_name"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def collection_info(collection_name, include_config=None, include_stats=None, **_extra):\n    import json, os, datetime\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0415000\" if __import__(\"os\").path.isdir(\"./environment_mix/0415000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    if not isinstance(collection_name, str) or not collection_name.strip():\n        return _err(\"VALIDATION_ERROR\", \"collection_name must be a non-empty string\")\n\n    if include_config is None:\n        include_config = True\n    if include_stats is None:\n        include_stats = True\n    if not isinstance(include_config, bool):\n        return _err(\"VALIDATION_ERROR\", \"include_config must be a boolean\")\n    if not isinstance(include_stats, bool):\n        return _err(\"VALIDATION_ERROR\", \"include_stats must be a boolean\")\n\n    cols = _load(\"collections.json\")\n    col = None\n    for c in cols:\n        if c.get(\"name\") == collection_name and c.get(\"status\") != \"deleted\":\n            col = c\n            break\n    if not col:\n        return _err(\"NOT_FOUND\", \"collection not found\", collection_name=collection_name)\n\n    info = {\n        \"id\": col.get(\"id\"),\n        \"name\": col.get(\"name\"),\n        \"status\": col.get(\"status\"),\n        \"created_at\": col.get(\"created_at\"),\n        \"updated_at\": col.get(\"updated_at\"),\n    }\n\n    if include_config:\n        info[\"config\"] = {\n            \"vector_size\": col.get(\"vector_size\"),\n            \"distance_metric\": col.get(\"distance_metric\"),\n            \"shard_count\": col.get(\"shard_count\"),\n            \"replication_factor\": col.get(\"replication_factor\"),\n            \"on_disk_payload\": col.get(\"on_disk_payload\"),\n            \"hnsw_config\": col.get(\"hnsw_config\"),\n            \"optimizer_config\": col.get(\"optimizer_config\"),\n        }\n\n    if include_stats:\n        info[\"stats\"] = {\n            \"points_count\": col.get(\"points_count\"),\n            \"vectors_count\": col.get(\"vectors_count\"),\n            \"segments_count\": col.get(\"segments_count\"),\n            \"last_optimized_at\": col.get(\"last_optimized_at\"),\n        }\n\n    return {\"result\": info}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_collection",
+          "description": "Creates a new collection with the provided configuration. Returns the created collection summary (including initial status=creating) when accepted. Refuses with VALIDATION_ERROR for invalid parameters (e.g., unsupported distance_metric, shard_count<1), and CONFLICT if a non-deleted collection with the same name already exists.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "collection_name": {
+                "type": "string",
+                "description": "Name of the collection to create (must be unique among non-deleted collections)."
+              },
+              "vector_size": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Dimensionality of vectors stored in this collection."
+              },
+              "distance_metric": {
+                "type": "string",
+                "enum": [
+                  "cosine",
+                  "dot",
+                  "euclid"
+                ],
+                "description": "Distance/similarity metric used for scoring."
+              },
+              "replication_factor": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Number of replicas to maintain for the collection."
+              },
+              "shard_count": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Number of shards to split the collection into."
+              },
+              "on_disk_payload": {
+                "type": "boolean",
+                "description": "Whether payloads are stored on disk instead of in-memory."
+              },
+              "hnsw_config": {
+                "type": "object",
+                "description": "HNSW index configuration object (engine-specific fields)."
+              },
+              "optimizer_config": {
+                "type": "object",
+                "description": "Optimizer configuration object controlling indexing/segment optimization (engine-specific fields)."
+              }
+            },
+            "required": [
+              "collection_name",
+              "vector_size",
+              "distance_metric"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_collection(collection_name, vector_size, distance_metric, replication_factor=None, shard_count=None, on_disk_payload=None, hnsw_config=None, optimizer_config=None, **_extra):\n    import json, os, datetime, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0415000\" if __import__(\"os\").path.isdir(\"./environment_mix/0415000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start_dt = datetime.datetime.utcnow()\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _gen_id(prefix):\n        # Qdrant-like id convention seen in store examples: qdrant_col_<something>\n        return f\"{prefix}_{uuid.uuid4().hex}\"\n\n    def _log_request(status, error_code=None, collection_id=None):\n        # No declared request-log collection in schema; still keep vendor-like observability if file exists.\n        latency_ms = int((datetime.datetime.utcnow() - start_dt).total_seconds() * 1000)\n        row = {\n            \"id\": _gen_id(\"qdrant_req\"),\n            \"endpoint\": \"create_collection\",\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now_iso(),\n        }\n        if collection_id is not None:\n            row[\"collection_id\"] = collection_id\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    # Validate required\n    if not isinstance(collection_name, str) or not collection_name.strip():\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"collection_name must be a non-empty string\")\n    collection_name = collection_name.strip()\n\n    if not isinstance(vector_size, int) or isinstance(vector_size, bool) or vector_size < 1:\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"vector_size must be an integer >= 1\")\n\n    if not isinstance(distance_metric, str) or distance_metric not in (\"cosine\", \"dot\", \"euclid\"):\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"distance_metric must be one of: cosine, dot, euclid\", allowed=[\"cosine\", \"dot\", \"euclid\"])\n\n    # Validate optionals / defaults\n    if replication_factor is None:\n        replication_factor = 1\n    if shard_count is None:\n        shard_count = 1\n    if on_disk_payload is None:\n        on_disk_payload = False\n    if hnsw_config is None:\n        hnsw_config = {}\n    if optimizer_config is None:\n        optimizer_config = {}\n\n    if not isinstance(replication_factor, int) or isinstance(replication_factor, bool) or replication_factor < 1:\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"replication_factor must be an integer >= 1\")\n    if not isinstance(shard_count, int) or isinstance(shard_count, bool) or shard_count < 1:\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"shard_count must be an integer >= 1\")\n    if not isinstance(on_disk_payload, bool):\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"on_disk_payload must be a boolean\")\n    if not isinstance(hnsw_config, dict):\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"hnsw_config must be an object\")\n    if not isinstance(optimizer_config, dict):\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"optimizer_config must be an object\")\n\n    cols = _load(\"collections.json\")\n    if not isinstance(cols, list):\n        cols = []\n\n    # CONFLICT only if non-deleted collection with same name exists\n    for r in cols:\n        if isinstance(r, dict) and r.get(\"name\") == collection_name and r.get(\"status\") != \"deleted\":\n            _log_request(\"failed\", \"CONFLICT\", collection_id=r.get(\"id\"))\n            return _err(\"CONFLICT\", \"collection with this name already exists\", collection_name=collection_name)\n\n    now = _now_iso()\n    col_id = _gen_id(\"qdrant_col\")\n\n    new_row = {\n        \"id\": col_id,\n        \"name\": collection_name,\n        \"status\": \"creating\",\n        \"vector_size\": vector_size,\n        \"distance_metric\": distance_metric,\n        \"replication_factor\": replication_factor,\n        \"shard_count\": shard_count,\n        \"on_disk_payload\": on_disk_payload,\n        \"hnsw_config\": hnsw_config,\n        \"optimizer_config\": optimizer_config,\n        \"points_count\": 0,\n        \"vectors_count\": 0,\n        \"segments_count\": 0,\n        \"last_optimized_at\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    cols.append(new_row)\n    _save(\"collections.json\", cols)\n\n    _log_request(\"succeeded\", None, collection_id=col_id)\n\n    # Return created collection summary including initial status=creating\n    return {\n        \"result\": {\n            \"id\": new_row[\"id\"],\n            \"name\": new_row[\"name\"],\n            \"status\": new_row[\"status\"],\n            \"vector_size\": new_row[\"vector_size\"],\n            \"distance_metric\": new_row[\"distance_metric\"],\n            \"replication_factor\": new_row[\"replication_factor\"],\n            \"shard_count\": new_row[\"shard_count\"],\n            \"on_disk_payload\": new_row[\"on_disk_payload\"],\n            \"hnsw_config\": new_row[\"hnsw_config\"],\n            \"optimizer_config\": new_row[\"optimizer_config\"],\n            \"points_count\": new_row[\"points_count\"],\n            \"vectors_count\": new_row[\"vectors_count\"],\n            \"segments_count\": new_row[\"segments_count\"],\n            \"last_optimized_at\": new_row[\"last_optimized_at\"],\n            \"created_at\": new_row[\"created_at\"],\n            \"updated_at\": new_row[\"updated_at\"],\n        }\n    }\n"
+        },
+        {
+          "name": "update_collection",
+          "description": "Updates an existing collection's mutable configuration fields. Returns the updated collection metadata. Refuses with NOT_FOUND if the collection does not exist or is deleted; refuses with CONFLICT if the collection is deleting/deleted; refuses with VALIDATION_ERROR for invalid values.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "collection_name": {
+                "type": "string",
+                "description": "Name of the collection to update."
+              },
+              "replication_factor": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "New replication factor for the collection."
+              },
+              "shard_count": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "New shard count for the collection (if supported by the backend)."
+              },
+              "on_disk_payload": {
+                "type": "boolean",
+                "description": "Enable/disable on-disk payload storage."
+              },
+              "hnsw_config": {
+                "type": "object",
+                "description": "Partial HNSW configuration update; omitted fields are unchanged."
+              },
+              "optimizer_config": {
+                "type": "object",
+                "description": "Partial optimizer configuration update; omitted fields are unchanged."
+              }
+            },
+            "required": [
+              "collection_name"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_collection(collection_name, replication_factor=None, shard_count=None, on_disk_payload=None, hnsw_config=None, optimizer_config=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0415000\" if __import__(\"os\").path.isdir(\"./environment_mix/0415000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = datetime.datetime.utcnow()\n    endpoint = \"update_collection\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status, error_code=None):\n        latency_ms = int((datetime.datetime.utcnow() - start).total_seconds() * 1000)\n        row = {\n            \"id\": f\"req_{int(datetime.datetime.utcnow().timestamp()*1000)}_{os.getpid()}\",\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now()\n        }\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    # Validate inputs\n    if not isinstance(collection_name, str) or not collection_name.strip():\n        _log(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"collection_name must be a non-empty string\")\n\n    if replication_factor is not None and (not isinstance(replication_factor, int) or replication_factor < 1):\n        _log(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"replication_factor must be an integer >= 1\")\n    if shard_count is not None and (not isinstance(shard_count, int) or shard_count < 1):\n        _log(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"shard_count must be an integer >= 1\")\n    if on_disk_payload is not None and not isinstance(on_disk_payload, bool):\n        _log(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"on_disk_payload must be a boolean\")\n    if hnsw_config is not None and not isinstance(hnsw_config, dict):\n        _log(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"hnsw_config must be an object\")\n    if optimizer_config is not None and not isinstance(optimizer_config, dict):\n        _log(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"optimizer_config must be an object\")\n\n    cols = _load(\"collections.json\")\n    if not isinstance(cols, list):\n        cols = []\n\n    col = None\n    for r in cols:\n        if isinstance(r, dict) and r.get(\"name\") == collection_name:\n            col = r\n            break\n\n    if not col or col.get(\"status\") == \"deleted\":\n        _log(\"failed\", \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Collection not found\")\n\n    if col.get(\"status\") in (\"deleting\", \"deleted\"):\n        _log(\"failed\", \"CONFLICT\")\n        return _err(\"CONFLICT\", \"Collection is deleting or deleted\")\n\n    # Apply updates (mutable config)\n    changed = False\n    if replication_factor is not None and col.get(\"replication_factor\") != replication_factor:\n        col[\"replication_factor\"] = replication_factor\n        changed = True\n    if shard_count is not None and col.get(\"shard_count\") != shard_count:\n        col[\"shard_count\"] = shard_count\n        changed = True\n    if on_disk_payload is not None and col.get(\"on_disk_payload\") != on_disk_payload:\n        col[\"on_disk_payload\"] = on_disk_payload\n        changed = True\n\n    if hnsw_config is not None:\n        cur = col.get(\"hnsw_config\")\n        if not isinstance(cur, dict):\n            cur = {}\n        merged = dict(cur)\n        merged.update(hnsw_config)\n        if merged != cur:\n            col[\"hnsw_config\"] = merged\n            changed = True\n\n    if optimizer_config is not None:\n        cur = col.get(\"optimizer_config\")\n        if not isinstance(cur, dict):\n            cur = {}\n        merged = dict(cur)\n        merged.update(optimizer_config)\n        if merged != cur:\n            col[\"optimizer_config\"] = merged\n            changed = True\n\n    if not changed:\n        # Still return updated metadata (idempotent)\n        _log(\"succeeded\")\n        return {\n            \"result\": {\n                \"name\": col.get(\"name\"),\n                \"status\": col.get(\"status\"),\n                \"config\": {\n                    \"vector_size\": col.get(\"vector_size\"),\n                    \"distance_metric\": col.get(\"distance_metric\"),\n                    \"shard_count\": col.get(\"shard_count\"),\n                    \"replication_factor\": col.get(\"replication_factor\"),\n                    \"on_disk_payload\": col.get(\"on_disk_payload\"),\n                    \"hnsw_config\": col.get(\"hnsw_config\"),\n                    \"optimizer_config\": col.get(\"optimizer_config\"),\n                },\n                \"stats\": {\n                    \"points_count\": col.get(\"points_count\"),\n                    \"vectors_count\": col.get(\"vectors_count\"),\n                    \"segments_count\": col.get(\"segments_count\"),\n                    \"last_optimized_at\": col.get(\"last_optimized_at\"),\n                },\n                \"updated_at\": col.get(\"updated_at\"),\n            }\n        }\n\n    col[\"updated_at\"] = _now()\n    _save(\"collections.json\", cols)\n\n    _log(\"succeeded\")\n    return {\n        \"result\": {\n            \"name\": col.get(\"name\"),\n            \"status\": col.get(\"status\"),\n            \"config\": {\n                \"vector_size\": col.get(\"vector_size\"),\n                \"distance_metric\": col.get(\"distance_metric\"),\n                \"shard_count\": col.get(\"shard_count\"),\n                \"replication_factor\": col.get(\"replication_factor\"),\n                \"on_disk_payload\": col.get(\"on_disk_payload\"),\n                \"hnsw_config\": col.get(\"hnsw_config\"),\n                \"optimizer_config\": col.get(\"optimizer_config\"),\n            },\n            \"stats\": {\n                \"points_count\": col.get(\"points_count\"),\n                \"vectors_count\": col.get(\"vectors_count\"),\n                \"segments_count\": col.get(\"segments_count\"),\n                \"last_optimized_at\": col.get(\"last_optimized_at\"),\n            },\n            \"updated_at\": col.get(\"updated_at\"),\n        }\n    }\n"
+        },
+        {
+          "name": "delete_collection",
+          "description": "Deletes a collection by name. The service transitions the collection status to deleting and eventually to deleted. Returns a deletion acknowledgement. Refuses with NOT_FOUND if the collection does not exist or is already deleted.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "collection_name": {
+                "type": "string",
+                "description": "Name of the collection to delete."
+              },
+              "wait": {
+                "type": "boolean",
+                "description": "If true, wait for deletion to reach status=deleted before returning; if false, return after status=deleting is set."
+              }
+            },
+            "required": [
+              "collection_name"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def delete_collection(collection_name, wait=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0415000\" if __import__(\"os\").path.isdir(\"./environment_mix/0415000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = datetime.datetime.utcnow()\n    endpoint = \"delete_collection\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status, error_code=None):\n        latency_ms = int((datetime.datetime.utcnow() - start).total_seconds() * 1000)\n        row = {\n            \"id\": f\"req_{int(datetime.datetime.utcnow().timestamp()*1000)}_{os.getpid()}\",\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now()\n        }\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(collection_name, str) or not collection_name.strip():\n        _log(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"collection_name must be a non-empty string\")\n    if wait is not None and not isinstance(wait, bool):\n        _log(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"wait must be a boolean\")\n\n    cols = _load(\"collections.json\")\n    if not isinstance(cols, list):\n        cols = []\n\n    col = None\n    for r in cols:\n        if isinstance(r, dict) and r.get(\"name\") == collection_name:\n            col = r\n            break\n\n    if not col or col.get(\"status\") == \"deleted\":\n        _log(\"failed\", \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Collection not found or already deleted\")\n\n    # Lifecycle transitions\n    transitions = {\n        \"creating\": [\"green\", \"degraded\", \"deleting\"],\n        \"green\": [\"optimizing\", \"degraded\", \"deleting\"],\n        \"optimizing\": [\"green\", \"degraded\", \"deleting\"],\n        \"degraded\": [\"green\", \"deleting\"],\n        \"deleting\": [\"deleted\"],\n        \"deleted\": []\n    }\n\n    cur = col.get(\"status\")\n    if cur != \"deleting\":\n        if cur not in transitions or \"deleting\" not in transitions.get(cur, []):\n            _log(\"failed\", \"INVALID_TRANSITION\")\n            return _err(\"INVALID_TRANSITION\", f\"Cannot transition collection from {cur} to deleting\")\n        col[\"status\"] = \"deleting\"\n        col[\"updated_at\"] = _now()\n        _save(\"collections.json\", cols)\n\n    if wait:\n        # Simulate eventual deletion by completing transition and marking deleted.\n        # Also mark all points in that collection as deleted (as a consequence).\n        # (Real Qdrant would drop the storage; here we retain rows but status changes for observability.)\n        deadline = time.time() + 5.0  # bounded wait to avoid hanging\n        while time.time() < deadline:\n            # complete transition\n            cols = _load(\"collections.json\")\n            if not isinstance(cols, list):\n                cols = []\n            col2 = None\n            for r in cols:\n                if isinstance(r, dict) and r.get(\"name\") == collection_name:\n                    col2 = r\n                    break\n            if not col2:\n                break\n            if col2.get(\"status\") == \"deleted\":\n                col = col2\n                break\n            if col2.get(\"status\") == \"deleting\":\n                col2[\"status\"] = \"deleted\"\n                col2[\"updated_at\"] = _now()\n                _save(\"collections.json\", cols)\n\n                # cascade point status to deleted and refresh cached counts\n                pts = _load(\"points.json\")\n                if not isinstance(pts, list):\n                    pts = []\n                changed = False\n                for p in pts:\n                    if isinstance(p, dict) and p.get(\"collection_id\") == col2.get(\"id\") and p.get(\"status\") == \"active\":\n                        p[\"status\"] = \"deleted\"\n                        p[\"updated_at\"] = _now()\n                        p[\"version\"] = int(p.get(\"version\") or 0) + 1\n                        changed = True\n                if changed:\n                    _save(\"points.json\", pts)\n                # cached stats\n                active_count = 0\n                for p in pts:\n                    if isinstance(p, dict) and p.get(\"collection_id\") == col2.get(\"id\") and p.get(\"status\") == \"active\":\n                        active_count += 1\n                col2[\"points_count\"] = active_count\n                col2[\"vectors_count\"] = active_count\n                col2[\"updated_at\"] = _now()\n                _save(\"collections.json\", cols)\n\n                col = col2\n                break\n            time.sleep(0.05)\n\n    _log(\"succeeded\")\n    return {\n        \"result\": {\n            \"name\": col.get(\"name\"),\n            \"status\": col.get(\"status\"),\n            \"waited\": bool(wait),\n            \"deleted\": col.get(\"status\") == \"deleted\",\n            \"updated_at\": col.get(\"updated_at\"),\n        }\n    }\n"
+        },
+        {
+          "name": "upsert_points",
+          "description": "Creates or updates points in a collection. Points are stored with status=active and replace any existing vector/payload for the same external_point_id (or point id if provided). Returns an acknowledgement including how many points were upserted. Refuses with NOT_FOUND if the collection does not exist or is deleted; refuses with CONFLICT if the collection status is creating/deleting; refuses with VALIDATION_ERROR when any vector length does not match the collection's vector_size.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "collection_name": {
+                "type": "string",
+                "description": "Name of the target collection."
+              },
+              "points": {
+                "type": "array",
+                "minItems": 1,
+                "description": "Points to insert or update.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "Optional internal point id (if omitted, the service will assign one)."
+                    },
+                    "external_point_id": {
+                      "type": "string",
+                      "description": "Client-supplied id used for idempotent upserts within a collection."
+                    },
+                    "vector": {
+                      "type": "array",
+                      "items": {
+                        "type": "number"
+                      },
+                      "description": "Vector to store for this point; length must equal the collection's vector_size."
+                    },
+                    "payload": {
+                      "type": "object",
+                      "description": "Optional payload metadata to attach to the point."
+                    }
+                  },
+                  "required": [
+                    "vector"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "wait": {
+                "type": "boolean",
+                "description": "If true, wait for the write to be durably applied before returning; if false, return after the write is accepted."
+              }
+            },
+            "required": [
+              "collection_name",
+              "points"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def upsert_points(collection_name, points, wait=None, **_extra):\n    import json, os, datetime, uuid, hashlib, math\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0415000\" if __import__(\"os\").path.isdir(\"./environment_mix/0415000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start_dt = datetime.datetime.utcnow()\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _gen_id(prefix):\n        return f\"{prefix}_{uuid.uuid4().hex}\"\n\n    def _log_request(status, error_code=None, collection_id=None):\n        latency_ms = int((datetime.datetime.utcnow() - start_dt).total_seconds() * 1000)\n        row = {\n            \"id\": _gen_id(\"qdrant_req\"),\n            \"endpoint\": \"upsert_points\",\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now_iso(),\n        }\n        if collection_id is not None:\n            row[\"collection_id\"] = collection_id\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _finite_num(x):\n        if isinstance(x, bool):\n            return False\n        if not isinstance(x, (int, float)):\n            return False\n        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):\n            return False\n        return True\n\n    # Validate inputs\n    if not isinstance(collection_name, str) or not collection_name.strip():\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"collection_name must be a non-empty string\")\n    collection_name = collection_name.strip()\n\n    if wait is None:\n        wait = True\n    if not isinstance(wait, bool):\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"wait must be a boolean\")\n\n    if not isinstance(points, list) or len(points) < 1:\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"points must be a non-empty array\")\n\n    cols = _load(\"collections.json\")\n    if not isinstance(cols, list):\n        cols = []\n    col = next((r for r in cols if isinstance(r, dict) and r.get(\"name\") == collection_name), None)\n    if not col or col.get(\"status\") == \"deleted\":\n        _log_request(\"failed\", \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"collection not found\", collection_name=collection_name)\n\n    if col.get(\"status\") in (\"creating\", \"deleting\"):\n        _log_request(\"failed\", \"CONFLICT\", collection_id=col.get(\"id\"))\n        return _err(\"CONFLICT\", \"collection is not ready for writes\", status=col.get(\"status\"), collection_name=collection_name)\n\n    vector_size = col.get(\"vector_size\")\n    if not isinstance(vector_size, int) or vector_size < 1:\n        _log_request(\"failed\", \"CONFLICT\", collection_id=col.get(\"id\"))\n        return _err(\"CONFLICT\", \"collection has invalid vector_size\", collection_id=col.get(\"id\"))\n\n    # Load points table\n    pts = _load(\"points.json\")\n    if not isinstance(pts, list):\n        pts = []\n\n    # Index existing points for fast lookup (within the collection)\n    by_internal = {}\n    by_external = {}\n    for p in pts:\n        if not isinstance(p, dict):\n            continue\n        if p.get(\"collection_id\") != col.get(\"id\"):\n            continue\n        pid = p.get(\"id\")\n        if isinstance(pid, str):\n            by_internal[pid] = p\n        ext = p.get(\"external_point_id\")\n        if isinstance(ext, str):\n            by_external[ext] = p\n\n    # Validate all points first (no partial writes on validation failure)\n    normalized = []\n    for i, p in enumerate(points):\n        if not isinstance(p, dict):\n            _log_request(\"failed\", \"VALIDATION_ERROR\", collection_id=col.get(\"id\"))\n            return _err(\"VALIDATION_ERROR\", f\"points[{i}] must be an object\")\n\n        allowed_keys = {\"id\", \"external_point_id\", \"vector\", \"payload\"}\n        for k in p.keys():\n            if k not in allowed_keys:\n                _log_request(\"failed\", \"VALIDATION_ERROR\", collection_id=col.get(\"id\"))\n                return _err(\"VALIDATION_ERROR\", f\"points[{i}] has unknown field '{k}'\")\n\n        if \"vector\" not in p:\n            _log_request(\"failed\", \"VALIDATION_ERROR\", collection_id=col.get(\"id\"))\n            return _err(\"VALIDATION_ERROR\", f\"points[{i}].vector is required\")\n\n        vec = p.get(\"vector\")\n        if not isinstance(vec, list):\n            _log_request(\"failed\", \"VALIDATION_ERROR\", collection_id=col.get(\"id\"))\n            return _err(\"VALIDATION_ERROR\", f\"points[{i}].vector must be an array of numbers\")\n        if len(vec) != vector_size:\n            _log_request(\"failed\", \"VALIDATION_ERROR\", collection_id=col.get(\"id\"))\n            return _err(\"VALIDATION_ERROR\", f\"points[{i}].vector length must equal collection vector_size ({vector_size})\", expected=vector_size, got=len(vec))\n        for j, x in enumerate(vec):\n            if not _finite_num(x):\n                _log_request(\"failed\", \"VALIDATION_ERROR\", collection_id=col.get(\"id\"))\n                return _err(\"VALIDATION_ERROR\", f\"points[{i}].vector[{j}] must be a finite number\")\n\n        pid = p.get(\"id\")\n        if pid is not None and (not isinstance(pid, str) or not pid.strip()):\n            _log_request(\"failed\", \"VALIDATION_ERROR\", collection_id=col.get(\"id\"))\n            return _err(\"VALIDATION_ERROR\", f\"points[{i}].id must be a non-empty string when provided\")\n        pid = pid.strip() if isinstance(pid, str) else None\n\n        ext = p.get(\"external_point_id\")\n        if ext is not None and (not isinstance(ext, str) or not ext.strip()):\n            _log_request(\"failed\", \"VALIDATION_ERROR\", collection_id=col.get(\"id\"))\n            return _err(\"VALIDATION_ERROR\", f\"points[{i}].external_point_id must be a non-empty string when provided\")\n        ext = ext.strip() if isinstance(ext, str) else None\n\n        payload = p.get(\"payload\") if \"payload\" in p else None\n        if payload is not None and not isinstance(payload, dict):\n            _log_request(\"failed\", \"VALIDATION_ERROR\", collection_id=col.get(\"id\"))\n            return _err(\"VALIDATION_ERROR\", f\"points[{i}].payload must be an object when provided\")\n\n        normalized.append({\"id\": pid, \"external_point_id\": ext, \"vector\": vec, \"payload\": payload})\n\n    # Apply upserts\n    now = _now_iso()\n    upserted = 0\n\n    def _hash_payload(pl):\n        if pl is None:\n            return None\n        try:\n            b = json.dumps(pl, ensure_ascii=False, sort_keys=True, separators=(\",\", \":\")).encode(\"utf-8\")\n        except Exception:\n            return None\n        return hashlib.sha256(b).hexdigest()\n\n    touched_active_delta = 0  # for cached stats updates (active points only)\n\n    for p in normalized:\n        target = None\n        # Prefer internal id if provided\n        if p[\"id\"] is not None and p[\"id\"] in by_internal:\n            target = by_internal[p[\"id\"]]\n        # Else external id if provided\n        elif p[\"external_point_id\"] is not None and p[\"external_point_id\"] in by_external:\n            target = by_external[p[\"external_point_id\"]]\n\n        if target is None:\n            # Insert new\n            new_id = p[\"id\"] if p[\"id\"] is not None else _gen_id(\"qdrant_pt\")\n            # Enforce unique(collection_id, external_point_id) if provided\n            ext_id = p[\"external_point_id\"] if p[\"external_point_id\"] is not None else new_id\n            if ext_id in by_external:\n                # Would conflict with existing different point (shouldn't happen due to lookup above unless id provided mismatches)\n                _log_request(\"failed\", \"CONFLICT\", collection_id=col.get(\"id\"))\n                return _err(\"CONFLICT\", \"external_point_id already exists in collection\", external_point_id=ext_id, collection_name=collection_name)\n\n            row = {\n                \"id\": new_id,\n                \"collection_id\": col.get(\"id\"),\n                \"external_point_id\": ext_id,\n                \"status\": \"active\",\n                \"vector\": p[\"vector\"],\n                \"payload\": p[\"payload\"],\n                \"payload_hash\": _hash_payload(p[\"payload\"]),\n                \"version\": 1,\n                \"created_at\": now,\n                \"updated_at\": now,\n            }\n            pts.append(row)\n            by_internal[new_id] = row\n            by_external[ext_id] = row\n            upserted += 1\n            touched_active_delta += 1\n        else:\n            # Update existing (idempotent upsert)\n            prior_status = target.get(\"status\")\n            if prior_status == \"deleted\":\n                # Upsert restores point to active (realistic Qdrant behavior)\n                target[\"status\"] = \"active\"\n                touched_active_delta += 1\n            target[\"vector\"] = p[\"vector\"]\n            if \"payload\" in p:\n                target[\"payload\"] = p[\"payload\"]\n                target[\"payload_hash\"] = _hash_payload(p[\"payload\"])\n            # External point id can be set only if missing; do not allow changing to another value that violates uniqueness\n            if p[\"external_point_id\"] is not None and target.get(\"external_point_id\") != p[\"external_point_id\"]:\n                if p[\"external_point_id\"] in by_external and by_external[p[\"external_point_id\"]].get(\"id\") != target.get(\"id\"):\n                    _log_request(\"failed\", \"CONFLICT\", collection_id=col.get(\"id\"))\n                    return _err(\"CONFLICT\", \"external_point_id already exists in collection\", external_point_id=p[\"external_point_id\"], collection_name=collection_name)\n                # Update index mapping\n                old_ext = target.get(\"external_point_id\")\n                if isinstance(old_ext, str) and old_ext in by_external:\n                    del by_external[old_ext]\n                target[\"external_point_id\"] = p[\"external_point_id\"]\n                by_external[p[\"external_point_id\"]] = target\n\n            v = target.get(\"version\")\n            target[\"version\"] = (v + 1) if isinstance(v, int) and v >= 1 else 1\n            target[\"updated_at\"] = now\n            upserted += 1\n\n    # Persist points\n    _save(\"points.json\", pts)\n\n    # Update cached stats (eventually consistent acceptable, but we do it now)\n    # Recompute for this collection to be safe.\n    active_count = 0\n    for p in pts:\n        if isinstance(p, dict) and p.get(\"collection_id\") == col.get(\"id\") and p.get(\"status\") == \"active\":\n            active_count += 1\n    col[\"points_count\"] = active_count\n    col[\"vectors_count\"] = active_count\n    col[\"updated_at\"] = now\n    _save(\"collections.json\", cols)\n\n    _log_request(\"succeeded\", None, collection_id=col.get(\"id\"))\n\n    return {\n        \"result\": {\n            \"collection_name\": collection_name,\n            \"collection_id\": col.get(\"id\"),\n            \"upserted\": upserted,\n            \"wait\": wait,\n        }\n    }\n"
+        },
+        {
+          "name": "delete_points",
+          "description": "Marks points as deleted within a collection (status transitions active -> deleted). Returns an acknowledgement including how many points were marked deleted. Refuses with NOT_FOUND if the collection does not exist or is deleted; refuses with VALIDATION_ERROR if neither ids nor external_point_ids are provided.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "collection_name": {
+                "type": "string",
+                "description": "Name of the target collection."
+              },
+              "ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Internal point ids to delete."
+              },
+              "external_point_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "External point ids to delete."
+              },
+              "wait": {
+                "type": "boolean",
+                "description": "If true, wait for the delete to be applied before returning; if false, return after the delete is accepted."
+              }
+            },
+            "required": [
+              "collection_name"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def delete_points(collection_name, ids=None, external_point_ids=None, wait=None, **_extra):\n    import json, os, datetime, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0415000\" if __import__(\"os\").path.isdir(\"./environment_mix/0415000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start_dt = datetime.datetime.utcnow()\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _gen_id(prefix):\n        return f\"{prefix}_{uuid.uuid4().hex}\"\n\n    def _log_request(status, error_code=None, collection_id=None):\n        latency_ms = int((datetime.datetime.utcnow() - start_dt).total_seconds() * 1000)\n        row = {\n            \"id\": _gen_id(\"qdrant_req\"),\n            \"endpoint\": \"delete_points\",\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now_iso(),\n        }\n        if collection_id is not None:\n            row[\"collection_id\"] = collection_id\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(collection_name, str) or not collection_name.strip():\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"collection_name must be a non-empty string\")\n    collection_name = collection_name.strip()\n\n    if wait is None:\n        wait = True\n    if not isinstance(wait, bool):\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"wait must be a boolean\")\n\n    if (ids is None or ids == []) and (external_point_ids is None or external_point_ids == []):\n        _log_request(\"failed\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"neither ids nor external_point_ids were provided\")\n\n    if ids is not None:\n        if not isinstance(ids, list) or any((not isinstance(x, str) or not x.strip()) for x in ids):\n            _log_request(\"failed\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"ids must be an array of non-empty strings\")\n        ids = [x.strip() for x in ids]\n\n    if external_point_ids is not None:\n        if not isinstance(external_point_ids, list) or any((not isinstance(x, str) or not x.strip()) for x in external_point_ids):\n            _log_request(\"failed\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"external_point_ids must be an array of non-empty strings\")\n        external_point_ids = [x.strip() for x in external_point_ids]\n\n    cols = _load(\"collections.json\")\n    if not isinstance(cols, list):\n        cols = []\n    col = next((r for r in cols if isinstance(r, dict) and r.get(\"name\") == collection_name), None)\n    if not col or col.get(\"status\") == \"deleted\":\n        _log_request(\"failed\", \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"collection not found\", collection_name=collection_name)\n\n    pts = _load(\"points.json\")\n    if not isinstance(pts, list):\n        pts = []\n\n    now = _now_iso()\n    deleted = 0\n\n    ids_set = set(ids or [])\n    ext_set = set(external_point_ids or [])\n\n    # Mutate: active -> deleted only\n    for p in pts:\n        if not isinstance(p, dict):\n            continue\n        if p.get(\"collection_id\") != col.get(\"id\"):\n            continue\n        match = False\n        if ids_set and p.get(\"id\") in ids_set:\n            match = True\n        if ext_set and p.get(\"external_point_id\") in ext_set:\n            match = True\n        if not match:\n            continue\n\n        if p.get(\"status\") == \"active\":\n            p[\"status\"] = \"deleted\"\n            p[\"updated_at\"] = now\n            v = p.get(\"version\")\n            p[\"version\"] = (v + 1) if isinstance(v, int) and v >= 1 else 1\n            deleted += 1\n        # If already deleted, idempotent: no-op\n\n    if deleted == 0:\n        _log_request(\"failed\", \"NOT_FOUND\", collection_id=col.get(\"id\"))\n        return _err(\"NOT_FOUND\", \"no matching active points found to delete\", collection_name=collection_name)\n\n    _save(\"points.json\", pts)\n\n    # Update cached stats\n    active_count = 0\n    for p in pts:\n        if isinstance(p, dict) and p.get(\"collection_id\") == col.get(\"id\") and p.get(\"status\") == \"active\":\n            active_count += 1\n    col[\"points_count\"] = active_count\n    col[\"vectors_count\"] = active_count\n    col[\"updated_at\"] = now\n    _save(\"collections.json\", cols)\n\n    _log_request(\"succeeded\", None, collection_id=col.get(\"id\"))\n\n    return {\n        \"result\": {\n            \"collection_name\": collection_name,\n            \"collection_id\": col.get(\"id\"),\n            \"deleted\": deleted,\n            \"wait\": wait,\n        }\n    }\n"
+        },
+        {
+          "name": "whoami",
+          "description": "Returns the calling identity as derived from the presented credentials, including current scopes and quota/rate-limit consumption. Refuses with AUTHORIZATION_ERROR when the credentials are missing or invalid.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "API key used to authenticate the caller."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def whoami(api_key, **_extra):\n    import json, os, datetime, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0415000\" if __import__(\"os\").path.isdir(\"./environment_mix/0415000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start_dt = datetime.datetime.utcnow()\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _gen_id(prefix):\n        return f\"{prefix}_{uuid.uuid4().hex}\"\n\n    def _log_request(status, error_code=None, credential_id=None):\n        latency_ms = int((datetime.datetime.utcnow() - start_dt).total_seconds() * 1000)\n        row = {\n            \"id\": _gen_id(\"qdrant_req\"),\n            \"endpoint\": \"whoami\",\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now_iso(),\n        }\n        if credential_id is not None:\n            row[\"credential_id\"] = credential_id\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(api_key, str) or not api_key.strip():\n        _log_request(\"failed\", \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Missing or invalid credentials (api_key)\")\n    api_key = api_key.strip()\n\n    # Authenticate against stored client-visible value OR id (never hashes/ciphertexts).\n    candidate_files = []\n    try:\n        candidate_files = [fn for fn in os.listdir(_DB) if fn.endswith(\".json\")]\n    except Exception:\n        candidate_files = []\n\n    def _match_credential_row(r):\n        if not isinstance(r, dict):\n            return False\n        if r.get(\"id\") == api_key:\n            return True\n        for k in (\"api_key\", \"key\", \"value\", \"token\", \"secret\"):\n            v = r.get(k)\n            if isinstance(v, str) and v == api_key:\n                return True\n        # Some stores may keep the client-visible token nested\n        auth = r.get(\"auth\")\n        if isinstance(auth, dict):\n            for k in (\"api_key\", \"key\", \"value\", \"token\", \"secret\"):\n                v = auth.get(k)\n                if isinstance(v, str) and v == api_key:\n                    return True\n        return False\n\n    cred_row = None\n    cred_file = None\n\n    # Prefer likely filenames first, then scan all json as fallback.\n    preferred = [\"credentials.json\", \"api_keys.json\", \"keys.json\", \"auth_keys.json\", \"access_tokens.json\", \"tokens.json\"]\n    for fn in preferred + [f for f in candidate_files if f not in preferred]:\n        path = os.path.join(_DB, fn)\n        if not os.path.exists(path):\n            continue\n        rows = _load(fn)\n        if not isinstance(rows, list):\n            continue\n        for r in rows:\n            if _match_credential_row(r):\n                cred_row = r\n                cred_file = fn\n                break\n        if cred_row is not None:\n            break\n\n    if cred_row is None:\n        _log_request(\"failed\", \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Missing or invalid credentials (api_key)\")\n\n    cred_id = cred_row.get(\"id\") if isinstance(cred_row.get(\"id\"), str) else None\n    _log_request(\"succeeded\", None, credential_id=cred_id)\n\n    # Return whatever identity info exists; do not fabricate fields.\n    result = {\n        \"credential\": {\"source\": cred_file, \"id\": cred_id},\n    }\n    for k in (\"account_id\", \"workspace_id\", \"user_id\", \"name\", \"scopes\", \"status\", \"created_at\", \"updated_at\"):\n        if k in cred_row:\n            result[\"credential\"][k] = cred_row.get(k)\n\n    # Basic request log stats if present\n    logs = _load(\"request_logs.json\")\n    if isinstance(logs, list):\n        used = 0\n        recent_60s = 0\n        now = datetime.datetime.utcnow()\n        for r in logs:\n            if not isinstance(r, dict):\n                continue\n            if cred_id is not None and r.get(\"credential_id\") != cred_id:\n                continue\n            used += 1\n            ts = r.get(\"created_at\")\n            if isinstance(ts, str) and ts.endswith(\"Z\"):\n                try:\n                    dt = datetime.datetime.fromisoformat(ts[:-1])\n                    if (now - dt).total_seconds() <= 60:\n                        recent_60s += 1\n                except Exception:\n                    pass\n        result[\"usage\"] = {\"total_requests_logged\": used, \"requests_last_60s\": recent_60s}\n\n    return {\"result\": result}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0415000",
+    "index": 415,
+    "name": "Qdrant Vector Search Server",
+    "description": "This backend models a Qdrant-like vector search service with named collections that contain vector points and optional payload metadata. The main workflows are: enumerate collections, fetch a collection's configuration/statistics, and execute a vector similarity query against a collection to return ",
+    "taxonomy": {
+      "L1_id": "L1-10",
+      "L1_name": "Data Storage & Databases",
+      "L1_name_zh": "数据存储与数据库",
+      "L2_id": "L2-26",
+      "L2_name": "NoSQL & Document Stores",
+      "L2_name_zh": "NoSQL 与文档存储",
+      "L3_name": "Vector Search Datastores",
+      "L3_name_zh": "向量检索数据存储"
+    },
+    "database_dir": "./environment_mix/0415000",
+    "mount_path": "/app/database",
+    "n_tools": 9,
+    "n_collections": 4,
+    "n_records": 112,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 9,
+      "loaded": 9,
+      "reads_returning_data": 3,
+      "read_operations": 3,
+      "mutations_persisted": 2,
+      "mutations_attempted": 6
+    },
+    "tools_loadable_from_database_dir": 9,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "query_collection",
+      "returned_chars": 113
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

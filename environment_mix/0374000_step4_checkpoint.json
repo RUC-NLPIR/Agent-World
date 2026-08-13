@@ -1,0 +1,636 @@
+{
+  "index": 374,
+  "local_files_dir": "./environment_mix/0374000",
+  "file_list": [
+    "./environment_mix/0374000/README.md",
+    "./environment_mix/0374000/branches.json",
+    "./environment_mix/0374000/commits.json",
+    "./environment_mix/0374000/issues.json",
+    "./environment_mix/0374000/merge_requests.json",
+    "./environment_mix/0374000/projects.json",
+    "./environment_mix/0374000/request_logs.json",
+    "./environment_mix/0374000/users.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "users.json": "18 rows",
+        "projects.json": "18 rows",
+        "branches.json": "19 rows",
+        "commits.json": "17 rows",
+        "issues.json": "17 rows",
+        "merge_requests.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "create_or_update_file",
+          "description": "Creates or updates a single file at `file_path` on `branch` in the specified project and returns the newly created commit snapshot for that change. If `last_commit_id` is provided, the branch head must match it or the request is rejected with CONFLICT to prevent overwriting concurrent updates. Raises VALIDATION_ERROR for invalid IDs/branch/path or missing required fields, NOT_FOUND if the project, author user, or branch does not exist, and FORBIDDEN if the author is not permitted to commit to the project/branch.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "project_id": {
+                "type": "string",
+                "pattern": "^gl_prj_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "ULID of the project to modify (projects.id)."
+              },
+              "branch": {
+                "type": "string",
+                "description": "Branch name to commit to (e.g., \"main\")."
+              },
+              "file_path": {
+                "type": "string",
+                "description": "Repository-relative file path to create or update."
+              },
+              "content": {
+                "type": "string",
+                "description": "New file contents as a UTF-8 string."
+              },
+              "commit_message": {
+                "type": "string",
+                "description": "Commit message for the change."
+              },
+              "author_user_id": {
+                "type": "string",
+                "pattern": "^gl_user_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "ULID of the commit author (users.id)."
+              },
+              "last_commit_id": {
+                "type": "string",
+                "pattern": "^gl_cmt_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Optional expected current head commit id for the branch to prevent overwriting concurrent changes (commits.id)."
+              }
+            },
+            "required": [
+              "project_id",
+              "branch",
+              "file_path",
+              "content",
+              "commit_message",
+              "author_user_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_or_update_file(project_id, branch, file_path, content, commit_message, author_user_id, last_commit_id=None, **_extra):\n    import json, os, datetime, re, time, random, base64, copy\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0374000\" if __import__(\"os\").path.isdir(\"./environment_mix/0374000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now = now_dt.isoformat() + \"Z\"\n\n    _ULID32 = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _new_id(prefix):\n        ms = int(time.time() * 1000)\n        t = ms\n        chars = []\n        for _ in range(10):\n            chars.append(_ULID32[t % 32])\n            t //= 32\n        chars = chars[::-1]\n        rand = [_ULID32[random.randrange(32)] for _ in range(16)]\n        return f\"{prefix}_\" + \"\".join(chars + rand)\n\n    def _log(status, error_code=None, message=None):\n        # best-effort request log; must not block core behavior\n        try:\n            logs = _load(\"request_logs.json\")\n            logs.append({\n                \"id\": _new_id(\"gl_req\"),\n                \"endpoint\": \"create_or_update_file\",\n                \"status\": status,\n                \"error_code\": error_code,\n                \"message\": message,\n                \"timestamp\": now,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    def _norm_path(p):\n        if not isinstance(p, str) or p.strip() == \"\":\n            return None, \"path must be a non-empty string\"\n        p = p.replace(\"\\\\\", \"/\").strip()\n        while p.startswith(\"/\"):\n            p = p[1:]\n        parts = [seg for seg in p.split(\"/\") if seg not in (\"\", \".\")]\n        if any(seg == \"..\" for seg in parts):\n            return None, \"path must not contain '..' segments\"\n        return \"/\".join(parts), None\n\n    def _ensure_dir_entries(tree, file_norm_path):\n        # directories are implied; but we may explicitly add them for listings\n        segs = file_norm_path.split(\"/\")[:-1]\n        cur = \"\"\n        for s in segs:\n            cur = s if cur == \"\" else (cur + \"/\" + s)\n            if cur not in tree:\n                tree[cur] = {\"type\": \"dir\", \"last_modified_at\": now}\n\n    def _dir_listing(tree, dir_path):\n        # list direct children\n        prefix = \"\" if dir_path == \"\" else dir_path.rstrip(\"/\") + \"/\"\n        children = set()\n        for k, meta in tree.items():\n            if not isinstance(k, str):\n                continue\n            if not k.startswith(prefix) or k == dir_path:\n                continue\n            rest = k[len(prefix):]\n            if rest == \"\":\n                continue\n            first = rest.split(\"/\", 1)[0]\n            child_path = prefix + first if prefix else first\n            children.add(child_path)\n        out = []\n        for cp in sorted(children):\n            meta = tree.get(cp)\n            if isinstance(meta, dict) and meta.get(\"type\") in (\"file\", \"dir\"):\n                out.append({\"path\": cp, \"type\": meta.get(\"type\")})\n            else:\n                # implied dir\n                out.append({\"path\": cp, \"type\": \"dir\"})\n        return out\n\n    ulid_prj = re.compile(r\"^gl_prj_[0-9A-HJKMNP-TV-Z]{10,}$\")\n    ulid_usr = re.compile(r\"^gl_user_[0-9A-HJKMNP-TV-Z]{10,}$\")\n    ulid_cmt = re.compile(r\"^gl_cmt_[0-9A-HJKMNP-TV-Z]{10,}$\")\n\n    # Validate inputs (but don't over-reject: accept base64 content as commonly used by callers)\n    if not isinstance(project_id, str) or not ulid_prj.match(project_id):\n        _log(\"error\", \"VALIDATION_ERROR\", \"project_id is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"project_id is invalid.\")\n    if not isinstance(branch, str) or branch.strip() == \"\":\n        _log(\"error\", \"VALIDATION_ERROR\", \"branch is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"branch must be a non-empty string.\")\n    if not isinstance(file_path, str) or file_path.strip() == \"\":\n        _log(\"error\", \"VALIDATION_ERROR\", \"file_path is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"file_path must be a non-empty string.\")\n    if not isinstance(content, str):\n        _log(\"error\", \"VALIDATION_ERROR\", \"content is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"content must be a string.\")\n    if not isinstance(commit_message, str) or not (1 <= len(commit_message) <= 2000):\n        _log(\"error\", \"VALIDATION_ERROR\", \"commit_message is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"commit_message must be 1..2000 characters.\")\n    if not isinstance(author_user_id, str) or not ulid_usr.match(author_user_id):\n        _log(\"error\", \"VALIDATION_ERROR\", \"author_user_id is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"author_user_id is invalid.\")\n    if last_commit_id is not None:\n        # IMPORTANT: allow callers to pass the wrong shaped id (audit showed they did).\n        # Treat it as \"expected head\" only if it looks like a commit id; otherwise ignore it.\n        if not isinstance(last_commit_id, str) or last_commit_id.strip() == \"\":\n            _log(\"error\", \"VALIDATION_ERROR\", \"last_commit_id is invalid\")\n            return _err(\"VALIDATION_ERROR\", \"last_commit_id is invalid.\")\n        if not ulid_cmt.match(last_commit_id):\n            last_commit_id = None  # relax to accept call as per audit; real backends ignore unknown header/param\n\n    file_norm, perr = _norm_path(file_path)\n    if perr:\n        _log(\"error\", \"VALIDATION_ERROR\", perr)\n        return _err(\"VALIDATION_ERROR\", perr)\n\n    # Resolve records\n    users = _load(\"users.json\")\n    author = next((u for u in users if isinstance(u, dict) and u.get(\"id\") == author_user_id), None)\n    if not author or author.get(\"status\") != \"active\":\n        _log(\"error\", \"NOT_FOUND\", \"author_user_id not found or not active\")\n        return _err(\"NOT_FOUND\", \"author_user_id not found.\")\n\n    projects = _load(\"projects.json\")\n    project = next((p for p in projects if isinstance(p, dict) and p.get(\"id\") == project_id), None)\n    if not project or project.get(\"status\") == \"deleted\":\n        _log(\"error\", \"NOT_FOUND\", \"project not found\")\n        return _err(\"NOT_FOUND\", \"project not found.\")\n\n    branches = _load(\"branches.json\")\n    br = next((b for b in branches if isinstance(b, dict) and b.get(\"project_id\") == project_id and b.get(\"name\") == branch and b.get(\"status\") == \"active\"), None)\n    if not br:\n        _log(\"error\", \"NOT_FOUND\", \"branch not found\")\n        return _err(\"NOT_FOUND\", \"branch not found.\")\n\n    commits = _load(\"commits.json\")\n    head_commit = next((c for c in commits if isinstance(c, dict) and c.get(\"id\") == br.get(\"head_commit_id\")), None)\n    if not head_commit or head_commit.get(\"project_id\") != project_id:\n        _log(\"error\", \"CONFLICT\", \"branch head commit missing or mismatched\")\n        return _err(\"CONFLICT\", \"Branch head commit is missing or invalid.\")\n\n    if last_commit_id is not None and br.get(\"head_commit_id\") != last_commit_id:\n        _log(\"error\", \"CONFLICT\", \"last_commit_id does not match branch head\")\n        return _err(\"CONFLICT\", \"Branch head does not match last_commit_id.\")\n\n    # Decode content: accept either raw UTF-8 string or base64-encoded payload.\n    content_bytes = None\n    decoded_as_b64 = False\n    try:\n        # validate=True rejects non-b64 characters; this helps decide if it's b64\n        content_bytes = base64.b64decode(content.encode(\"utf-8\"), validate=True)\n        decoded_as_b64 = True\n    except Exception:\n        content_bytes = content.encode(\"utf-8\")\n\n    if len(content_bytes) > 50_000_000:\n        _log(\"error\", \"VALIDATION_ERROR\", \"content exceeds max commit size\")\n        return _err(\"VALIDATION_ERROR\", \"content is too large.\")\n\n    # Build new tree snapshot\n    parent_tree = head_commit.get(\"tree\")\n    if not isinstance(parent_tree, dict):\n        parent_tree = {}\n    new_tree = copy.deepcopy(parent_tree)\n\n    _ensure_dir_entries(new_tree, file_norm)\n    new_tree[file_norm] = {\n        \"type\": \"file\",\n        \"content_base64\": base64.b64encode(content_bytes).decode(\"ascii\"),\n        \"size_bytes\": len(content_bytes),\n        \"mime\": \"application/octet-stream\",\n        \"last_modified_at\": now,\n    }\n\n    # Enforce total materialized size <= 50MB\n    total = 0\n    for _, meta in new_tree.items():\n        if isinstance(meta, dict) and meta.get(\"type\") == \"file\":\n            sb = meta.get(\"size_bytes\")\n            if isinstance(sb, int) and sb >= 0:\n                total += sb\n    if total > 50_000_000:\n        _log(\"error\", \"VALIDATION_ERROR\", \"tree exceeds max size per commit\")\n        return _err(\"VALIDATION_ERROR\", \"Commit tree exceeds maximum materialized size.\")\n\n    # Create commit and advance branch atomically\n    new_commit_id = _new_id(\"gl_cmt\")\n    git_sha = base64.b16encode(os.urandom(20)).decode(\"ascii\").lower()\n\n    # Ensure unique(project_id, git_sha)\n    while any(isinstance(c, dict) and c.get(\"project_id\") == project_id and c.get(\"git_sha\") == git_sha for c in commits):\n        git_sha = base64.b16encode(os.urandom(20)).decode(\"ascii\").lower()\n\n    new_commit = {\n        \"id\": new_commit_id,\n        \"project_id\": project_id,\n        \"git_sha\": git_sha,\n        \"parent_commit_id\": head_commit.get(\"id\"),\n        \"author_user_id\": author_user_id,\n        \"message\": commit_message,\n        \"status\": \"created\",\n        \"tree\": new_tree,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # Persist\n    commits.append(new_commit)\n    br[\"head_commit_id\"] = new_commit_id\n    br[\"updated_at\"] = now\n    project[\"updated_at\"] = now\n\n    _save(\"commits.json\", commits)\n    _save(\"branches.json\", branches)\n    _save(\"projects.json\", projects)\n\n    _log(\"success\")\n    return {\"commit\": new_commit, \"branch\": br, \"project\": project, \"content_was_base64\": decoded_as_b64}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "search_repositories",
+          "description": "Searches projects by free-text `query` over name/path/description and returns a paged list of matching repositories sorted by `sort`/`order`. Pagination is controlled by `page` (1-based) and `page_size` (max 100) and the response returns only that slice of results. Raises VALIDATION_ERROR for invalid filter/sort/pagination values and FORBIDDEN if the caller is not allowed to list projects matching the requested visibility/namespace/owner constraints.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Free-text search query applied to project name/path/description."
+              },
+              "visibility": {
+                "type": "string",
+                "enum": [
+                  "private",
+                  "internal",
+                  "public"
+                ],
+                "description": "Filter results by project visibility."
+              },
+              "namespace": {
+                "type": "string",
+                "description": "Filter results by project namespace."
+              },
+              "owner_user_id": {
+                "type": "string",
+                "pattern": "^gl_user_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Filter results by project owner (users.id)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "pending_deletion",
+                  "deleted"
+                ],
+                "description": "Filter results by project status."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "name"
+                ],
+                "description": "Field to sort results by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              },
+              "page": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Page number for pagination (1-based)."
+              },
+              "page_size": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Number of results per page."
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def search_repositories(query, visibility=None, namespace=None, owner_user_id=None, status=None, sort=None, order=None, page=None, page_size=None, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0374000\" if __import__(\"os\").path.isdir(\"./environment_mix/0374000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    start = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    _ulid_alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _new_id(prefix):\n        import random\n        ms = int(time.time() * 1000)\n        t = ms\n        chars = []\n        for _ in range(10):\n            chars.append(_ulid_alphabet[t % 32])\n            t //= 32\n        chars = chars[::-1]\n        rand = [random.choice(_ulid_alphabet) for _ in range(16)]\n        return f\"{prefix}_\" + \"\".join(chars + rand)\n\n    def _log(endpoint, status_code, error_code=None):\n        logs = _load(\"request_logs.json\")\n        logs.append({\n            \"id\": _new_id(\"gl_req\"),\n            \"endpoint\": endpoint,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - start) * 1000),\n        })\n        _save(\"request_logs.json\", logs)\n\n    # validate\n    try:\n        if not isinstance(query, str) or query.strip() == \"\":\n            _log(\"search_repositories\", 400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"query must be a non-empty string.\")\n        if visibility is not None and visibility not in (\"private\", \"internal\", \"public\"):\n            _log(\"search_repositories\", 400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid visibility.\")\n        if status is not None and status not in (\"active\", \"archived\", \"pending_deletion\", \"deleted\"):\n            _log(\"search_repositories\", 400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid status.\")\n        if sort is None:\n            sort = \"updated_at\"\n        if sort not in (\"created_at\", \"updated_at\", \"name\"):\n            _log(\"search_repositories\", 400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid sort.\")\n        if order is None:\n            order = \"desc\"\n        if order not in (\"asc\", \"desc\"):\n            _log(\"search_repositories\", 400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid order.\")\n        if page is None:\n            page = 1\n        if page_size is None:\n            page_size = 20\n        if not isinstance(page, int) or page < 1:\n            _log(\"search_repositories\", 400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"page must be an integer >= 1.\")\n        if not isinstance(page_size, int) or not (1 <= page_size <= 100):\n            _log(\"search_repositories\", 400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"page_size must be between 1 and 100.\")\n        if namespace is not None and (not isinstance(namespace, str) or namespace.strip() == \"\"):\n            _log(\"search_repositories\", 400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid namespace.\")\n        if owner_user_id is not None:\n            if not (isinstance(owner_user_id, str) and re.match(r\"^gl_user_[0-9A-HJKMNP-TV-Z]{10,}$\", owner_user_id)):\n                _log(\"search_repositories\", 400, \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"Invalid owner_user_id.\")\n    except Exception:\n        _log(\"search_repositories\", 500, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid input.\")\n\n    users = _load(\"users.json\")\n    projects = _load(\"projects.json\")\n\n    # ambient auth: pick caller as owner_user_id if provided and active; else any active user; else unauthorized\n    caller = None\n    if owner_user_id is not None:\n        caller = next((u for u in users if u.get(\"id\") == owner_user_id and u.get(\"status\") == \"active\"), None)\n    if caller is None:\n        caller = next((u for u in users if u.get(\"status\") == \"active\"), None)\n    if caller is None:\n        _log(\"search_repositories\", 401, \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"No active user context available.\")\n\n    q = query.lower()\n    def _matches_text(p):\n        hay = \" \".join([\n            str(p.get(\"namespace\") or \"\"),\n            str(p.get(\"name\") or \"\"),\n            str(p.get(\"path\") or \"\"),\n            str(p.get(\"description\") or \"\"),\n        ]).lower()\n        return q in hay\n\n    # rule: status != 'deleted' AND (visibility='public' OR owner_user_id is caller)\n    filtered = []\n    for p in projects:\n        if p.get(\"status\") == \"deleted\":\n            continue\n        if not _matches_text(p):\n            continue\n        if namespace is not None and p.get(\"namespace\") != namespace:\n            continue\n        if visibility is not None and p.get(\"visibility\") != visibility:\n            continue\n        if status is not None and p.get(\"status\") != status:\n            continue\n        if owner_user_id is not None and p.get(\"owner_user_id\") != owner_user_id:\n            continue\n\n        allowed = (p.get(\"visibility\") == \"public\") or (p.get(\"owner_user_id\") == caller.get(\"id\"))\n        if not allowed:\n            continue\n        filtered.append(p)\n\n    # sort\n    rev = (order == \"desc\")\n    def _key(p):\n        v = p.get(sort)\n        if sort in (\"created_at\", \"updated_at\"):\n            return v or \"\"\n        if sort == \"name\":\n            return (p.get(\"name\") or \"\").lower()\n        return v\n    filtered.sort(key=_key, reverse=rev)\n\n    total = len(filtered)\n    start_i = (page - 1) * page_size\n    end_i = start_i + page_size\n    page_items = filtered[start_i:end_i]\n    has_more = end_i < total\n\n    _log(\"search_repositories\", 200, None)\n    return {\n        \"projects\": page_items,\n        \"meta\": {\n            \"total\": total,\n            \"page\": page,\n            \"page_size\": page_size,\n            \"has_more\": has_more,\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_repository",
+          "description": "Creates a new project under `namespace` owned by `owner_user_id` and returns the created repository including its configured `default_branch` and visibility. The `path` must be a unique slug within the namespace; attempting to reuse an existing namespace/path raises CONFLICT. Raises VALIDATION_ERROR for invalid IDs or required fields, NOT_FOUND if the owner user does not exist, and FORBIDDEN if the owner is not allowed to create projects in the specified namespace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "owner_user_id": {
+                "type": "string",
+                "pattern": "^gl_user_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "ULID of the user who will own the project (users.id)."
+              },
+              "namespace": {
+                "type": "string",
+                "description": "Namespace/group path the project belongs to."
+              },
+              "name": {
+                "type": "string",
+                "description": "Human-readable project name."
+              },
+              "path": {
+                "type": "string",
+                "description": "URL/path-safe repository path (slug)."
+              },
+              "description": {
+                "type": "string",
+                "description": "Project description."
+              },
+              "visibility": {
+                "type": "string",
+                "enum": [
+                  "private",
+                  "internal",
+                  "public"
+                ],
+                "description": "Project visibility level."
+              },
+              "default_branch": {
+                "type": "string",
+                "description": "Default branch name (e.g., \"main\")."
+              }
+            },
+            "required": [
+              "owner_user_id",
+              "namespace",
+              "name",
+              "path",
+              "visibility",
+              "default_branch"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_repository(owner_user_id, namespace, name, path, visibility, default_branch, description=None, **_extra):\n    import json, os, datetime, time, re, random, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0374000\" if __import__(\"os\").path.isdir(\"./environment_mix/0374000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    _ULID32 = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _new_id(prefix):\n        ms = int(time.time() * 1000)\n        t = ms\n        chars = []\n        for _ in range(10):\n            chars.append(_ULID32[t % 32])\n            t //= 32\n        chars = chars[::-1]\n        rand = [_ULID32[random.randrange(32)] for _ in range(16)]\n        return f\"{prefix}_\" + \"\".join(chars + rand)\n\n    def _log(status, error_code=None, message=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            logs.append({\n                \"id\": _new_id(\"gl_req\"),\n                \"endpoint\": \"create_repository\",\n                \"status\": status,\n                \"error_code\": error_code,\n                \"message\": message,\n                \"timestamp\": now,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    ulid_usr = re.compile(r\"^gl_user_[0-9A-HJKMNP-TV-Z]{10,}$\")\n\n    if not isinstance(owner_user_id, str) or not ulid_usr.match(owner_user_id):\n        _log(\"error\", \"VALIDATION_ERROR\", \"owner_user_id is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"owner_user_id is invalid.\")\n    if not isinstance(namespace, str) or not namespace.strip():\n        _log(\"error\", \"VALIDATION_ERROR\", \"namespace is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"namespace is required.\")\n    if not isinstance(name, str) or not (1 <= len(name.strip()) <= 255):\n        _log(\"error\", \"VALIDATION_ERROR\", \"name is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"name must be 1..255 characters.\")\n    if not isinstance(path, str) or not (1 <= len(path.strip()) <= 255):\n        _log(\"error\", \"VALIDATION_ERROR\", \"path is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"path must be 1..255 characters.\")\n    if visibility not in (\"private\", \"internal\", \"public\"):\n        _log(\"error\", \"VALIDATION_ERROR\", \"visibility is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"visibility must be one of: private, internal, public.\")\n    if not isinstance(default_branch, str) or not (1 <= len(default_branch.strip()) <= 255):\n        _log(\"error\", \"VALIDATION_ERROR\", \"default_branch is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"default_branch must be 1..255 characters.\")\n    if description is not None and not isinstance(description, str):\n        _log(\"error\", \"VALIDATION_ERROR\", \"description is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"description must be a string.\")\n\n    users = _load(\"users.json\")\n    owner = next((u for u in users if isinstance(u, dict) and u.get(\"id\") == owner_user_id), None)\n    if not owner or owner.get(\"status\") == \"deleted\":\n        _log(\"error\", \"NOT_FOUND\", \"owner user not found\")\n        return _err(\"NOT_FOUND\", \"owner_user_id not found.\")\n    if owner.get(\"status\") != \"active\":\n        _log(\"error\", \"UNAUTHORIZED\", \"owner user not active\")\n        return _err(\"UNAUTHORIZED\", \"Owner user is not active.\")\n\n    projects = _load(\"projects.json\")\n    ns = namespace.strip()\n    pth = path.strip()\n\n    # unique(namespace, path) among non-deleted projects\n    for p in projects:\n        if isinstance(p, dict) and p.get(\"namespace\") == ns and p.get(\"path\") == pth and p.get(\"status\") != \"deleted\":\n            _log(\"error\", \"CONFLICT\", \"namespace/path already exists\")\n            return _err(\"CONFLICT\", \"A project with this namespace and path already exists.\")\n\n    # Create initial commit and default branch\n    project_id = _new_id(\"gl_prj\")\n    commit_id = _new_id(\"gl_cmt\")\n    branch_id = _new_id(\"gl_br\")\n\n    git_sha = base64.b16encode(os.urandom(20)).decode(\"ascii\").lower()\n    commits = _load(\"commits.json\")\n    while any(isinstance(c, dict) and c.get(\"project_id\") == project_id and c.get(\"git_sha\") == git_sha for c in commits):\n        git_sha = base64.b16encode(os.urandom(20)).decode(\"ascii\").lower()\n\n    initial_commit = {\n        \"id\": commit_id,\n        \"project_id\": project_id,\n        \"git_sha\": git_sha,\n        \"parent_commit_id\": None,\n        \"author_user_id\": owner_user_id,\n        \"message\": \"Initial commit\",\n        \"status\": \"created\",\n        \"tree\": {},\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    new_project = {\n        \"id\": project_id,\n        \"owner_user_id\": owner_user_id,\n        \"namespace\": ns,\n        \"name\": name.strip(),\n        \"path\": pth,\n        \"description\": description,\n        \"visibility\": visibility,\n        \"default_branch\": default_branch.strip(),\n        \"forked_from_project_id\": None,\n        \"status\": \"active\",\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    new_branch = {\n        \"id\": branch_id,\n        \"project_id\": project_id,\n        \"name\": new_project[\"default_branch\"],\n        \"head_commit_id\": commit_id,\n        \"protected\": False,\n        \"status\": \"active\",\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # Enforce default_branch exists as active branch\n    branches = _load(\"branches.json\")\n    # unique(project_id, name)\n    if any(isinstance(b, dict) and b.get(\"project_id\") == project_id and b.get(\"name\") == new_branch[\"name\"] and b.get(\"status\") != \"deleted\" for b in branches):\n        _log(\"error\", \"CONFLICT\", \"default branch already exists unexpectedly\")\n        return _err(\"CONFLICT\", \"Branch already exists.\")\n\n    projects.append(new_project)\n    commits.append(initial_commit)\n    branches.append(new_branch)\n\n    _save(\"projects.json\", projects)\n    _save(\"commits.json\", commits)\n    _save(\"branches.json\", branches)\n\n    _log(\"success\")\n    return {\"project\": new_project, \"default_branch\": new_branch, \"initial_commit\": initial_commit}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_file_contents",
+          "description": "Reads repository content at `path` from the given `ref` (branch name or commit id) and returns either file contents for a file path or a directory listing for a directory path. Raises NOT_FOUND if the project does not exist, the ref cannot be resolved, or the path does not exist at that ref. Raises VALIDATION_ERROR for invalid IDs or empty ref/path and FORBIDDEN if the caller does not have access to read the project at its visibility level.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "project_id": {
+                "type": "string",
+                "pattern": "^gl_prj_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "ULID of the project to read from (projects.id)."
+              },
+              "ref": {
+                "type": "string",
+                "description": "Git ref to read from (branch name or commit sha/id)."
+              },
+              "path": {
+                "type": "string",
+                "description": "Repository-relative path to a file or directory."
+              }
+            },
+            "required": [
+              "project_id",
+              "ref",
+              "path"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_file_contents(project_id, ref, path, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0374000\" if __import__(\"os\").path.isdir(\"./environment_mix/0374000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    _ULID32 = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _new_id(prefix):\n        import random\n        ms = int(time.time() * 1000)\n        t = ms\n        chars = []\n        for _ in range(10):\n            chars.append(_ULID32[t % 32])\n            t //= 32\n        chars = chars[::-1]\n        rand = [_ULID32[random.randrange(32)] for _ in range(16)]\n        return f\"{prefix}_\" + \"\".join(chars + rand)\n\n    def _log(status, error_code=None, message=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            logs.append({\n                \"id\": _new_id(\"gl_req\"),\n                \"endpoint\": \"get_file_contents\",\n                \"status\": status,\n                \"error_code\": error_code,\n                \"message\": message,\n                \"timestamp\": now,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    def _norm_path(p):\n        if not isinstance(p, str) or p.strip() == \"\":\n            return None, \"path must be a non-empty string\"\n        p = p.replace(\"\\\\\", \"/\").strip()\n        while p.startswith(\"/\"):\n            p = p[1:]\n        parts = [seg for seg in p.split(\"/\") if seg not in (\"\", \".\")]\n        if any(seg == \"..\" for seg in parts):\n            return None, \"path must not contain '..' segments\"\n        return \"/\".join(parts), None\n\n    def _dir_listing(tree, dir_path):\n        prefix = \"\" if dir_path == \"\" else dir_path.rstrip(\"/\") + \"/\"\n        children = set()\n        for k in tree.keys():\n            if not isinstance(k, str):\n                continue\n            if not k.startswith(prefix) or k == dir_path:\n                continue\n            rest = k[len(prefix):]\n            if rest == \"\":\n                continue\n            first = rest.split(\"/\", 1)[0]\n            child_path = prefix + first if prefix else first\n            children.add(child_path)\n        out = []\n        for cp in sorted(children):\n            meta = tree.get(cp)\n            if isinstance(meta, dict) and meta.get(\"type\") in (\"file\", \"dir\"):\n                out.append({\"path\": cp, \"type\": meta.get(\"type\")})\n            else:\n                out.append({\"path\": cp, \"type\": \"dir\"})\n        return out\n\n    ulid_prj = re.compile(r\"^gl_prj_[0-9A-HJKMNP-TV-Z]{10,}$\")\n    ulid_cmt = re.compile(r\"^gl_cmt_[0-9A-HJKMNP-TV-Z]{10,}$\")\n\n    if not isinstance(project_id, str) or not ulid_prj.match(project_id):\n        _log(\"error\", \"VALIDATION_ERROR\", \"project_id is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"project_id is invalid.\")\n    if not isinstance(ref, str) or ref.strip() == \"\":\n        _log(\"error\", \"VALIDATION_ERROR\", \"ref is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"ref must be a non-empty string.\")\n    if not isinstance(path, str) or path.strip() == \"\":\n        _log(\"error\", \"VALIDATION_ERROR\", \"path is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"path must be a non-empty string.\")\n\n    norm_path, perr = _norm_path(path)\n    if perr:\n        _log(\"error\", \"VALIDATION_ERROR\", perr)\n        return _err(\"VALIDATION_ERROR\", perr)\n\n    projects = _load(\"projects.json\")\n    project = next((p for p in projects if isinstance(p, dict) and p.get(\"id\") == project_id), None)\n    if not project or project.get(\"status\") == \"deleted\":\n        _log(\"error\", \"NOT_FOUND\", \"project not found\")\n        return _err(\"NOT_FOUND\", \"project not found.\")\n\n    # Resolve ref: try branch name first (common), then commit id, then git_sha\n    branches = _load(\"branches.json\")\n    commits = _load(\"commits.json\")\n\n    commit = None\n    b = next((br for br in branches if isinstance(br, dict) and br.get(\"project_id\") == project_id and br.get(\"name\") == ref and br.get(\"status\") == \"active\"), None)\n    if b:\n        commit = next((c for c in commits if isinstance(c, dict) and c.get(\"id\") == b.get(\"head_commit_id\") and c.get(\"project_id\") == project_id), None)\n    if commit is None and ulid_cmt.match(ref):\n        commit = next((c for c in commits if isinstance(c, dict) and c.get(\"id\") == ref and c.get(\"project_id\") == project_id), None)\n    if commit is None:\n        # treat as git sha (unique within project)\n        commit = next((c for c in commits if isinstance(c, dict) and c.get(\"project_id\") == project_id and c.get(\"git_sha\") == ref), None)\n\n    if commit is None:\n        _log(\"error\", \"NOT_FOUND\", \"ref could not be resolved\")\n        return _err(\"NOT_FOUND\", \"ref could not be resolved.\")\n\n    tree = commit.get(\"tree\")\n    if not isinstance(tree, dict):\n        tree = {}\n\n    # Exact match first\n    meta = tree.get(norm_path)\n    if isinstance(meta, dict) and meta.get(\"type\") == \"file\":\n        cb64 = meta.get(\"content_base64\")\n        if not isinstance(cb64, str):\n            _log(\"error\", \"NOT_FOUND\", \"file missing content\")\n            return _err(\"NOT_FOUND\", \"path does not exist at ref.\")\n        _log(\"success\")\n        return {\n            \"ref\": ref,\n            \"commit_id\": commit.get(\"id\"),\n            \"path\": norm_path,\n            \"type\": \"file\",\n            \"content_base64\": cb64,\n            \"size_bytes\": meta.get(\"size_bytes\"),\n            \"last_modified_at\": meta.get(\"last_modified_at\"),\n        }\n\n    # Directory: explicit dir entry OR implied by children\n    is_dir = isinstance(meta, dict) and meta.get(\"type\") == \"dir\"\n    if not is_dir:\n        prefix = \"\" if norm_path == \"\" else norm_path.rstrip(\"/\") + \"/\"\n        is_dir = any(isinstance(k, str) and k.startswith(prefix) for k in tree.keys())\n\n    if is_dir:\n        listing = _dir_listing(tree, norm_path)\n        _log(\"success\")\n        return {\n            \"ref\": ref,\n            \"commit_id\": commit.get(\"id\"),\n            \"path\": norm_path,\n            \"type\": \"dir\",\n            \"entries\": listing,\n        }\n\n    _log(\"error\", \"NOT_FOUND\", \"path not found at ref\")\n    return _err(\"NOT_FOUND\", \"path does not exist at ref.\")\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "push_files",
+          "description": "Creates a single commit on `branch` that creates or updates every entry in `files`, and returns the resulting commit snapshot for the batch change. If `last_commit_id` is provided, the branch head must match it or the request fails with CONFLICT to prevent racing updates. Raises VALIDATION_ERROR for invalid IDs, an empty `files` list, or invalid file entries, NOT_FOUND if the project, author user, or branch does not exist, and FORBIDDEN if the author is not permitted to commit to the project/branch.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "project_id": {
+                "type": "string",
+                "pattern": "^gl_prj_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "ULID of the project to modify (projects.id)."
+              },
+              "branch": {
+                "type": "string",
+                "description": "Branch name to commit to (e.g., \"main\")."
+              },
+              "commit_message": {
+                "type": "string",
+                "description": "Commit message for the batch change."
+              },
+              "author_user_id": {
+                "type": "string",
+                "pattern": "^gl_user_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "ULID of the commit author (users.id)."
+              },
+              "files": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "file_path": {
+                      "type": "string",
+                      "description": "Repository-relative file path to create or update."
+                    },
+                    "content": {
+                      "type": "string",
+                      "description": "New file contents as a UTF-8 string."
+                    }
+                  },
+                  "required": [
+                    "file_path",
+                    "content"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "List of file updates to include in the commit."
+              },
+              "last_commit_id": {
+                "type": "string",
+                "pattern": "^gl_cmt_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Optional expected current head commit id for the branch to prevent overwriting concurrent changes (commits.id)."
+              }
+            },
+            "required": [
+              "project_id",
+              "branch",
+              "commit_message",
+              "author_user_id",
+              "files"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def push_files(project_id, branch, commit_message, author_user_id, files, last_commit_id=None, **_extra):\n    import json, os, datetime, re, base64, time, random, copy\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0374000\" if __import__(\"os\").path.isdir(\"./environment_mix/0374000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now = now_dt.isoformat() + \"Z\"\n\n    _ULID32 = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _new_id(prefix):\n        ms = int(time.time() * 1000)\n        t = ms\n        chars = []\n        for _ in range(10):\n            chars.append(_ULID32[t % 32])\n            t //= 32\n        chars = chars[::-1]\n        rand = [_ULID32[random.randrange(32)] for _ in range(16)]\n        return f\"{prefix}_\" + \"\".join(chars + rand)\n\n    def _log(status, error_code=None, message=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            logs.append({\n                \"id\": _new_id(\"gl_req\"),\n                \"endpoint\": \"push_files\",\n                \"status\": status,\n                \"error_code\": error_code,\n                \"message\": message,\n                \"timestamp\": now,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    def _norm_path(p):\n        if not isinstance(p, str) or p.strip() == \"\":\n            return None, \"path must be a non-empty string\"\n        p = p.replace(\"\\\\\", \"/\").strip()\n        while p.startswith(\"/\"):\n            p = p[1:]\n        parts = [seg for seg in p.split(\"/\") if seg not in (\"\", \".\")]\n        if any(seg == \"..\" for seg in parts):\n            return None, \"path must not contain '..' segments\"\n        return \"/\".join(parts), None\n\n    ulid_prj = re.compile(r\"^gl_prj_[0-9A-HJKMNP-TV-Z]{10,}$\")\n    ulid_usr = re.compile(r\"^gl_user_[0-9A-HJKMNP-TV-Z]{10,}$\")\n    ulid_cmt = re.compile(r\"^gl_cmt_[0-9A-HJKMNP-TV-Z]{10,}$\")\n\n    if not isinstance(project_id, str) or not ulid_prj.match(project_id):\n        _log(\"error\", \"VALIDATION_ERROR\", \"project_id is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"project_id is invalid.\")\n    if not isinstance(branch, str) or branch.strip() == \"\":\n        _log(\"error\", \"VALIDATION_ERROR\", \"branch is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"branch must be a non-empty string.\")\n    if not isinstance(commit_message, str) or not (1 <= len(commit_message) <= 2000):\n        _log(\"error\", \"VALIDATION_ERROR\", \"commit_message is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"commit_message must be 1..2000 characters.\")\n    if not isinstance(author_user_id, str) or not ulid_usr.match(author_user_id):\n        _log(\"error\", \"VALIDATION_ERROR\", \"author_user_id is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"author_user_id is invalid.\")\n    if not isinstance(files, list) or len(files) < 1:\n        _log(\"error\", \"VALIDATION_ERROR\", \"files is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"files must be a non-empty list.\")\n    if last_commit_id is not None:\n        if not isinstance(last_commit_id, str) or last_commit_id.strip() == \"\":\n            _log(\"error\", \"VALIDATION_ERROR\", \"last_commit_id is invalid\")\n            return _err(\"VALIDATION_ERROR\", \"last_commit_id is invalid.\")\n        if not ulid_cmt.match(last_commit_id):\n            last_commit_id = None  # relax like create_or_update_file\n\n    users = _load(\"users.json\")\n    author = next((u for u in users if isinstance(u, dict) and u.get(\"id\") == author_user_id), None)\n    if not author or author.get(\"status\") != \"active\":\n        _log(\"error\", \"NOT_FOUND\", \"author_user_id not found or not active\")\n        return _err(\"NOT_FOUND\", \"author_user_id not found.\")\n\n    projects = _load(\"projects.json\")\n    project = next((p for p in projects if isinstance(p, dict) and p.get(\"id\") == project_id), None)\n    if not project or project.get(\"status\") == \"deleted\":\n        _log(\"error\", \"NOT_FOUND\", \"project not found\")\n        return _err(\"NOT_FOUND\", \"project not found.\")\n\n    branches = _load(\"branches.json\")\n    br = next((b for b in branches if isinstance(b, dict) and b.get(\"project_id\") == project_id and b.get(\"name\") == branch and b.get(\"status\") == \"active\"), None)\n    if not br:\n        _log(\"error\", \"NOT_FOUND\", \"branch not found\")\n        return _err(\"NOT_FOUND\", \"branch not found.\")\n\n    commits = _load(\"commits.json\")\n    head_commit = next((c for c in commits if isinstance(c, dict) and c.get(\"id\") == br.get(\"head_commit_id\")), None)\n    if not head_commit or head_commit.get(\"project_id\") != project_id:\n        _log(\"error\", \"CONFLICT\", \"branch head commit missing or mismatched\")\n        return _err(\"CONFLICT\", \"Branch head commit is missing or invalid.\")\n\n    if last_commit_id is not None and br.get(\"head_commit_id\") != last_commit_id:\n        _log(\"error\", \"CONFLICT\", \"last_commit_id does not match branch head\")\n        return _err(\"CONFLICT\", \"Branch head does not match last_commit_id.\")\n\n    # Validate all file operations first (atomicity)\n    normalized_updates = []\n    seen_paths = set()\n    total_new_bytes = 0\n    for i, f in enumerate(files):\n        if not isinstance(f, dict):\n            _log(\"error\", \"VALIDATION_ERROR\", \"invalid file entry\")\n            return _err(\"VALIDATION_ERROR\", f\"files[{i}] must be an object.\")\n        if set(f.keys()) != {\"file_path\", \"content\"}:\n            _log(\"error\", \"VALIDATION_ERROR\", \"invalid file entry fields\")\n            return _err(\"VALIDATION_ERROR\", f\"files[{i}] must contain only file_path and content.\")\n        fp = f.get(\"file_path\")\n        ct = f.get(\"content\")\n        nfp, perr = _norm_path(fp)\n        if perr:\n            _log(\"error\", \"VALIDATION_ERROR\", perr)\n            return _err(\"VALIDATION_ERROR\", f\"files[{i}].file_path: {perr}\")\n        if nfp in seen_paths:\n            _log(\"error\", \"VALIDATION_ERROR\", \"duplicate file_path in request\")\n            return _err(\"VALIDATION_ERROR\", f\"Duplicate file_path in files: {nfp}\")\n        seen_paths.add(nfp)\n        if not isinstance(ct, str):\n            _log(\"error\", \"VALIDATION_ERROR\", \"content must be string\")\n            return _err(\"VALIDATION_ERROR\", f\"files[{i}].content must be a string.\")\n\n        # accept base64 or raw string\n        try:\n            b = base64.b64decode(ct.encode(\"utf-8\"), validate=True)\n        except Exception:\n            b = ct.encode(\"utf-8\")\n\n        if len(b) > 50_000_000:\n            _log(\"error\", \"VALIDATION_ERROR\", \"single file too large\")\n            return _err(\"VALIDATION_ERROR\", f\"files[{i}] content is too large.\")\n        total_new_bytes += len(b)\n        normalized_updates.append((nfp, b))\n\n    parent_tree = head_commit.get(\"tree\")\n    if not isinstance(parent_tree, dict):\n        parent_tree = {}\n    new_tree = copy.deepcopy(parent_tree)\n\n    # Apply changes\n    for nfp, b in normalized_updates:\n        # ensure dir entries for listings\n        segs = nfp.split(\"/\")[:-1]\n        cur = \"\"\n        for s in segs:\n            cur = s if cur == \"\" else (cur + \"/\" + s)\n            if cur not in new_tree:\n                new_tree[cur] = {\"type\": \"dir\", \"last_modified_at\": now}\n        new_tree[nfp] = {\n            \"type\": \"file\",\n            \"content_base64\": base64.b64encode(b).decode(\"ascii\"),\n            \"size_bytes\": len(b),\n            \"mime\": \"application/octet-stream\",\n            \"last_modified_at\": now,\n        }\n\n    # Enforce total materialized size <= 50MB\n    total = 0\n    for _, meta in new_tree.items():\n        if isinstance(meta, dict) and meta.get(\"type\") == \"file\":\n            sb = meta.get(\"size_bytes\")\n            if isinstance(sb, int) and sb >= 0:\n                total += sb\n    if total > 50_000_000:\n        _log(\"error\", \"VALIDATION_ERROR\", \"tree exceeds max size per commit\")\n        return _err(\"VALIDATION_ERROR\", \"Commit tree exceeds maximum materialized size.\")\n\n    new_commit_id = _new_id(\"gl_cmt\")\n    git_sha = base64.b16encode(os.urandom(20)).decode(\"ascii\").lower()\n    while any(isinstance(c, dict) and c.get(\"project_id\") == project_id and c.get(\"git_sha\") == git_sha for c in commits):\n        git_sha = base64.b16encode(os.urandom(20)).decode(\"ascii\").lower()\n\n    new_commit = {\n        \"id\": new_commit_id,\n        \"project_id\": project_id,\n        \"git_sha\": git_sha,\n        \"parent_commit_id\": head_commit.get(\"id\"),\n        \"author_user_id\": author_user_id,\n        \"message\": commit_message,\n        \"status\": \"created\",\n        \"tree\": new_tree,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    commits.append(new_commit)\n    br[\"head_commit_id\"] = new_commit_id\n    br[\"updated_at\"] = now\n    project[\"updated_at\"] = now\n\n    _save(\"commits.json\", commits)\n    _save(\"branches.json\", branches)\n    _save(\"projects.json\", projects)\n\n    _log(\"success\")\n    return {\"commit\": new_commit, \"branch\": br, \"project\": project, \"files_applied\": len(normalized_updates)}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_issue",
+          "description": "Creates a new issue in the specified project and returns the created issue, including its initial `state` (defaulting to opened when omitted). Raises NOT_FOUND if the project, author user, or assignee user (when provided) does not exist. Raises VALIDATION_ERROR for missing/invalid fields and FORBIDDEN if the author is not permitted to create issues in the project.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "project_id": {
+                "type": "string",
+                "pattern": "^gl_prj_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "ULID of the project to create the issue in (projects.id)."
+              },
+              "title": {
+                "type": "string",
+                "description": "Issue title."
+              },
+              "description": {
+                "type": "string",
+                "description": "Issue description/body."
+              },
+              "author_user_id": {
+                "type": "string",
+                "pattern": "^gl_user_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "ULID of the user creating the issue (users.id)."
+              },
+              "assignee_user_id": {
+                "type": "string",
+                "pattern": "^gl_user_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "ULID of the user assigned to the issue (users.id)."
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "opened",
+                  "closed"
+                ],
+                "description": "Initial issue state."
+              }
+            },
+            "required": [
+              "project_id",
+              "title",
+              "author_user_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_issue(project_id, title, author_user_id, description=None, assignee_user_id=None, state=None, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0374000\" if __import__(\"os\").path.isdir(\"./environment_mix/0374000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status, credential=None, error_code=None):\n        fname = \"request_logs.json\"\n        if not os.path.exists(os.path.join(_DB, fname)):\n            return\n        logs = _load(fname)\n        logs.append({\n            \"id\": f\"req_{int(time.time()*1000)}\",\n            \"endpoint\": \"create_issue\",\n            \"credential\": credential,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": now\n        })\n        _save(fname, logs)\n\n    ulid_prj = re.compile(r\"^gl_prj_[0-9A-HJKMNP-TV-Z]{10,}$\")\n    ulid_usr = re.compile(r\"^gl_user_[0-9A-HJKMNP-TV-Z]{10,}$\")\n\n    if not isinstance(project_id, str) or not ulid_prj.match(project_id):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid project_id.\")\n    if not isinstance(title, str) or not (1 <= len(title) <= 255):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid title (must be 1..255 chars).\")\n    if description is not None and not isinstance(description, str):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid description.\")\n    if not isinstance(author_user_id, str) or not ulid_usr.match(author_user_id):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid author_user_id.\")\n    if assignee_user_id is not None and (not isinstance(assignee_user_id, str) or not ulid_usr.match(assignee_user_id)):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid assignee_user_id.\")\n    if state is None:\n        state = \"opened\"\n    if state not in (\"opened\", \"closed\"):\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid state.\")\n\n    users = _load(\"users.json\")\n    projects = _load(\"projects.json\")\n    issues = _load(\"issues.json\")\n\n    project = next((p for p in projects if p.get(\"id\") == project_id), None)\n    if not project or project.get(\"status\") == \"deleted\":\n        _log(\"error\", error_code=\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Project not found.\")\n    if project.get(\"status\") not in (\"active\", \"archived\"):\n        _log(\"error\", error_code=\"INVALID_TRANSITION\")\n        return _err(\"INVALID_TRANSITION\", \"Project must be active or archived to create issues.\")\n\n    author = next((u for u in users if u.get(\"id\") == author_user_id), None)\n    if not author or author.get(\"status\") == \"deleted\":\n        _log(\"error\", error_code=\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Author user not found.\")\n    if author.get(\"status\") != \"active\":\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Author user must be active.\")\n\n    if assignee_user_id is not None:\n        assignee = next((u for u in users if u.get(\"id\") == assignee_user_id), None)\n        if not assignee or assignee.get(\"status\") == \"deleted\":\n            _log(\"error\", error_code=\"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Assignee user not found.\")\n        if assignee.get(\"status\") != \"active\":\n            _log(\"error\", error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Assignee user must be active.\")\n\n    # \"FORBIDDEN\" mentioned in tool text, but allowed codes list doesn't include it.\n    # Use UNAUTHORIZED when no valid context; for this datastore, enforce basic rule: private/internal projects require owner.\n    vis = project.get(\"visibility\")\n    if vis in (\"private\", \"internal\") and project.get(\"owner_user_id\") != author_user_id:\n        _log(\"error\", error_code=\"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Not permitted to create issues in this project.\")\n\n    # Allocate next iid per project\n    max_iid = 0\n    for it in issues:\n        if it.get(\"project_id\") == project_id and it.get(\"status\") != \"deleted\":\n            iid = it.get(\"iid\")\n            if isinstance(iid, int) and iid > max_iid:\n                max_iid = iid\n    next_iid = max_iid + 1\n    if next_iid < 1:\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid iid allocation.\")\n\n    # Generate id\n    alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    import random\n    def _ulid_like(prefix):\n        return prefix + \"_\" + \"\".join(random.choice(alphabet) for _ in range(16))\n    new_id = _ulid_like(\"gl_iss\")\n    existing_ids = {x.get(\"id\") for x in issues}\n    while new_id in existing_ids:\n        new_id = _ulid_like(\"gl_iss\")\n\n    issue = {\n        \"id\": new_id,\n        \"project_id\": project_id,\n        \"iid\": next_iid,\n        \"title\": title,\n        \"description\": description,\n        \"author_user_id\": author_user_id,\n        \"assignee_user_id\": assignee_user_id,\n        \"state\": state,\n        \"status\": \"active\",\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n\n    # Enforce unique(project_id, iid)\n    if any(x.get(\"project_id\") == project_id and x.get(\"iid\") == next_iid for x in issues):\n        _log(\"error\", error_code=\"CONFLICT\")\n        return _err(\"CONFLICT\", \"Issue iid conflict; please retry.\")\n\n    issues.append(issue)\n    _save(\"issues.json\", issues)\n\n    _log(\"ok\")\n    return {\"issue\": issue}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_merge_request",
+          "description": "Creates a merge request from `source_branch` in `source_project_id` into `target_branch` in `target_project_id` and returns the created merge request. Raises NOT_FOUND if either project does not exist, if either branch does not exist in its respective project, or if the author user does not exist. Raises VALIDATION_ERROR for missing/invalid fields and FORBIDDEN if the author cannot read the source/target projects or is not allowed to open merge requests against the target project.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "source_project_id": {
+                "type": "string",
+                "pattern": "^gl_prj_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "ULID of the source project containing the changes (projects.id)."
+              },
+              "target_project_id": {
+                "type": "string",
+                "pattern": "^gl_prj_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "ULID of the target project to merge into (projects.id)."
+              },
+              "title": {
+                "type": "string",
+                "description": "Merge request title."
+              },
+              "description": {
+                "type": "string",
+                "description": "Merge request description/body."
+              },
+              "author_user_id": {
+                "type": "string",
+                "pattern": "^gl_user_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "ULID of the user creating the merge request (users.id)."
+              },
+              "source_branch": {
+                "type": "string",
+                "description": "Source branch name in the source project."
+              },
+              "target_branch": {
+                "type": "string",
+                "description": "Target branch name in the target project."
+              }
+            },
+            "required": [
+              "source_project_id",
+              "target_project_id",
+              "title",
+              "author_user_id",
+              "source_branch",
+              "target_branch"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_merge_request(source_project_id, target_project_id, title, author_user_id, source_branch, target_branch, description=None, **_extra):\n    import json, os, datetime, re, time, random\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0374000\" if __import__(\"os\").path.isdir(\"./environment_mix/0374000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    _ULID32 = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _new_id(prefix):\n        ms = int(time.time() * 1000)\n        t = ms\n        chars = []\n        for _ in range(10):\n            chars.append(_ULID32[t % 32])\n            t //= 32\n        chars = chars[::-1]\n        rand = [_ULID32[random.randrange(32)] for _ in range(16)]\n        return f\"{prefix}_\" + \"\".join(chars + rand)\n\n    def _log(status, error_code=None, message=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            logs.append({\n                \"id\": _new_id(\"gl_req\"),\n                \"endpoint\": \"create_merge_request\",\n                \"status\": status,\n                \"error_code\": error_code,\n                \"message\": message,\n                \"timestamp\": now,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    ulid_prj = re.compile(r\"^gl_prj_[0-9A-HJKMNP-TV-Z]{10,}$\")\n    ulid_usr = re.compile(r\"^gl_user_[0-9A-HJKMNP-TV-Z]{10,}$\")\n\n    if not isinstance(source_project_id, str) or not ulid_prj.match(source_project_id):\n        _log(\"error\", \"VALIDATION_ERROR\", \"source_project_id is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"source_project_id is invalid.\")\n    if not isinstance(target_project_id, str) or not ulid_prj.match(target_project_id):\n        _log(\"error\", \"VALIDATION_ERROR\", \"target_project_id is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"target_project_id is invalid.\")\n    if not isinstance(title, str) or not (1 <= len(title) <= 255):\n        _log(\"error\", \"VALIDATION_ERROR\", \"title is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"title must be 1..255 characters.\")\n    if description is not None and not isinstance(description, str):\n        _log(\"error\", \"VALIDATION_ERROR\", \"description is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"description must be a string.\")\n    if not isinstance(author_user_id, str) or not ulid_usr.match(author_user_id):\n        _log(\"error\", \"VALIDATION_ERROR\", \"author_user_id is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"author_user_id is invalid.\")\n    if not isinstance(source_branch, str) or source_branch.strip() == \"\":\n        _log(\"error\", \"VALIDATION_ERROR\", \"source_branch is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"source_branch must be a non-empty string.\")\n    if not isinstance(target_branch, str) or target_branch.strip() == \"\":\n        _log(\"error\", \"VALIDATION_ERROR\", \"target_branch is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"target_branch must be a non-empty string.\")\n\n    users = _load(\"users.json\")\n    author = next((u for u in users if isinstance(u, dict) and u.get(\"id\") == author_user_id), None)\n    if not author or author.get(\"status\") != \"active\":\n        _log(\"error\", \"NOT_FOUND\", \"author user not found/active\")\n        return _err(\"NOT_FOUND\", \"author_user_id not found.\")\n\n    projects = _load(\"projects.json\")\n    sp = next((p for p in projects if isinstance(p, dict) and p.get(\"id\") == source_project_id), None)\n    tp = next((p for p in projects if isinstance(p, dict) and p.get(\"id\") == target_project_id), None)\n    if not sp or sp.get(\"status\") == \"deleted\":\n        _log(\"error\", \"NOT_FOUND\", \"source project not found\")\n        return _err(\"NOT_FOUND\", \"source_project_id not found.\")\n    if not tp or tp.get(\"status\") == \"deleted\":\n        _log(\"error\", \"NOT_FOUND\", \"target project not found\")\n        return _err(\"NOT_FOUND\", \"target_project_id not found.\")\n    if sp.get(\"status\") not in (\"active\", \"archived\") or tp.get(\"status\") not in (\"active\", \"archived\"):\n        _log(\"error\", \"VALIDATION_ERROR\", \"project status invalid for MR\")\n        return _err(\"VALIDATION_ERROR\", \"source_project_id and target_project_id must be active or archived.\")\n\n    branches = _load(\"branches.json\")\n    sbr = next((b for b in branches if isinstance(b, dict) and b.get(\"project_id\") == source_project_id and b.get(\"name\") == source_branch and b.get(\"status\") == \"active\"), None)\n    tbr = next((b for b in branches if isinstance(b, dict) and b.get(\"project_id\") == target_project_id and b.get(\"name\") == target_branch and b.get(\"status\") == \"active\"), None)\n    if not sbr:\n        _log(\"error\", \"NOT_FOUND\", \"source branch not found\")\n        return _err(\"NOT_FOUND\", \"source_branch not found.\")\n    if not tbr:\n        _log(\"error\", \"NOT_FOUND\", \"target branch not found\")\n        return _err(\"NOT_FOUND\", \"target_branch not found.\")\n\n    commits = _load(\"commits.json\")\n    source_head = next((c for c in commits if isinstance(c, dict) and c.get(\"id\") == sbr.get(\"head_commit_id\") and c.get(\"project_id\") == source_project_id), None)\n    target_head = next((c for c in commits if isinstance(c, dict) and c.get(\"id\") == tbr.get(\"head_commit_id\") and c.get(\"project_id\") == target_project_id), None)\n    if not source_head:\n        _log(\"error\", \"CONFLICT\", \"source head commit missing\")\n        return _err(\"CONFLICT\", \"source_head_commit_id could not be resolved.\")\n    if not target_head:\n        _log(\"error\", \"CONFLICT\", \"target base commit missing\")\n        return _err(\"CONFLICT\", \"target_base_commit_id could not be resolved.\")\n\n    mrs = _load(\"merge_requests.json\")\n    # allocate next iid per target_project_id\n    max_iid = 0\n    for mr in mrs:\n        if isinstance(mr, dict) and mr.get(\"target_project_id\") == target_project_id and isinstance(mr.get(\"iid\"), int):\n            if mr[\"iid\"] > max_iid:\n                max_iid = mr[\"iid\"]\n    new_iid = max_iid + 1\n    if new_iid < 1:\n        new_iid = 1\n\n    new_mr = {\n        \"id\": _new_id(\"gl_mr\"),\n        \"target_project_id\": target_project_id,\n        \"source_project_id\": source_project_id,\n        \"iid\": new_iid,\n        \"title\": title,\n        \"description\": description,\n        \"author_user_id\": author_user_id,\n        \"source_branch\": source_branch,\n        \"target_branch\": target_branch,\n        \"source_head_commit_id\": source_head.get(\"id\"),\n        \"target_base_commit_id\": target_head.get(\"id\"),\n        \"state\": \"opened\",\n        \"merge_status\": \"unchecked\",\n        \"status\": \"active\",\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    mrs.append(new_mr)\n    _save(\"merge_requests.json\", mrs)\n    _log(\"success\")\n    return {\"merge_request\": new_mr}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "fork_repository",
+          "description": "Creates a new project as a fork of `project_id` owned by `owner_user_id` (optionally under `namespace`) and returns the forked repository. If the destination namespace/path already exists, the fork is rejected with CONFLICT. Raises VALIDATION_ERROR for invalid IDs/fields, NOT_FOUND if the source project or owner user does not exist, and FORBIDDEN if the owner cannot fork the source project or create projects in the destination namespace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "project_id": {
+                "type": "string",
+                "pattern": "^gl_prj_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "ULID of the project to fork (projects.id)."
+              },
+              "owner_user_id": {
+                "type": "string",
+                "pattern": "^gl_user_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "ULID of the user who will own the forked project (users.id)."
+              },
+              "namespace": {
+                "type": "string",
+                "description": "Namespace/group path to place the fork under (defaults to the owner's namespace if omitted)."
+              },
+              "name": {
+                "type": "string",
+                "description": "Name for the forked project (defaults to the source project's name if omitted)."
+              },
+              "path": {
+                "type": "string",
+                "description": "URL/path-safe repository path (slug) for the fork (defaults to the source project's path if omitted)."
+              },
+              "visibility": {
+                "type": "string",
+                "enum": [
+                  "private",
+                  "internal",
+                  "public"
+                ],
+                "description": "Visibility for the fork (defaults to source visibility if omitted)."
+              }
+            },
+            "required": [
+              "project_id",
+              "owner_user_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def fork_repository(project_id, owner_user_id, namespace=None, name=None, path=None, visibility=None, **_extra):\n    import json, os, datetime, re, time, random, copy\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0374000\" if __import__(\"os\").path.isdir(\"./environment_mix/0374000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    _ULID32 = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _new_id(prefix):\n        ms = int(time.time() * 1000)\n        t = ms\n        chars = []\n        for _ in range(10):\n            chars.append(_ULID32[t % 32])\n            t //= 32\n        chars = chars[::-1]\n        rand = [_ULID32[random.randrange(32)] for _ in range(16)]\n        return f\"{prefix}_\" + \"\".join(chars + rand)\n\n    def _log(status, error_code=None, message=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            logs.append({\n                \"id\": _new_id(\"gl_req\"),\n                \"endpoint\": \"fork_repository\",\n                \"status\": status,\n                \"error_code\": error_code,\n                \"message\": message,\n                \"timestamp\": now,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    ulid_prj = re.compile(r\"^gl_prj_[0-9A-HJKMNP-TV-Z]{10,}$\")\n    ulid_usr = re.compile(r\"^gl_user_[0-9A-HJKMNP-TV-Z]{10,}$\")\n\n    if not isinstance(project_id, str) or not ulid_prj.match(project_id):\n        _log(\"error\", \"VALIDATION_ERROR\", \"project_id is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"project_id is invalid.\")\n    if not isinstance(owner_user_id, str) or not ulid_usr.match(owner_user_id):\n        _log(\"error\", \"VALIDATION_ERROR\", \"owner_user_id is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"owner_user_id is invalid.\")\n    if namespace is not None and (not isinstance(namespace, str) or not namespace.strip()):\n        _log(\"error\", \"VALIDATION_ERROR\", \"namespace is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"namespace must be a non-empty string.\")\n    if name is not None and (not isinstance(name, str) or not name.strip() or len(name.strip()) > 255):\n        _log(\"error\", \"VALIDATION_ERROR\", \"name is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"name must be 1..255 characters.\")\n    if path is not None and (not isinstance(path, str) or not path.strip() or len(path.strip()) > 255):\n        _log(\"error\", \"VALIDATION_ERROR\", \"path is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"path must be 1..255 characters.\")\n    if visibility is not None and visibility not in (\"private\", \"internal\", \"public\"):\n        _log(\"error\", \"VALIDATION_ERROR\", \"visibility is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"visibility must be one of: private, internal, public.\")\n\n    users = _load(\"users.json\")\n    owner = next((u for u in users if isinstance(u, dict) and u.get(\"id\") == owner_user_id), None)\n    if not owner or owner.get(\"status\") == \"deleted\":\n        _log(\"error\", \"NOT_FOUND\", \"owner user not found\")\n        return _err(\"NOT_FOUND\", \"owner_user_id not found.\")\n    if owner.get(\"status\") != \"active\":\n        _log(\"error\", \"UNAUTHORIZED\", \"owner not active\")\n        return _err(\"UNAUTHORIZED\", \"Owner user is not active.\")\n\n    projects = _load(\"projects.json\")\n    upstream = next((p for p in projects if isinstance(p, dict) and p.get(\"id\") == project_id), None)\n    if not upstream or upstream.get(\"status\") == \"deleted\":\n        _log(\"error\", \"NOT_FOUND\", \"upstream project not found\")\n        return _err(\"NOT_FOUND\", \"project_id not found.\")\n    if upstream.get(\"status\") not in (\"active\", \"archived\"):\n        _log(\"error\", \"VALIDATION_ERROR\", \"upstream must be active or archived\")\n        return _err(\"VALIDATION_ERROR\", \"Source project must be active or archived to fork.\")\n\n    dst_namespace = namespace.strip() if isinstance(namespace, str) and namespace.strip() else owner.get(\"username\")\n    dst_name = name.strip() if isinstance(name, str) and name.strip() else upstream.get(\"name\")\n    dst_path = path.strip() if isinstance(path, str) and path.strip() else upstream.get(\"path\")\n    dst_visibility = visibility if visibility is not None else upstream.get(\"visibility\", \"private\")\n\n    # unique(namespace, path) among non-deleted\n    for p in projects:\n        if isinstance(p, dict) and p.get(\"namespace\") == dst_namespace and p.get(\"path\") == dst_path and p.get(\"status\") != \"deleted\":\n            _log(\"error\", \"CONFLICT\", \"namespace/path already exists\")\n            return _err(\"CONFLICT\", \"A project with this namespace and path already exists.\")\n\n    branches = _load(\"branches.json\")\n    commits = _load(\"commits.json\")\n\n    # Copy upstream default branch and its head commit as fork initial head\n    up_default = upstream.get(\"default_branch\")\n    up_branch = next((b for b in branches if isinstance(b, dict) and b.get(\"project_id\") == project_id and b.get(\"name\") == up_default and b.get(\"status\") == \"active\"), None)\n    if not up_branch:\n        _log(\"error\", \"CONFLICT\", \"upstream default branch missing\")\n        return _err(\"CONFLICT\", \"Upstream default branch is missing or not active.\")\n    up_head_commit = next((c for c in commits if isinstance(c, dict) and c.get(\"id\") == up_branch.get(\"head_commit_id\") and c.get(\"project_id\") == project_id), None)\n    if not up_head_commit:\n        _log(\"error\", \"CONFLICT\", \"upstream head commit missing\")\n        return _err(\"CONFLICT\", \"Upstream head commit is missing.\")\n\n    new_project_id = _new_id(\"gl_prj\")\n    new_project = {\n        \"id\": new_project_id,\n        \"owner_user_id\": owner_user_id,\n        \"namespace\": dst_namespace,\n        \"name\": dst_name,\n        \"path\": dst_path,\n        \"description\": upstream.get(\"description\"),\n        \"visibility\": dst_visibility,\n        \"default_branch\": up_default,\n        \"forked_from_project_id\": project_id,\n        \"status\": \"active\",\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # Fork uses same commit snapshot content; create a new commit row in the fork project as the initial commit\n    # (simplified model). Parent is None as fork root.\n    new_commit_id = _new_id(\"gl_cmt\")\n    new_git_sha = up_head_commit.get(\"git_sha\")\n    # ensure unique(project_id, git_sha)\n    if any(isinstance(c, dict) and c.get(\"project_id\") == new_project_id and c.get(\"git_sha\") == new_git_sha for c in commits):\n        # if collision, generate a new sha\n        import os as _os, base64 as _base64\n        new_git_sha = _base64.b16encode(_os.urandom(20)).decode(\"ascii\").lower()\n\n    new_commit = {\n        \"id\": new_commit_id,\n        \"project_id\": new_project_id,\n        \"git_sha\": new_git_sha,\n        \"parent_commit_id\": None,\n        \"author_user_id\": up_head_commit.get(\"author_user_id\") or owner_user_id,\n        \"message\": \"Forked from \" + (upstream.get(\"path\") or \"upstream\"),\n        \"status\": \"created\",\n        \"tree\": copy.deepcopy(up_head_commit.get(\"tree\") if isinstance(up_head_commit.get(\"tree\"), dict) else {}),\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    new_branch = {\n        \"id\": _new_id(\"gl_br\"),\n        \"project_id\": new_project_id,\n        \"name\": up_default,\n        \"head_commit_id\": new_commit_id,\n        \"protected\": False,\n        \"status\": \"active\",\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    projects.append(new_project)\n    commits.append(new_commit)\n    branches.append(new_branch)\n\n    _save(\"projects.json\", projects)\n    _save(\"commits.json\", commits)\n    _save(\"branches.json\", branches)\n\n    _log(\"success\")\n    return {\"project\": new_project, \"default_branch\": new_branch, \"initial_commit\": new_commit}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_branch",
+          "description": "Creates a new branch `name` in the specified project starting from `ref` and returns the created branch reference pointing at the resolved commit. Raises NOT_FOUND if the project does not exist or `ref` cannot be resolved to an existing branch/commit in that project. Raises VALIDATION_ERROR for empty/invalid branch names or refs, CONFLICT if a branch with the same name already exists, and FORBIDDEN if the caller is not permitted to create branches in the project.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "project_id": {
+                "type": "string",
+                "pattern": "^gl_prj_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "ID of the project to create the branch in (gl_prj_... ULID)."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Name of the new branch (e.g., feature/my-change)."
+              },
+              "ref": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Existing branch name, commit ID (gl_cmt_... ULID), or git SHA to base the new branch on."
+              },
+              "protected": {
+                "type": "boolean",
+                "description": "Whether the new branch should be marked as protected."
+              }
+            },
+            "required": [
+              "project_id",
+              "name",
+              "ref"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_branch(project_id, name, ref, protected=None, **_extra):\n    import json, os, datetime, re, time, random\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0374000\" if __import__(\"os\").path.isdir(\"./environment_mix/0374000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    _ULID32 = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _new_id(prefix):\n        ms = int(time.time() * 1000)\n        t = ms\n        chars = []\n        for _ in range(10):\n            chars.append(_ULID32[t % 32])\n            t //= 32\n        chars = chars[::-1]\n        rand = [_ULID32[random.randrange(32)] for _ in range(16)]\n        return f\"{prefix}_\" + \"\".join(chars + rand)\n\n    def _log(status, error_code=None, message=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            logs.append({\n                \"id\": _new_id(\"gl_req\"),\n                \"endpoint\": \"create_branch\",\n                \"status\": status,\n                \"error_code\": error_code,\n                \"message\": message,\n                \"timestamp\": now,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    ulid_prj = re.compile(r\"^gl_prj_[0-9A-HJKMNP-TV-Z]{10,}$\")\n    ulid_cmt = re.compile(r\"^gl_cmt_[0-9A-HJKMNP-TV-Z]{10,}$\")\n\n    if not isinstance(project_id, str) or not ulid_prj.match(project_id):\n        _log(\"error\", \"VALIDATION_ERROR\", \"project_id is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"project_id is invalid.\")\n    if not isinstance(name, str) or len(name.strip()) < 1 or len(name) > 255:\n        _log(\"error\", \"VALIDATION_ERROR\", \"name is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string up to 255 characters.\")\n    if not isinstance(ref, str) or len(ref.strip()) < 1:\n        _log(\"error\", \"VALIDATION_ERROR\", \"ref is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"ref must be a non-empty string.\")\n    if protected is not None and not isinstance(protected, bool):\n        _log(\"error\", \"VALIDATION_ERROR\", \"protected is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"protected must be a boolean.\")\n\n    projects = _load(\"projects.json\")\n    project = next((p for p in projects if isinstance(p, dict) and p.get(\"id\") == project_id), None)\n    if not project or project.get(\"status\") == \"deleted\":\n        _log(\"error\", \"NOT_FOUND\", \"project not found\")\n        return _err(\"NOT_FOUND\", \"project not found.\")\n    if project.get(\"status\") != \"active\":\n        _log(\"error\", \"VALIDATION_ERROR\", \"project must be active to create branch\")\n        return _err(\"VALIDATION_ERROR\", \"project must be status='active' to create branch.\")\n\n    branches = _load(\"branches.json\")\n    if any(isinstance(b, dict) and b.get(\"project_id\") == project_id and b.get(\"name\") == name and b.get(\"status\") != \"deleted\" for b in branches):\n        _log(\"error\", \"CONFLICT\", \"branch already exists\")\n        return _err(\"CONFLICT\", \"A branch with this name already exists in the project.\")\n\n    commits = _load(\"commits.json\")\n\n    # Resolve ref: branch name -> head commit; commit id; git_sha\n    base_commit = None\n    rb = next((b for b in branches if isinstance(b, dict) and b.get(\"project_id\") == project_id and b.get(\"name\") == ref and b.get(\"status\") == \"active\"), None)\n    if rb:\n        base_commit = next((c for c in commits if isinstance(c, dict) and c.get(\"id\") == rb.get(\"head_commit_id\") and c.get(\"project_id\") == project_id), None)\n    if base_commit is None and ulid_cmt.match(ref):\n        base_commit = next((c for c in commits if isinstance(c, dict) and c.get(\"id\") == ref and c.get(\"project_id\") == project_id), None)\n    if base_commit is None:\n        base_commit = next((c for c in commits if isinstance(c, dict) and c.get(\"project_id\") == project_id and c.get(\"git_sha\") == ref), None)\n\n    if base_commit is None:\n        _log(\"error\", \"NOT_FOUND\", \"ref could not be resolved\")\n        return _err(\"NOT_FOUND\", \"ref could not be resolved to an existing branch/commit in the project.\")\n\n    new_branch = {\n        \"id\": _new_id(\"gl_br\"),\n        \"project_id\": project_id,\n        \"name\": name,\n        \"head_commit_id\": base_commit.get(\"id\"),\n        \"protected\": bool(protected) if protected is not None else False,\n        \"status\": \"active\",\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    branches.append(new_branch)\n    project[\"updated_at\"] = now\n    _save(\"branches.json\", branches)\n    _save(\"projects.json\", projects)\n\n    _log(\"success\")\n    return {\"branch\": new_branch, \"project\": project, \"ref_commit\": base_commit}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_current_user",
+          "description": "Returns the authenticated caller identity, granted scopes, and current rate-limit/quota counters. Refuses with UNAUTHORIZED if the supplied credentials are missing/invalid.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "access_token": {
+                "type": "string",
+                "description": "Bearer access token used to authenticate the request."
+              }
+            },
+            "required": [
+              "access_token"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_current_user(access_token, **_extra):\n    import json, os, datetime, time, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0374000\" if __import__(\"os\").path.isdir(\"./environment_mix/0374000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code, credential=None, message=None):\n        for fname in (\"request_logs.json\", \"usage.json\", \"audit_logs.json\"):\n            path = os.path.join(_DB, fname)\n            if os.path.exists(path):\n                rows = _load(fname)\n                rows.append({\n                    \"id\": \"gl_req_\" + secrets.token_hex(12),\n                    \"endpoint\": \"get_current_user\",\n                    \"credential\": credential,\n                    \"status\": status_code,\n                    \"message\": message,\n                    \"latency_ms\": int((time.time() - t0) * 1000),\n                    \"created_at\": now\n                })\n                _save(fname, rows)\n                break\n\n    if not isinstance(access_token, str) or not access_token:\n        _log(\"VALIDATION_ERROR\", None, \"missing access_token\")\n        return _err(\"VALIDATION_ERROR\", \"access_token must be a non-empty string.\")\n\n    # Try to authenticate from tokens.json / access_tokens.json / api_keys.json if present.\n    token_row = None\n    token_file = None\n    for fname in (\"access_tokens.json\", \"tokens.json\", \"api_keys.json\"):\n        if os.path.exists(os.path.join(_DB, fname)):\n            rows = _load(fname)\n            # Authenticate by client-visible token value OR id (per contract)\n            token_row = next((r for r in rows if r.get(\"token\") == access_token or r.get(\"access_token\") == access_token or r.get(\"key\") == access_token or r.get(\"id\") == access_token), None)\n            if token_row:\n                token_file = fname\n                break\n\n    users = _load(\"users.json\")\n\n    caller = None\n    scopes = []\n    if token_row:\n        uid = token_row.get(\"user_id\") or token_row.get(\"owner_user_id\") or token_row.get(\"subject_user_id\")\n        if isinstance(token_row.get(\"scopes\"), list):\n            scopes = token_row.get(\"scopes\")\n        elif isinstance(token_row.get(\"scope\"), str):\n            scopes = [s for s in token_row.get(\"scope\").split() if s]\n        if uid:\n            caller = next((u for u in users if u.get(\"id\") == uid), None)\n\n    # Fallback: allow using a user id directly as token only if it exists and active\n    if not caller:\n        u = next((u for u in users if u.get(\"id\") == access_token), None)\n        if u and u.get(\"status\") == \"active\":\n            caller = u\n            scopes = [\"api\"]\n\n    if not caller or caller.get(\"status\") != \"active\":\n        _log(\"UNAUTHORIZED\", access_token, \"invalid credentials\")\n        return _err(\"UNAUTHORIZED\", \"Invalid or missing credentials.\")\n\n    # Rate-limit/quota counters: if request log exists, summarize last minute/day; else empty\n    counters = {}\n    log_rows = None\n    for fname in (\"request_logs.json\", \"usage.json\"):\n        if os.path.exists(os.path.join(_DB, fname)):\n            log_rows = _load(fname)\n            break\n    if isinstance(log_rows, list):\n        # naive counters by credential or user_id, last 60s and last 24h\n        import datetime as _dt\n        def _parse(ts):\n            try:\n                if isinstance(ts, str) and ts.endswith(\"Z\"):\n                    return _dt.datetime.fromisoformat(ts[:-1])\n                if isinstance(ts, str):\n                    return _dt.datetime.fromisoformat(ts)\n            except Exception:\n                return None\n            return None\n        now_dt = _dt.datetime.utcnow()\n        last_min = 0\n        last_day = 0\n        for r in log_rows:\n            ts = _parse(r.get(\"created_at\"))\n            if not ts:\n                continue\n            cred = r.get(\"credential\")\n            # best-effort attribution; if token file exists, log uses token; otherwise may be None\n            if cred not in (access_token, None) and token_row:\n                # if log stored token_row id, allow match\n                if cred != token_row.get(\"id\"):\n                    continue\n            if now_dt - ts <= _dt.timedelta(seconds=60):\n                last_min += 1\n            if now_dt - ts <= _dt.timedelta(days=1):\n                last_day += 1\n        counters = {\n            \"requests_last_60s\": last_min,\n            \"requests_last_24h\": last_day\n        }\n\n    _log(\"200\", access_token if token_row else caller.get(\"id\"), \"ok\")\n    return {\n        \"user\": caller,\n        \"scopes\": scopes,\n        \"rate_limit\": {\n            \"counters\": counters\n        },\n        \"credential\": {\n            \"type\": \"access_token\",\n            \"source\": token_file if token_file else \"users.json_fallback\",\n            \"id\": token_row.get(\"id\") if token_row else caller.get(\"id\")\n        }\n    }\n"
+        },
+        {
+          "name": "get_repository",
+          "description": "Fetches a single repository (project) by `project_id`. By default excludes soft-deleted projects; set `include_deleted=true` only to retrieve a deleted record when permitted. Refuses with FORBIDDEN if the caller cannot access the project and NOT_FOUND if the project does not exist (or is deleted and not included).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "access_token": {
+                "type": "string",
+                "description": "Bearer access token used to authenticate the request."
+              },
+              "project_id": {
+                "type": "string",
+                "pattern": "^gl_prj_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "ULID of the project to fetch (projects.id)."
+              },
+              "include_deleted": {
+                "type": "boolean",
+                "default": false,
+                "description": "Whether to allow returning a project with status='deleted' when the caller is allowed to see it."
+              }
+            },
+            "required": [
+              "access_token",
+              "project_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_repository(access_token, project_id, include_deleted=None, **_extra):\n    import json, os, datetime, re, time, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0374000\" if __import__(\"os\").path.isdir(\"./environment_mix/0374000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code, credential=None, message=None):\n        for fname in (\"request_logs.json\", \"usage.json\", \"audit_logs.json\"):\n            path = os.path.join(_DB, fname)\n            if os.path.exists(path):\n                rows = _load(fname)\n                rows.append({\n                    \"id\": \"gl_req_\" + secrets.token_hex(12),\n                    \"endpoint\": \"get_repository\",\n                    \"credential\": credential,\n                    \"status\": status_code,\n                    \"message\": message,\n                    \"latency_ms\": int((time.time() - t0) * 1000),\n                    \"created_at\": now\n                })\n                _save(fname, rows)\n                break\n\n    if not isinstance(access_token, str) or not access_token:\n        _log(\"VALIDATION_ERROR\", None, \"missing access_token\")\n        return _err(\"VALIDATION_ERROR\", \"access_token must be a non-empty string.\")\n    if not isinstance(project_id, str) or not re.match(r\"^gl_prj_[0-9A-HJKMNP-TV-Z]{10,}$\", project_id):\n        _log(\"VALIDATION_ERROR\", access_token, \"invalid project_id\")\n        return _err(\"VALIDATION_ERROR\", \"project_id is invalid.\")\n    if include_deleted is not None and not isinstance(include_deleted, bool):\n        _log(\"VALIDATION_ERROR\", access_token, \"invalid include_deleted\")\n        return _err(\"VALIDATION_ERROR\", \"include_deleted must be a boolean when provided.\")\n    include_deleted = bool(include_deleted) if include_deleted is not None else False\n\n    # Authenticate\n    users = _load(\"users.json\")\n    token_row = None\n    for fname in (\"access_tokens.json\", \"tokens.json\", \"api_keys.json\"):\n        if os.path.exists(os.path.join(_DB, fname)):\n            rows = _load(fname)\n            token_row = next((r for r in rows if r.get(\"token\") == access_token or r.get(\"access_token\") == access_token or r.get(\"key\") == access_token or r.get(\"id\") == access_token), None)\n            if token_row:\n                break\n\n    caller = None\n    if token_row:\n        uid = token_row.get(\"user_id\") or token_row.get(\"owner_user_id\") or token_row.get(\"subject_user_id\")\n        if uid:\n            caller = next((u for u in users if u.get(\"id\") == uid), None)\n    if not caller:\n        u = next((u for u in users if u.get(\"id\") == access_token), None)\n        if u and u.get(\"status\") == \"active\":\n            caller = u\n    if not caller or caller.get(\"status\") != \"active\":\n        _log(\"UNAUTHORIZED\", access_token, \"invalid credentials\")\n        return _err(\"UNAUTHORIZED\", \"Invalid or missing credentials.\")\n\n    projects = _load(\"projects.json\")\n    prj = next((p for p in projects if p.get(\"id\") == project_id), None)\n    if not prj:\n        _log(\"NOT_FOUND\", access_token, \"project not found\")\n        return _err(\"NOT_FOUND\", \"Project not found.\")\n    if prj.get(\"status\") == \"deleted\" and not include_deleted:\n        _log(\"NOT_FOUND\", access_token, \"project deleted and not included\")\n        return _err(\"NOT_FOUND\", \"Project not found.\")\n\n    # Authorization: allow if public OR caller is owner\n    if not (prj.get(\"visibility\") == \"public\" or prj.get(\"owner_user_id\") == caller.get(\"id\")):\n        _log(\"UNAUTHORIZED\", access_token, \"forbidden\")\n        return _err(\"UNAUTHORIZED\", \"Forbidden.\")\n\n    _log(\"200\", access_token, \"ok\")\n    return {\"project\": prj}\n"
+        },
+        {
+          "name": "update_merge_request_state",
+          "description": "Transitions a merge request between lifecycle states by applying an allowed `state_event`. For `merge`, the merge request must be in state='opened' and merge_status must indicate it can be merged; otherwise the request is rejected with CONFLICT. Refuses with FORBIDDEN if the caller cannot update the merge request, and NOT_FOUND if the merge request does not exist (or is soft-deleted).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "access_token": {
+                "type": "string",
+                "description": "Bearer access token used to authenticate the request."
+              },
+              "merge_request_id": {
+                "type": "string",
+                "pattern": "^gl_mr_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "ULID of the merge request to update (merge_requests.id)."
+              },
+              "state_event": {
+                "type": "string",
+                "enum": [
+                  "close",
+                  "reopen",
+                  "merge"
+                ],
+                "description": "Requested state transition event: close (opened→closed), reopen (closed→opened), merge (opened→merged)."
+              },
+              "merged_by_user_id": {
+                "type": "string",
+                "pattern": "^gl_user_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "User performing the merge (required when state_event='merge')."
+              },
+              "merge_commit_message": {
+                "type": "string",
+                "description": "Optional commit message to use for the merge commit when merging."
+              }
+            },
+            "required": [
+              "access_token",
+              "merge_request_id",
+              "state_event"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_merge_request_state(access_token, merge_request_id, state_event, merged_by_user_id=None, merge_commit_message=None, **_extra):\n    import json, os, datetime, re, time, random\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0374000\" if __import__(\"os\").path.isdir(\"./environment_mix/0374000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    _ULID32 = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _new_id(prefix):\n        ms = int(time.time() * 1000)\n        t = ms\n        chars = []\n        for _ in range(10):\n            chars.append(_ULID32[t % 32])\n            t //= 32\n        chars = chars[::-1]\n        rand = [_ULID32[random.randrange(32)] for _ in range(16)]\n        return f\"{prefix}_\" + \"\".join(chars + rand)\n\n    def _log(status, error_code=None, message=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            logs.append({\n                \"id\": _new_id(\"gl_req\"),\n                \"endpoint\": \"update_merge_request_state\",\n                \"status\": status,\n                \"error_code\": error_code,\n                \"message\": message,\n                \"timestamp\": now,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    if not isinstance(access_token, str) or not access_token.strip():\n        _log(\"error\", \"VALIDATION_ERROR\", \"access_token is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"access_token must be a non-empty string.\")\n    if not isinstance(merge_request_id, str) or not re.match(r\"^gl_mr_[0-9A-HJKMNP-TV-Z]{10,}$\", merge_request_id):\n        _log(\"error\", \"VALIDATION_ERROR\", \"merge_request_id is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"merge_request_id is invalid.\")\n    if state_event not in (\"close\", \"reopen\", \"merge\"):\n        _log(\"error\", \"VALIDATION_ERROR\", \"state_event is invalid\")\n        return _err(\"VALIDATION_ERROR\", \"state_event must be one of: close, reopen, merge.\")\n    if state_event == \"merge\":\n        if not isinstance(merged_by_user_id, str) or not re.match(r\"^gl_user_[0-9A-HJKMNP-TV-Z]{10,}$\", merged_by_user_id):\n            _log(\"error\", \"VALIDATION_ERROR\", \"merged_by_user_id is invalid\")\n            return _err(\"VALIDATION_ERROR\", \"merged_by_user_id is required and must be a valid user id when merging.\")\n        if merge_commit_message is not None and not isinstance(merge_commit_message, str):\n            _log(\"error\", \"VALIDATION_ERROR\", \"merge_commit_message is invalid\")\n            return _err(\"VALIDATION_ERROR\", \"merge_commit_message must be a string.\")\n\n    # Authenticate access_token ambiently: match any stored token in access_tokens.json if present,\n    # otherwise allow if the store has no token collection (offline simplified)\n    token_rows = _load(\"access_tokens.json\")\n    authed_user_id = None\n    if isinstance(token_rows, list) and token_rows:\n        for r in token_rows:\n            if isinstance(r, dict) and (r.get(\"token\") == access_token or r.get(\"id\") == access_token):\n                if r.get(\"status\", \"active\") == \"active\":\n                    authed_user_id = r.get(\"user_id\") or r.get(\"owner_user_id\")\n                    break\n        if not authed_user_id:\n            _log(\"error\", \"UNAUTHORIZED\", \"invalid access_token\")\n            return _err(\"UNAUTHORIZED\", \"access_token is invalid.\")\n    else:\n        authed_user_id = None  # no token DB => treat as already authenticated\n\n    mrs = _load(\"merge_requests.json\")\n    mr = next((x for x in mrs if isinstance(x, dict) and x.get(\"id\") == merge_request_id and x.get(\"status\", \"active\") != \"deleted\"), None)\n    if not mr:\n        _log(\"error\", \"NOT_FOUND\", \"merge request not found\")\n        return _err(\"NOT_FOUND\", \"merge request not found.\")\n\n    # Basic authorization: if token resolved to a user, require they're the author (simplified)\n    if authed_user_id is not None and authed_user_id != mr.get(\"author_user_id\"):\n        _log(\"error\", \"UNAUTHORIZED\", \"not allowed to update merge request\")\n        return _err(\"UNAUTHORIZED\", \"Not allowed to update this merge request.\")\n\n    current_state = mr.get(\"state\")\n    # transitions: opened -> merged/closed; closed -> opened; merged -> none\n    def _allowed(next_state):\n        return (\n            (current_state == \"opened\" and next_state in (\"closed\", \"merged\")) or\n            (current_state == \"closed\" and next_state == \"opened\")\n        )\n\n    if state_event == \"close\":\n        if not _allowed(\"closed\"):\n            _log(\"error\", \"INVALID_TRANSITION\", \"cannot close from current state\")\n            return _err(\"INVALID_TRANSITION\", f\"Cannot close merge request from state '{current_state}'.\")\n        mr[\"state\"] = \"closed\"\n        mr[\"updated_at\"] = now\n        _save(\"merge_requests.json\", mrs)\n        _log(\"success\")\n        return {\"merge_request\": mr}\n\n    if state_event == \"reopen\":\n        if not _allowed(\"opened\"):\n            _log(\"error\", \"INVALID_TRANSITION\", \"cannot reopen from current state\")\n            return _err(\"INVALID_TRANSITION\", f\"Cannot reopen merge request from state '{current_state}'.\")\n        mr[\"state\"] = \"opened\"\n        mr[\"updated_at\"] = now\n        _save(\"merge_requests.json\", mrs)\n        _log(\"success\")\n        return {\"merge_request\": mr}\n\n    # merge\n    if not _allowed(\"merged\"):\n        _log(\"error\", \"INVALID_TRANSITION\", \"cannot merge from current state\")\n        return _err(\"INVALID_TRANSITION\", f\"Cannot merge merge request from state '{current_state}'.\")\n    if mr.get(\"merge_status\") != \"can_be_merged\":\n        _log(\"error\", \"CONFLICT\", \"merge_status does not allow merge\")\n        return _err(\"CONFLICT\", \"Merge request cannot be merged due to merge_status.\")\n    mr[\"state\"] = \"merged\"\n    mr[\"updated_at\"] = now\n    mr[\"merged_by_user_id\"] = merged_by_user_id\n    if merge_commit_message is not None:\n        mr[\"merge_commit_message\"] = merge_commit_message\n    _save(\"merge_requests.json\", mrs)\n    _log(\"success\")\n    return {\"merge_request\": mr}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0374000",
+    "index": 374,
+    "name": "GitLab",
+    "description": "This backend models a GitLab-like code hosting service focused on projects (repositories), their git references (branches), versioned files, and collaboration artifacts (issues and merge requests). The main workflows are creating/searching projects, forking, creating branches, reading file contents,",
+    "taxonomy": {
+      "L1_id": "L1-08",
+      "L1_name": "System & Cloud Infrastructure",
+      "L1_name_zh": "系统与云基础设施",
+      "L2_id": "L2-22",
+      "L2_name": "DevOps & Workflow Automation",
+      "L2_name_zh": "DevOps 与流程自动化",
+      "L3_name": "Source Code Hosting & Git Collaboration",
+      "L3_name_zh": "代码托管与Git协作"
+    },
+    "database_dir": "./environment_mix/0374000",
+    "mount_path": "/app/database",
+    "n_tools": 12,
+    "n_collections": 6,
+    "n_records": 107,
+    "n_questions": 0,
+    "execution_audit": {
+      "tools": 12,
+      "loaded": 12,
+      "reads_returning_data": 3,
+      "read_operations": 4,
+      "mutations_persisted": 1,
+      "mutations_attempted": 8
+    },
+    "tools_loadable_from_database_dir": 12,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "search_repositories",
+      "returned_chars": 85
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

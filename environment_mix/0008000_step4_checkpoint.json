@@ -1,0 +1,725 @@
+{
+  "index": 8,
+  "local_files_dir": "./environment_mix/0008000",
+  "file_list": [
+    "./environment_mix/0008000/README.md",
+    "./environment_mix/0008000/dashboard_cards.json",
+    "./environment_mix/0008000/metabase_cards.json",
+    "./environment_mix/0008000/metabase_connections.json",
+    "./environment_mix/0008000/metabase_dashboards.json",
+    "./environment_mix/0008000/metabase_databases.json",
+    "./environment_mix/0008000/query_executions.json",
+    "./environment_mix/0008000/request_logs.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "metabase_connections.json": "12 rows",
+        "metabase_databases.json": "12 rows",
+        "metabase_cards.json": "38 rows",
+        "metabase_dashboards.json": "12 rows",
+        "dashboard_cards.json": "35 rows",
+        "query_executions.json": "20 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "list_dashboards",
+          "description": "Lists dashboards visible through the given Metabase connection, applying optional status/archived/search filters and returning a sorted, cursor-paginated page of dashboard records up to limit with an opaque cursor for the next page. Raises VALIDATION_ERROR when connection_id is malformed, limit/cursor/sort/order/status values are invalid, or unsupported filters are provided. Raises UNAUTHORIZED when the connection cannot be used by the caller, NOT_FOUND when the connection_id does not exist, and QUOTA_EXCEEDED when the caller has exhausted list/read quotas for the connection.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "connection_id": {
+                "type": "string",
+                "pattern": "^mbc_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Metabase connection id to list dashboards from."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted_remote"
+                ],
+                "description": "Filter dashboards by sync/status."
+              },
+              "archived": {
+                "type": "boolean",
+                "description": "Filter by archived flag."
+              },
+              "search": {
+                "type": "string",
+                "description": "Case-insensitive substring match on dashboard name/description."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "name",
+                  "created_at",
+                  "updated_at",
+                  "last_synced_at"
+                ],
+                "description": "Field to sort dashboards by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of dashboards to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page."
+              }
+            },
+            "required": [
+              "connection_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def list_dashboards(connection_id, status=None, archived=None, search=None, sort=None, order=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0008000\" if __import__(\"os\").path.isdir(\"./environment_mix/0008000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, (int, float)):\n            try:\n                return datetime.datetime.fromtimestamp(v, tz=datetime.timezone.utc)\n            except Exception:\n                return None\n        if isinstance(v, str):\n            try:\n                s = v.replace(\"Z\", \"+00:00\")\n                return datetime.datetime.fromisoformat(s)\n            except Exception:\n                return None\n        return None\n\n    def _dt_key(v):\n        dt = _parse_dt(v)\n        if dt is None:\n            return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt\n\n    def _log(endpoint, credential_id, status_code, error_code=None, error_message=None, meta=None, latency_ms=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": \"req_\" + base64.b32encode(os.urandom(10)).decode(\"utf-8\").rstrip(\"=\").lower(),\n            \"timestamp\": _now_iso(),\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"error_message\": error_message,\n            \"latency_ms\": latency_ms,\n            \"meta\": meta or {},\n        }\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    t0 = time.time()\n    endpoint = \"list_dashboards\"\n\n    # Validate inputs\n    if not isinstance(connection_id, str) or not re.match(r\"^mbc_[0-9A-HJKMNP-TV-Z]{17,}$\", connection_id):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"connection_id is malformed\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"connection_id is malformed\")\n\n    if status is not None and status not in (\"active\", \"archived\", \"deleted_remote\"):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"Invalid status\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"Invalid status\", field=\"status\")\n\n    if archived is not None and not isinstance(archived, bool):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"archived must be boolean\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"archived must be boolean\", field=\"archived\")\n\n    if search is not None and not isinstance(search, str):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"search must be a string\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"search must be a string\", field=\"search\")\n\n    if sort is None:\n        sort = \"updated_at\"\n    if sort not in (\"name\", \"created_at\", \"updated_at\", \"last_synced_at\"):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"Invalid sort\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort\", field=\"sort\")\n\n    if order is None:\n        order = \"desc\"\n    if order not in (\"asc\", \"desc\"):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"Invalid order\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"Invalid order\", field=\"order\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"limit out of bounds\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"limit out of bounds\", field=\"limit\", minimum=1, maximum=200)\n\n    if cursor is not None and not isinstance(cursor, str):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"cursor must be a string\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\", field=\"cursor\")\n\n    # Resolve connection and authorization context (ambient)\n    conns = _load(\"metabase_connections.json\")\n    conn = next((c for c in conns if isinstance(c, dict) and c.get(\"id\") == connection_id), None)\n    if conn is None:\n        # Per contract: try to find any combination that can serve call; for list endpoints,\n        # \"authenticated\" ambient is satisfied if store contains the referenced connection.\n        _log(endpoint, None, 404, \"NOT_FOUND\", \"Connection not found\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"NOT_FOUND\", \"Connection not found\", connection_id=connection_id)\n\n    # BUSINESS RULE: list_dashboards returns dashboards where connection is active; exclude deleted_remote always\n    if conn.get(\"status\") != \"active\":\n        _log(endpoint, None, 401, \"UNAUTHORIZED\", \"Connection is not active\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"UNAUTHORIZED\", \"Connection is not active\")\n\n    rows = _load(\"metabase_dashboards.json\")\n    if not isinstance(rows, list):\n        rows = []\n\n    # Filter base set\n    filtered = []\n    q = (search or \"\").strip().lower()\n    for r in rows:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"connection_id\") != connection_id:\n            continue\n        if r.get(\"status\") == \"deleted_remote\":\n            continue\n        if r.get(\"status\") not in (\"active\", \"archived\"):\n            continue\n        if status is not None:\n            # user may request deleted_remote but business rule excludes it regardless\n            if status == \"deleted_remote\":\n                continue\n            if r.get(\"status\") != status:\n                continue\n        if archived is not None and bool(r.get(\"archived\")) != archived:\n            continue\n        if q:\n            hay = ((r.get(\"name\") or \"\") + \" \" + (r.get(\"description\") or \"\")).lower()\n            if q not in hay:\n                continue\n        filtered.append(r)\n\n    # Sorting\n    reverse = (order == \"desc\")\n\n    def _sort_key(r):\n        if sort == \"name\":\n            return (str(r.get(\"name\") or \"\").lower(), r.get(\"id\") or \"\")\n        if sort in (\"created_at\", \"updated_at\", \"last_synced_at\"):\n            return (_dt_key(r.get(sort)), r.get(\"id\") or \"\")\n        return (r.get(\"id\") or \"\")\n\n    filtered.sort(key=_sort_key, reverse=reverse)\n\n    # Cursor pagination: cursor is base64url of integer offset\n    offset = 0\n    if cursor:\n        try:\n            pad = \"=\" * (-len(cursor) % 4)\n            offset = int(base64.urlsafe_b64decode((cursor + pad).encode(\"utf-8\")).decode(\"utf-8\"))\n            if offset < 0:\n                raise ValueError()\n        except Exception:\n            _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"Invalid cursor\", latency_ms=int((time.time() - t0) * 1000))\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\", field=\"cursor\")\n\n    total = len(filtered)\n    page = filtered[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(str(next_offset).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    latency = int((time.time() - t0) * 1000)\n    _log(endpoint, None, 200, meta={\"connection_id\": connection_id, \"returned\": len(page), \"total\": total}, latency_ms=latency)\n\n    return {\n        \"dashboards\": page,\n        \"page\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"sort\": sort,\n            \"order\": order,\n        },\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_cards",
+          "description": "Lists Metabase questions/cards for the connection, optionally filtered by database_id, status/archived/query_type and search, and returns results sorted as requested and paged via limit plus an opaque next cursor. Raises VALIDATION_ERROR for malformed IDs, invalid enums (status/query_type/sort/order), invalid limit/cursor, or a database_id that does not match the provided connection_id. Raises UNAUTHORIZED when the connection is not accessible to the caller, NOT_FOUND when the connection_id (or specified database_id) does not exist, and QUOTA_EXCEEDED when read/list quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "connection_id": {
+                "type": "string",
+                "pattern": "^mbc_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Metabase connection id to list cards from."
+              },
+              "database_id": {
+                "type": "string",
+                "pattern": "^mbdb_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Filter cards to a specific stored Metabase database (internal id)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted_remote"
+                ],
+                "description": "Filter cards by sync/status."
+              },
+              "archived": {
+                "type": "boolean",
+                "description": "Filter by archived flag."
+              },
+              "query_type": {
+                "type": "string",
+                "enum": [
+                  "native",
+                  "query",
+                  "unknown"
+                ],
+                "description": "Filter by card query type."
+              },
+              "search": {
+                "type": "string",
+                "description": "Case-insensitive substring match on card name/description."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "name",
+                  "created_at",
+                  "updated_at",
+                  "last_synced_at"
+                ],
+                "description": "Field to sort cards by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of cards to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page."
+              }
+            },
+            "required": [
+              "connection_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def list_cards(connection_id, database_id=None, status=None, archived=None, query_type=None, search=None, sort=None, order=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0008000\" if __import__(\"os\").path.isdir(\"./environment_mix/0008000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, (int, float)):\n            try:\n                return datetime.datetime.fromtimestamp(v, tz=datetime.timezone.utc)\n            except Exception:\n                return None\n        if isinstance(v, str):\n            try:\n                s = v.replace(\"Z\", \"+00:00\")\n                return datetime.datetime.fromisoformat(s)\n            except Exception:\n                return None\n        return None\n\n    def _dt_key(v):\n        dt = _parse_dt(v)\n        if dt is None:\n            return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt\n\n    def _log(endpoint, credential_id, status_code, error_code=None, error_message=None, meta=None, latency_ms=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": \"req_\" + base64.b32encode(os.urandom(10)).decode(\"utf-8\").rstrip(\"=\").lower(),\n            \"timestamp\": _now_iso(),\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"error_message\": error_message,\n            \"latency_ms\": latency_ms,\n            \"meta\": meta or {},\n        }\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    t0 = time.time()\n    endpoint = \"list_cards\"\n\n    if not isinstance(connection_id, str) or not re.match(r\"^mbc_[0-9A-HJKMNP-TV-Z]{17,}$\", connection_id):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"connection_id is malformed\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"connection_id is malformed\")\n\n    if database_id is not None:\n        if not isinstance(database_id, str) or not re.match(r\"^mbdb_[0-9A-HJKMNP-TV-Z]{17,}$\", database_id):\n            _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"database_id is malformed\", latency_ms=int((time.time() - t0) * 1000))\n            return _err(\"VALIDATION_ERROR\", \"database_id is malformed\", field=\"database_id\")\n\n    if status is not None and status not in (\"active\", \"archived\", \"deleted_remote\"):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"Invalid status\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"Invalid status\", field=\"status\")\n\n    if archived is not None and not isinstance(archived, bool):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"archived must be boolean\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"archived must be boolean\", field=\"archived\")\n\n    if query_type is not None and query_type not in (\"native\", \"query\", \"unknown\"):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"Invalid query_type\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"Invalid query_type\", field=\"query_type\")\n\n    if search is not None and not isinstance(search, str):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"search must be a string\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"search must be a string\", field=\"search\")\n\n    if sort is None:\n        sort = \"updated_at\"\n    if sort not in (\"name\", \"created_at\", \"updated_at\", \"last_synced_at\"):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"Invalid sort\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort\", field=\"sort\")\n\n    if order is None:\n        order = \"desc\"\n    if order not in (\"asc\", \"desc\"):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"Invalid order\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"Invalid order\", field=\"order\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"limit out of bounds\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"limit out of bounds\", field=\"limit\", minimum=1, maximum=200)\n\n    if cursor is not None and not isinstance(cursor, str):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"cursor must be a string\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\", field=\"cursor\")\n\n    conns = _load(\"metabase_connections.json\")\n    conn = next((c for c in conns if isinstance(c, dict) and c.get(\"id\") == connection_id), None)\n    if conn is None:\n        _log(endpoint, None, 404, \"NOT_FOUND\", \"Connection not found\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"NOT_FOUND\", \"Connection not found\", connection_id=connection_id)\n\n    if conn.get(\"status\") != \"active\":\n        _log(endpoint, None, 401, \"UNAUTHORIZED\", \"Connection is not active\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"UNAUTHORIZED\", \"Connection is not active\")\n\n    dbs = _load(\"metabase_databases.json\")\n    if not isinstance(dbs, list):\n        dbs = []\n    if database_id is not None:\n        db = next((d for d in dbs if isinstance(d, dict) and d.get(\"id\") == database_id), None)\n        if db is None:\n            _log(endpoint, None, 404, \"NOT_FOUND\", \"Database not found\", latency_ms=int((time.time() - t0) * 1000))\n            return _err(\"NOT_FOUND\", \"Database not found\", database_id=database_id)\n        if db.get(\"connection_id\") != connection_id:\n            _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"database_id does not match connection_id\", latency_ms=int((time.time() - t0) * 1000))\n            return _err(\"VALIDATION_ERROR\", \"database_id does not match connection_id\", field=\"database_id\")\n\n    cards = _load(\"metabase_cards.json\")\n    if not isinstance(cards, list):\n        cards = []\n\n    q = (search or \"\").strip().lower()\n    filtered = []\n    for r in cards:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"connection_id\") != connection_id:\n            continue\n        if r.get(\"status\") == \"deleted_remote\":\n            continue\n        if r.get(\"status\") not in (\"active\", \"archived\"):\n            continue\n        if status is not None:\n            if status == \"deleted_remote\":\n                continue\n            if r.get(\"status\") != status:\n                continue\n        if database_id is not None and r.get(\"database_id\") != database_id:\n            continue\n        if archived is not None and bool(r.get(\"archived\")) != archived:\n            continue\n        if query_type is not None and r.get(\"query_type\") != query_type:\n            continue\n        if q:\n            hay = ((r.get(\"name\") or \"\") + \" \" + (r.get(\"description\") or \"\")).lower()\n            if q not in hay:\n                continue\n        filtered.append(r)\n\n    reverse = (order == \"desc\")\n\n    def _sort_key(r):\n        if sort == \"name\":\n            return (str(r.get(\"name\") or \"\").lower(), r.get(\"id\") or \"\")\n        if sort in (\"created_at\", \"updated_at\", \"last_synced_at\"):\n            return (_dt_key(r.get(sort)), r.get(\"id\") or \"\")\n        return (r.get(\"id\") or \"\")\n\n    filtered.sort(key=_sort_key, reverse=reverse)\n\n    offset = 0\n    if cursor:\n        try:\n            pad = \"=\" * (-len(cursor) % 4)\n            offset = int(base64.urlsafe_b64decode((cursor + pad).encode(\"utf-8\")).decode(\"utf-8\"))\n            if offset < 0:\n                raise ValueError()\n        except Exception:\n            _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"Invalid cursor\", latency_ms=int((time.time() - t0) * 1000))\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\", field=\"cursor\")\n\n    total = len(filtered)\n    page = filtered[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(str(next_offset).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    latency = int((time.time() - t0) * 1000)\n    _log(endpoint, None, 200, meta={\"connection_id\": connection_id, \"returned\": len(page), \"total\": total}, latency_ms=latency)\n\n    return {\n        \"cards\": page,\n        \"page\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"sort\": sort,\n            \"order\": order,\n        },\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_databases",
+          "description": "Lists databases configured in the connected Metabase instance, optionally filtered by status, is_sample, engine, and search, and returns a sorted, cursor-paginated page of database records up to limit with an opaque cursor for the next page. Raises VALIDATION_ERROR when connection_id is malformed, filter/sort/order values are invalid, or limit/cursor are out of bounds. Raises UNAUTHORIZED when the caller cannot use the connection, NOT_FOUND when the connection_id does not exist, and QUOTA_EXCEEDED when the caller exceeds allowed listing volume.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "connection_id": {
+                "type": "string",
+                "pattern": "^mbc_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Metabase connection id to list databases from."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "unavailable"
+                ],
+                "description": "Filter databases by status."
+              },
+              "is_sample": {
+                "type": "boolean",
+                "description": "Filter by whether database is the Metabase sample dataset."
+              },
+              "engine": {
+                "type": "string",
+                "description": "Filter by database engine (e.g., postgres, mysql)."
+              },
+              "search": {
+                "type": "string",
+                "description": "Case-insensitive substring match on database name."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "name",
+                  "created_at",
+                  "updated_at",
+                  "last_synced_at"
+                ],
+                "description": "Field to sort databases by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of databases to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page."
+              }
+            },
+            "required": [
+              "connection_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def list_databases(connection_id, status=None, is_sample=None, engine=None, search=None, sort=None, order=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0008000\" if __import__(\"os\").path.isdir(\"./environment_mix/0008000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, (int, float)):\n            try:\n                return datetime.datetime.fromtimestamp(v, tz=datetime.timezone.utc)\n            except Exception:\n                return None\n        if isinstance(v, str):\n            try:\n                s = v.replace(\"Z\", \"+00:00\")\n                return datetime.datetime.fromisoformat(s)\n            except Exception:\n                return None\n        return None\n\n    def _dt_key(v):\n        dt = _parse_dt(v)\n        if dt is None:\n            return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt\n\n    def _log(endpoint, credential_id, status_code, error_code=None, error_message=None, meta=None, latency_ms=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": \"req_\" + base64.b32encode(os.urandom(10)).decode(\"utf-8\").rstrip(\"=\").lower(),\n            \"timestamp\": _now_iso(),\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"error_message\": error_message,\n            \"latency_ms\": latency_ms,\n            \"meta\": meta or {},\n        }\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    t0 = time.time()\n    endpoint = \"list_databases\"\n\n    if not isinstance(connection_id, str) or not re.match(r\"^mbc_[0-9A-HJKMNP-TV-Z]{17,}$\", connection_id):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"connection_id is malformed\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"connection_id is malformed\")\n\n    if status is not None and status not in (\"active\", \"archived\", \"unavailable\"):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"Invalid status\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"Invalid status\", field=\"status\")\n\n    if is_sample is not None and not isinstance(is_sample, bool):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"is_sample must be boolean\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"is_sample must be boolean\", field=\"is_sample\")\n\n    if engine is not None and not isinstance(engine, str):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"engine must be a string\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"engine must be a string\", field=\"engine\")\n\n    if search is not None and not isinstance(search, str):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"search must be a string\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"search must be a string\", field=\"search\")\n\n    if sort is None:\n        sort = \"updated_at\"\n    if sort not in (\"name\", \"created_at\", \"updated_at\", \"last_synced_at\"):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"Invalid sort\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort\", field=\"sort\")\n\n    if order is None:\n        order = \"desc\"\n    if order not in (\"asc\", \"desc\"):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"Invalid order\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"Invalid order\", field=\"order\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"limit out of bounds\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"limit out of bounds\", field=\"limit\", minimum=1, maximum=200)\n\n    if cursor is not None and not isinstance(cursor, str):\n        _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"cursor must be a string\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\", field=\"cursor\")\n\n    conns = _load(\"metabase_connections.json\")\n    conn = next((c for c in conns if isinstance(c, dict) and c.get(\"id\") == connection_id), None)\n    if conn is None:\n        _log(endpoint, None, 404, \"NOT_FOUND\", \"Connection not found\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"NOT_FOUND\", \"Connection not found\", connection_id=connection_id)\n\n    if conn.get(\"status\") != \"active\":\n        _log(endpoint, None, 401, \"UNAUTHORIZED\", \"Connection is not active\", latency_ms=int((time.time() - t0) * 1000))\n        return _err(\"UNAUTHORIZED\", \"Connection is not active\")\n\n    dbs = _load(\"metabase_databases.json\")\n    if not isinstance(dbs, list):\n        dbs = []\n\n    q = (search or \"\").strip().lower()\n    eng = engine.strip().lower() if isinstance(engine, str) else None\n\n    filtered = []\n    for r in dbs:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"connection_id\") != connection_id:\n            continue\n\n        # BUSINESS RULE: default list_databases returns status='active'\n        if status is None:\n            if r.get(\"status\") != \"active\":\n                continue\n        else:\n            if r.get(\"status\") != status:\n                continue\n\n        if is_sample is not None and bool(r.get(\"is_sample\")) != is_sample:\n            continue\n        if eng is not None:\n            if (r.get(\"engine\") or \"\").strip().lower() != eng:\n                continue\n        if q:\n            if q not in (r.get(\"name\") or \"\").lower():\n                continue\n        filtered.append(r)\n\n    reverse = (order == \"desc\")\n\n    def _sort_key(r):\n        if sort == \"name\":\n            return (str(r.get(\"name\") or \"\").lower(), r.get(\"id\") or \"\")\n        if sort in (\"created_at\", \"updated_at\", \"last_synced_at\"):\n            return (_dt_key(r.get(sort)), r.get(\"id\") or \"\")\n        return (r.get(\"id\") or \"\")\n\n    filtered.sort(key=_sort_key, reverse=reverse)\n\n    offset = 0\n    if cursor:\n        try:\n            pad = \"=\" * (-len(cursor) % 4)\n            offset = int(base64.urlsafe_b64decode((cursor + pad).encode(\"utf-8\")).decode(\"utf-8\"))\n            if offset < 0:\n                raise ValueError()\n        except Exception:\n            _log(endpoint, None, 400, \"VALIDATION_ERROR\", \"Invalid cursor\", latency_ms=int((time.time() - t0) * 1000))\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\", field=\"cursor\")\n\n    total = len(filtered)\n    page = filtered[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(str(next_offset).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    latency = int((time.time() - t0) * 1000)\n    _log(endpoint, None, 200, meta={\"connection_id\": connection_id, \"returned\": len(page), \"total\": total}, latency_ms=latency)\n\n    return {\n        \"databases\": page,\n        \"page\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"sort\": sort,\n            \"order\": order,\n        },\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "execute_card",
+          "description": "Executes a saved Metabase card (by stored card_id or metabase_card_id) through the specified connection and returns the query result up to max_rows along with execution metadata, subject to timeout_ms. Raises VALIDATION_ERROR when IDs are malformed/invalid, max_rows or timeout_ms are out of range, the parameter payload is invalid for the card, or neither card_id nor metabase_card_id can be resolved. Raises UNAUTHORIZED when the caller cannot execute queries on the connection, NOT_FOUND when the connection or card does not exist (or is deleted_remote), CONFLICT when the card is archived or otherwise not executable in its current state, and QUOTA_EXCEEDED when execution or row/timeout quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "connection_id": {
+                "type": "string",
+                "pattern": "^mbc_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Metabase connection id to execute the card against."
+              },
+              "card_id": {
+                "type": "string",
+                "pattern": "^mbc_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Stored Metabase card id (internal id)."
+              },
+              "metabase_card_id": {
+                "type": "string",
+                "minimum": 1,
+                "description": "Metabase-native card id to execute (if not using card_id)."
+              },
+              "parameters": {
+                "type": "object",
+                "description": "Parameter values for the card execution (Metabase parameter payload)."
+              },
+              "max_rows": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10000,
+                "description": "Maximum number of rows to return in the result."
+              },
+              "timeout_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 600000,
+                "description": "Client-side timeout in milliseconds for the execution."
+              }
+            },
+            "required": [
+              "connection_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def execute_card(connection_id, card_id=None, metabase_card_id=None, parameters=None, max_rows=None, timeout_ms=None, **_extra):\n    import json, os, datetime, time, re, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0008000\" if __import__(\"os\").path.isdir(\"./environment_mix/0008000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"execute_card\"\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _now_iso():\n        return _now().isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v.strip()\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except ValueError:\n                return None\n        return None\n\n    def _log(status, err=None, meta=None):\n        # Prefer request_logs.json (used by other tools); fall back to metabase_request_logs.json if present in store.\n        fn = \"request_logs.json\"\n        logs = _load(fn)\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": f\"rql_{int(time.time()*1000)}_{os.getpid()}_{len(logs)+1}\",\n            \"ts\": _now_iso(),\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"latency_ms\": int(max(0, (time.time() - t0) * 1000)),\n            \"meta\": meta or {},\n            \"error\": err\n        })\n        _save(fn, logs)\n\n    def _rate_limit_check():\n        limits = _load(\"service_limits.json\")\n        if not isinstance(limits, dict):\n            return None\n        rl = limits.get(\"rate_limit_per_minute\")\n        if rl is None:\n            return None\n        try:\n            rl = int(rl)\n        except Exception:\n            return None\n        if rl <= 0:\n            return None\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        cutoff = _now() - datetime.timedelta(seconds=60)\n        c = 0\n        for r in reversed(logs[-5000:]):\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"endpoint\") != endpoint:\n                continue\n            ts = _parse_dt(r.get(\"ts\") or r.get(\"timestamp\"))\n            if ts is None:\n                continue\n            if ts >= cutoff:\n                c += 1\n            else:\n                break\n        if c >= rl:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n        return None\n\n    # Rate limit (if configured)\n    rlerr = _rate_limit_check()\n    if rlerr:\n        _log(\"error\", rlerr[\"error\"], meta={\"connection_id\": connection_id})\n        return rlerr\n\n    # Validate inputs (relax to match parameter schema; do not over-reject)\n    if not isinstance(connection_id, str) or not re.match(r\"^mbc_[0-9A-HJKMNP-TV-Z]{17,}$\", connection_id):\n        e = _err(\"VALIDATION_ERROR\", \"connection_id is malformed\", field=\"connection_id\")\n        _log(\"error\", e[\"error\"], meta={\"connection_id\": connection_id})\n        return e\n\n    if card_id is not None:\n        if not isinstance(card_id, str) or not re.match(r\"^mbc_[0-9A-HJKMNP-TV-Z]{17,}$\", card_id):\n            e = _err(\"VALIDATION_ERROR\", \"card_id is malformed\", field=\"card_id\")\n            _log(\"error\", e[\"error\"], meta={\"connection_id\": connection_id, \"card_id\": card_id})\n            return e\n\n    if metabase_card_id is not None:\n        if not isinstance(metabase_card_id, int) or metabase_card_id < 1:\n            e = _err(\"VALIDATION_ERROR\", \"metabase_card_id is invalid\", field=\"metabase_card_id\")\n            _log(\"error\", e[\"error\"], meta={\"connection_id\": connection_id, \"metabase_card_id\": metabase_card_id})\n            return e\n\n    if parameters is not None and not isinstance(parameters, dict):\n        e = _err(\"VALIDATION_ERROR\", \"parameters must be an object\", field=\"parameters\")\n        _log(\"error\", e[\"error\"], meta={\"connection_id\": connection_id})\n        return e\n\n    if max_rows is None:\n        max_rows = 1000\n    if not isinstance(max_rows, int) or max_rows < 1 or max_rows > 10000:\n        e = _err(\"VALIDATION_ERROR\", \"max_rows is out of range\", field=\"max_rows\")\n        _log(\"error\", e[\"error\"], meta={\"connection_id\": connection_id, \"max_rows\": max_rows})\n        return e\n\n    if timeout_ms is None:\n        timeout_ms = 60000\n    if not isinstance(timeout_ms, int) or timeout_ms < 1 or timeout_ms > 600000:\n        e = _err(\"VALIDATION_ERROR\", \"timeout_ms is out of range\", field=\"timeout_ms\")\n        _log(\"error\", e[\"error\"], meta={\"connection_id\": connection_id, \"timeout_ms\": timeout_ms})\n        return e\n\n    # Resolve connection and enforce: execution requests rejected when connection.status != 'active'\n    conns = _load(\"metabase_connections.json\")\n    if not isinstance(conns, list):\n        conns = []\n    conn = next((c for c in conns if isinstance(c, dict) and c.get(\"id\") == connection_id), None)\n    if conn is None:\n        e = _err(\"NOT_FOUND\", \"Connection not found\", connection_id=connection_id)\n        _log(\"error\", e[\"error\"], meta={\"connection_id\": connection_id})\n        return e\n    if conn.get(\"status\") != \"active\":\n        e = _err(\"UNAUTHORIZED\", \"Connection is not active\", connection_id=connection_id, status=conn.get(\"status\"))\n        _log(\"error\", e[\"error\"], meta={\"connection_id\": connection_id})\n        return e\n\n    # Resolve card:\n    # Business rules allow executing by metabase_card_id even if local card record missing.\n    cards = _load(\"metabase_cards.json\")\n    if not isinstance(cards, list):\n        cards = []\n\n    card_row = None\n    resolved_metabase_card_id = metabase_card_id\n\n    if card_id is not None:\n        card_row = next((r for r in cards if isinstance(r, dict) and r.get(\"id\") == card_id), None)\n        # If card_id not found, but metabase_card_id provided, allow fallback to metabase_card_id instead of failing.\n        if card_row is None and metabase_card_id is None:\n            e = _err(\"NOT_FOUND\", \"Card not found\", card_id=card_id)\n            _log(\"error\", e[\"error\"], meta={\"connection_id\": connection_id, \"card_id\": card_id})\n            return e\n        if card_row is not None:\n            # Must match connection_id\n            if card_row.get(\"connection_id\") != connection_id:\n                e = _err(\"CONFLICT\", \"card_id does not belong to the provided connection\", card_id=card_id, connection_id=connection_id)\n                _log(\"error\", e[\"error\"], meta={\"connection_id\": connection_id, \"card_id\": card_id})\n                return e\n            # Exclude deleted_remote from being runnable (consistent with availability rules)\n            if card_row.get(\"status\") == \"deleted_remote\":\n                e = _err(\"NOT_FOUND\", \"Card is deleted on remote\", card_id=card_id)\n                _log(\"error\", e[\"error\"], meta={\"connection_id\": connection_id, \"card_id\": card_id})\n                return e\n            resolved_metabase_card_id = card_row.get(\"metabase_card_id\") if resolved_metabase_card_id is None else resolved_metabase_card_id\n\n    if card_row is None and resolved_metabase_card_id is not None:\n        # Try to resolve local card row by metabase_card_id for metadata, but do not require it.\n        card_row = next((r for r in cards if isinstance(r, dict) and r.get(\"metabase_card_id\") == resolved_metabase_card_id and r.get(\"connection_id\") == connection_id), None)\n        # If found and deleted_remote, reject\n        if card_row is not None and card_row.get(\"status\") == \"deleted_remote\":\n            e = _err(\"NOT_FOUND\", \"Card is deleted on remote\", metabase_card_id=resolved_metabase_card_id)\n            _log(\"error\", e[\"error\"], meta={\"connection_id\": connection_id, \"metabase_card_id\": resolved_metabase_card_id})\n            return e\n\n    if resolved_metabase_card_id is None:\n        e = _err(\"VALIDATION_ERROR\", \"Either card_id or metabase_card_id must be provided and resolvable\", field=\"card_id\")\n        _log(\"error\", e[\"error\"], meta={\"connection_id\": connection_id, \"card_id\": card_id, \"metabase_card_id\": metabase_card_id})\n        return e\n\n    # Create query_executions row\n    executions = _load(\"query_executions.json\")\n    if not isinstance(executions, list):\n        executions = []\n\n    exec_id = \"mbqe_\" + secrets.token_hex(10)\n    started_at = _now()\n    created = {\n        \"id\": exec_id,\n        \"connection_id\": connection_id,\n        \"execution_type\": \"card\",\n        \"metabase_database_id\": None,\n        \"database_id\": None,\n        \"metabase_card_id\": int(resolved_metabase_card_id),\n        \"card_id\": (card_row.get(\"id\") if isinstance(card_row, dict) else None),\n        \"native_sql\": None,\n        \"parameters\": parameters if parameters is not None else {},\n        \"status\": \"running\",\n        \"started_at\": started_at.isoformat(),\n        \"finished_at\": None,\n        \"duration_ms\": None,\n        \"row_count\": None,\n        \"result_columns\": None,\n        \"result_preview_rows\": None,\n        \"error_message\": None,\n        \"created_at\": _now_iso(),\n        \"updated_at\": _now_iso(),\n    }\n    executions.append(created)\n    _save(\"query_executions.json\", executions)\n\n    # Since we cannot call real Metabase offline, mark as succeeded with empty results,\n    # but still respect lifecycle + timestamps and keep \"no success without effect\" (we did persist).\n    finished_at = _now()\n    dur = int(max(0, (finished_at - started_at).total_seconds() * 1000))\n    created[\"status\"] = \"succeeded\"\n    created[\"finished_at\"] = finished_at.isoformat()\n    created[\"duration_ms\"] = dur\n    created[\"row_count\"] = 0\n    created[\"result_columns\"] = []\n    created[\"result_preview_rows\"] = []\n    created[\"updated_at\"] = _now_iso()\n    _save(\"query_executions.json\", executions)\n\n    out = {\n        \"execution\": created,\n        \"data\": {\n            \"columns\": created[\"result_columns\"],\n            \"rows\": created[\"result_preview_rows\"],\n            \"max_rows\": max_rows,\n            \"timeout_ms\": timeout_ms,\n        }\n    }\n    _log(\"ok\", meta={\"connection_id\": connection_id, \"execution_id\": exec_id, \"metabase_card_id\": resolved_metabase_card_id, \"card_id\": created[\"card_id\"]})\n    return out\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_dashboard_cards",
+          "description": "Returns the cards linked to a dashboard (by stored dashboard_id or metabase_dashboard_id), optionally filtered by link status, sorted as requested, and paged with limit and an opaque cursor for the next page. Raises VALIDATION_ERROR when IDs are malformed/invalid, sort/order/status values are invalid, or limit/cursor are out of bounds. Raises UNAUTHORIZED when the caller cannot read the connection’s dashboards, NOT_FOUND when the connection or dashboard does not exist (or is deleted_remote), and QUOTA_EXCEEDED when list/read quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "connection_id": {
+                "type": "string",
+                "pattern": "^mbc_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Metabase connection id the dashboard belongs to."
+              },
+              "dashboard_id": {
+                "type": "string",
+                "pattern": "^mbdsh_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Stored dashboard id (internal id)."
+              },
+              "metabase_dashboard_id": {
+                "type": "string",
+                "minimum": 1,
+                "description": "Metabase-native dashboard id (if not using dashboard_id)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "removed"
+                ],
+                "description": "Filter dashboard-card links by status."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "position",
+                  "created_at",
+                  "updated_at",
+                  "last_synced_at"
+                ],
+                "description": "Field to sort dashboard cards by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500,
+                "description": "Maximum number of dashboard cards to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page."
+              }
+            },
+            "required": [
+              "connection_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_dashboard_cards(connection_id, dashboard_id=None, metabase_dashboard_id=None, status=None, sort=None, order=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0008000\" if __import__(\"os\").path.isdir(\"./environment_mix/0008000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_dashboard_cards\"\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _now_iso():\n        return _now().isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v.strip()\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except ValueError:\n                return None\n        return None\n\n    def _log(status_code, err=None, meta=None):\n        fn = \"request_logs.json\"\n        logs = _load(fn)\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": f\"rql_{int(time.time()*1000)}_{os.getpid()}_{len(logs)+1}\",\n            \"ts\": _now_iso(),\n            \"endpoint\": endpoint,\n            \"status\": status_code,\n            \"latency_ms\": int(max(0, (time.time() - t0) * 1000)),\n            \"meta\": meta or {},\n            \"error\": err\n        })\n        _save(fn, logs)\n\n    def _rate_limit_check():\n        limits = _load(\"service_limits.json\")\n        if not isinstance(limits, dict):\n            return None\n        rl = limits.get(\"rate_limit_per_minute\")\n        if rl is None:\n            return None\n        try:\n            rl = int(rl)\n        except Exception:\n            return None\n        if rl <= 0:\n            return None\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        cutoff = _now() - datetime.timedelta(seconds=60)\n        c = 0\n        for r in reversed(logs[-5000:]):\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"endpoint\") != endpoint:\n                continue\n            ts = r.get(\"ts\") or r.get(\"timestamp\")\n            dt = _parse_dt(ts)\n            if not dt:\n                continue\n            if dt < cutoff:\n                break\n            c += 1\n        if c >= rl:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        return None\n\n    # ---- validation (relaxed to schema; cursor is opaque) ----\n    conn_pat = re.compile(r\"^mbc_[0-9A-HJKMNP-TV-Z]{17,}$\")\n    dash_pat = re.compile(r\"^mbdsh_[0-9A-HJKMNP-TV-Z]{17,}$\")\n\n    if not isinstance(connection_id, str) or not conn_pat.match(connection_id):\n        e = _err(\"VALIDATION_ERROR\", \"connection_id is malformed\", field=\"connection_id\")\n        _log(\"error\", err=e[\"error\"])\n        return e\n\n    if dashboard_id is not None:\n        if not isinstance(dashboard_id, str) or not dash_pat.match(dashboard_id):\n            # Must accept real ids from store; do not over-reject\n            e = _err(\"VALIDATION_ERROR\", \"dashboard_id is malformed\", field=\"dashboard_id\")\n            _log(\"error\", err=e[\"error\"])\n            return e\n\n    if metabase_dashboard_id is not None:\n        if not isinstance(metabase_dashboard_id, int) or metabase_dashboard_id < 1:\n            e = _err(\"VALIDATION_ERROR\", \"metabase_dashboard_id must be an integer >= 1\", field=\"metabase_dashboard_id\")\n            _log(\"error\", err=e[\"error\"])\n            return e\n\n    if dashboard_id is None and metabase_dashboard_id is None:\n        e = _err(\"VALIDATION_ERROR\", \"Either dashboard_id or metabase_dashboard_id must be provided.\", field=\"dashboard_id\")\n        _log(\"error\", err=e[\"error\"])\n        return e\n\n    if status is not None and status not in (\"active\", \"removed\"):\n        e = _err(\"VALIDATION_ERROR\", \"Invalid status.\", field=\"status\")\n        _log(\"error\", err=e[\"error\"])\n        return e\n\n    if sort is None:\n        sort = \"position\"\n    if sort not in (\"position\", \"created_at\", \"updated_at\", \"last_synced_at\"):\n        e = _err(\"VALIDATION_ERROR\", \"Invalid sort field.\", field=\"sort\")\n        _log(\"error\", err=e[\"error\"])\n        return e\n\n    if order is None:\n        order = \"asc\"\n    if order not in (\"asc\", \"desc\"):\n        e = _err(\"VALIDATION_ERROR\", \"Invalid order.\", field=\"order\")\n        _log(\"error\", err=e[\"error\"])\n        return e\n\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int) or limit < 1 or limit > 500:\n        e = _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 500.\", field=\"limit\")\n        _log(\"error\", err=e[\"error\"])\n        return e\n\n    if cursor is not None and not isinstance(cursor, str):\n        e = _err(\"VALIDATION_ERROR\", \"cursor must be a string.\", field=\"cursor\")\n        _log(\"error\", err=e[\"error\"])\n        return e\n\n    # rate limit before work\n    rl = _rate_limit_check()\n    if rl:\n        _log(\"error\", err=rl[\"error\"])\n        return rl\n\n    # ---- auth/context resolution (ambient): ensure connection exists (do not require active for read) ----\n    conns = _load(\"metabase_connections.json\")\n    if not isinstance(conns, list):\n        conns = []\n    conn = next((c for c in conns if isinstance(c, dict) and c.get(\"id\") == connection_id), None)\n    if not conn:\n        e = _err(\"UNAUTHORIZED\", \"The caller cannot read the connection.\")\n        _log(\"error\", err=e[\"error\"])\n        return e\n\n    dashboards = _load(\"metabase_dashboards.json\")\n    if not isinstance(dashboards, list):\n        dashboards = []\n    dash = None\n    if dashboard_id is not None:\n        dash = next((d for d in dashboards if isinstance(d, dict) and d.get(\"id\") == dashboard_id and d.get(\"connection_id\") == connection_id), None)\n    else:\n        dash = next((d for d in dashboards if isinstance(d, dict) and d.get(\"metabase_dashboard_id\") == metabase_dashboard_id and d.get(\"connection_id\") == connection_id), None)\n\n    if not dash:\n        e = _err(\"NOT_FOUND\", \"Dashboard not found.\")\n        _log(\"error\", err=e[\"error\"])\n        return e\n\n    if dash.get(\"status\") == \"deleted_remote\":\n        e = _err(\"NOT_FOUND\", \"Dashboard not found.\")\n        _log(\"error\", err=e[\"error\"])\n        return e\n\n    dash_id_local = dash.get(\"id\")\n\n    placements = _load(\"dashboard_cards.json\")\n    if not isinstance(placements, list):\n        placements = []\n\n    cards = _load(\"metabase_cards.json\")\n    if not isinstance(cards, list):\n        cards = []\n    cards_by_id = {c.get(\"id\"): c for c in cards if isinstance(c, dict) and c.get(\"id\")}\n\n    # base filter: must be this connection, this dashboard, placement active, and card not deleted_remote\n    rows = []\n    for p in placements:\n        if not isinstance(p, dict):\n            continue\n        if p.get(\"connection_id\") != connection_id:\n            continue\n        if p.get(\"dashboard_id\") != dash_id_local:\n            continue\n        if p.get(\"status\") != \"active\":\n            continue\n        if status is not None and p.get(\"status\") != status:\n            continue  # status filter (though base is active for endpoint rules)\n        card = cards_by_id.get(p.get(\"card_id\"))\n        if not card or card.get(\"connection_id\") != connection_id:\n            continue\n        if card.get(\"status\") == \"deleted_remote\":\n            continue\n        # business rule: join to card\n        out = dict(p)\n        out[\"card\"] = card\n        rows.append(out)\n\n    # sorting\n    reverse = (order == \"desc\")\n\n    def _key(r):\n        v = r.get(sort)\n        if sort in (\"created_at\", \"updated_at\", \"last_synced_at\"):\n            dt = _parse_dt(v)\n            # None sorts last in asc, first in desc; approximate by tuple\n            return (dt is None, dt or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc))\n        # numeric sort fields\n        return (v is None, v)\n\n    rows.sort(key=_key, reverse=reverse)\n\n    # cursor pagination (opaque): accept raw id OR base64-encoded JSON {\"last_id\": \"...\"}\n    start = 0\n    if cursor:\n        last_id = None\n        # attempt decode\n        try:\n            raw = cursor\n            try:\n                decoded = base64.urlsafe_b64decode(raw.encode(\"utf-8\") + b\"===\")\n                decoded_s = decoded.decode(\"utf-8\", errors=\"ignore\").strip()\n                if decoded_s.startswith(\"{\"):\n                    obj = json.loads(decoded_s)\n                    if isinstance(obj, dict):\n                        last_id = obj.get(\"last_id\") or obj.get(\"id\")\n                else:\n                    last_id = decoded_s if decoded_s else None\n            except Exception:\n                # treat as plain opaque token\n                last_id = raw\n        except Exception:\n            last_id = None\n        if last_id:\n            for i, r in enumerate(rows):\n                if r.get(\"id\") == last_id:\n                    start = i + 1\n                    break\n            # if not found: treat as out-of-range cursor => empty page (not error)\n    page = rows[start:start + limit]\n    has_more = (start + limit) < len(rows)\n    next_cursor = None\n    if has_more and page:\n        payload = {\"last_id\": page[-1].get(\"id\")}\n        next_cursor = base64.urlsafe_b64encode(json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    resp = {\n        \"dashboard\": dash,\n        \"data\": page,\n        \"meta\": {\n            \"total\": len(rows),\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"sort\": sort,\n            \"order\": order\n        }\n    }\n    _log(\"ok\", meta={\"connection_id\": connection_id, \"dashboard_id\": dash_id_local, \"returned\": len(page), \"total\": len(rows)})\n    return resp\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "execute_query",
+          "description": "Executes an ad-hoc native SQL query (native_sql) against a selected Metabase database (by stored database_id or metabase_database_id) and returns the result up to max_rows with execution metadata, subject to timeout_ms. Raises VALIDATION_ERROR when native_sql is empty/invalid, IDs are malformed/invalid, max_rows or timeout_ms are out of range, parameters payload is invalid, or no resolvable database is provided for the connection. Raises UNAUTHORIZED when the caller cannot execute queries on the connection, NOT_FOUND when the connection or target database does not exist (or is unavailable), CONFLICT when the target database is archived/unavailable for execution, and QUOTA_EXCEEDED when execution, time, or row quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "connection_id": {
+                "type": "string",
+                "pattern": "^mbc_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Metabase connection id to execute the query against."
+              },
+              "database_id": {
+                "type": "string",
+                "pattern": "^mbdb_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Stored Metabase database id (internal id) to run the SQL against."
+              },
+              "metabase_database_id": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Metabase-native database id to run the SQL against (if not using database_id)."
+              },
+              "native_sql": {
+                "type": "string",
+                "description": "SQL string to execute as a native query."
+              },
+              "parameters": {
+                "type": "object",
+                "description": "Optional query parameters (Metabase native query parameter payload)."
+              },
+              "max_rows": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10000,
+                "description": "Maximum number of rows to return in the result."
+              },
+              "timeout_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 600000,
+                "description": "Client-side timeout in milliseconds for the execution."
+              }
+            },
+            "required": [
+              "connection_id",
+              "native_sql"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def execute_query(connection_id, native_sql, database_id=None, metabase_database_id=None, parameters=None, max_rows=None, timeout_ms=None, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0008000\" if __import__(\"os\").path.isdir(\"./environment_mix/0008000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    request_log_file = \"metabase_request_logs.json\"\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _now_iso():\n        return _now().isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            if v.tzinfo is None:\n                return v.replace(tzinfo=datetime.timezone.utc)\n            return v\n        if isinstance(v, str):\n            s = v.strip()\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(s)\n        raise ValueError(\"invalid datetime\")\n\n    def _log(endpoint, status, connection=None, error=None):\n        logs = _load(request_log_file)\n        if not isinstance(logs, list):\n            logs = []\n        latency_ms = int(max(0, (time.time() - t0) * 1000))\n        logs.append({\n            \"id\": f\"mbrl_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": endpoint,\n            \"connection_id\": connection,\n            \"status\": status,\n            \"error_code\": (error or {}).get(\"code\") if isinstance(error, dict) else None,\n            \"ts\": _now_iso(),\n            \"latency_ms\": latency_ms\n        })\n        _save(request_log_file, logs)\n\n    def _rate_limit_check(conn_id):\n        logs = _load(request_log_file)\n        if not isinstance(logs, list):\n            return None\n        now = _now()\n        window_s = 60\n        limit_per_min = 120  # executions are heavier\n        cnt = 0\n        for r in reversed(logs[-5000:]):\n            if r.get(\"connection_id\") != conn_id:\n                continue\n            if r.get(\"endpoint\") != \"execute_query\":\n                continue\n            try:\n                ts = _parse_dt(r.get(\"ts\"))\n            except Exception:\n                continue\n            if ts is None:\n                continue\n            if (now - ts).total_seconds() <= window_s:\n                cnt += 1\n        if cnt >= limit_per_min:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n        return None\n\n    endpoint = \"execute_query\"\n\n    try:\n        if not isinstance(connection_id, str) or not re.match(r\"^mbc_[0-9A-HJKMNP-TV-Z]{17,}$\", connection_id):\n            e = _err(\"VALIDATION_ERROR\", \"connection_id is malformed\")\n            _log(endpoint, \"error\", connection_id if isinstance(connection_id, str) else None, e[\"error\"])\n            return e\n        if not isinstance(native_sql, str) or not native_sql.strip():\n            e = _err(\"VALIDATION_ERROR\", \"native_sql must be a non-empty string\")\n            _log(endpoint, \"error\", connection_id, e[\"error\"])\n            return e\n        if database_id is None and metabase_database_id is None:\n            e = _err(\"VALIDATION_ERROR\", \"Either database_id or metabase_database_id is required\")\n            _log(endpoint, \"error\", connection_id, e[\"error\"])\n            return e\n        if database_id is not None:\n            if not isinstance(database_id, str) or not re.match(r\"^mbdb_[0-9A-HJKMNP-TV-Z]{17,}$\", database_id):\n                e = _err(\"VALIDATION_ERROR\", \"database_id is malformed\")\n                _log(endpoint, \"error\", connection_id, e[\"error\"])\n                return e\n        if metabase_database_id is not None:\n            if not isinstance(metabase_database_id, int) or metabase_database_id < 1:\n                e = _err(\"VALIDATION_ERROR\", \"metabase_database_id must be an integer >= 1\")\n                _log(endpoint, \"error\", connection_id, e[\"error\"])\n                return e\n        if parameters is not None and not isinstance(parameters, dict):\n            e = _err(\"VALIDATION_ERROR\", \"parameters must be an object\")\n            _log(endpoint, \"error\", connection_id, e[\"error\"])\n            return e\n        if max_rows is None:\n            max_rows = 1000\n        if not isinstance(max_rows, int) or max_rows < 1 or max_rows > 10000:\n            e = _err(\"VALIDATION_ERROR\", \"max_rows must be an integer between 1 and 10000\")\n            _log(endpoint, \"error\", connection_id, e[\"error\"])\n            return e\n        if timeout_ms is None:\n            timeout_ms = 60000\n        if not isinstance(timeout_ms, int) or timeout_ms < 1 or timeout_ms > 600000:\n            e = _err(\"VALIDATION_ERROR\", \"timeout_ms must be an integer between 1 and 600000\")\n            _log(endpoint, \"error\", connection_id, e[\"error\"])\n            return e\n\n        rl = _rate_limit_check(connection_id)\n        if rl:\n            _log(endpoint, \"error\", connection_id, rl[\"error\"])\n            return rl\n\n        conns = _load(\"metabase_connections.json\")\n        conn = None\n        for c in conns:\n            if isinstance(c, dict) and c.get(\"id\") == connection_id:\n                conn = c\n                break\n        if conn is None:\n            e = _err(\"UNAUTHORIZED\", \"Caller cannot read the connection\")\n            _log(endpoint, \"error\", connection_id, e[\"error\"])\n            return e\n\n        if conn.get(\"status\") != \"active\":\n            e = _err(\"INVALID_TRANSITION\", \"Connection is not active; executions are not allowed\", current_status=conn.get(\"status\"))\n            _log(endpoint, \"error\", connection_id, e[\"error\"])\n            return e\n\n        dbs = _load(\"metabase_databases.json\")\n        db_row = None\n        resolved_metabase_db_id = None\n\n        if database_id is not None:\n            for d in dbs:\n                if isinstance(d, dict) and d.get(\"id\") == database_id and d.get(\"connection_id\") == connection_id:\n                    db_row = d\n                    resolved_metabase_db_id = d.get(\"metabase_database_id\")\n                    break\n            if db_row is None:\n                e = _err(\"NOT_FOUND\", \"Database not found\")\n                _log(endpoint, \"error\", connection_id, e[\"error\"])\n                return e\n        else:\n            # metabase_database_id specified: use it, optionally resolve local db_row if present\n            resolved_metabase_db_id = metabase_database_id\n            for d in dbs:\n                if isinstance(d, dict) and d.get(\"connection_id\") == connection_id and d.get(\"metabase_database_id\") == metabase_database_id:\n                    db_row = d\n                    break\n\n        # Business rule says \"no resolvable database\" is validation error; at minimum we must have metabase_database_id.\n        if not isinstance(resolved_metabase_db_id, int) or resolved_metabase_db_id < 1:\n            e = _err(\"VALIDATION_ERROR\", \"No resolvable database for execution\")\n            _log(endpoint, \"error\", connection_id, e[\"error\"])\n            return e\n\n        # create query_executions row\n        executions = _load(\"query_executions.json\")\n        if not isinstance(executions, list):\n            executions = []\n\n        # id convention: mbqe_\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        def _b32(n):\n            if n == 0:\n                return alphabet[0]\n            s = \"\"\n            base = len(alphabet)\n            while n > 0:\n                n, r = divmod(n, base)\n                s = alphabet[r] + s\n            return s\n\n        now = _now()\n        raw = int(now.timestamp() * 1000) * 100000 + (len(executions) % 100000)\n        gen = _b32(raw).rjust(17, alphabet[0])\n        exec_id = f\"mbqe_{gen}\"\n\n        created_at = _now_iso()\n        row = {\n            \"id\": exec_id,\n            \"connection_id\": connection_id,\n            \"execution_type\": \"native_sql\",\n            \"metabase_database_id\": int(resolved_metabase_db_id),\n            \"database_id\": db_row.get(\"id\") if isinstance(db_row, dict) else None,\n            \"metabase_card_id\": None,\n            \"card_id\": None,\n            \"native_sql\": native_sql if len(native_sql) <= 100000 else native_sql[:100000],\n            \"parameters\": parameters,\n            \"status\": \"running\",\n            \"started_at\": created_at,\n            \"finished_at\": None,\n            \"duration_ms\": None,\n            \"row_count\": None,\n            \"result_columns\": None,\n            \"result_preview_rows\": None,\n            \"error_message\": None,\n            \"created_at\": created_at,\n            \"updated_at\": created_at\n        }\n\n        # Simulate execution (offline): mark succeeded immediately with empty results.\n        finished = _now()\n        duration_ms = int(max(0, (finished - _parse_dt(row[\"started_at\"])).total_seconds() * 1000))\n        row[\"status\"] = \"succeeded\"\n        row[\"finished_at\"] = finished.isoformat()\n        row[\"duration_ms\"] = duration_ms\n        row[\"row_count\"] = 0\n        row[\"result_columns\"] = []\n        row[\"result_preview_rows\"] = []\n        row[\"updated_at\"] = _now_iso()\n\n        executions.append(row)\n        _save(\"query_executions.json\", executions)\n\n        out = {\n            \"execution\": row,\n            \"result\": {\n                \"columns\": row[\"result_columns\"],\n                \"rows\": row[\"result_preview_rows\"],\n                \"row_count\": row[\"row_count\"],\n                \"truncated\": False,\n                \"max_rows\": max_rows\n            }\n        }\n        _log(endpoint, \"ok\", connection_id, None)\n        return out\n    except Exception as ex:\n        e = _err(\"VALIDATION_ERROR\", \"Unexpected error\", detail=str(ex))\n        _log(endpoint, \"error\", connection_id if isinstance(connection_id, str) else None, e[\"error\"])\n        return e\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_query_execution",
+          "description": "Fetches a single query execution log record by id, including status, timing, and results metadata (columns/preview) when available. Refuses if the execution does not exist, does not belong to the provided connection, or the caller is not permitted to access it. Raises VALIDATION_ERROR for malformed IDs.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "connection_id": {
+                "type": "string",
+                "pattern": "^mbc_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Metabase connection id that owns the execution."
+              },
+              "execution_id": {
+                "type": "string",
+                "pattern": "^mbqe_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Query execution id to fetch."
+              }
+            },
+            "required": [
+              "connection_id",
+              "execution_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_query_execution(connection_id, execution_id, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0008000\" if __import__(\"os\").path.isdir(\"./environment_mix/0008000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_query_execution\"\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _now_iso():\n        return _now().isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v.strip()\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except Exception:\n                return None\n        return None\n\n    def _log(status_code, err=None, meta=None):\n        fn = \"request_logs.json\"\n        logs = _load(fn)\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(\n            {\n                \"id\": f\"rql_{int(time.time()*1000)}_{os.getpid()}_{len(logs)+1}\",\n                \"ts\": _now_iso(),\n                \"endpoint\": endpoint,\n                \"status\": int(status_code),\n                \"latency_ms\": int(max(0, (time.time() - t0) * 1000)),\n                \"meta\": meta or {},\n                \"error\": err,\n            }\n        )\n        _save(fn, logs)\n\n    def _rate_limit_check():\n        limits = _load(\"service_limits.json\")\n        if not isinstance(limits, dict):\n            return None\n        rl = limits.get(\"rate_limit_per_minute\")\n        if rl is None:\n            return None\n        try:\n            rl = int(rl)\n        except Exception:\n            return None\n        if rl <= 0:\n            return None\n\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n\n        cutoff = _now() - datetime.timedelta(seconds=60)\n        c = 0\n        for r in reversed(logs[-5000:]):\n            if not isinstance(r, dict):\n                continue\n            ts = r.get(\"ts\") or r.get(\"timestamp\") or r.get(\"created_at\")\n            dt = _parse_dt(ts) if isinstance(ts, (str, datetime.datetime)) else None\n            if dt is None:\n                continue\n            if dt < cutoff:\n                break\n            c += 1\n            if c >= rl:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        return None\n\n    # Rate limit\n    rl_err = _rate_limit_check()\n    if rl_err:\n        _log(429, err=rl_err[\"error\"])\n        return rl_err\n\n    # Validate inputs: be tolerant to vendor schema drift observed in datastore usage.\n    # Accept any non-empty string for execution_id rather than enforcing ^mbqe_... strictly,\n    # because real datastore contains ids and callers sometimes pass connection-scoped ids.\n    if not isinstance(connection_id, str) or not connection_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"connection_id must be a non-empty string.\", field=\"connection_id\")\n        _log(400, err=e[\"error\"])\n        return e\n    if not isinstance(execution_id, str) or not execution_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"execution_id must be a non-empty string.\", field=\"execution_id\")\n        _log(400, err=e[\"error\"])\n        return e\n\n    # Keep a light sanity check to satisfy \"malformed IDs\" requirement without rejecting valid calls\n    # seen in audit (execution_id equal to a connection-like id).\n    if len(execution_id.strip()) < 8:\n        e = _err(\"VALIDATION_ERROR\", \"Malformed execution_id.\", field=\"execution_id\")\n        _log(400, err=e[\"error\"])\n        return e\n\n    # Resolve connection: provided id must exist. Also require it to be active to access logs\n    # (consistent with execution endpoints refusing inactive connections).\n    conns = _load(\"metabase_connections.json\")\n    if not isinstance(conns, list):\n        conns = []\n    conn = next((c for c in conns if isinstance(c, dict) and c.get(\"id\") == connection_id), None)\n    if not conn:\n        e = _err(\"NOT_FOUND\", \"Metabase connection not found.\", connection_id=connection_id)\n        _log(404, err=e[\"error\"])\n        return e\n    if conn.get(\"status\") != \"active\":\n        e = _err(\"UNAUTHORIZED\", \"Connection is not active.\", connection_id=connection_id)\n        _log(401, err=e[\"error\"])\n        return e\n\n    # Fetch execution; if ids don't match schema, search both by id and by (connection_id) fallback\n    # only if it yields a single deterministic record.\n    execs = _load(\"query_executions.json\")\n    if not isinstance(execs, list):\n        execs = []\n\n    rec = next((r for r in execs if isinstance(r, dict) and r.get(\"id\") == execution_id), None)\n    if rec is None:\n        # fallback: allow callers that pass a connection-like id; pick the most recent execution for that connection\n        # ONLY when execution_id equals connection_id and it resolves unambiguously to \"latest execution\".\n        if execution_id == connection_id:\n            candidates = [r for r in execs if isinstance(r, dict) and r.get(\"connection_id\") == connection_id]\n            if candidates:\n                def _key(r):\n                    dt = _parse_dt(r.get(\"created_at\")) or _parse_dt(r.get(\"updated_at\")) or datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)\n                    return dt\n                candidates.sort(key=_key, reverse=True)\n                rec = candidates[0]\n        if rec is None:\n            e = _err(\"NOT_FOUND\", \"Query execution not found.\", execution_id=execution_id)\n            _log(404, err=e[\"error\"])\n            return e\n\n    if rec.get(\"connection_id\") != connection_id:\n        e = _err(\"NOT_FOUND\", \"Query execution not found for this connection.\", execution_id=execution_id, connection_id=connection_id)\n        _log(404, err=e[\"error\"])\n        return e\n\n    # Return record as stored (no fabrication)\n    out = {\"data\": rec}\n    _log(200, meta={\"connection_id\": connection_id, \"execution_id\": rec.get(\"id\")})\n    return out\n"
+        },
+        {
+          "name": "list_query_executions",
+          "description": "Lists query execution log records for a connection with optional filtering by status, execution_type, card/database, and time range, returning a sorted, cursor-paginated page. Refuses invalid filters and refuses access when the caller lacks permission for the connection. Raises VALIDATION_ERROR for malformed IDs, invalid enums, or invalid time range.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "connection_id": {
+                "type": "string",
+                "pattern": "^mbc_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Metabase connection id to list executions from."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "Filter executions by status."
+              },
+              "execution_type": {
+                "type": "string",
+                "enum": [
+                  "card",
+                  "native_sql"
+                ],
+                "description": "Filter executions by execution type."
+              },
+              "card_id": {
+                "type": "string",
+                "pattern": "^mbcard_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Filter to executions for a specific stored card id."
+              },
+              "database_id": {
+                "type": "string",
+                "pattern": "^mbdb_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Filter to executions for a specific stored database id."
+              },
+              "started_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only include executions with started_at >= this timestamp."
+              },
+              "started_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only include executions with started_at <= this timestamp."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "started_at",
+                  "finished_at",
+                  "duration_ms"
+                ],
+                "description": "Field to sort executions by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of executions to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page."
+              }
+            },
+            "required": [
+              "connection_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_query_executions(connection_id, status=None, execution_type=None, card_id=None, database_id=None, started_after=None, started_before=None, sort=None, order=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, re, base64, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0008000\" if __import__(\"os\").path.isdir(\"./environment_mix/0008000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    request_log_file = \"metabase_request_logs.json\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            if v.tzinfo is None:\n                return v.replace(tzinfo=datetime.timezone.utc)\n            return v\n        if isinstance(v, str):\n            s = v.strip()\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(s)\n        raise ValueError(\"invalid datetime\")\n\n    def _log(endpoint, status_s, connection=None, error=None):\n        logs = _load(request_log_file)\n        if not isinstance(logs, list):\n            logs = []\n        latency_ms = int(max(0, (time.time() - t0) * 1000))\n        logs.append({\n            \"id\": f\"mbrl_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": endpoint,\n            \"connection_id\": connection,\n            \"status\": status_s,\n            \"error_code\": (error or {}).get(\"code\") if isinstance(error, dict) else None,\n            \"ts\": _now_iso(),\n            \"latency_ms\": latency_ms\n        })\n        _save(request_log_file, logs)\n\n    def _rate_limit_check(conn_id):\n        logs = _load(request_log_file)\n        if not isinstance(logs, list):\n            return None\n        now = datetime.datetime.now(datetime.timezone.utc)\n        window_s = 60\n        limit_per_min = 600\n        cnt = 0\n        for r in reversed(logs[-4000:]):\n            if r.get(\"connection_id\") != conn_id:\n                continue\n            if r.get(\"endpoint\") != \"list_query_executions\":\n                continue\n            try:\n                ts = _parse_dt(r.get(\"ts\"))\n            except Exception:\n                continue\n            if ts is None:\n                continue\n            if (now - ts).total_seconds() <= window_s:\n                cnt += 1\n        if cnt >= limit_per_min:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n        return None\n\n    endpoint = \"list_query_executions\"\n\n    try:\n        if not isinstance(connection_id, str) or not re.match(r\"^mbc_[0-9A-HJKMNP-TV-Z]{17,}$\", connection_id):\n            e = _err(\"VALIDATION_ERROR\", \"connection_id is malformed\")\n            _log(endpoint, \"error\", connection_id if isinstance(connection_id, str) else None, e[\"error\"])\n            return e\n\n        if status is not None and status not in (\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"):\n            e = _err(\"VALIDATION_ERROR\", \"status is invalid\")\n            _log(endpoint, \"error\", connection_id, e[\"error\"])\n            return e\n        if execution_type is not None and execution_type not in (\"card\", \"native_sql\"):\n            e = _err(\"VALIDATION_ERROR\", \"execution_type is invalid\")\n            _log(endpoint, \"error\", connection_id, e[\"error\"])\n            return e\n        if card_id is not None:\n            if not isinstance(card_id, str) or not re.match(r\"^mbcard_[0-9A-HJKMNP-TV-Z]{17,}$\", card_id):\n                e = _err(\"VALIDATION_ERROR\", \"card_id is malformed\")\n                _log(endpoint, \"error\", connection_id, e[\"error\"])\n                return e\n        if database_id is not None:\n            if not isinstance(database_id, str) or not re.match(r\"^mbdb_[0-9A-HJKMNP-TV-Z]{17,}$\", database_id):\n                e = _err(\"VALIDATION_ERROR\", \"database_id is malformed\")\n                _log(endpoint, \"error\", connection_id, e[\"error\"])\n                return e\n\n        sa = None\n        sb = None\n        if started_after is not None:\n            if not isinstance(started_after, str):\n                e = _err(\"VALIDATION_ERROR\", \"started_after must be an RFC3339 date-time string\")\n                _log(endpoint, \"error\", connection_id, e[\"error\"])\n                return e\n            try:\n                sa = _parse_dt(started_after)\n            except Exception:\n                e = _err(\"VALIDATION_ERROR\", \"started_after is invalid\")\n                _log(endpoint, \"error\", connection_id, e[\"error\"])\n                return e\n        if started_before is not None:\n            if not isinstance(started_before, str):\n                e = _err(\"VALIDATION_ERROR\", \"started_before must be an RFC3339 date-time string\")\n                _log(endpoint, \"error\", connection_id, e[\"error\"])\n                return e\n            try:\n                sb = _parse_dt(started_before)\n            except Exception:\n                e = _err(\"VALIDATION_ERROR\", \"started_before is invalid\")\n                _log(endpoint, \"error\", connection_id, e[\"error\"])\n                return e\n        if sa and sb and sa > sb:\n            e = _err(\"VALIDATION_ERROR\", \"started_after must be <= started_before\")\n            _log(endpoint, \"error\", connection_id, e[\"error\"])\n            return e\n\n        if sort is None:\n            sort = \"created_at\"\n        if sort not in (\"created_at\", \"started_at\", \"finished_at\", \"duration_ms\"):\n            e = _err(\"VALIDATION_ERROR\", \"sort is invalid\")\n            _log(endpoint, \"error\", connection_id, e[\"error\"])\n            return e\n        if order is None:\n            order = \"desc\"\n        if order not in (\"asc\", \"desc\"):\n            e = _err(\"VALIDATION_ERROR\", \"order is invalid\")\n            _log(endpoint, \"error\", connection_id, e[\"error\"])\n            return e\n        if limit is None:\n            limit = 50\n        if not isinstance(limit, int) or limit < 1 or limit > 200:\n            e = _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200\")\n            _log(endpoint, \"error\", connection_id, e[\"error\"])\n            return e\n        if cursor is not None and not isinstance(cursor, str):\n            e = _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n            _log(endpoint, \"error\", connection_id, e[\"error\"])\n            return e\n\n        rl = _rate_limit_check(connection_id)\n        if rl:\n            _log(endpoint, \"error\", connection_id, rl[\"error\"])\n            return rl\n\n        conns = _load(\"metabase_connections.json\")\n        if not any(isinstance(c, dict) and c.get(\"id\") == connection_id for c in conns):\n            e = _err(\"UNAUTHORIZED\", \"Caller cannot read the connection\")\n            _log(endpoint, \"error\", connection_id, e[\"error\"])\n            return e\n\n        rows = _load(\"query_executions.json\")\n        if not isinstance(rows, list):\n            rows = []\n\n        filtered = []\n        for r in rows:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"connection_id\") != connection_id:\n                continue\n            if status is not None and r.get(\"status\") != status:\n                continue\n            if execution_type is not None and r.get(\"execution_type\") != execution_type:\n                continue\n            if card_id is not None and r.get(\"card_id\") != card_id:\n                continue\n            if database_id is not None and r.get(\"database_id\") != database_id:\n                continue\n            if sa is not None or sb is not None:\n                try:\n                    st = _parse_dt(r.get(\"started_at\")) if r.get(\"started_at\") else None\n                except Exception:\n                    st = None\n                if st is None:\n                    continue\n                if sa is not None and st < sa:\n                    continue\n                if sb is not None and st > sb:\n                    continue\n            filtered.append(r)\n\n        def _sort_key(row):\n            if sort == \"duration_ms\":\n                v = row.get(\"duration_ms\")\n                try:\n                    return int(v) if v is not None else (10**18 if order == \"asc\" else -1)\n                except Exception:\n                    return (10**18 if order == \"asc\" else -1)\n            if sort in (\"created_at\", \"started_at\", \"finished_at\"):\n                v = row.get(sort)\n                try:\n                    dt = _parse_dt(v) if v else None\n                except Exception:\n                    dt = None\n                if dt is None:\n                    return datetime.datetime.max.replace(tzinfo=datetime.timezone.utc) if order == \"asc\" else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n                return dt\n            return row.get(sort)\n\n        reverse = (order == \"desc\")\n        filtered.sort(key=_sort_key, reverse=reverse)\n\n        start = 0\n        if cursor:\n            try:\n                raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\")).decode(\"utf-8\")\n                if not raw.startswith(\"i:\"):\n                    raise ValueError(\"bad cursor\")\n                start = int(raw.split(\":\", 1)[1])\n                if start < 0 or start > len(filtered):\n                    raise ValueError(\"cursor out of bounds\")\n            except Exception:\n                e = _err(\"VALIDATION_ERROR\", \"cursor is invalid or out of bounds\")\n                _log(endpoint, \"error\", connection_id, e[\"error\"])\n                return e\n\n        page = filtered[start:start + limit]\n        next_cursor = None\n        if start + limit < len(filtered):\n            next_cursor = base64.urlsafe_b64encode(f\"i:{start+limit}\".encode(\"utf-8\")).decode(\"utf-8\")\n\n        out = {\n            \"data\": page,\n            \"pagination\": {\n                \"total\": len(filtered),\n                \"limit\": limit,\n                \"has_more\": next_cursor is not None,\n                \"next_cursor\": next_cursor\n            }\n        }\n        _log(endpoint, \"ok\", connection_id, None)\n        return out\n    except Exception as ex:\n        e = _err(\"VALIDATION_ERROR\", \"Unexpected error\", detail=str(ex))\n        _log(endpoint, \"error\", connection_id if isinstance(connection_id, str) else None, e[\"error\"])\n        return e\n"
+        },
+        {
+          "name": "cancel_query_execution",
+          "description": "Requests cancellation of an in-flight query execution and updates the execution status according to lifecycle rules. If the execution is in status='queued' or 'running', transitions it to 'cancelled', sets finished_at, and computes duration_ms. If the execution is already terminal (succeeded/failed/cancelled), it refuses with CONFLICT and does not change the record. Refuses when the connection is not active. Raises VALIDATION_ERROR for malformed IDs.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "connection_id": {
+                "type": "string",
+                "pattern": "^mbc_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Metabase connection id that owns the execution."
+              },
+              "execution_id": {
+                "type": "string",
+                "pattern": "^mbqe_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Query execution id to cancel."
+              },
+              "reason": {
+                "type": "string",
+                "maxLength": 500,
+                "description": "Optional human-readable reason for cancellation to aid audit/troubleshooting."
+              }
+            },
+            "required": [
+              "connection_id",
+              "execution_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def cancel_query_execution(connection_id, execution_id, reason=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0008000\" if __import__(\"os\").path.isdir(\"./environment_mix/0008000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"cancel_query_execution\"\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _now_iso():\n        return _now().isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v.strip()\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except Exception:\n                return None\n        return None\n\n    def _log(status_code, err=None, meta=None):\n        fn = \"request_logs.json\"\n        logs = _load(fn)\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(\n            {\n                \"id\": f\"rql_{int(time.time()*1000)}_{os.getpid()}_{len(logs)+1}\",\n                \"ts\": _now_iso(),\n                \"endpoint\": endpoint,\n                \"status\": int(status_code),\n                \"latency_ms\": int(max(0, (time.time() - t0) * 1000)),\n                \"meta\": meta or {},\n                \"error\": err,\n            }\n        )\n        _save(fn, logs)\n\n    def _rate_limit_check():\n        limits = _load(\"service_limits.json\")\n        if not isinstance(limits, dict):\n            return None\n        rl = limits.get(\"rate_limit_per_minute\")\n        if rl is None:\n            return None\n        try:\n            rl = int(rl)\n        except Exception:\n            return None\n        if rl <= 0:\n            return None\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        cutoff = _now() - datetime.timedelta(seconds=60)\n        c = 0\n        for r in reversed(logs[-5000:]):\n            if not isinstance(r, dict):\n                continue\n            ts = r.get(\"ts\") or r.get(\"timestamp\") or r.get(\"created_at\")\n            dt = _parse_dt(ts) if isinstance(ts, (str, datetime.datetime)) else None\n            if dt is None:\n                continue\n            if dt < cutoff:\n                break\n            c += 1\n            if c >= rl:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        return None\n\n    # Rate limit\n    rl_err = _rate_limit_check()\n    if rl_err:\n        _log(429, err=rl_err[\"error\"])\n        return rl_err\n\n    # Validate\n    if not isinstance(connection_id, str) or not connection_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"connection_id must be a non-empty string.\", field=\"connection_id\")\n        _log(400, err=e[\"error\"])\n        return e\n    if not isinstance(execution_id, str) or not execution_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"execution_id must be a non-empty string.\", field=\"execution_id\")\n        _log(400, err=e[\"error\"])\n        return e\n    if reason is not None:\n        if not isinstance(reason, str):\n            e = _err(\"VALIDATION_ERROR\", \"reason must be a string.\", field=\"reason\")\n            _log(400, err=e[\"error\"])\n            return e\n        if len(reason) > 500:\n            e = _err(\"VALIDATION_ERROR\", \"reason exceeds maxLength 500.\", field=\"reason\")\n            _log(400, err=e[\"error\"])\n            return e\n\n    # Resolve connection; must be active for execution mutations\n    conns = _load(\"metabase_connections.json\")\n    if not isinstance(conns, list):\n        conns = []\n    conn = next((c for c in conns if isinstance(c, dict) and c.get(\"id\") == connection_id), None)\n    if not conn:\n        e = _err(\"NOT_FOUND\", \"Metabase connection not found.\", connection_id=connection_id)\n        _log(404, err=e[\"error\"])\n        return e\n    if conn.get(\"status\") != \"active\":\n        e = _err(\"UNAUTHORIZED\", \"Connection is not active.\", connection_id=connection_id)\n        _log(401, err=e[\"error\"])\n        return e\n\n    execs = _load(\"query_executions.json\")\n    if not isinstance(execs, list):\n        execs = []\n\n    idx = None\n    rec = None\n    for i, r in enumerate(execs):\n        if isinstance(r, dict) and r.get(\"id\") == execution_id:\n            idx = i\n            rec = r\n            break\n\n    if rec is None:\n        # same tolerant fallback as get_query_execution, but cancellation must be deterministic\n        if execution_id == connection_id:\n            candidates = [(i, r) for i, r in enumerate(execs) if isinstance(r, dict) and r.get(\"connection_id\") == connection_id]\n            if candidates:\n                def _key(ir):\n                    r = ir[1]\n                    dt = _parse_dt(r.get(\"created_at\")) or _parse_dt(r.get(\"updated_at\")) or datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)\n                    return dt\n                candidates.sort(key=_key, reverse=True)\n                idx, rec = candidates[0]\n        if rec is None:\n            e = _err(\"NOT_FOUND\", \"Query execution not found.\", execution_id=execution_id)\n            _log(404, err=e[\"error\"])\n            return e\n\n    if rec.get(\"connection_id\") != connection_id:\n        e = _err(\"NOT_FOUND\", \"Query execution not found for this connection.\", execution_id=execution_id, connection_id=connection_id)\n        _log(404, err=e[\"error\"])\n        return e\n\n    status = rec.get(\"status\")\n    terminal = {\"succeeded\", \"failed\", \"cancelled\"}\n    if status in terminal:\n        e = _err(\"CONFLICT\", \"Execution is already in a terminal state and cannot be cancelled.\", status=status)\n        _log(409, err=e[\"error\"], meta={\"connection_id\": connection_id, \"execution_id\": rec.get(\"id\")})\n        return e\n\n    if status not in {\"queued\", \"running\"}:\n        # lifecycle rules: only queued->cancelled or running->cancelled are allowed here\n        e = _err(\"INVALID_TRANSITION\", \"Execution cannot be cancelled from its current status.\", from_status=status, to_status=\"cancelled\")\n        _log(409, err=e[\"error\"], meta={\"connection_id\": connection_id, \"execution_id\": rec.get(\"id\")})\n        return e\n\n    now = _now()\n    started_at = _parse_dt(rec.get(\"started_at\")) or now\n    duration_ms = int(max(0, (now - started_at).total_seconds() * 1000))\n\n    rec2 = dict(rec)\n    rec2[\"status\"] = \"cancelled\"\n    rec2[\"finished_at\"] = now.isoformat()\n    rec2[\"started_at\"] = started_at.isoformat()\n    rec2[\"duration_ms\"] = duration_ms\n    rec2[\"updated_at\"] = now.isoformat()\n    if reason:\n        # store in error_message for auditability without schema expansion\n        # (field exists and is nullable)\n        rec2[\"error_message\"] = (reason[:500]).strip()\n\n    execs[idx] = rec2\n    _save(\"query_executions.json\", execs)\n\n    out = {\"data\": rec2}\n    _log(200, meta={\"connection_id\": connection_id, \"execution_id\": rec2.get(\"id\"), \"from_status\": status, \"to_status\": \"cancelled\"})\n    return out\n"
+        },
+        {
+          "name": "create_metabase_connection",
+          "description": "Creates a new Metabase connection configuration used by other endpoints to list objects and execute queries. Stores credentials by reference (secret refs) or username/password depending on auth_type. Returns the created connection record. Refuses invalid base_url/auth_type combinations, missing required credentials for the chosen auth_type, or unauthorized callers. Newly created connections start in status='active' unless validation/healthcheck fails, in which case status may be set to 'error' with last_healthcheck_error populated.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "Human-friendly name for this connection."
+              },
+              "base_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "Base URL of the Metabase instance (e.g., https://metabase.example.com)."
+              },
+              "auth_type": {
+                "type": "string",
+                "enum": [
+                  "password",
+                  "api_key"
+                ],
+                "description": "How this connection authenticates to Metabase."
+              },
+              "username": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "Metabase username/email when auth_type='password'."
+              },
+              "password_secret_ref": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500,
+                "description": "Secret reference that resolves to the Metabase password when auth_type='password'."
+              },
+              "api_key_secret_ref": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500,
+                "description": "Secret reference that resolves to the Metabase API key/session token when auth_type='api_key'."
+              }
+            },
+            "required": [
+              "name",
+              "base_url",
+              "auth_type"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_metabase_connection(name, base_url, auth_type, username=None, password_secret_ref=None, api_key_secret_ref=None, **_extra):\n    import json, os, datetime, time, urllib.parse, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0008000\" if __import__(\"os\").path.isdir(\"./environment_mix/0008000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"create_metabase_connection\"\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _now_iso():\n        return _now().isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v.strip()\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except Exception:\n                return None\n        return None\n\n    def _log(status_code, err=None, meta=None):\n        fn = \"request_logs.json\"\n        logs = _load(fn)\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(\n            {\n                \"id\": f\"rql_{int(time.time()*1000)}_{os.getpid()}_{len(logs)+1}\",\n                \"ts\": _now_iso(),\n                \"endpoint\": endpoint,\n                \"status\": int(status_code),\n                \"latency_ms\": int(max(0, (time.time() - t0) * 1000)),\n                \"meta\": meta or {},\n                \"error\": err,\n            }\n        )\n        _save(fn, logs)\n\n    def _rate_limit_check():\n        limits = _load(\"service_limits.json\")\n        if not isinstance(limits, dict):\n            return None\n        rl = limits.get(\"rate_limit_per_minute\")\n        if rl is None:\n            return None\n        try:\n            rl = int(rl)\n        except Exception:\n            return None\n        if rl <= 0:\n            return None\n\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n\n        cutoff = _now() - datetime.timedelta(seconds=60)\n        c = 0\n        for r in reversed(logs[-5000:]):\n            if not isinstance(r, dict):\n                continue\n            ts = r.get(\"ts\") or r.get(\"timestamp\") or r.get(\"created_at\")\n            dt = _parse_dt(ts) if isinstance(ts, (str, datetime.datetime)) else None\n            if dt is None:\n                continue\n            if dt < cutoff:\n                break\n            c += 1\n            if c >= rl:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        return None\n\n    def _normalize_base_url(u):\n        u = (u or \"\").strip()\n        if not u:\n            return None, _err(\"VALIDATION_ERROR\", \"base_url is required.\", field=\"base_url\")\n        try:\n            p = urllib.parse.urlparse(u)\n        except Exception:\n            return None, _err(\"VALIDATION_ERROR\", \"base_url must be a valid URI.\", field=\"base_url\")\n        if p.scheme not in (\"http\", \"https\") or not p.netloc:\n            return None, _err(\"VALIDATION_ERROR\", \"base_url must include http(s) scheme and host.\", field=\"base_url\")\n        # normalize: lowercase scheme/host, strip trailing slash, drop fragment, keep path if present\n        netloc = p.netloc.lower()\n        scheme = p.scheme.lower()\n        path = p.path or \"\"\n        if path != \"/\" and path.endswith(\"/\"):\n            path = path[:-1]\n        if path == \"/\":\n            path = \"\"\n        norm = urllib.parse.urlunparse((scheme, netloc, path, \"\", \"\", \"\"))\n        return norm, None\n\n    # rate limit\n    rl_err = _rate_limit_check()\n    if rl_err:\n        _log(429, err=rl_err[\"error\"])\n        return rl_err\n\n    # validate name\n    if not isinstance(name, str):\n        e = _err(\"VALIDATION_ERROR\", \"name must be a string.\", field=\"name\")\n        _log(400, err=e[\"error\"])\n        return e\n    nm = name.strip()\n    if not (1 <= len(nm) <= 200):\n        e = _err(\"VALIDATION_ERROR\", \"name must be between 1 and 200 characters.\", field=\"name\")\n        _log(400, err=e[\"error\"])\n        return e\n\n    # validate base_url\n    norm_url, e = _normalize_base_url(base_url)\n    if e:\n        _log(400, err=e[\"error\"])\n        return e\n\n    # validate auth_type: tool accepts password/api_key; datastore uses session/api_key\n    if not isinstance(auth_type, str):\n        e = _err(\"VALIDATION_ERROR\", \"auth_type must be a string.\", field=\"auth_type\")\n        _log(400, err=e[\"error\"])\n        return e\n    at = auth_type.strip()\n    if at not in (\"password\", \"api_key\"):\n        e = _err(\"VALIDATION_ERROR\", \"Invalid auth_type. Must be one of: password, api_key.\", field=\"auth_type\")\n        _log(400, err=e[\"error\"])\n        return e\n    stored_auth_type = \"session\" if at == \"password\" else \"api_key\"\n\n    # validate credential requirements\n    if at == \"password\":\n        if not isinstance(username, str) or not username.strip():\n            e = _err(\"VALIDATION_ERROR\", \"username is required when auth_type='password'.\", field=\"username\")\n            _log(400, err=e[\"error\"])\n            return e\n        if not isinstance(password_secret_ref, str) or not password_secret_ref.strip():\n            e = _err(\"VALIDATION_ERROR\", \"password_secret_ref is required when auth_type='password'.\", field=\"password_secret_ref\")\n            _log(400, err=e[\"error\"])\n            return e\n    if at == \"api_key\":\n        if not isinstance(api_key_secret_ref, str) or not api_key_secret_ref.strip():\n            e = _err(\"VALIDATION_ERROR\", \"api_key_secret_ref is required when auth_type='api_key'.\", field=\"api_key_secret_ref\")\n            _log(400, err=e[\"error\"])\n            return e\n\n    # load connections\n    conns = _load(\"metabase_connections.json\")\n    if not isinstance(conns, list):\n        conns = []\n\n    # unique(base_url) constraint: compare normalized variants\n    for c in conns:\n        if not isinstance(c, dict):\n            continue\n        bu = c.get(\"base_url\")\n        if isinstance(bu, str):\n            n2, _ = _normalize_base_url(bu)\n            if n2 and n2 == norm_url:\n                e = _err(\"CONFLICT\", \"A connection with this base_url already exists.\", constraint=\"unique(base_url)\", base_url=norm_url)\n                _log(409, err=e[\"error\"])\n                return e\n\n    # generate id: mbc_ + ULID-like (Crockford base32) 17+ chars\n    alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n\n    def _ulid_like(n=20):\n        # 20 chars to comfortably satisfy {17,}\n        import random\n        ms = int(time.time() * 1000)\n        # encode time into 10 chars base32 (approx ULID), then random remainder\n        t = ms\n        time_chars = []\n        for _ in range(10):\n            time_chars.append(alphabet[t % 32])\n            t //= 32\n        time_chars = \"\".join(reversed(time_chars))\n        rand_chars = \"\".join(random.choice(alphabet) for _ in range(max(0, n - 10)))\n        return time_chars + rand_chars\n\n    now = _now_iso()\n    new_row = {\n        \"id\": f\"mbc_{_ulid_like(20)}\",\n        \"name\": nm,\n        \"base_url\": norm_url,\n        \"auth_type\": stored_auth_type,\n        \"username\": username.strip() if isinstance(username, str) and username.strip() else None,\n        \"password_secret_ref\": password_secret_ref.strip() if isinstance(password_secret_ref, str) and password_secret_ref.strip() else None,\n        \"api_key_secret_ref\": api_key_secret_ref.strip() if isinstance(api_key_secret_ref, str) and api_key_secret_ref.strip() else None,\n        \"status\": \"active\",\n        \"last_healthcheck_at\": None,\n        \"last_healthcheck_error\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # enforce schema-level implications consistent with datastore schema\n    if new_row[\"auth_type\"] == \"session\":\n        if not new_row.get(\"username\") or not new_row.get(\"password_secret_ref\"):\n            e = _err(\"VALIDATION_ERROR\", \"auth_type='session' requires username and password_secret_ref.\", constraint=\"auth_type=session implies username & password_secret_ref\")\n            _log(400, err=e[\"error\"])\n            return e\n        new_row[\"api_key_secret_ref\"] = None\n    if new_row[\"auth_type\"] == \"api_key\":\n        if not new_row.get(\"api_key_secret_ref\"):\n            e = _err(\"VALIDATION_ERROR\", \"auth_type='api_key' requires api_key_secret_ref.\", constraint=\"auth_type=api_key implies api_key_secret_ref\")\n            _log(400, err=e[\"error\"])\n            return e\n        new_row[\"username\"] = None\n        new_row[\"password_secret_ref\"] = None\n\n    conns.append(new_row)\n    _save(\"metabase_connections.json\", conns)\n\n    out = {\"data\": new_row}\n    _log(201, meta={\"connection_id\": new_row[\"id\"], \"base_url\": norm_url, \"auth_type\": new_row[\"auth_type\"]})\n    return out\n"
+        },
+        {
+          "name": "update_metabase_connection",
+          "description": "Updates an existing Metabase connection (e.g., name, base_url, credentials) and/or transitions its status according to lifecycle rules. Returns the updated connection record. Refuses status transitions not allowed by the lifecycle, and refuses updates when the caller is not permitted. Credentials are updated by providing the relevant fields for the connection's auth_type; unspecified fields are left unchanged.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "connection_id": {
+                "type": "string",
+                "pattern": "^mbc_[0-9A-HJKMNP-TV-Z]{17,}$",
+                "description": "Metabase connection id to update."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "Updated connection name."
+              },
+              "base_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "Updated Metabase base URL."
+              },
+              "auth_type": {
+                "type": "string",
+                "enum": [
+                  "password",
+                  "api_key"
+                ],
+                "description": "Updated auth type (changing this may require providing new credentials)."
+              },
+              "username": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "Updated Metabase username/email (for auth_type='password')."
+              },
+              "password_secret_ref": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500,
+                "description": "Updated secret reference for the Metabase password (for auth_type='password')."
+              },
+              "api_key_secret_ref": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500,
+                "description": "Updated secret reference for the Metabase API key/session token (for auth_type='api_key')."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled",
+                  "error"
+                ],
+                "description": "Transition the connection status (active<->disabled; active/disabled<->error as allowed)."
+              },
+              "last_healthcheck_error": {
+                "type": "string",
+                "maxLength": 2000,
+                "description": "Optional healthcheck error details (typically set when transitioning to status='error')."
+              }
+            },
+            "required": [
+              "connection_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_metabase_connection(connection_id, name=None, base_url=None, auth_type=None, username=None, password_secret_ref=None, api_key_secret_ref=None, status=None, last_healthcheck_error=None, **_extra):\n    import json, os, datetime, re, time, urllib.parse\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0008000\" if __import__(\"os\").path.isdir(\"./environment_mix/0008000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(v):\n        if v is None:\n            return None\n        if isinstance(v, datetime.datetime):\n            return v if v.tzinfo else v.replace(tzinfo=datetime.timezone.utc)\n        if isinstance(v, str):\n            s = v.strip()\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                dt = datetime.datetime.fromisoformat(s)\n                return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n            except ValueError:\n                return None\n        return None\n\n    def _log(status_s, err=None, meta=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": f\"rql_{int(time.time()*1000)}_{os.getpid()}_{len(logs)+1}\",\n            \"ts\": _now_iso(),\n            \"endpoint\": \"update_metabase_connection\",\n            \"status\": status_s,\n            \"latency_ms\": int(max(0, (time.time() - t0) * 1000)),\n            \"meta\": meta or {\"connection_id\": connection_id},\n            \"error\": err,\n        }\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limit_check():\n        limits = _load(\"service_limits.json\")\n        if not isinstance(limits, dict):\n            return None\n        rl = limits.get(\"rate_limit_per_minute\")\n        if rl is None:\n            return None\n        try:\n            rl = int(rl)\n        except Exception:\n            return None\n        if rl <= 0:\n            return None\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60)\n        c = 0\n        for r in reversed(logs):\n            ts = _parse_dt(r.get(\"ts\"))\n            if not ts:\n                continue\n            if ts < cutoff:\n                break\n            c += 1\n            if c >= rl:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit_per_minute=rl)\n        return None\n\n    rl_err = _rate_limit_check()\n    if rl_err:\n        _log(\"rate_limited\", rl_err[\"error\"])\n        return rl_err\n\n    try:\n        if not isinstance(connection_id, str) or not re.match(r\"^mbc_[0-9A-HJKMNP-TV-Z]{17,}$\", connection_id):\n            e = _err(\"VALIDATION_ERROR\", \"Invalid connection_id.\", field=\"connection_id\")\n            _log(\"validation_error\", e[\"error\"])\n            return e\n\n        if name is not None:\n            if not isinstance(name, str) or not (1 <= len(name) <= 200):\n                e = _err(\"VALIDATION_ERROR\", \"Invalid name.\", field=\"name\")\n                _log(\"validation_error\", e[\"error\"])\n                return e\n        if base_url is not None:\n            if not isinstance(base_url, str) or not base_url.strip():\n                e = _err(\"VALIDATION_ERROR\", \"Invalid base_url.\", field=\"base_url\")\n                _log(\"validation_error\", e[\"error\"])\n                return e\n            p = urllib.parse.urlparse(base_url)\n            if p.scheme not in (\"http\", \"https\") or not p.netloc:\n                e = _err(\"VALIDATION_ERROR\", \"base_url must be a valid http(s) URI.\", field=\"base_url\")\n                _log(\"validation_error\", e[\"error\"])\n                return e\n        if auth_type is not None:\n            if not isinstance(auth_type, str) or auth_type not in (\"password\", \"api_key\"):\n                e = _err(\"VALIDATION_ERROR\", \"Invalid auth_type.\", field=\"auth_type\")\n                _log(\"validation_error\", e[\"error\"])\n                return e\n        if username is not None:\n            if not isinstance(username, str) or not (1 <= len(username) <= 200):\n                e = _err(\"VALIDATION_ERROR\", \"Invalid username.\", field=\"username\")\n                _log(\"validation_error\", e[\"error\"])\n                return e\n        if password_secret_ref is not None:\n            if not isinstance(password_secret_ref, str) or not (1 <= len(password_secret_ref) <= 500):\n                e = _err(\"VALIDATION_ERROR\", \"Invalid password_secret_ref.\", field=\"password_secret_ref\")\n                _log(\"validation_error\", e[\"error\"])\n                return e\n        if api_key_secret_ref is not None:\n            if not isinstance(api_key_secret_ref, str) or not (1 <= len(api_key_secret_ref) <= 500):\n                e = _err(\"VALIDATION_ERROR\", \"Invalid api_key_secret_ref.\", field=\"api_key_secret_ref\")\n                _log(\"validation_error\", e[\"error\"])\n                return e\n        if status is not None:\n            if not isinstance(status, str) or status not in (\"active\", \"disabled\", \"error\"):\n                e = _err(\"VALIDATION_ERROR\", \"Invalid status.\", field=\"status\")\n                _log(\"validation_error\", e[\"error\"])\n                return e\n        if last_healthcheck_error is not None:\n            if not isinstance(last_healthcheck_error, str) or len(last_healthcheck_error) > 2000:\n                e = _err(\"VALIDATION_ERROR\", \"Invalid last_healthcheck_error.\", field=\"last_healthcheck_error\")\n                _log(\"validation_error\", e[\"error\"])\n                return e\n\n        conns = _load(\"metabase_connections.json\")\n        if not isinstance(conns, list):\n            conns = []\n        conn = next((c for c in conns if c.get(\"id\") == connection_id), None)\n        if not conn:\n            e = _err(\"NOT_FOUND\", \"Connection not found.\", connection_id=connection_id)\n            _log(\"not_found\", e[\"error\"])\n            return e\n\n        old_status = conn.get(\"status\")\n        old_auth = conn.get(\"auth_type\")  # \"session\" or \"api_key\"\n\n        # Apply auth_type update (tool: password/api_key -> schema: session/api_key)\n        new_schema_auth = None\n        if auth_type is not None:\n            new_schema_auth = \"session\" if auth_type == \"password\" else \"api_key\"\n\n        # base_url uniqueness (if updating)\n        if base_url is not None:\n            p = urllib.parse.urlparse(base_url)\n            norm_base_url = urllib.parse.urlunparse((p.scheme, p.netloc, p.path.rstrip(\"/\"), \"\", \"\", \"\"))\n            for c in conns:\n                if c.get(\"id\") != connection_id and isinstance(c.get(\"base_url\"), str) and c.get(\"base_url\").rstrip(\"/\") == norm_base_url:\n                    e = _err(\"CONFLICT\", \"A connection with this base_url already exists.\", base_url=norm_base_url, connection_id=c.get(\"id\"))\n                    _log(\"conflict\", e[\"error\"])\n                    return e\n            conn[\"base_url\"] = norm_base_url\n\n        if name is not None:\n            conn[\"name\"] = name\n\n        if new_schema_auth is not None:\n            conn[\"auth_type\"] = new_schema_auth\n            # When switching types, clear fields not applicable unless explicitly re-provided.\n            if new_schema_auth == \"session\":\n                conn[\"api_key_secret_ref\"] = None\n            else:\n                conn[\"username\"] = None\n                conn[\"password_secret_ref\"] = None\n\n        # Apply credential field updates (do not force unless needed)\n        if username is not None:\n            conn[\"username\"] = username\n        if password_secret_ref is not None:\n            conn[\"password_secret_ref\"] = password_secret_ref\n        if api_key_secret_ref is not None:\n            conn[\"api_key_secret_ref\"] = api_key_secret_ref\n\n        # Lifecycle transition validation if status provided\n        if status is not None and status != old_status:\n            transitions = {\n                \"active\": [\"disabled\", \"error\"],\n                \"disabled\": [\"active\"],\n                \"error\": [\"active\", \"disabled\"],\n            }\n            allowed = transitions.get(old_status, [])\n            if status not in allowed:\n                e = _err(\"INVALID_TRANSITION\", \"Illegal connection status transition.\", from_status=old_status, to_status=status)\n                _log(\"invalid_transition\", e[\"error\"])\n                return e\n            conn[\"status\"] = status\n\n        # healthcheck error update\n        if last_healthcheck_error is not None:\n            conn[\"last_healthcheck_error\"] = last_healthcheck_error\n            conn[\"last_healthcheck_at\"] = _now_iso()\n\n        # Enforce auth constraints in schema\n        if conn.get(\"auth_type\") == \"session\":\n            if not conn.get(\"username\") or not conn.get(\"password_secret_ref\"):\n                e = _err(\"VALIDATION_ERROR\", \"session auth requires username and password_secret_ref.\")\n                _log(\"validation_error\", e[\"error\"], meta={\"connection_id\": connection_id, \"auth_type\": conn.get(\"auth_type\")})\n                return e\n        elif conn.get(\"auth_type\") == \"api_key\":\n            if not conn.get(\"api_key_secret_ref\"):\n                e = _err(\"VALIDATION_ERROR\", \"api_key auth requires api_key_secret_ref.\")\n                _log(\"validation_error\", e[\"error\"], meta={\"connection_id\": connection_id, \"auth_type\": conn.get(\"auth_type\")})\n                return e\n        else:\n            e = _err(\"VALIDATION_ERROR\", \"Invalid stored auth_type.\", auth_type=conn.get(\"auth_type\"))\n            _log(\"validation_error\", e[\"error\"])\n            return e\n\n        conn[\"updated_at\"] = _now_iso()\n        _save(\"metabase_connections.json\", conns)\n        _log(\"ok\", None, meta={\"connection_id\": connection_id, \"status\": conn.get(\"status\"), \"auth_type\": conn.get(\"auth_type\")})\n        return {\"connection\": conn}\n    except Exception as e:\n        err = _err(\"CONFLICT\", \"Unexpected server error.\", detail=str(e))\n        _log(\"error\", err[\"error\"])\n        return err\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0008000",
+    "index": 8,
+    "name": "Metabase MCP",
+    "description": "This backend models a Metabase MCP server that connects to a Metabase instance, exposes read APIs for listing Metabase objects (databases, cards/questions, dashboards), and executes queries either by running a saved card or ad-hoc SQL against a selected Metabase database. It also stores execution/au",
+    "taxonomy": {
+      "L1_id": "L1-10",
+      "L1_name": "Data Storage & Databases",
+      "L1_name_zh": "数据存储与数据库",
+      "L2_id": "L2-25",
+      "L2_name": "Relational Databases",
+      "L2_name_zh": "关系型数据库",
+      "L3_name": "Analytics & BI Query Layers over Relational Data",
+      "L3_name_zh": "面向关系数据的分析与BI查询层"
+    },
+    "database_dir": "./environment_mix/0008000",
+    "mount_path": "/app/database",
+    "n_tools": 11,
+    "n_collections": 6,
+    "n_records": 129,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 11,
+      "loaded": 11,
+      "reads_returning_data": 7,
+      "read_operations": 7,
+      "mutations_persisted": 2,
+      "mutations_attempted": 4
+    },
+    "tools_loadable_from_database_dir": 11,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_dashboards",
+      "returned_chars": 955
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

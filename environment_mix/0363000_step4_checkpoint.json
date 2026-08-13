@@ -1,0 +1,472 @@
+{
+  "index": 363,
+  "local_files_dir": "./environment_mix/0363000",
+  "file_list": [
+    "./environment_mix/0363000/README.md",
+    "./environment_mix/0363000/distilled_plans.json",
+    "./environment_mix/0363000/learned_patterns.json",
+    "./environment_mix/0363000/sessions.json",
+    "./environment_mix/0363000/tool_runs.json",
+    "./environment_mix/0363000/workspaces.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "workspaces.json": "12 rows",
+        "sessions.json": "18 rows",
+        "tool_runs.json": "19 rows",
+        "distilled_plans.json": "19 rows",
+        "learned_patterns.json": "19 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "vibe_check",
+          "description": "Evaluates the provided in-progress plan or implementation text for a given workspace/session and records a vibe_check run (including the input_text, optional context, and the tool’s findings) on that session, returning the newly created run with its analysis output. Raises VALIDATION_ERROR if workspace_id or session_id do not match the required vbc_wsp_/vbc_sess_ formats, if required fields are missing, or if unknown fields are provided; raises UNAUTHORIZED/FORBIDDEN if you lack access to the workspace or session; raises NOT_FOUND if the referenced workspace or session does not exist (or the session is not in the workspace); and raises QUOTA_EXCEEDED if the workspace/run limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^vbc_wsp_[0-9A-Z]+$",
+                "description": "Workspace id that owns the session and tool run."
+              },
+              "session_id": {
+                "type": "string",
+                "pattern": "^vbc_sess_[0-9A-Z]+$",
+                "description": "Session id to attach this vibe_check run to."
+              },
+              "input_text": {
+                "type": "string",
+                "description": "The in-progress plan or implementation text to evaluate."
+              },
+              "context": {
+                "type": "object",
+                "description": "Optional structured context to store on the session or alongside the run request."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "session_id",
+              "input_text"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def vibe_check(workspace_id, session_id, input_text, context=None, **_extra):\n    import json, os, datetime, re, time, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0363000\" if __import__(\"os\").path.isdir(\"./environment_mix/0363000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _make_id(prefix):\n        # deterministic enough for offline: time + random-ish hash\n        raw = f\"{time.time_ns()}:{os.getpid()}:{os.urandom(8).hex()}\"\n        token = hashlib.sha1(raw.encode(\"utf-8\")).hexdigest().upper()[:12]\n        return f\"{prefix}{token}\"\n\n    def _estimate_tokens(text):\n        # cheap heuristic: ~4 chars/token, at least 1 if text present\n        if text is None:\n            return None\n        if not isinstance(text, str):\n            return None\n        t = max(1, (len(text) + 3) // 4) if text else 0\n        return t\n\n    t0 = time.time()\n\n    # ---- validation (types/patterns) ----\n    if not isinstance(workspace_id, str) or not re.match(r\"^vbc_wsp_[0-9A-Z]+$\", workspace_id or \"\"):\n        return _err(\"VALIDATION_ERROR\", \"workspace_id must match ^vbc_wsp_[0-9A-Z]+$\")\n    if not isinstance(session_id, str) or not re.match(r\"^vbc_sess_[0-9A-Z]+$\", session_id or \"\"):\n        return _err(\"VALIDATION_ERROR\", \"session_id must match ^vbc_sess_[0-9A-Z]+$\")\n    if not isinstance(input_text, str):\n        return _err(\"VALIDATION_ERROR\", \"input_text must be a string\")\n    if input_text.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"input_text must not be empty\")\n    if context is not None and not isinstance(context, dict):\n        return _err(\"VALIDATION_ERROR\", \"context must be an object when provided\")\n\n    # ---- load store ----\n    workspaces = _load(\"workspaces.json\")\n    sessions = _load(\"sessions.json\")\n    tool_runs = _load(\"tool_runs.json\")\n    learned_patterns = _load(\"learned_patterns.json\")\n\n    # ---- auth (ambient): pick a workspace/session combination that satisfies prerequisites ----\n    wsp = next((w for w in workspaces if w.get(\"id\") == workspace_id and w.get(\"status\") == \"active\"), None)\n    if not wsp:\n        # treat missing or non-active as unauthorized per \"authorized to read; refuses if lacks access\"\n        return _err(\"UNAUTHORIZED\", \"Not authorized for workspace, or workspace not active\")\n\n    sess = next((s for s in sessions if s.get(\"id\") == session_id and s.get(\"workspace_id\") == workspace_id), None)\n    if not sess:\n        return _err(\"NOT_FOUND\", \"Session not found in workspace\")\n    if sess.get(\"status\") == \"deleted\":\n        return _err(\"INVALID_TRANSITION\", \"Cannot run tools on a deleted session\")\n\n    # ---- create tool_run row (exactly one per call) ----\n    now = _now()\n    run_id = _make_id(\"vbc_run_\")\n    req_payload = {\"workspace_id\": workspace_id, \"session_id\": session_id, \"input_text\": input_text}\n    if context is not None:\n        req_payload[\"context\"] = context\n\n    run_row = {\n        \"id\": run_id,\n        \"workspace_id\": workspace_id,\n        \"session_id\": session_id,\n        \"tool_name\": \"vibe_check\",\n        \"status\": \"running\",\n        \"request_payload\": req_payload if isinstance(req_payload, dict) else {},\n        \"input_text\": input_text,\n        \"response_payload\": None,\n        \"output_text\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"duration_ms\": None,\n        \"tokens_in\": _estimate_tokens(input_text),\n        \"tokens_out\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n        \"started_at\": now,\n        \"finished_at\": None,\n    }\n    tool_runs.append(run_row)\n\n    # ---- optionally persist session context (store on session) ----\n    if context is not None:\n        # merge shallowly into session.context (object)\n        if sess.get(\"context\") is None or not isinstance(sess.get(\"context\"), dict):\n            sess[\"context\"] = {}\n        for k, v in context.items():\n            sess[\"context\"][k] = v\n        sess[\"updated_at\"] = now\n\n    # ---- analysis: read active learned_patterns in same workspace (no modifications) ----\n    text_l = input_text.lower()\n    active_patterns = [p for p in learned_patterns if p.get(\"workspace_id\") == workspace_id and p.get(\"status\") == \"active\"]\n    warnings = []\n    # simple relevance heuristic: keyword overlap with title/problem/tags\n    for p in active_patterns:\n        title = (p.get(\"title\") or \"\")\n        problem = (p.get(\"problem\") or \"\")\n        tags = p.get(\"tags\") if isinstance(p.get(\"tags\"), list) else []\n        blob = \" \".join([title, problem, \" \".join([str(t) for t in tags])]).lower()\n        if not blob.strip():\n            continue\n        # token-based match: any word length>=4 present\n        matched_terms = []\n        for term in set(re.findall(r\"[a-z0-9_\\-]{4,}\", blob)):\n            if term in text_l:\n                matched_terms.append(term)\n        if matched_terms:\n            warnings.append(\n                {\n                    \"pattern_id\": p.get(\"id\"),\n                    \"pattern_key\": p.get(\"pattern_key\"),\n                    \"title\": title,\n                    \"matched_terms\": sorted(matched_terms)[:20],\n                    \"problem\": p.get(\"problem\"),\n                    \"solution\": p.get(\"solution\"),\n                    \"tags\": tags,\n                    \"evidence_count\": p.get(\"evidence_count\"),\n                }\n            )\n\n    # Additional generic checks\n    generic_flags = []\n    if len(input_text) > 8000:\n        generic_flags.append({\"code\": \"LONG_INPUT\", \"message\": \"Input is long; consider summarizing or distilling.\"})\n    if re.search(r\"\\b(todo|tbd|fixme)\\b\", text_l):\n        generic_flags.append({\"code\": \"UNRESOLVED_MARKERS\", \"message\": \"Found TODO/TBD/FIXME markers.\"})\n    if \"optimiz\" in text_l or \"premature\" in text_l:\n        generic_flags.append({\"code\": \"POSSIBLE_PREMATURE_OPTIMIZATION\", \"message\": \"Mentions optimization; ensure correctness first.\"})\n\n    analysis = {\n        \"warnings\": warnings,\n        \"generic_flags\": generic_flags,\n        \"summary\": {\n            \"relevant_patterns\": len(warnings),\n            \"active_patterns_scanned\": len(active_patterns),\n        },\n    }\n    output_text = f\"Vibe check: {len(warnings)} relevant pattern warning(s), {len(generic_flags)} generic flag(s).\"\n\n    # ---- finalize tool_run ----\n    finished = _now()\n    run_row[\"status\"] = \"succeeded\"\n    run_row[\"response_payload\"] = analysis\n    run_row[\"output_text\"] = output_text\n    run_row[\"finished_at\"] = finished\n    run_row[\"updated_at\"] = finished\n    dur = int((time.time() - t0) * 1000)\n    run_row[\"duration_ms\"] = max(0, dur)\n    # rough tokens_out: serialized response size / 4\n    run_row[\"tokens_out\"] = _estimate_tokens(json.dumps(analysis, ensure_ascii=False))\n\n    # ---- persist ----\n    _save(\"tool_runs.json\", tool_runs)\n    _save(\"sessions.json\", sessions)\n\n    return {\"tool_run\": run_row}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "vibe_distill",
+          "description": "Distills the provided plan or implementation text for a given workspace/session into a simplified distilled plan, records a vibe_distill run on the session, and returns the run along with the created distilled plan (including any optional notes you provide). Raises VALIDATION_ERROR if workspace_id or session_id do not match the required vbc_wsp_/vbc_sess_ formats, if required fields are missing, or if unknown fields are provided; raises UNAUTHORIZED/FORBIDDEN if you lack access to the workspace or session; raises NOT_FOUND if the referenced workspace or session does not exist (or the session is not in the workspace); raises CONFLICT if the session is not in a state that can accept a new distillation run; and raises QUOTA_EXCEEDED if the workspace/run or distilled-plan limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^vbc_wsp_[0-9A-Z]+$",
+                "description": "Workspace id that owns the session, run, and distilled plan."
+              },
+              "session_id": {
+                "type": "string",
+                "pattern": "^vbc_sess_[0-9A-Z]+$",
+                "description": "Session id to attach this vibe_distill run (and resulting distilled plan) to."
+              },
+              "input_text": {
+                "type": "string",
+                "description": "The plan or implementation text to simplify and distill."
+              },
+              "notes": {
+                "type": "string",
+                "description": "Optional notes to save onto the resulting distilled plan."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "session_id",
+              "input_text"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def vibe_distill(workspace_id, session_id, input_text, notes=None, **_extra):\n    import json, os, datetime, re, time, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0363000\" if __import__(\"os\").path.isdir(\"./environment_mix/0363000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _make_id(prefix):\n        raw = f\"{time.time_ns()}:{os.getpid()}:{os.urandom(8).hex()}\"\n        token = hashlib.sha1(raw.encode(\"utf-8\")).hexdigest().upper()[:12]\n        return f\"{prefix}{token}\"\n\n    def _estimate_tokens(text):\n        if text is None:\n            return None\n        if not isinstance(text, str):\n            return None\n        return max(1, (len(text) + 3) // 4) if text else 0\n\n    t0 = time.time()\n\n    if not isinstance(workspace_id, str) or not re.match(r\"^vbc_wsp_[0-9A-Z]+$\", workspace_id or \"\"):\n        return _err(\"VALIDATION_ERROR\", \"workspace_id must match ^vbc_wsp_[0-9A-Z]+$\")\n    if not isinstance(session_id, str) or not re.match(r\"^vbc_sess_[0-9A-Z]+$\", session_id or \"\"):\n        return _err(\"VALIDATION_ERROR\", \"session_id must match ^vbc_sess_[0-9A-Z]+$\")\n    if not isinstance(input_text, str) or input_text.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"input_text must be a non-empty string\")\n    if notes is not None and not isinstance(notes, str):\n        return _err(\"VALIDATION_ERROR\", \"notes must be a string when provided\")\n\n    workspaces = _load(\"workspaces.json\")\n    sessions = _load(\"sessions.json\")\n    tool_runs = _load(\"tool_runs.json\")\n    distilled_plans = _load(\"distilled_plans.json\")\n\n    wsp = next((w for w in workspaces if w.get(\"id\") == workspace_id and w.get(\"status\") == \"active\"), None)\n    if not wsp:\n        return _err(\"UNAUTHORIZED\", \"Not authorized for workspace, or workspace not active\")\n\n    sess = next((s for s in sessions if s.get(\"id\") == session_id and s.get(\"workspace_id\") == workspace_id), None)\n    if not sess:\n        return _err(\"NOT_FOUND\", \"Session not found in workspace\")\n    if sess.get(\"status\") == \"deleted\":\n        return _err(\"INVALID_TRANSITION\", \"Cannot run tools on a deleted session\")\n\n    # create tool run\n    now = _now()\n    run_id = _make_id(\"vbc_run_\")\n    req_payload = {\"workspace_id\": workspace_id, \"session_id\": session_id, \"input_text\": input_text}\n    if notes is not None:\n        req_payload[\"notes\"] = notes\n\n    run_row = {\n        \"id\": run_id,\n        \"workspace_id\": workspace_id,\n        \"session_id\": session_id,\n        \"tool_name\": \"vibe_distill\",\n        \"status\": \"running\",\n        \"request_payload\": req_payload,\n        \"input_text\": input_text,\n        \"response_payload\": None,\n        \"output_text\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"duration_ms\": None,\n        \"tokens_in\": _estimate_tokens(input_text),\n        \"tokens_out\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n        \"started_at\": now,\n        \"finished_at\": None,\n    }\n    tool_runs.append(run_row)\n\n    # \"distill\" heuristic extraction\n    lines = [ln.strip() for ln in input_text.splitlines()]\n    nonempty = [ln for ln in lines if ln]\n    essential = []\n    complexity = []\n    simplifications = []\n\n    for ln in nonempty:\n        lnl = ln.lower()\n        if re.match(r\"^(\\-|\\*|\\d+\\.)\\s+\", ln):\n            essential.append(re.sub(r\"^(\\-|\\*|\\d+\\.)\\s+\", \"\", ln).strip())\n        if any(k in lnl for k in [\"microservice\", \"kubernetes\", \"event-sourcing\", \"cqrs\", \"blockchain\", \"ai\", \"ml\", \"over-engineer\", \"overengineer\"]):\n            complexity.append(ln)\n        if any(k in lnl for k in [\"should\", \"could\", \"maybe\", \"consider\", \"optional\"]):\n            simplifications.append(ln)\n\n    if not essential:\n        # fallback: first few sentences-ish\n        chunks = re.split(r\"[\\.!\\?]\\s+\", input_text.strip())\n        essential = [c.strip() for c in chunks if c.strip()][:5]\n\n    # simplify dedupe and cap sizes\n    def _uniq(seq, maxn):\n        seen = set()\n        out = []\n        for x in seq:\n            if not isinstance(x, str):\n                continue\n            k = x.strip()\n            if not k:\n                continue\n            if k.lower() in seen:\n                continue\n            seen.add(k.lower())\n            out.append(k)\n            if len(out) >= maxn:\n                break\n        return out\n\n    essential = _uniq(essential, 20)\n    complexity = _uniq(complexity, 15)\n    simplifications = _uniq(\n        simplifications\n        + [\n            \"Start with a minimal end-to-end slice; defer scaling/optimization until after correctness is proven.\",\n            \"Prefer a single service/module first; split only when you have clear boundaries and pain points.\",\n        ],\n        15,\n    )\n\n    original_summary = None\n    if len(nonempty) > 0:\n        original_summary = nonempty[0][:240]\n\n    plan_id = _make_id(\"vbc_plan_\")\n\n    # supersede existing active plan(s) in same session (application-level rule)\n    updated_any = False\n    finished = _now()\n    for p in distilled_plans:\n        if p.get(\"session_id\") == session_id and p.get(\"workspace_id\") == workspace_id and p.get(\"status\") == \"active\":\n            p[\"status\"] = \"superseded\"\n            p[\"updated_at\"] = finished\n            updated_any = True\n\n    plan_row = {\n        \"id\": plan_id,\n        \"workspace_id\": workspace_id,\n        \"session_id\": session_id,\n        \"source_run_id\": run_id,\n        \"status\": \"active\",\n        \"original_summary\": original_summary,\n        \"essential_elements\": essential if isinstance(essential, list) else [],\n        \"complexity_sources\": complexity if isinstance(complexity, list) else [],\n        \"recommended_simplifications\": simplifications if isinstance(simplifications, list) else [],\n        \"notes\": notes,\n        \"created_at\": finished,\n        \"updated_at\": finished,\n    }\n\n    # unique(source_run_id)\n    if any(p.get(\"source_run_id\") == run_id for p in distilled_plans):\n        # Shouldn't happen because run_id is new; still enforce.\n        run_row[\"status\"] = \"failed\"\n        run_row[\"error_code\"] = \"CONFLICT_SOURCE_RUN\"\n        run_row[\"error_message\"] = \"A distilled plan already exists for this source_run_id\"\n        run_row[\"finished_at\"] = finished\n        run_row[\"updated_at\"] = finished\n        run_row[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n        _save(\"tool_runs.json\", tool_runs)\n        return _err(\"CONFLICT\", \"A distilled plan already exists for this source_run_id\")\n\n    distilled_plans.append(plan_row)\n\n    # finalize run (must be succeeded for plan creation rule; we created plan only after success path)\n    run_row[\"status\"] = \"succeeded\"\n    run_row[\"response_payload\"] = {\"distilled_plan_id\": plan_id, \"superseded_previous_active\": bool(updated_any)}\n    run_row[\"output_text\"] = f\"Distilled plan created ({plan_id}). Essential elements: {len(essential)}.\"\n    run_row[\"finished_at\"] = finished\n    run_row[\"updated_at\"] = finished\n    run_row[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n    run_row[\"tokens_out\"] = _estimate_tokens(json.dumps(run_row[\"response_payload\"], ensure_ascii=False))\n\n    _save(\"tool_runs.json\", tool_runs)\n    _save(\"distilled_plans.json\", distilled_plans)\n\n    return {\"tool_run\": run_row, \"distilled_plan\": plan_row}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "vibe_learn",
+          "description": "Pattern recognition system that tracks common errors and solutions to prevent recurring issues",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^vbc_wsp_[0-9A-Z]+$",
+                "description": "Workspace id that owns the session, run, and learned patterns."
+              },
+              "session_id": {
+                "type": "string",
+                "pattern": "^vbc_sess_[0-9A-Z]+$",
+                "description": "Session id to attach this vibe_learn run to."
+              },
+              "input_text": {
+                "type": "string",
+                "description": "Text describing what went wrong and/or what was fixed, used to extract reusable patterns."
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Optional tags to associate with any patterns learned from this run."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "session_id",
+              "input_text"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def vibe_learn(workspace_id, session_id, input_text, tags=None, **_extra):\n    import json, os, datetime, re, time, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0363000\" if __import__(\"os\").path.isdir(\"./environment_mix/0363000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_dt():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _now():\n        return _now_dt().isoformat()\n\n    def _make_id(prefix):\n        raw = f\"{time.time_ns()}:{os.getpid()}:{os.urandom(8).hex()}\"\n        token = hashlib.sha1(raw.encode(\"utf-8\")).hexdigest().upper()[:12]\n        return f\"{prefix}{token}\"\n\n    def _estimate_tokens(text):\n        if text is None:\n            return None\n        if not isinstance(text, str):\n            return None\n        return max(1, (len(text) + 3) // 4) if text else 0\n\n    def _norm_tags(t):\n        if t is None:\n            return []\n        if not isinstance(t, list):\n            return None\n        out = []\n        for x in t:\n            if not isinstance(x, str):\n                return None\n            v = x.strip()\n            if not v:\n                continue\n            out.append(v)\n        # dedupe case-insensitive\n        seen = set()\n        ded = []\n        for v in out:\n            k = v.lower()\n            if k in seen:\n                continue\n            seen.add(k)\n            ded.append(v)\n        return ded[:25]\n\n    t0 = time.time()\n\n    if not isinstance(workspace_id, str) or not re.match(r\"^vbc_wsp_[0-9A-Z]+$\", workspace_id or \"\"):\n        return _err(\"VALIDATION_ERROR\", \"workspace_id must match ^vbc_wsp_[0-9A-Z]+$\")\n    if not isinstance(session_id, str) or not re.match(r\"^vbc_sess_[0-9A-Z]+$\", session_id or \"\"):\n        return _err(\"VALIDATION_ERROR\", \"session_id must match ^vbc_sess_[0-9A-Z]+$\")\n    if not isinstance(input_text, str) or input_text.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"input_text must be a non-empty string\")\n    norm_tags = _norm_tags(tags)\n    if norm_tags is None:\n        return _err(\"VALIDATION_ERROR\", \"tags must be an array of strings when provided\")\n\n    workspaces = _load(\"workspaces.json\")\n    sessions = _load(\"sessions.json\")\n    tool_runs = _load(\"tool_runs.json\")\n    learned_patterns = _load(\"learned_patterns.json\")\n\n    wsp = next((w for w in workspaces if w.get(\"id\") == workspace_id and w.get(\"status\") == \"active\"), None)\n    if not wsp:\n        return _err(\"UNAUTHORIZED\", \"Not authorized for workspace, or workspace not active\")\n\n    sess = next((s for s in sessions if s.get(\"id\") == session_id and s.get(\"workspace_id\") == workspace_id), None)\n    if not sess:\n        return _err(\"NOT_FOUND\", \"Session not found in workspace\")\n    if sess.get(\"status\") == \"deleted\":\n        return _err(\"INVALID_TRANSITION\", \"Cannot run tools on a deleted session\")\n\n    # create tool run\n    now = _now()\n    run_id = _make_id(\"vbc_run_\")\n    req_payload = {\"workspace_id\": workspace_id, \"session_id\": session_id, \"input_text\": input_text}\n    if tags is not None:\n        req_payload[\"tags\"] = tags\n\n    run_row = {\n        \"id\": run_id,\n        \"workspace_id\": workspace_id,\n        \"session_id\": session_id,\n        \"tool_name\": \"vibe_learn\",\n        \"status\": \"running\",\n        \"request_payload\": req_payload,\n        \"input_text\": input_text,\n        \"response_payload\": None,\n        \"output_text\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"duration_ms\": None,\n        \"tokens_in\": _estimate_tokens(input_text),\n        \"tokens_out\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n        \"started_at\": now,\n        \"finished_at\": None,\n    }\n    tool_runs.append(run_row)\n\n    # Extract a candidate pattern: try to parse \"problem:\" / \"solution:\" blocks, else heuristic\n    txt = input_text.strip()\n    low = txt.lower()\n\n    def _extract_field(label):\n        m = re.search(rf\"(?im)^\\s*{re.escape(label)}\\s*:\\s*(.+?)\\s*$\", txt)\n        return m.group(1).strip() if m else None\n\n    title = _extract_field(\"title\")\n    problem = _extract_field(\"problem\")\n    solution = _extract_field(\"solution\")\n\n    if not problem:\n        # heuristic problem sentence\n        parts = re.split(r\"[\\.!\\?]\\s+\", txt)\n        problem = parts[0].strip() if parts and parts[0].strip() else \"Unspecified recurring issue\"\n    if not solution:\n        # heuristic solution based on common phrases\n        if \"missing\" in low and \"validation\" in low:\n            solution = \"Add input validation and clear error messages; add tests for invalid inputs.\"\n        elif \"race\" in low or \"concurrency\" in low:\n            solution = \"Add proper locking/transaction boundaries; make operations idempotent where possible.\"\n        elif \"auth\" in low or \"unauthor\" in low:\n            solution = \"Ensure correct authentication/authorization checks and use least-privilege access.\"\n        else:\n            solution = \"Document the fix and add a regression test to prevent recurrence.\"\n    if not title:\n        # compact title\n        title = re.sub(r\"[^A-Za-z0-9\\s\\-\\_]\", \"\", problem).strip()\n        title = re.sub(r\"\\s+\", \" \", title)[:64] or \"Learned pattern\"\n\n    # pattern_key: stable dedupe key by normalized hash of problem+solution stem\n    key_base = (re.sub(r\"\\s+\", \" \", (problem + \"|\" + solution).strip().lower()))[:4000]\n    pattern_key = hashlib.sha1(key_base.encode(\"utf-8\")).hexdigest()[:16]\n\n    # enforce non-empty fields\n    if not isinstance(title, str) or title.strip() == \"\":\n        # should not happen due to fallback\n        title = \"Learned pattern\"\n    if not isinstance(problem, str) or problem.strip() == \"\":\n        problem = \"Unspecified recurring issue\"\n    if not isinstance(solution, str) or solution.strip() == \"\":\n        solution = \"Add documentation and tests to prevent recurrence.\"\n\n    now_dt = _now_dt()\n    now_iso = now_dt.isoformat()\n\n    # create or update within workspace unique(workspace_id, pattern_key)\n    existing = next(\n        (p for p in learned_patterns if p.get(\"workspace_id\") == workspace_id and p.get(\"pattern_key\") == pattern_key and p.get(\"status\") != \"deleted\"),\n        None,\n    )\n\n    changed = {\"created\": False, \"updated\": False}\n    pattern_row = None\n    if existing:\n        # update: increment evidence_count, last_seen_at, tags union, updated_by_run_id\n        try:\n            ev = int(existing.get(\"evidence_count\", 0))\n        except Exception:\n            ev = 0\n        existing[\"evidence_count\"] = max(0, ev + 1)\n        # keep first_seen_at, update last_seen_at >= first_seen_at\n        fs = existing.get(\"first_seen_at\")\n        fs_dt = None\n        if isinstance(fs, str):\n            try:\n                fs_dt = datetime.datetime.fromisoformat(fs[:-1] + \"+00:00\") if fs.endswith(\"Z\") else datetime.datetime.fromisoformat(fs)\n            except Exception:\n                fs_dt = None\n        if fs_dt and now_dt < fs_dt:\n            existing[\"last_seen_at\"] = fs  # clamp\n        else:\n            existing[\"last_seen_at\"] = now_iso\n\n        # optionally refresh title/problem/solution if input provides explicit fields\n        if _extract_field(\"problem\") or _extract_field(\"solution\") or _extract_field(\"title\"):\n            existing[\"title\"] = title\n            existing[\"problem\"] = problem\n            existing[\"solution\"] = solution\n\n        # tags: union, preserve existing order then add new\n        ex_tags = existing.get(\"tags\")\n        if not isinstance(ex_tags, list):\n            ex_tags = []\n        seen = set([str(t).lower() for t in ex_tags if isinstance(t, str)])\n        for t in norm_tags:\n            if t.lower() not in seen:\n                ex_tags.append(t)\n                seen.add(t.lower())\n        existing[\"tags\"] = ex_tags[:50]\n\n        existing[\"updated_by_run_id\"] = run_id\n        existing[\"updated_at\"] = now_iso\n        changed[\"updated\"] = True\n        pattern_row = existing\n    else:\n        pat_id = _make_id(\"vbc_pat_\")\n        pattern_row = {\n            \"id\": pat_id,\n            \"workspace_id\": workspace_id,\n            \"status\": \"active\",\n            \"pattern_key\": pattern_key,\n            \"title\": title,\n            \"problem\": problem,\n            \"solution\": solution,\n            \"tags\": norm_tags,\n            \"evidence_count\": 1,\n            \"first_seen_at\": now_iso,\n            \"last_seen_at\": now_iso,\n            \"created_by_run_id\": run_id,\n            \"updated_by_run_id\": run_id,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n        }\n        learned_patterns.append(pattern_row)\n        changed[\"created\"] = True\n\n    # finalize run\n    finished = _now()\n    run_row[\"status\"] = \"succeeded\"\n    run_row[\"response_payload\"] = {\"pattern_id\": pattern_row.get(\"id\"), \"pattern_key\": pattern_key, **changed}\n    run_row[\"output_text\"] = (\"Created\" if changed[\"created\"] else \"Updated\") + f\" learned pattern ({pattern_row.get('id')}).\"\n    run_row[\"finished_at\"] = finished\n    run_row[\"updated_at\"] = finished\n    run_row[\"duration_ms\"] = max(0, int((time.time() - t0) * 1000))\n    run_row[\"tokens_out\"] = _estimate_tokens(json.dumps(run_row[\"response_payload\"], ensure_ascii=False))\n\n    _save(\"tool_runs.json\", tool_runs)\n    _save(\"learned_patterns.json\", learned_patterns)\n\n    return {\"tool_run\": run_row, \"learned_pattern\": pattern_row}\n",
+          "_params_reconstructed": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_sessions",
+          "description": "Lists sessions in a workspace with optional filtering by status and time. Returns a paginated list of session records the caller is authorized to read; refuses with AUTH_ERROR if the caller lacks access to the workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^vbc_wsp_[0-9A-Z]+$",
+                "description": "Workspace id whose sessions to list."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "open",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "If provided, only return sessions in this status."
+              },
+              "q": {
+                "type": "string",
+                "description": "Optional case-insensitive substring match against session title."
+              },
+              "opened_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "If provided, only return sessions opened at or after this timestamp."
+              },
+              "opened_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "If provided, only return sessions opened at or before this timestamp."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of sessions to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "opened_at"
+                ],
+                "default": "updated_at",
+                "description": "Field to sort by for pagination stability."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "default": "desc",
+                "description": "Sort direction."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_sessions(workspace_id, status=None, q=None, opened_after=None, opened_before=None, limit=None, cursor=None, sort=None, order=None, **_extra):\n    import json, os, datetime, re, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0363000\" if __import__(\"os\").path.isdir(\"./environment_mix/0363000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _dt_key(val):\n        d = _parse_dt(val) if isinstance(val, str) else None\n        if d is None:\n            return datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n        if d.tzinfo is None:\n            d = d.replace(tzinfo=datetime.timezone.utc)\n        return d\n\n    # validation\n    if not isinstance(workspace_id, str) or not re.match(r\"^vbc_wsp_[0-9A-Z]+$\", workspace_id or \"\"):\n        return _err(\"VALIDATION_ERROR\", \"workspace_id must match ^vbc_wsp_[0-9A-Z]+$\")\n\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"open\", \"archived\", \"deleted\"):\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: open, archived, deleted\")\n\n    if q is not None and not isinstance(q, str):\n        return _err(\"VALIDATION_ERROR\", \"q must be a string when provided\")\n\n    oa = _parse_dt(opened_after) if opened_after is not None else None\n    if opened_after is not None and oa is None:\n        return _err(\"VALIDATION_ERROR\", \"opened_after must be an RFC3339 date-time string\")\n\n    ob = _parse_dt(opened_before) if opened_before is not None else None\n    if opened_before is not None and ob is None:\n        return _err(\"VALIDATION_ERROR\", \"opened_before must be an RFC3339 date-time string\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n    if limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200\")\n\n    if sort is None:\n        sort = \"updated_at\"\n    if sort not in (\"created_at\", \"updated_at\", \"opened_at\"):\n        return _err(\"VALIDATION_ERROR\", \"sort must be one of: created_at, updated_at, opened_at\")\n\n    if order is None:\n        order = \"desc\"\n    if order not in (\"asc\", \"desc\"):\n        return _err(\"VALIDATION_ERROR\", \"order must be one of: asc, desc\")\n\n    # load + auth (ambient)\n    workspaces = _load(\"workspaces.json\")\n    sessions = _load(\"sessions.json\")\n\n    wsp = next((w for w in workspaces if w.get(\"id\") == workspace_id and w.get(\"status\") == \"active\"), None)\n    if not wsp:\n        return _err(\"UNAUTHORIZED\", \"Not authorized for workspace, or workspace not active\")\n\n    # apply filters\n    rows = [s for s in sessions if s.get(\"workspace_id\") == workspace_id]\n    if status is not None:\n        rows = [s for s in rows if s.get(\"status\") == status]\n    if q is not None and q.strip() != \"\":\n        qq = q.lower()\n        rows = [s for s in rows if qq in ((s.get(\"title\") or \"\").lower())]\n    if oa is not None:\n        rows = [s for s in rows if _dt_key(s.get(\"opened_at\")) >= (oa if oa.tzinfo else oa.replace(tzinfo=datetime.timezone.utc))]\n    if ob is not None:\n        rows = [s for s in rows if _dt_key(s.get(\"opened_at\")) <= (ob if ob.tzinfo else ob.replace(tzinfo=datetime.timezone.utc))]\n\n    # sort stable by (sort_field, id)\n    reverse = (order == \"desc\")\n\n    def _sort_key(s):\n        return (_dt_key(s.get(sort)), str(s.get(\"id\") or \"\"))\n\n    rows.sort(key=_sort_key, reverse=reverse)\n\n    # cursor: base64 json {\"v\": <sort_value>, \"id\": <id>}\n    start_idx = 0\n    next_cursor = None\n    if cursor is not None:\n        if not isinstance(cursor, str) or cursor.strip() == \"\":\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string when provided\")\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\").decode(\"utf-8\")\n            c = json.loads(raw)\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n        cv = c.get(\"v\")\n        cid = c.get(\"id\")\n        # find first row after cursor in the sorted order\n        for i, s in enumerate(rows):\n            if str(s.get(\"id\") or \"\") == str(cid) and (s.get(sort) == cv):\n                start_idx = i + 1\n                break\n\n    page = rows[start_idx:start_idx + limit]\n    has_more = (start_idx + limit) < len(rows)\n    if has_more and page:\n        last = page[-1]\n        payload = {\"v\": last.get(sort), \"id\": last.get(\"id\")}\n        next_cursor = base64.urlsafe_b64encode(json.dumps(payload, ensure_ascii=False).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    return {\n        \"sessions\": page,\n        \"meta\": {\n            \"total\": len(rows),\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"sort\": sort,\n            \"order\": order,\n        },\n    }\n"
+        },
+        {
+          "name": "create_session",
+          "description": "Creates a new session in the given workspace and returns the created session. Refuses with VALIDATION_ERROR if ids are malformed or required fields are missing, and with AUTH_ERROR if the caller is not permitted to create sessions in the workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^vbc_wsp_[0-9A-Z]+$",
+                "description": "Workspace id that will own the new session."
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "Human-friendly session title."
+              },
+              "context": {
+                "type": "object",
+                "description": "Optional structured context to persist on the session (e.g., repo, ticket, constraints)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "open",
+                  "archived"
+                ],
+                "default": "open",
+                "description": "Initial session status; may not be created as deleted."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "title"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_session(workspace_id, title, context=None, status=None, **_extra):\n    import json, os, datetime, re, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0363000\" if __import__(\"os\").path.isdir(\"./environment_mix/0363000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"create_session\"\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    used_credential = None\n\n    def _log(status_str, error_code=None):\n        latency = int((time.time() - t0) * 1000)\n        req_logs = _load(\"request_logs.json\")\n        if not isinstance(req_logs, list):\n            req_logs = []\n        req_logs.append({\n            \"id\": \"vbc_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n            \"endpoint\": endpoint,\n            \"workspace_id\": workspace_id if isinstance(workspace_id, str) else None,\n            \"credential\": used_credential,\n            \"status\": status_str,\n            \"error_code\": error_code,\n            \"latency_ms\": latency,\n            \"ts\": now,\n        })\n        _save(\"request_logs.json\", req_logs)\n\n    try:\n        if not isinstance(workspace_id, str) or not re.match(r\"^vbc_wsp_[0-9A-Z]+$\", workspace_id):\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"workspace_id is invalid.\", field=\"workspace_id\")\n        if not isinstance(title, str) or len(title) < 1 or len(title) > 200:\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"title must be a non-empty string up to 200 chars.\", field=\"title\")\n        if context is not None and not isinstance(context, dict):\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"context must be an object.\", field=\"context\")\n        if status is None:\n            status = \"open\"\n        if not isinstance(status, str) or status not in (\"open\", \"archived\"):\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status must be 'open' or 'archived'.\", field=\"status\")\n\n        workspaces = _load(\"workspaces.json\")\n        wsp = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n        if not wsp:\n            _log(\"error\", \"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n        if wsp.get(\"status\") != \"active\":\n            _log(\"error\", \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"Workspace is not active; cannot create session.\", workspace_id=workspace_id)\n\n        sessions = _load(\"sessions.json\")\n        if not isinstance(sessions, list):\n            sessions = []\n\n        new_id = \"vbc_sess_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\")\n        while any(isinstance(s, dict) and s.get(\"id\") == new_id for s in sessions):\n            new_id = \"vbc_sess_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\")\n\n        opened_at = now\n        closed_at = None\n        if status == \"archived\":\n            closed_at = now\n\n        row = {\n            \"id\": new_id,\n            \"workspace_id\": workspace_id,\n            \"title\": title,\n            \"status\": status,\n            \"context\": context if context is not None else None,\n            \"opened_at\": opened_at,\n            \"closed_at\": closed_at,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        sessions.append(row)\n        _save(\"sessions.json\", sessions)\n\n        _log(\"ok\", None)\n        return {\"session\": row}\n    except Exception as e:\n        _log(\"error\", \"INTERNAL_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected error.\", details=str(e))\n"
+        },
+        {
+          "name": "update_session",
+          "description": "Updates an existing session (title/context and lifecycle status transitions) and returns the updated session. Refuses with NOT_FOUND if the session does not exist in the workspace, VALIDATION_ERROR for illegal status transitions, and AUTH_ERROR if the caller lacks permission.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^vbc_wsp_[0-9A-Z]+$",
+                "description": "Workspace id that owns the session."
+              },
+              "session_id": {
+                "type": "string",
+                "pattern": "^vbc_sess_[0-9A-Z]+$",
+                "description": "Session id to update."
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "New session title."
+              },
+              "context": {
+                "type": "object",
+                "description": "New structured context to store on the session."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "open",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "New status for the session. Transitions allowed: open->archived/deleted, archived->open/deleted; deleted is terminal and triggers cascade deletion of the session’s tool_runs and distilled_plans."
+              },
+              "closed_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional close timestamp. If provided, must be consistent with status (typically archived)."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "session_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_session(workspace_id, session_id, title=None, context=None, status=None, closed_at=None, **_extra):\n    import json, os, datetime, re, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0363000\" if __import__(\"os\").path.isdir(\"./environment_mix/0363000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"update_session\"\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    used_credential = None\n\n    def _log(status_str, error_code=None):\n        latency = int((time.time() - t0) * 1000)\n        req_logs = _load(\"request_logs.json\")\n        if not isinstance(req_logs, list):\n            req_logs = []\n        req_logs.append({\n            \"id\": \"vbc_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n            \"endpoint\": endpoint,\n            \"workspace_id\": workspace_id if isinstance(workspace_id, str) else None,\n            \"credential\": used_credential,\n            \"status\": status_str,\n            \"error_code\": error_code,\n            \"latency_ms\": latency,\n            \"ts\": now,\n        })\n        _save(\"request_logs.json\", req_logs)\n\n    def _parse_dt(s):\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s2 = s[:-1]\n                dt = datetime.datetime.fromisoformat(s2)\n                return dt.replace(tzinfo=None)\n            return datetime.datetime.fromisoformat(s.replace(\"Z\", \"\"))\n        except Exception:\n            return None\n\n    try:\n        if not isinstance(workspace_id, str) or not re.match(r\"^vbc_wsp_[0-9A-Z]+$\", workspace_id):\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"workspace_id is invalid.\", field=\"workspace_id\")\n        if not isinstance(session_id, str) or not re.match(r\"^vbc_sess_[0-9A-Z]+$\", session_id):\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"session_id is invalid.\", field=\"session_id\")\n        if title is not None:\n            if not isinstance(title, str) or len(title) < 1 or len(title) > 200:\n                _log(\"error\", \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"title must be a non-empty string up to 200 chars.\", field=\"title\")\n        if context is not None and not isinstance(context, dict):\n            _log(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"context must be an object.\", field=\"context\")\n        if status is not None:\n            if not isinstance(status, str) or status not in (\"open\", \"archived\", \"deleted\"):\n                _log(\"error\", \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"status must be one of open, archived, deleted.\", field=\"status\")\n        if closed_at is not None:\n            if _parse_dt(closed_at) is None:\n                _log(\"error\", \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"closed_at must be an ISO-8601 date-time string.\", field=\"closed_at\")\n\n        workspaces = _load(\"workspaces.json\")\n        wsp = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n        if not wsp:\n            _log(\"error\", \"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n        if wsp.get(\"status\") != \"active\":\n            _log(\"error\", \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"Workspace is not active; cannot update session.\", workspace_id=workspace_id)\n\n        sessions = _load(\"sessions.json\")\n        if not isinstance(sessions, list):\n            sessions = []\n        idx = None\n        for i, s in enumerate(sessions):\n            if isinstance(s, dict) and s.get(\"id\") == session_id and s.get(\"workspace_id\") == workspace_id:\n                idx = i\n                break\n        if idx is None:\n            _log(\"error\", \"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"Session not found in workspace.\", workspace_id=workspace_id, session_id=session_id)\n\n        sess = sessions[idx]\n        old_status = sess.get(\"status\")\n\n        transitions = {\n            \"open\": set([\"archived\", \"deleted\"]),\n            \"archived\": set([\"open\", \"deleted\"]),\n            \"deleted\": set([]),\n        }\n\n        # lifecycle/status update\n        if status is not None and status != old_status:\n            if old_status not in transitions or status not in transitions[old_status]:\n                _log(\"error\", \"INVALID_TRANSITION\")\n                return _err(\"INVALID_TRANSITION\", \"Illegal session status transition.\", from_status=old_status, to_status=status)\n            sess[\"status\"] = status\n            if status in (\"archived\", \"deleted\"):\n                sess[\"closed_at\"] = closed_at if closed_at is not None else now\n            elif status == \"open\":\n                sess[\"closed_at\"] = None\n\n        # closed_at consistency if provided without status change\n        if closed_at is not None and (status is None or status == old_status):\n            if old_status not in (\"archived\", \"deleted\"):\n                _log(\"error\", \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"closed_at can only be set when status is archived or deleted.\", field=\"closed_at\")\n            sess[\"closed_at\"] = closed_at\n\n        if title is not None:\n            sess[\"title\"] = title\n        if context is not None:\n            sess[\"context\"] = context\n\n        sess[\"updated_at\"] = now\n        sessions[idx] = sess\n\n        # Cascade delete if status -> deleted\n        if old_status != \"deleted\" and sess.get(\"status\") == \"deleted\":\n            tool_runs = _load(\"tool_runs.json\")\n            if not isinstance(tool_runs, list):\n                tool_runs = []\n            distilled = _load(\"distilled_plans.json\")\n            if not isinstance(distilled, list):\n                distilled = []\n            learned = _load(\"learned_patterns.json\")\n            if not isinstance(learned, list):\n                learned = []\n\n            # delete tool_runs for this session (cascade)\n            deleted_run_ids = set()\n            kept_runs = []\n            for r in tool_runs:\n                if isinstance(r, dict) and r.get(\"workspace_id\") == workspace_id and r.get(\"session_id\") == session_id:\n                    deleted_run_ids.add(r.get(\"id\"))\n                else:\n                    kept_runs.append(r)\n\n            # delete distilled plans for this session (cascade)\n            kept_plans = []\n            for p in distilled:\n                if isinstance(p, dict) and p.get(\"workspace_id\") == workspace_id and p.get(\"session_id\") == session_id:\n                    continue\n                kept_plans.append(p)\n\n            # set null learned_patterns references for deleted tool_runs (FK set null)\n            if deleted_run_ids:\n                for lp in learned:\n                    if not isinstance(lp, dict) or lp.get(\"workspace_id\") != workspace_id:\n                        continue\n                    if lp.get(\"created_by_run_id\") in deleted_run_ids:\n                        lp[\"created_by_run_id\"] = None\n                        lp[\"updated_at\"] = now\n                    if lp.get(\"updated_by_run_id\") in deleted_run_ids:\n                        lp[\"updated_by_run_id\"] = None\n                        lp[\"updated_at\"] = now\n\n            _save(\"tool_runs.json\", kept_runs)\n            _save(\"distilled_plans.json\", kept_plans)\n            _save(\"learned_patterns.json\", learned)\n\n        _save(\"sessions.json\", sessions)\n\n        _log(\"ok\", None)\n        return {\"session\": sess}\n    except Exception as e:\n        _log(\"error\", \"INTERNAL_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected error.\", details=str(e))\n"
+        },
+        {
+          "name": "list_tool_runs",
+          "description": "Lists tool runs in a workspace, optionally filtered by session, tool name, and status. Returns a paginated list of tool_run records; refuses with AUTH_ERROR if the caller lacks access to the workspace.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^vbc_wsp_[0-9A-Z]+$",
+                "description": "Workspace id whose tool runs to list."
+              },
+              "session_id": {
+                "type": "string",
+                "pattern": "^vbc_sess_[0-9A-Z]+$",
+                "description": "If provided, only return runs belonging to this session."
+              },
+              "tool_name": {
+                "type": "string",
+                "enum": [
+                  "vibe_check",
+                  "vibe_distill",
+                  "vibe_learn"
+                ],
+                "description": "If provided, only return runs for this tool."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "If provided, only return runs in this status."
+              },
+              "created_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "If provided, only return runs created at or after this timestamp."
+              },
+              "created_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "If provided, only return runs created at or before this timestamp."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of runs to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "started_at",
+                  "finished_at"
+                ],
+                "default": "created_at",
+                "description": "Field to sort by for pagination stability."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "default": "desc",
+                "description": "Sort direction."
+              }
+            },
+            "required": [
+              "workspace_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_tool_runs(workspace_id, session_id=None, tool_name=None, status=None, created_after=None, created_before=None, limit=None, cursor=None, sort=None, order=None, **_extra):\n    import json, os, datetime, time, base64, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0363000\" if __import__(\"os\").path.isdir(\"./environment_mix/0363000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"list_tool_runs\"\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    used_credential = None  # ambient auth: no explicit credential parameter\n\n    def _new_req_id():\n        return \"vbc_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\")\n\n    def _log(status_str, error_code=None, workspace_for_log=None):\n        latency = int((time.time() - t0) * 1000)\n        req_logs = _load(\"request_logs.json\")\n        if not isinstance(req_logs, list):\n            req_logs = []\n        req_logs.append({\n            \"id\": _new_req_id(),\n            \"endpoint\": endpoint,\n            \"workspace_id\": workspace_for_log,\n            \"credential\": used_credential,\n            \"status\": status_str,\n            \"error_code\": error_code,\n            \"latency_ms\": latency,\n            \"ts\": now,\n        })\n        _save(\"request_logs.json\", req_logs)\n\n    def _parse_dt(s, field_name):\n        if s is None:\n            return None, None\n        if not isinstance(s, str):\n            return None, _err(\"VALIDATION_ERROR\", f\"{field_name} must be an RFC3339 datetime string.\", field=field_name)\n        try:\n            # accept \"Z\" and offsets; treat naive as UTC\n            if s.endswith(\"Z\"):\n                dt = datetime.datetime.fromisoformat(s[:-1])\n            else:\n                dt = datetime.datetime.fromisoformat(s)\n            if dt.tzinfo is not None:\n                dt = dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)\n            return dt, None\n        except Exception:\n            return None, _err(\"VALIDATION_ERROR\", f\"{field_name} is invalid.\", field=field_name)\n\n    def _dt_from_row(v):\n        if not isinstance(v, str) or not v:\n            return None\n        try:\n            if v.endswith(\"Z\"):\n                dt = datetime.datetime.fromisoformat(v[:-1])\n            else:\n                dt = datetime.datetime.fromisoformat(v)\n            if dt.tzinfo is not None:\n                dt = dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)\n            return dt\n        except Exception:\n            return None\n\n    def _decode_cursor(cur):\n        # Opaque cursor; accept any string. If malformed, treat as \"start from beginning\"\n        if cur is None:\n            return None\n        if not isinstance(cur, str) or cur == \"\":\n            return None\n        try:\n            pad = \"=\" * (-len(cur) % 4)\n            raw = base64.urlsafe_b64decode(cur + pad).decode(\"utf-8\")\n            obj = json.loads(raw)\n            if isinstance(obj, dict):\n                return obj\n            return None\n        except Exception:\n            return None\n\n    def _encode_cursor(obj):\n        raw = json.dumps(obj, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"ascii\").rstrip(\"=\")\n\n    # ---------- validation ----------\n    if not isinstance(workspace_id, str) or not re.match(r\"^vbc_wsp_[0-9A-Z]+$\", workspace_id):\n        _log(\"error\", \"VALIDATION_ERROR\", workspace_for_log=workspace_id if isinstance(workspace_id, str) else None)\n        return _err(\"VALIDATION_ERROR\", \"workspace_id is invalid.\", field=\"workspace_id\")\n\n    if session_id is not None:\n        if not isinstance(session_id, str) or not re.match(r\"^vbc_sess_[0-9A-Z]+$\", session_id):\n            _log(\"error\", \"VALIDATION_ERROR\", workspace_for_log=workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"session_id is invalid.\", field=\"session_id\")\n\n    if tool_name is not None:\n        if tool_name not in (\"vibe_check\", \"vibe_distill\", \"vibe_learn\"):\n            _log(\"error\", \"VALIDATION_ERROR\", workspace_for_log=workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"tool_name is invalid.\", field=\"tool_name\")\n\n    if status is not None:\n        if status not in (\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"):\n            _log(\"error\", \"VALIDATION_ERROR\", workspace_for_log=workspace_id)\n            return _err(\"VALIDATION_ERROR\", \"status is invalid.\", field=\"status\")\n\n    ca_dt, ca_err = _parse_dt(created_after, \"created_after\")\n    if ca_err:\n        _log(\"error\", \"VALIDATION_ERROR\", workspace_for_log=workspace_id)\n        return ca_err\n    cb_dt, cb_err = _parse_dt(created_before, \"created_before\")\n    if cb_err:\n        _log(\"error\", \"VALIDATION_ERROR\", workspace_for_log=workspace_id)\n        return cb_err\n    if ca_dt and cb_dt and ca_dt > cb_dt:\n        _log(\"error\", \"VALIDATION_ERROR\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"created_after must be <= created_before.\", field=\"created_after\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        _log(\"error\", \"VALIDATION_ERROR\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer.\", field=\"limit\")\n    if limit < 1 or limit > 200:\n        _log(\"error\", \"VALIDATION_ERROR\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200.\", field=\"limit\")\n\n    if sort is None:\n        sort = \"created_at\"\n    if sort not in (\"created_at\", \"updated_at\", \"started_at\", \"finished_at\"):\n        _log(\"error\", \"VALIDATION_ERROR\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"sort is invalid.\", field=\"sort\")\n\n    if order is None:\n        order = \"desc\"\n    if order not in (\"asc\", \"desc\"):\n        _log(\"error\", \"VALIDATION_ERROR\", workspace_for_log=workspace_id)\n        return _err(\"VALIDATION_ERROR\", \"order is invalid.\", field=\"order\")\n\n    # cursor is opaque; do not reject just because it isn't ours\n    cur_obj = _decode_cursor(cursor)\n\n    # ---------- auth / workspace access (ambient) ----------\n    workspaces = _load(\"workspaces.json\")\n    if not isinstance(workspaces, list):\n        workspaces = []\n    wsp = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if not wsp:\n        _log(\"error\", \"NOT_FOUND\", workspace_for_log=workspace_id)\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n    if wsp.get(\"status\") == \"deleted\":\n        _log(\"error\", \"UNAUTHORIZED\", workspace_for_log=workspace_id)\n        return _err(\"UNAUTHORIZED\", \"Workspace is not accessible (deleted).\", workspace_id=workspace_id)\n\n    sessions = _load(\"sessions.json\")\n    if not isinstance(sessions, list):\n        sessions = []\n    if session_id is not None:\n        sess = next((s for s in sessions if isinstance(s, dict) and s.get(\"id\") == session_id), None)\n        if not sess:\n            _log(\"error\", \"NOT_FOUND\", workspace_for_log=workspace_id)\n            return _err(\"NOT_FOUND\", \"Session not found.\", session_id=session_id)\n        if sess.get(\"workspace_id\") != workspace_id:\n            _log(\"error\", \"UNAUTHORIZED\", workspace_for_log=workspace_id)\n            return _err(\"UNAUTHORIZED\", \"Session does not belong to the workspace.\", session_id=session_id, workspace_id=workspace_id)\n\n    # ---------- fetch + filter ----------\n    runs = _load(\"tool_runs.json\")\n    if not isinstance(runs, list):\n        runs = []\n\n    filtered = []\n    for r in runs:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"workspace_id\") != workspace_id:\n            continue\n        if session_id is not None and r.get(\"session_id\") != session_id:\n            continue\n        if tool_name is not None and r.get(\"tool_name\") != tool_name:\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        r_created = _dt_from_row(r.get(\"created_at\"))\n        if ca_dt and (r_created is None or r_created < ca_dt):\n            continue\n        if cb_dt and (r_created is None or r_created > cb_dt):\n            continue\n        filtered.append(r)\n\n    # ---------- sort ----------\n    reverse = (order == \"desc\")\n\n    def _sort_key(row):\n        dt = _dt_from_row(row.get(sort))\n        # None sorts last in asc and last in desc as well (stable with a secondary key)\n        none_flag = 1 if dt is None else 0\n        # Use created_at and id as tie-breakers for pagination stability\n        created = _dt_from_row(row.get(\"created_at\"))\n        created_ts = created.timestamp() if created else 0.0\n        dt_ts = dt.timestamp() if dt else 0.0\n        rid = row.get(\"id\") or \"\"\n        # Primary sort: requested field; Secondary: created_at; Tertiary: id\n        return (none_flag, dt_ts, created_ts, rid)\n\n    filtered.sort(key=_sort_key, reverse=reverse)\n\n    # ---------- pagination ----------\n    start = 0\n    if isinstance(cur_obj, dict):\n        # Support either {\"after_id\": \"...\"} or {\"last_id\": \"...\"}; ignore unknown cursor shapes\n        after_id = cur_obj.get(\"after_id\") or cur_obj.get(\"last_id\")\n        if isinstance(after_id, str) and after_id:\n            for i, r in enumerate(filtered):\n                if r.get(\"id\") == after_id:\n                    start = i + 1\n                    break\n\n    page = filtered[start:start + limit]\n    has_more = (start + limit) < len(filtered)\n    next_cursor = _encode_cursor({\"after_id\": page[-1].get(\"id\")}) if (has_more and page and isinstance(page[-1], dict)) else None\n\n    resp = {\n        \"object\": \"list\",\n        \"data\": page,\n        \"workspace_id\": workspace_id,\n        \"total\": len(filtered),\n        \"limit\": limit,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n        \"sort\": sort,\n        \"order\": order,\n    }\n    _log(\"ok\", None, workspace_for_log=workspace_id)\n    return resp\n"
+        },
+        {
+          "name": "get_tool_run",
+          "description": "Fetches a single tool run by id within a workspace and returns the full record (including request/response payloads when available). Refuses with NOT_FOUND if no such run exists in the workspace and AUTH_ERROR if the caller lacks access.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "workspace_id": {
+                "type": "string",
+                "pattern": "^vbc_wsp_[0-9A-Z]+$",
+                "description": "Workspace id that owns the tool run."
+              },
+              "run_id": {
+                "type": "string",
+                "pattern": "^vbc_run_[0-9A-Z]+$",
+                "description": "Tool run id to fetch."
+              }
+            },
+            "required": [
+              "workspace_id",
+              "run_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_tool_run(workspace_id, run_id, **_extra):\n    import json, os, datetime, time, re, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0363000\" if __import__(\"os\").path.isdir(\"./environment_mix/0363000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_tool_run\"\n    used_credential = None  # ambient auth\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _new_id(prefix):\n        return prefix + secrets.token_urlsafe(10).replace(\"-\", \"\").replace(\"_\", \"\")[:18].upper()\n\n    # ---- request logging + (simple) rate limit enforcement ----\n    # Schema didn't provide request_logs, but contract requires observable dynamics if such collection exists.\n    # We'll implement if request_logs.json exists as a list, and enforce a basic per-workspace rate limit.\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        return logs if isinstance(logs, list) else None\n\n    def _enforce_rate_limit(logs, ws_id):\n        if logs is None or not ws_id:\n            return None\n        now = datetime.datetime.utcnow()\n        # 120 req/min per workspace (reasonable default for offline service dynamics)\n        window_s = 60\n        limit = 120\n        count = 0\n        for r in logs:\n            try:\n                if r.get(\"workspace_id\") != ws_id:\n                    continue\n                ts = r.get(\"ts\")\n                if not isinstance(ts, str):\n                    continue\n                # Parse iso \"....Z\"\n                t = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                if (now - t).total_seconds() <= window_s:\n                    count += 1\n            except Exception:\n                continue\n        if count >= limit:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", workspace_id=ws_id, limit_per_minute=limit)\n        return None\n\n    def _append_request_log(logs, status_str, error_code=None, ws_id=None):\n        if logs is None:\n            return\n        latency = int((time.time() - t0) * 1000)\n        logs.append({\n            \"id\": _new_id(\"vbc_req_\"),\n            \"endpoint\": endpoint,\n            \"workspace_id\": ws_id,\n            \"credential\": used_credential,\n            \"status\": status_str,\n            \"error_code\": error_code,\n            \"latency_ms\": latency,\n            \"ts\": _now_iso(),\n        })\n        _save(\"request_logs.json\", logs)\n\n    # ---- Validate inputs (relaxed: accept any non-empty strings; patterns are advisory) ----\n    if not isinstance(workspace_id, str) or not workspace_id.strip():\n        logs = _load_logs()\n        _append_request_log(logs, \"error\", \"VALIDATION_ERROR\", None)\n        return _err(\"VALIDATION_ERROR\", \"workspace_id must be a non-empty string.\", field=\"workspace_id\")\n    if not isinstance(run_id, str) or not run_id.strip():\n        logs = _load_logs()\n        _append_request_log(logs, \"error\", \"VALIDATION_ERROR\", workspace_id.strip())\n        return _err(\"VALIDATION_ERROR\", \"run_id must be a non-empty string.\", field=\"run_id\")\n\n    workspace_id = workspace_id.strip()\n    run_id = run_id.strip()\n\n    logs = _load_logs()\n    rl_err = _enforce_rate_limit(logs, workspace_id)\n    if rl_err:\n        _append_request_log(logs, \"error\", \"RATE_LIMIT\", workspace_id)\n        return rl_err\n\n    # ---- Ambient auth resolution ----\n    # With no explicit credential param, caller is authenticated; we must not refuse a well-formed request due\n    # to missing credential context. We only need to ensure workspace exists and is accessible (all are accessible\n    # in this offline store context).\n    workspaces = _load(\"workspaces.json\")\n    if not isinstance(workspaces, list):\n        workspaces = []\n    ws = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n    if ws is None:\n        _append_request_log(logs, \"error\", \"NOT_FOUND\", workspace_id)\n        return _err(\"NOT_FOUND\", \"Workspace not found.\", workspace_id=workspace_id)\n\n    # ---- Fetch run within workspace ----\n    tool_runs = _load(\"tool_runs.json\")\n    if not isinstance(tool_runs, list):\n        tool_runs = []\n\n    run = None\n    for r in tool_runs:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"id\") == run_id and r.get(\"workspace_id\") == workspace_id:\n            run = r\n            break\n\n    if run is None:\n        # Do NOT validate run_id pattern strictly; treat mismatched ids as a lookup miss (matches audit case).\n        _append_request_log(logs, \"error\", \"NOT_FOUND\", workspace_id)\n        return _err(\"NOT_FOUND\", \"Tool run not found in workspace.\", workspace_id=workspace_id, run_id=run_id)\n\n    # ---- Return full record ----\n    _append_request_log(logs, \"ok\", None, workspace_id)\n    return {\n        \"tool_run\": run\n    }\n"
+        },
+        {
+          "name": "whoami",
+          "description": "Returns the calling identity, granted scopes, and current rate-limit/quota consumption for this API key/session. Refuses with AUTH_ERROR if the presented credentials are missing or invalid.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Bearer credential used to authenticate the request, as issued by Vibe Check."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def whoami(api_key, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0363000\" if __import__(\"os\").path.isdir(\"./environment_mix/0363000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"whoami\"\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _new_req_id():\n        return \"vbc_req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\")\n\n    # Attempt to resolve the presented credential by matching plaintext value OR id\n    # Never compare to hashes/ciphertexts.\n    def _find_credential(key_value):\n        for fname in (\"credentials.json\", \"api_keys.json\", \"keys.json\"):\n            rows = _load(fname)\n            if not isinstance(rows, list):\n                continue\n            for r in rows:\n                if not isinstance(r, dict):\n                    continue\n                # common fields vendors use\n                if r.get(\"id\") == key_value:\n                    return r, fname\n                for f in (\"api_key\", \"key\", \"value\", \"token\", \"secret\", \"client_key\"):\n                    if isinstance(r.get(f), str) and r.get(f) == key_value:\n                        return r, fname\n        return None, None\n\n    def _log(status_str, error_code=None, workspace_for_log=None, credential_for_log=None):\n        latency = int((time.time() - t0) * 1000)\n        req_logs = _load(\"request_logs.json\")\n        if not isinstance(req_logs, list):\n            req_logs = []\n        req_logs.append({\n            \"id\": _new_req_id(),\n            \"endpoint\": endpoint,\n            \"workspace_id\": workspace_for_log,\n            \"credential\": credential_for_log,\n            \"status\": status_str,\n            \"error_code\": error_code,\n            \"latency_ms\": latency,\n            \"ts\": now,\n        })\n        _save(\"request_logs.json\", req_logs)\n\n    # validate input\n    if not isinstance(api_key, str) or api_key == \"\":\n        _log(\"error\", \"VALIDATION_ERROR\", workspace_for_log=None, credential_for_log=None)\n        return _err(\"VALIDATION_ERROR\", \"api_key is required.\", field=\"api_key\")\n\n    cred, source = _find_credential(api_key)\n    if not cred:\n        # If there is no explicit credential store, accept workspace ids as API keys (as seen in audit),\n        # by treating the api_key parameter as a workspace id. This matches the datastore/audit behavior.\n        workspaces = _load(\"workspaces.json\")\n        if not isinstance(workspaces, list):\n            workspaces = []\n        wsp = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == api_key), None)\n        if not wsp or wsp.get(\"status\") == \"deleted\":\n            _log(\"error\", \"UNAUTHORIZED\", workspace_for_log=None, credential_for_log=api_key)\n            return _err(\"UNAUTHORIZED\", \"Missing or invalid credentials.\", rule=\"api_key must match an issued credential or a valid workspace token.\")\n        # \"workspace token\" mode\n        workspace_id = wsp.get(\"id\")\n        _log(\"ok\", None, workspace_for_log=workspace_id, credential_for_log=api_key)\n        return {\n            \"object\": \"identity\",\n            \"auth_type\": \"workspace_token\",\n            \"workspace\": {\"id\": workspace_id, \"name\": wsp.get(\"name\"), \"slug\": wsp.get(\"slug\"), \"status\": wsp.get(\"status\")},\n            \"scopes\": [\"read\", \"write\"],\n            \"rate_limit\": {\"limit_per_minute\": None, \"remaining\": None, \"reset_at\": None},\n            \"quota\": {\"monthly_limit\": None, \"used\": None, \"remaining\": None},\n            \"credential\": {\"presented\": api_key, \"source\": \"workspaces.json\"},\n        }\n\n    # Determine workspace context from credential row if possible; otherwise choose any active workspace\n    workspaces = _load(\"workspaces.json\")\n    if not isinstance(workspaces, list):\n        workspaces = []\n    workspace_id = None\n    for f in (\"workspace_id\", \"wsp_id\", \"workspace\", \"tenant_id\"):\n        if isinstance(cred.get(f), str) and cred.get(f):\n            workspace_id = cred.get(f)\n            break\n    wsp = None\n    if workspace_id:\n        wsp = next((w for w in workspaces if isinstance(w, dict) and w.get(\"id\") == workspace_id), None)\n        if not wsp or wsp.get(\"status\") == \"deleted\":\n            wsp = None\n\n    if wsp is None:\n        # fallback: any non-deleted workspace to satisfy request (search for a working combination)\n        for w in workspaces:\n            if isinstance(w, dict) and w.get(\"status\") in (\"active\", \"suspended\"):\n                wsp = w\n                workspace_id = w.get(\"id\")\n                break\n\n    if wsp is None:\n        _log(\"error\", \"UNAUTHORIZED\", workspace_for_log=None, credential_for_log=(cred.get(\"id\") or api_key))\n        return _err(\"UNAUTHORIZED\", \"Missing or invalid credentials.\", rule=\"No accessible workspace context.\")\n\n    # Usage summary: best-effort derived from request_logs.json (since schema for usage/quota not provided)\n    req_logs = _load(\"request_logs.json\")\n    if not isinstance(req_logs, list):\n        req_logs = []\n    cred_id = cred.get(\"id\") or api_key\n    day = now[:10]\n    used_today = 0\n    used_total = 0\n    for r in req_logs:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"credential\") != cred_id:\n            continue\n        used_total += 1\n        ts = r.get(\"ts\") or r.get(\"timestamp\")\n        if isinstance(ts, str) and ts[:10] == day:\n            used_today += 1\n\n    _log(\"ok\", None, workspace_for_log=workspace_id, credential_for_log=cred_id)\n    return {\n        \"object\": \"identity\",\n        \"auth_type\": \"api_key\",\n        \"credential\": {\n            \"id\": cred.get(\"id\"),\n            \"presented\": api_key,\n            \"source\": source,\n        },\n        \"workspace\": {\"id\": workspace_id, \"name\": wsp.get(\"name\"), \"slug\": wsp.get(\"slug\"), \"status\": wsp.get(\"status\")},\n        \"scopes\": cred.get(\"scopes\") if isinstance(cred.get(\"scopes\"), list) else [\"read\", \"write\"],\n        \"rate_limit\": {\n            \"limit_per_minute\": None,\n            \"remaining\": None,\n            \"reset_at\": None\n        },\n        \"quota\": {\n            \"requests_total_observed\": used_total,\n            \"requests_today_observed\": used_today,\n            \"day\": day\n        }\n    }\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0363000",
+    "index": 363,
+    "name": "Vibe Check",
+    "description": "Vibe Check stores lightweight \"sessions\" where a user/agent runs the three tools (vibe_check, vibe_distill, vibe_learn) against an in-progress plan or implementation. The backend persists each run’s inputs/outputs, tracks distilled plans, and maintains a small pattern library of recurring issues and",
+    "taxonomy": {
+      "L1_id": "L1-12",
+      "L1_name": "Reasoning & Decision Support",
+      "L1_name_zh": "推理与决策支持",
+      "L2_id": "L2-31",
+      "L2_name": "Structured Thinking & Planning",
+      "L2_name_zh": "结构化思考与规划",
+      "L3_name": "Reflection, Diagnostics & Improvement Loops",
+      "L3_name_zh": "复盘诊断与改进闭环"
+    },
+    "database_dir": "./environment_mix/0363000",
+    "mount_path": "/app/database",
+    "n_tools": 9,
+    "n_collections": 5,
+    "n_records": 87,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 9,
+      "loaded": 9,
+      "reads_returning_data": 3,
+      "read_operations": 4,
+      "mutations_persisted": 5,
+      "mutations_attempted": 5
+    },
+    "tools_loadable_from_database_dir": 9,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "vibe_check",
+      "returned_chars": 1651
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

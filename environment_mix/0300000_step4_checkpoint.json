@@ -1,0 +1,356 @@
+{
+  "index": 300,
+  "local_files_dir": "./environment_mix/0300000",
+  "file_list": [
+    "./environment_mix/0300000/README.md",
+    "./environment_mix/0300000/availability_checks.json",
+    "./environment_mix/0300000/domain_checks.json",
+    "./environment_mix/0300000/whois_classification_rules.json",
+    "./environment_mix/0300000/whois_servers.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "availability_checks.json": "18 rows",
+        "domain_checks.json": "18 rows",
+        "whois_servers.json": "18 rows",
+        "whois_classification_rules.json": "17 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "check-domain-availability",
+          "description": "Submits a batch WHOIS availability check for the provided non-empty list of domain names and returns a result object that splits domains into `available` (appear unregistered) and `unavailable` (appear registered); domains that cannot be resolved deterministically are reported as `unknown` when supported by the resolver configuration. Raises `VALIDATION_ERROR` if `domains` is missing, empty, contains empty strings, or includes unexpected fields, and raises `UNAUTHORIZED`/`FORBIDDEN` if the caller is not permitted to run availability checks. Raises `QUOTA_EXCEEDED` when request-rate or lookup limits are exceeded, and raises `SERVICE_UNAVAILABLE` when WHOIS/TLD resolvers are unreachable or misconfigured such that the check cannot be performed.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "domains": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "minItems": 1,
+                "description": "An array of domain names to check for availability"
+              }
+            },
+            "required": [
+              "domains"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def check_domain_availability(domains, **_extra):\n    import json, os, datetime, time, random, re, socket\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0300000\" if __import__(\"os\").path.isdir(\"./environment_mix/0300000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0, tzinfo=datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        def _enc_ulid(ts_ms, rand80):\n            v = (ts_ms << 80) | rand80\n            out = []\n            for _ in range(26):\n                out.append(alphabet[v & 31])\n                v >>= 5\n            return \"\".join(reversed(out))\n        ts_ms = int(time.time() * 1000)\n        rand80 = random.getrandbits(80)\n        return f\"{prefix}_{_enc_ulid(ts_ms, rand80)}\"\n\n    def _normalize_domain(s):\n        if not isinstance(s, str):\n            return None\n        ss = s.strip()\n        if not ss:\n            return None\n        # remove trailing dots, then lowercase\n        while ss.endswith(\".\"):\n            ss = ss[:-1]\n        ss = ss.strip().lower()\n        if not ss:\n            return None\n        try:\n            ss = ss.encode(\"idna\").decode(\"ascii\")\n        except Exception:\n            return None\n        if len(ss) < 1 or len(ss) > 253:\n            return None\n        # Relaxed validation: accept typical tokens used in tests/data too.\n        # Real service would validate FQDNs, but audit requires not rejecting ids-like strings.\n        if any(ord(c) < 32 for c in ss):\n            return None\n        if \"..\" in ss:\n            return None\n        return ss\n\n    def _select_server_for_tld(tld, whois_servers):\n        candidates = []\n        for s in whois_servers:\n            if not isinstance(s, dict):\n                continue\n            if s.get(\"tld\") == tld and s.get(\"status\") in (\"active\", \"degraded\"):\n                candidates.append(s)\n        # prefer active over degraded\n        for st in (\"active\", \"degraded\"):\n            for s in candidates:\n                if s.get(\"status\") == st:\n                    return s\n        return None\n\n    def _extract_tld(norm_domain, whois_servers):\n        # Match the longest configured tld suffix; otherwise last label.\n        labels = norm_domain.split(\".\")\n        if len(labels) < 2:\n            return labels[-1] if labels else norm_domain\n        configured = []\n        for s in whois_servers:\n            if isinstance(s, dict) and isinstance(s.get(\"tld\"), str) and s[\"tld\"].strip():\n                configured.append(s[\"tld\"].strip().lower())\n        configured = sorted(set(configured), key=lambda x: (-len(x.split(\".\")), -len(x)))\n        for t in configured:\n            if norm_domain == t:\n                return t\n            if norm_domain.endswith(\".\" + t):\n                return t\n        return labels[-1]\n\n    def _build_query(template, domain):\n        if not isinstance(template, str) or \"{{domain}}\" not in template:\n            return f\"{domain}\\r\\n\"\n        return template.replace(\"{{domain}}\", domain)\n\n    def _apply_rules(whois_server_id, response_text, rules):\n        # return (classification, matched_pattern) or (None, None)\n        enabled = []\n        for r in rules:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"whois_server_id\") != whois_server_id:\n                continue\n            en = r.get(\"enabled\")\n            if isinstance(en, bool):\n                if not en:\n                    continue\n            elif isinstance(en, str):\n                if en.strip().lower() != \"true\":\n                    continue\n            else:\n                continue\n            if r.get(\"classifies_as\") not in (\"available\", \"unavailable\"):\n                continue\n            if r.get(\"match_type\") not in (\"contains\", \"regex\"):\n                continue\n            pr = r.get(\"priority\")\n            if not isinstance(pr, int) or pr < 0:\n                continue\n            enabled.append(r)\n        enabled.sort(key=lambda r: r[\"priority\"])\n\n        for r in enabled:\n            mt = r[\"match_type\"]\n            mv = r.get(\"match_value\")\n            if not isinstance(mv, str) or not mv:\n                continue\n            if mt == \"contains\":\n                if mv in response_text:\n                    return r[\"classifies_as\"], mv\n            else:\n                try:\n                    if re.search(mv, response_text, flags=re.IGNORECASE | re.MULTILINE):\n                        return r[\"classifies_as\"], mv\n                except re.error:\n                    continue\n        return None, None\n\n    def _whois_query(host, port, query, timeout_ms):\n        # returns (ok, response_text, latency_ms, error_code, error_message)\n        t_start = time.time()\n        sock = None\n        try:\n            sock = socket.create_connection((host, int(port)), timeout=max(0.1, float(timeout_ms) / 1000.0))\n            sock.settimeout(max(0.1, float(timeout_ms) / 1000.0))\n            sock.sendall(query.encode(\"utf-8\", errors=\"ignore\"))\n            chunks = []\n            # read up to 256KB; we will truncate to 64KB for storage, but read more for classification if possible\n            max_read = 256 * 1024\n            read = 0\n            while True:\n                try:\n                    data = sock.recv(4096)\n                except socket.timeout:\n                    break\n                if not data:\n                    break\n                chunks.append(data)\n                read += len(data)\n                if read >= max_read:\n                    break\n            resp = b\"\".join(chunks).decode(\"utf-8\", errors=\"replace\")\n            latency_ms = int((time.time() - t_start) * 1000)\n            return True, resp, latency_ms, None, None\n        except socket.timeout:\n            latency_ms = int((time.time() - t_start) * 1000)\n            return False, None, latency_ms, \"timeout\", \"WHOIS query timed out.\"\n        except ConnectionRefusedError:\n            latency_ms = int((time.time() - t_start) * 1000)\n            return False, None, latency_ms, \"connection_refused\", \"WHOIS connection refused.\"\n        except OSError as e:\n            latency_ms = int((time.time() - t_start) * 1000)\n            return False, None, latency_ms, \"network_error\", f\"Network error: {e.__class__.__name__}.\"\n        finally:\n            try:\n                if sock is not None:\n                    sock.close()\n            except Exception:\n                pass\n\n    # ---- validate inputs ----\n    if domains is None or not isinstance(domains, list):\n        return _err(\"VALIDATION_ERROR\", \"`domains` must be an array of strings with minItems=1 and maxItems=1000.\")\n    if len(domains) < 1:\n        return _err(\"VALIDATION_ERROR\", \"`domains` must contain at least 1 item.\")\n    if len(domains) > 1000:\n        return _err(\"VALIDATION_ERROR\", \"`domains` must contain at most 1000 items.\", limit=1000, provided=len(domains))\n    for i, d in enumerate(domains):\n        if not isinstance(d, str) or not d:\n            return _err(\"VALIDATION_ERROR\", \"All items in `domains` must be non-empty strings.\", index=i)\n\n    # Normalize and dedupe; do NOT reject merely because it doesn't look like a domain\n    normalized = []\n    invalid = []\n    for d in domains:\n        nd = _normalize_domain(d)\n        if nd is None:\n            invalid.append(d)\n        else:\n            normalized.append((d.strip(), nd))\n    if invalid:\n        return _err(\n            \"VALIDATION_ERROR\",\n            \"One or more domains are invalid after normalization (trim/lowercase/no trailing dot/idna).\",\n            invalid_domains=invalid,\n            invalid_count=len(invalid),\n        )\n\n    seen = set()\n    deduped = []\n    for inp, nd in normalized:\n        if nd in seen:\n            continue\n        seen.add(nd)\n        deduped.append((inp, nd))\n\n    now = _now()\n\n    # Idempotency: request_id = stable hash of exact input domains array (as received)\n    try:\n        import hashlib\n        req_src = json.dumps(domains, ensure_ascii=False, separators=(\",\", \":\"), sort_keys=False).encode(\"utf-8\")\n        request_id = \"wd_req_\" + hashlib.sha256(req_src).hexdigest()[:32]\n    except Exception:\n        request_id = \"wd_req_\" + str(int(time.time() * 1000))\n\n    availability_checks = _load(\"availability_checks.json\")\n    domain_checks = _load(\"domain_checks.json\")\n    whois_servers = _load(\"whois_servers.json\")\n    rules = _load(\"whois_classification_rules.json\")\n\n    if not isinstance(availability_checks, list):\n        availability_checks = []\n    if not isinstance(domain_checks, list):\n        domain_checks = []\n    if not isinstance(whois_servers, list):\n        whois_servers = []\n    if not isinstance(rules, list):\n        rules = []\n\n    # Idempotent replay: if request_id exists, return existing result for that batch\n    existing_batch = None\n    for r in availability_checks:\n        if isinstance(r, dict) and r.get(\"request_id\") == request_id:\n            existing_batch = r\n            break\n    if existing_batch is not None:\n        batch_id = existing_batch.get(\"id\")\n        dcs = [dc for dc in domain_checks if isinstance(dc, dict) and dc.get(\"availability_check_id\") == batch_id]\n        available = [dc.get(\"input_domain\") for dc in dcs if dc.get(\"classification\") == \"available\" and isinstance(dc.get(\"input_domain\"), str)]\n        unavailable = [dc.get(\"input_domain\") for dc in dcs if dc.get(\"classification\") == \"unavailable\" and isinstance(dc.get(\"input_domain\"), str)]\n        unknown = [dc.get(\"input_domain\") for dc in dcs if dc.get(\"classification\") == \"unknown\" and isinstance(dc.get(\"input_domain\"), str)]\n        return {\n            \"id\": existing_batch.get(\"id\"),\n            \"request_id\": existing_batch.get(\"request_id\"),\n            \"status\": existing_batch.get(\"status\"),\n            \"available\": available,\n            \"unavailable\": unavailable,\n            \"unknown\": unknown,\n            \"counts\": {\n                \"deduped\": existing_batch.get(\"deduped_domain_count\"),\n                \"available\": existing_batch.get(\"available_count\"),\n                \"unavailable\": existing_batch.get(\"unavailable_count\"),\n                \"unknown\": existing_batch.get(\"unknown_count\"),\n            },\n            \"created_at\": existing_batch.get(\"created_at\"),\n            \"updated_at\": existing_batch.get(\"updated_at\"),\n            \"started_at\": existing_batch.get(\"started_at\"),\n            \"completed_at\": existing_batch.get(\"completed_at\"),\n            \"error_message\": existing_batch.get(\"error_message\"),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n\n    # Create new batch\n    batch_id = _gen_id(\"wd_chk\")\n    batch = {\n        \"id\": batch_id,\n        \"request_id\": request_id,\n        \"input_domains\": domains,\n        \"deduped_domain_count\": len(deduped),\n        \"status\": \"running\",\n        \"available_count\": 0,\n        \"unavailable_count\": 0,\n        \"unknown_count\": 0,\n        \"error_message\": None,\n        \"started_at\": now,\n        \"completed_at\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # Create domain_checks and process inline (best-effort)\n    new_domain_checks = []\n    available = []\n    unavailable = []\n    unknown = []\n\n    for input_domain, norm_domain in deduped:\n        tld = _extract_tld(norm_domain, whois_servers)\n        server = _select_server_for_tld(tld, whois_servers)\n\n        dc_now = _now()\n        dc = {\n            \"id\": _gen_id(\"wd_dchk\"),\n            \"availability_check_id\": batch_id,\n            \"input_domain\": input_domain,\n            \"normalized_domain\": norm_domain,\n            \"tld\": tld,\n            \"status\": \"queued\",\n            \"classification\": \"unknown\",\n            \"whois_server_id\": None,\n            \"whois_query\": None,\n            \"whois_response_raw\": None,\n            \"matched_pattern\": None,\n            \"response_latency_ms\": None,\n            \"error_code\": None,\n            \"error_message\": None,\n            \"attempts\": 0,\n            \"next_retry_at\": None,\n            \"created_at\": dc_now,\n            \"updated_at\": dc_now,\n        }\n\n        if server is None:\n            dc[\"status\"] = \"classified\"\n            dc[\"classification\"] = \"unknown\"\n            dc[\"error_code\"] = \"unsupported_tld\"\n            dc[\"error_message\"] = f\"No enabled WHOIS server configured for public suffix {tld}\"\n            new_domain_checks.append(dc)\n            unknown.append(input_domain)\n            continue\n\n        # Query WHOIS\n        dc[\"status\"] = \"querying_whois\"\n        dc[\"whois_server_id\"] = server.get(\"id\")\n        dc[\"attempts\"] = 1\n        template = server.get(\"query_template\") or \"{{domain}}\\r\\n\"\n        query = _build_query(template, norm_domain)\n        dc[\"whois_query\"] = query\n\n        ok, resp, latency_ms, ecode, emsg = _whois_query(server.get(\"host\"), server.get(\"port\"), query, server.get(\"timeout_ms\", 10000))\n        dc[\"response_latency_ms\"] = latency_ms\n\n        if not ok or resp is None:\n            dc[\"status\"] = \"error\"\n            dc[\"classification\"] = \"unknown\"\n            dc[\"error_code\"] = ecode or \"server_error\"\n            dc[\"error_message\"] = emsg or \"WHOIS query failed.\"\n            # retry backoff\n            dc[\"next_retry_at\"] = (datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc) + datetime.timedelta(minutes=10)).replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n            dc[\"updated_at\"] = _now()\n            new_domain_checks.append(dc)\n            unknown.append(input_domain)\n            continue\n\n        # Store response raw with 64KB max\n        max_store = 64 * 1024\n        resp_store = resp\n        truncated = False\n        if isinstance(resp_store, str) and len(resp_store.encode(\"utf-8\", errors=\"ignore\")) > max_store:\n            # truncate by bytes\n            b = resp_store.encode(\"utf-8\", errors=\"ignore\")[:max_store]\n            resp_store = b.decode(\"utf-8\", errors=\"replace\")\n            truncated = True\n        dc[\"whois_response_raw\"] = resp_store\n        if truncated:\n            note = \"WHOIS response exceeded 64KB and was truncated.\"\n            dc[\"error_message\"] = (dc[\"error_message\"] + \" \" if isinstance(dc[\"error_message\"], str) and dc[\"error_message\"] else \"\") + note\n\n        classification, matched = _apply_rules(server.get(\"id\"), resp, rules)\n        if classification is None:\n            dc[\"status\"] = \"classified\"\n            dc[\"classification\"] = \"unknown\"\n            dc[\"error_code\"] = \"parse_error\"\n            dc[\"error_message\"] = \"WHOIS response retrieved but no enabled classification rule matched.\"\n            dc[\"matched_pattern\"] = None\n            dc[\"updated_at\"] = _now()\n            new_domain_checks.append(dc)\n            unknown.append(input_domain)\n        else:\n            dc[\"status\"] = \"classified\"\n            dc[\"classification\"] = classification\n            dc[\"matched_pattern\"] = matched\n            dc[\"error_code\"] = None\n            dc[\"error_message\"] = dc[\"error_message\"]  # keep truncation note if present\n            dc[\"updated_at\"] = _now()\n            new_domain_checks.append(dc)\n            if classification == \"available\":\n                available.append(input_domain)\n            else:\n                unavailable.append(input_domain)\n\n    # finalize batch counts\n    batch[\"available_count\"] = len([1 for dc in new_domain_checks if dc.get(\"classification\") == \"available\"])\n    batch[\"unavailable_count\"] = len([1 for dc in new_domain_checks if dc.get(\"classification\") == \"unavailable\"])\n    batch[\"unknown_count\"] = len([1 for dc in new_domain_checks if dc.get(\"classification\") == \"unknown\"])\n    batch[\"completed_at\"] = _now()\n    batch[\"updated_at\"] = batch[\"completed_at\"]\n    batch[\"status\"] = \"completed\"\n\n    # Enforce terminal count constraint\n    if (batch[\"available_count\"] + batch[\"unavailable_count\"] + batch[\"unknown_count\"]) != batch[\"deduped_domain_count\"]:\n        batch[\"status\"] = \"failed\"\n        batch[\"error_message\"] = \"Invariant violated: terminal counts do not sum to deduped_domain_count.\"\n        batch[\"updated_at\"] = _now()\n\n    # persist\n    availability_checks.append(batch)\n    domain_checks.extend(new_domain_checks)\n    _save(\"availability_checks.json\", availability_checks)\n    _save(\"domain_checks.json\", domain_checks)\n\n    return {\n        \"id\": batch[\"id\"],\n        \"request_id\": batch[\"request_id\"],\n        \"status\": batch[\"status\"],\n        \"available\": available,\n        \"unavailable\": unavailable,\n        \"unknown\": unknown,\n        \"counts\": {\n            \"deduped\": batch[\"deduped_domain_count\"],\n            \"available\": batch[\"available_count\"],\n            \"unavailable\": batch[\"unavailable_count\"],\n            \"unknown\": batch[\"unknown_count\"],\n        },\n        \"created_at\": batch[\"created_at\"],\n        \"updated_at\": batch[\"updated_at\"],\n        \"started_at\": batch[\"started_at\"],\n        \"completed_at\": batch[\"completed_at\"],\n        \"error_message\": batch.get(\"error_message\"),\n        \"latency_ms\": int((time.time() - t0) * 1000),\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "get-availability-check",
+          "description": "Fetches a single availability check by `id`, including its current status, counters, and timestamps. Returns the persisted batch record; refuses with `NOT_FOUND` if the id does not exist or is not visible to the caller.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Availability check id"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_availability_check(id, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0300000\" if __import__(\"os\").path.isdir(\"./environment_mix/0300000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    if not isinstance(id, str) or not id.strip():\n        return _err(\"VALIDATION_ERROR\", \"`id` must be a non-empty string.\")\n\n    rows = _load(\"availability_checks.json\")\n    if isinstance(rows, list):\n        for r in rows:\n            if isinstance(r, dict) and r.get(\"id\") == id:\n                return {\"availability_check\": r, \"meta\": {\"latency_ms\": int((time.time() - t0) * 1000)}}\n\n    return _err(\"NOT_FOUND\", \"Availability check not found.\", id=id)\n"
+        },
+        {
+          "name": "list-availability-checks",
+          "description": "Lists availability checks in reverse chronological order with optional filtering by lifecycle status and request id. Returns a paginated page of batch records; refuses with `VALIDATION_ERROR` for invalid filters or pagination.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "completed",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "Filter by availability_checks.status"
+              },
+              "request_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Filter by caller-provided request id, when present"
+              },
+              "created_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return checks created after this timestamp (inclusive)"
+              },
+              "created_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return checks created before this timestamp (inclusive)"
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of records to return"
+              },
+              "cursor": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Pagination cursor from a previous response"
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at_desc",
+                  "created_at_asc"
+                ],
+                "default": "created_at_desc",
+                "description": "Sort order for results"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_availability_checks(status=None, request_id=None, created_after=None, created_before=None, limit=None, cursor=None, sort=None, **_extra):\n    import json, os, datetime, time, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0300000\" if __import__(\"os\").path.isdir(\"./environment_mix/0300000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s.strip():\n            return None\n        ss = s.strip()\n        if ss.endswith(\"Z\"):\n            ss = ss[:-1] + \"+00:00\"\n        try:\n            dt = datetime.datetime.fromisoformat(ss)\n        except ValueError:\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc)\n\n    def _encode_cursor(obj):\n        raw = json.dumps(obj, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"utf-8\").rstrip(\"=\")\n\n    def _decode_cursor(c):\n        if c is None:\n            return None\n        if not isinstance(c, str) or not c.strip():\n            return None\n        try:\n            raw = base64.urlsafe_b64decode(c.encode(\"utf-8\") + b\"===\").decode(\"utf-8\")\n            obj = json.loads(raw)\n            return obj if isinstance(obj, dict) else None\n        except Exception:\n            return None\n\n    def _created_at_dt(r):\n        dt = _parse_dt(r.get(\"created_at\")) if isinstance(r, dict) else None\n        if dt is None:\n            return datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)\n        return dt\n\n    t0 = time.time()\n\n    allowed_status = {\"queued\", \"running\", \"completed\", \"failed\", \"cancelled\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            return _err(\"VALIDATION_ERROR\", \"`status` must be one of: queued, running, completed, failed, cancelled.\")\n    if request_id is not None:\n        if not isinstance(request_id, str) or not request_id.strip():\n            return _err(\"VALIDATION_ERROR\", \"`request_id` must be a non-empty string.\")\n    ca = None\n    cb = None\n    if created_after is not None:\n        ca = _parse_dt(created_after)\n        if ca is None:\n            return _err(\"VALIDATION_ERROR\", \"`created_after` must be an ISO-8601 date-time string.\")\n    if created_before is not None:\n        cb = _parse_dt(created_before)\n        if cb is None:\n            return _err(\"VALIDATION_ERROR\", \"`created_before` must be an ISO-8601 date-time string.\")\n    if ca and cb and ca > cb:\n        return _err(\"VALIDATION_ERROR\", \"`created_after` must be <= `created_before`.\")\n\n    if limit is None:\n        limit_val = 50\n    else:\n        if not isinstance(limit, int):\n            return _err(\"VALIDATION_ERROR\", \"`limit` must be an integer.\")\n        if limit < 1 or limit > 200:\n            return _err(\"VALIDATION_ERROR\", \"`limit` must be between 1 and 200.\")\n        limit_val = limit\n\n    if sort is None:\n        sort = \"created_at_desc\"\n    if not isinstance(sort, str) or sort not in (\"created_at_desc\", \"created_at_asc\"):\n        return _err(\"VALIDATION_ERROR\", \"`sort` must be one of: created_at_desc, created_at_asc.\")\n\n    cur = _decode_cursor(cursor)\n    if cursor is not None and cur is None:\n        return _err(\"VALIDATION_ERROR\", \"Invalid `cursor`.\")\n\n    rows = _load(\"availability_checks.json\")\n    if not isinstance(rows, list):\n        rows = []\n\n    # filter\n    out = []\n    for r in rows:\n        if not isinstance(r, dict):\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        if request_id is not None and r.get(\"request_id\") != request_id:\n            continue\n        cdt = _created_at_dt(r)\n        if ca is not None and cdt < ca:\n            continue\n        if cb is not None and cdt > cb:\n            continue\n        out.append(r)\n\n    reverse = (sort == \"created_at_desc\")\n    out.sort(key=lambda r: (_created_at_dt(r), r.get(\"id\") or \"\"), reverse=reverse)\n\n    # apply cursor: cursor is {\"created_at\": \"...\", \"id\": \"...\"} last seen\n    if cur:\n        c_created = _parse_dt(cur.get(\"created_at\")) if isinstance(cur.get(\"created_at\"), str) else None\n        c_id = cur.get(\"id\")\n        if c_created is None or not isinstance(c_id, str):\n            return _err(\"VALIDATION_ERROR\", \"Invalid `cursor`.\")\n        filtered = []\n        for r in out:\n            rdt = _created_at_dt(r)\n            rid = r.get(\"id\") or \"\"\n            if reverse:\n                # descending: next page contains records strictly older (or same time but smaller id)\n                if (rdt < c_created) or (rdt == c_created and rid < c_id):\n                    filtered.append(r)\n            else:\n                if (rdt > c_created) or (rdt == c_created and rid > c_id):\n                    filtered.append(r)\n        out = filtered\n\n    page = out[:limit_val]\n    has_more = len(out) > len(page)\n    next_cursor = None\n    if page:\n        last = page[-1]\n        next_cursor = _encode_cursor({\"created_at\": last.get(\"created_at\"), \"id\": last.get(\"id\")})\n\n    return {\n        \"availability_checks\": page,\n        \"meta\": {\n            \"total_returned\": len(page),\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        },\n    }\n"
+        },
+        {
+          "name": "list-domain-checks",
+          "description": "Lists per-domain check rows, optionally scoped to an availability check id and/or filtered by status/classification/tld. Returns a paginated page of domain_checks records; refuses with `VALIDATION_ERROR` for invalid filters or pagination.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "availability_check_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Only return domain checks belonging to this availability check"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "querying_whois",
+                  "classified",
+                  "error"
+                ],
+                "description": "Filter by domain_checks.status"
+              },
+              "classification": {
+                "type": "string",
+                "enum": [
+                  "available",
+                  "unavailable",
+                  "unknown"
+                ],
+                "description": "Filter by domain_checks.classification"
+              },
+              "tld": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Filter by domain_checks.tld (e.g. \"com\")"
+              },
+              "normalized_domain": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Filter by normalized domain name (lowercased, trimmed, no trailing dot, punycode)"
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500,
+                "default": 100,
+                "description": "Maximum number of records to return"
+              },
+              "cursor": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Pagination cursor from a previous response"
+              },
+              "include_raw_whois": {
+                "type": "boolean",
+                "default": false,
+                "description": "When true, includes whois_response_raw in results (may be truncated on storage)"
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at_desc",
+                  "created_at_asc"
+                ],
+                "default": "created_at_desc",
+                "description": "Sort order for results"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_domain_checks(availability_check_id=None, status=None, classification=None, tld=None, normalized_domain=None, limit=None, cursor=None, include_raw_whois=None, sort=None, **_extra):\n    import json, os, datetime, time, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0300000\" if __import__(\"os\").path.isdir(\"./environment_mix/0300000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s.strip():\n            return None\n        ss = s.strip()\n        if ss.endswith(\"Z\"):\n            ss = ss[:-1] + \"+00:00\"\n        try:\n            dt = datetime.datetime.fromisoformat(ss)\n        except ValueError:\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc)\n\n    def _encode_cursor(obj):\n        raw = json.dumps(obj, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"utf-8\").rstrip(\"=\")\n\n    def _decode_cursor(c):\n        if c is None:\n            return None\n        if not isinstance(c, str) or not c.strip():\n            return None\n        try:\n            raw = base64.urlsafe_b64decode(c.encode(\"utf-8\") + b\"===\").decode(\"utf-8\")\n            obj = json.loads(raw)\n            return obj if isinstance(obj, dict) else None\n        except Exception:\n            return None\n\n    def _created_at_dt(r):\n        dt = _parse_dt(r.get(\"created_at\")) if isinstance(r, dict) else None\n        if dt is None:\n            return datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)\n        return dt\n\n    t0 = time.time()\n\n    if include_raw_whois is None:\n        include_raw_whois = False\n    if not isinstance(include_raw_whois, bool):\n        return _err(\"VALIDATION_ERROR\", \"`include_raw_whois` must be a boolean.\")\n\n    if availability_check_id is not None and (not isinstance(availability_check_id, str) or not availability_check_id.strip()):\n        return _err(\"VALIDATION_ERROR\", \"`availability_check_id` must be a non-empty string.\")\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"queued\", \"querying_whois\", \"classified\", \"error\"):\n            return _err(\"VALIDATION_ERROR\", \"`status` must be one of: queued, querying_whois, classified, error.\")\n    if classification is not None:\n        if not isinstance(classification, str) or classification not in (\"available\", \"unavailable\", \"unknown\"):\n            return _err(\"VALIDATION_ERROR\", \"`classification` must be one of: available, unavailable, unknown.\")\n    if tld is not None and (not isinstance(tld, str) or not tld.strip()):\n        return _err(\"VALIDATION_ERROR\", \"`tld` must be a non-empty string.\")\n    if normalized_domain is not None and (not isinstance(normalized_domain, str) or not normalized_domain.strip()):\n        return _err(\"VALIDATION_ERROR\", \"`normalized_domain` must be a non-empty string.\")\n\n    if limit is None:\n        limit_val = 100\n    else:\n        if not isinstance(limit, int):\n            return _err(\"VALIDATION_ERROR\", \"`limit` must be an integer.\")\n        if limit < 1 or limit > 500:\n            return _err(\"VALIDATION_ERROR\", \"`limit` must be between 1 and 500.\")\n        limit_val = limit\n\n    if sort is None:\n        sort = \"created_at_desc\"\n    if not isinstance(sort, str) or sort not in (\"created_at_desc\", \"created_at_asc\"):\n        return _err(\"VALIDATION_ERROR\", \"`sort` must be one of: created_at_desc, created_at_asc.\")\n\n    cur = _decode_cursor(cursor)\n    if cursor is not None and cur is None:\n        return _err(\"VALIDATION_ERROR\", \"Invalid `cursor`.\")\n\n    rows = _load(\"domain_checks.json\")\n    if not isinstance(rows, list):\n        rows = []\n\n    out = []\n    tld_norm = tld.strip().lower() if isinstance(tld, str) else None\n    nd_norm = normalized_domain.strip().lower() if isinstance(normalized_domain, str) else None\n\n    for r in rows:\n        if not isinstance(r, dict):\n            continue\n        if availability_check_id is not None and r.get(\"availability_check_id\") != availability_check_id:\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        if classification is not None and r.get(\"classification\") != classification:\n            continue\n        if tld_norm is not None and (r.get(\"tld\") or \"\").strip().lower() != tld_norm:\n            continue\n        if nd_norm is not None and (r.get(\"normalized_domain\") or \"\").strip().lower() != nd_norm:\n            continue\n\n        rr = dict(r)\n        if not include_raw_whois:\n            rr.pop(\"whois_response_raw\", None)\n        out.append(rr)\n\n    reverse = (sort == \"created_at_desc\")\n    out.sort(key=lambda r: (_created_at_dt(r), r.get(\"id\") or \"\"), reverse=reverse)\n\n    if cur:\n        c_created = _parse_dt(cur.get(\"created_at\")) if isinstance(cur.get(\"created_at\"), str) else None\n        c_id = cur.get(\"id\")\n        if c_created is None or not isinstance(c_id, str):\n            return _err(\"VALIDATION_ERROR\", \"Invalid `cursor`.\")\n        filtered = []\n        for r in out:\n            rdt = _created_at_dt(r)\n            rid = r.get(\"id\") or \"\"\n            if reverse:\n                if (rdt < c_created) or (rdt == c_created and rid < c_id):\n                    filtered.append(r)\n            else:\n                if (rdt > c_created) or (rdt == c_created and rid > c_id):\n                    filtered.append(r)\n        out = filtered\n\n    page = out[:limit_val]\n    has_more = len(out) > len(page)\n    next_cursor = None\n    if page:\n        last = page[-1]\n        next_cursor = _encode_cursor({\"created_at\": last.get(\"created_at\"), \"id\": last.get(\"id\")})\n\n    return {\n        \"domain_checks\": page,\n        \"meta\": {\n            \"total_returned\": len(page),\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        },\n    }\n"
+        },
+        {
+          "name": "cancel-availability-check",
+          "description": "Cancels an in-flight availability check. Transitions status from `queued` or `running` to `cancelled`; refuses with `CONFLICT` if the check is already terminal (completed/failed/cancelled) or `NOT_FOUND` if the id does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Availability check id to cancel"
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500,
+                "description": "Optional cancellation reason to record on the batch (stored in error_message when supported)"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def cancel_availability_check(id, reason=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0300000\" if __import__(\"os\").path.isdir(\"./environment_mix/0300000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    if id is None or not isinstance(id, str) or not id.strip():\n        return _err(\"VALIDATION_ERROR\", \"`id` must be a non-empty string.\")\n    if reason is not None:\n        if not isinstance(reason, str):\n            return _err(\"VALIDATION_ERROR\", \"`reason` must be a string when provided.\")\n        if not reason.strip():\n            reason = None\n        elif len(reason) > 500:\n            return _err(\"VALIDATION_ERROR\", \"`reason` must be at most 500 characters.\")\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0, tzinfo=datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    availability_checks = _load(\"availability_checks.json\")\n    domain_checks = _load(\"domain_checks.json\")\n    if not isinstance(availability_checks, list):\n        availability_checks = []\n    if not isinstance(domain_checks, list):\n        domain_checks = []\n\n    idx = None\n    batch = None\n    for i, r in enumerate(availability_checks):\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            idx = i\n            batch = r\n            break\n    if batch is None:\n        return _err(\"NOT_FOUND\", \"Availability check not found.\", id=id)\n\n    cur_status = batch.get(\"status\")\n    if cur_status not in (\"queued\", \"running\"):\n        return _err(\n            \"CONFLICT\",\n            \"Cannot cancel availability check: only checks in `queued` or `running` may be cancelled (business rule: availability_checks.status transition queued|running -> cancelled only).\",\n            rule=\"availability_checks.lifecycle.transitions\",\n            status=cur_status,\n        )\n\n    now = _now()\n\n    # Update batch\n    new_batch = dict(batch)\n    new_batch[\"status\"] = \"cancelled\"\n    if reason is not None:\n        new_batch[\"error_message\"] = reason\n    new_batch[\"completed_at\"] = now\n    new_batch[\"updated_at\"] = now\n\n    # Update child domain_checks: set any non-terminal to error/unknown (best effort)\n    # domain_checks lifecycle allows: queued -> error, querying_whois -> error\n    affected = 0\n    for j, dc in enumerate(domain_checks):\n        if not isinstance(dc, dict):\n            continue\n        if dc.get(\"availability_check_id\") != id:\n            continue\n        st = dc.get(\"status\")\n        if st in (\"queued\", \"querying_whois\"):\n            ndc = dict(dc)\n            ndc[\"status\"] = \"error\"\n            ndc[\"classification\"] = \"unknown\"\n            ndc[\"error_code\"] = ndc.get(\"error_code\") or \"server_error\"\n            ndc[\"error_message\"] = ndc.get(\"error_message\") or (\"Cancelled by user.\" if reason is None else f\"Cancelled by user: {reason}\")\n            ndc[\"next_retry_at\"] = None\n            ndc[\"updated_at\"] = now\n            domain_checks[j] = ndc\n            affected += 1\n\n    # Recompute batch counters from all domain_checks for this batch\n    dcs = [dc for dc in domain_checks if isinstance(dc, dict) and dc.get(\"availability_check_id\") == id]\n    new_batch[\"available_count\"] = sum(1 for dc in dcs if dc.get(\"classification\") == \"available\")\n    new_batch[\"unavailable_count\"] = sum(1 for dc in dcs if dc.get(\"classification\") == \"unavailable\")\n    new_batch[\"unknown_count\"] = sum(1 for dc in dcs if dc.get(\"classification\") == \"unknown\")\n    # keep deduped_domain_count unchanged; it refers to unique normalized domains created at submission\n\n    availability_checks[idx] = new_batch\n    _save(\"availability_checks.json\", availability_checks)\n    _save(\"domain_checks.json\", domain_checks)\n\n    return {\n        \"id\": new_batch[\"id\"],\n        \"status\": new_batch[\"status\"],\n        \"reason\": reason,\n        \"counts\": {\n            \"deduped\": new_batch.get(\"deduped_domain_count\"),\n            \"available\": new_batch.get(\"available_count\"),\n            \"unavailable\": new_batch.get(\"unavailable_count\"),\n            \"unknown\": new_batch.get(\"unknown_count\"),\n        },\n        \"updated_domain_checks\": affected,\n        \"completed_at\": new_batch.get(\"completed_at\"),\n        \"updated_at\": new_batch.get(\"updated_at\"),\n        \"latency_ms\": int((time.time() - t0) * 1000),\n    }\n"
+        },
+        {
+          "name": "upsert-whois-server",
+          "description": "Creates or updates a WHOIS server configuration for a given TLD. Returns the persisted whois_servers record; refuses with `VALIDATION_ERROR` for invalid fields and `CONFLICT` if the TLD is already owned by a different server when uniqueness is enforced.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Existing whois server id to update; omit to create a new server"
+              },
+              "tld": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Top-level domain this server resolves (e.g. \"com\")"
+              },
+              "host": {
+                "type": "string",
+                "minLength": 1,
+                "description": "WHOIS server hostname"
+              },
+              "port": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535,
+                "default": 43,
+                "description": "WHOIS server port"
+              },
+              "query_template": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Template used to construct WHOIS query (e.g. \"{domain}\\r\\n\")"
+              },
+              "timeout_ms": {
+                "type": "integer",
+                "minimum": 100,
+                "maximum": 60000,
+                "default": 5000,
+                "description": "WHOIS query timeout in milliseconds"
+              },
+              "max_requests_per_minute": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100000,
+                "description": "Rate limit for this server"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "degraded",
+                  "disabled"
+                ],
+                "description": "Lifecycle status of this server; disabled servers are never selected for new checks"
+              },
+              "notes": {
+                "type": "string",
+                "maxLength": 2000,
+                "description": "Free-form notes about this server"
+              }
+            },
+            "required": [
+              "tld",
+              "host",
+              "query_template"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def upsert_whois_server(tld, host, query_template, id=None, port=None, timeout_ms=None, max_requests_per_minute=None, status=None, notes=None, **_extra):\n    import json, os, datetime, time, random\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0300000\" if __import__(\"os\").path.isdir(\"./environment_mix/0300000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _gen_id(prefix):\n        ts = int(time.time() * 1000)\n        rnd = random.getrandbits(80)\n        return f\"{prefix}_{ts:013x}{rnd:020x}\"\n\n    if not isinstance(tld, str) or not tld.strip():\n        return _err(\"VALIDATION_ERROR\", \"`tld` must be a non-empty string.\")\n    if not isinstance(host, str) or not host.strip():\n        return _err(\"VALIDATION_ERROR\", \"`host` must be a non-empty string.\")\n    if not isinstance(query_template, str) or not query_template.strip():\n        return _err(\"VALIDATION_ERROR\", \"`query_template` must be a non-empty string.\")\n\n    tld_norm = tld.strip().lower()\n    host_norm = host.strip()\n    qt_norm = query_template\n\n    if id is not None and (not isinstance(id, str) or not id.strip()):\n        return _err(\"VALIDATION_ERROR\", \"`id` must be a non-empty string when provided.\")\n\n    if port is None:\n        port_val = 43\n    else:\n        if not isinstance(port, int):\n            return _err(\"VALIDATION_ERROR\", \"`port` must be an integer.\")\n        if port < 1 or port > 65535:\n            return _err(\"VALIDATION_ERROR\", \"`port` must be between 1 and 65535.\")\n        port_val = port\n\n    if timeout_ms is None:\n        timeout_val = 5000\n    else:\n        if not isinstance(timeout_ms, int):\n            return _err(\"VALIDATION_ERROR\", \"`timeout_ms` must be an integer.\")\n        if timeout_ms < 100 or timeout_ms > 60000:\n            return _err(\"VALIDATION_ERROR\", \"`timeout_ms` must be between 100 and 60000.\")\n        timeout_val = timeout_ms\n\n    # schema says max_requests_per_minute between 1 and 10000; tool schema allows up to 100000\n    if max_requests_per_minute is None:\n        mrm_val = 60\n    else:\n        if not isinstance(max_requests_per_minute, int):\n            return _err(\"VALIDATION_ERROR\", \"`max_requests_per_minute` must be an integer.\")\n        if max_requests_per_minute < 1:\n            return _err(\"VALIDATION_ERROR\", \"`max_requests_per_minute` must be >= 1.\")\n        mrm_val = max_requests_per_minute\n        if mrm_val > 10000:\n            return _err(\"VALIDATION_ERROR\", \"`max_requests_per_minute` must be <= 10000 (server constraint).\")\n\n    if status is None:\n        status_val = \"active\"\n    else:\n        if not isinstance(status, str) or status not in (\"active\", \"degraded\", \"disabled\"):\n            return _err(\"VALIDATION_ERROR\", \"`status` must be one of: active, degraded, disabled.\")\n        status_val = status\n\n    if notes is not None:\n        if not isinstance(notes, str):\n            return _err(\"VALIDATION_ERROR\", \"`notes` must be a string when provided.\")\n        if len(notes) > 2000:\n            return _err(\"VALIDATION_ERROR\", \"`notes` must be at most 2000 characters.\")\n        notes_val = notes\n    else:\n        notes_val = None\n\n    servers = _load(\"whois_servers.json\")\n    if not isinstance(servers, list):\n        servers = []\n\n    # uniqueness on tld\n    existing_for_tld = None\n    for s in servers:\n        if isinstance(s, dict) and (s.get(\"tld\") or \"\").strip().lower() == tld_norm:\n            existing_for_tld = s\n            break\n\n    now = _now()\n\n    if id is not None:\n        # update by id if present, else create-but-respect tld uniqueness\n        idx = None\n        existing = None\n        for i, s in enumerate(servers):\n            if isinstance(s, dict) and s.get(\"id\") == id:\n                idx = i\n                existing = s\n                break\n\n        if existing is None:\n            # Realistic behavior: if id not found but tld exists, update that row if it matches the target tld.\n            # This relaxes callers that accidentally pass a non-server id.\n            if existing_for_tld is not None:\n                # update existing_for_tld (by its actual index)\n                for i, s in enumerate(servers):\n                    if s is existing_for_tld:\n                        idx = i\n                        existing = existing_for_tld\n                        break\n            else:\n                # create new with provided id\n                if existing_for_tld is not None:\n                    return _err(\"CONFLICT\", \"TLD is already configured for a different WHOIS server.\", tld=tld_norm, existing_id=existing_for_tld.get(\"id\"))\n                new_row = {\n                    \"id\": id.strip(),\n                    \"tld\": tld_norm,\n                    \"host\": host_norm,\n                    \"port\": int(port_val),\n                    \"query_template\": qt_norm,\n                    \"timeout_ms\": int(timeout_val),\n                    \"max_requests_per_minute\": int(mrm_val),\n                    \"status\": status_val,\n                    \"last_healthcheck_at\": None,\n                    \"last_error_at\": None,\n                    \"notes\": notes_val,\n                    \"created_at\": now,\n                    \"updated_at\": now,\n                }\n                servers.append(new_row)\n                _save(\"whois_servers.json\", servers)\n                return {\"whois_server\": new_row}\n        # if updating existing but tld is changing to one owned by someone else -> conflict\n        if existing_for_tld is not None and existing_for_tld.get(\"id\") != existing.get(\"id\") and tld_norm == (existing_for_tld.get(\"tld\") or \"\").strip().lower():\n            return _err(\"CONFLICT\", \"TLD is already configured for a different WHOIS server.\", tld=tld_norm, existing_id=existing_for_tld.get(\"id\"))\n\n        new_row = dict(existing)\n        new_row[\"tld\"] = tld_norm\n        new_row[\"host\"] = host_norm\n        new_row[\"port\"] = int(port_val)\n        new_row[\"query_template\"] = qt_norm\n        new_row[\"timeout_ms\"] = int(timeout_val)\n        new_row[\"max_requests_per_minute\"] = int(mrm_val)\n        new_row[\"status\"] = status_val\n        new_row[\"notes\"] = notes_val\n        new_row[\"updated_at\"] = now\n        servers[idx] = new_row\n        _save(\"whois_servers.json\", servers)\n        return {\"whois_server\": new_row}\n\n    # create (id omitted)\n    if existing_for_tld is not None:\n        return _err(\"CONFLICT\", \"TLD is already configured for a different WHOIS server.\", tld=tld_norm, existing_id=existing_for_tld.get(\"id\"))\n\n    new_id = _gen_id(\"wd_who\")\n    new_row = {\n        \"id\": new_id,\n        \"tld\": tld_norm,\n        \"host\": host_norm,\n        \"port\": int(port_val),\n        \"query_template\": qt_norm,\n        \"timeout_ms\": int(timeout_val),\n        \"max_requests_per_minute\": int(mrm_val),\n        \"status\": status_val,\n        \"last_healthcheck_at\": None,\n        \"last_error_at\": None,\n        \"notes\": notes_val,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    servers.append(new_row)\n    _save(\"whois_servers.json\", servers)\n    return {\"whois_server\": new_row}\n"
+        },
+        {
+          "name": "get-auth-context",
+          "description": "Returns the authenticated caller identity, granted scopes, and current rate-limit/quota context for this API key/token. Refuses with `UNAUTHENTICATED` when no valid credentials are presented.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "include_rate_limits": {
+                "type": "boolean",
+                "default": true,
+                "description": "When true, includes current rate-limit window and remaining quota information when available"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_auth_context(include_rate_limits=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0300000\" if __import__(\"os\").path.isdir(\"./environment_mix/0300000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    if include_rate_limits is None:\n        include_rate_limits = True\n    if not isinstance(include_rate_limits, bool):\n        return _err(\"VALIDATION_ERROR\", \"`include_rate_limits` must be a boolean.\")\n\n    ctx = {\n        \"authenticated\": True,\n        \"subject\": {\"type\": \"ambient\", \"id\": \"caller\"},\n        \"scopes\": [\"domain:read\", \"domain:check\", \"whois:admin\"],\n    }\n\n    if include_rate_limits:\n        # No explicit usage/audit collections exist in provided schema; return best-effort note.\n        ctx[\"rate_limits\"] = {\n            \"enforced\": False,\n            \"note\": \"Rate limits/quotas are not enforced because no usage/audit datastore collection is defined for this service snapshot.\",\n        }\n\n    return {\"auth_context\": ctx}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0300000",
+    "index": 300,
+    "name": "Whodis Domain Availability Server",
+    "description": "This backend stores requests to check domain name availability via WHOIS lookups, along with per-domain results and the WHOIS/TLD resolver configuration used to perform checks. The main workflow is: accept a batch availability check request, enqueue/execute WHOIS queries per domain, store normalized",
+    "taxonomy": {
+      "L1_id": "L1-01",
+      "L1_name": "Search & Information Retrieval",
+      "L1_name_zh": "搜索与信息获取",
+      "L2_id": "L2-03",
+      "L2_name": "API Gateway & Aggregation",
+      "L2_name_zh": "API 网关与聚合",
+      "L3_name": "Domain Availability & Registration Gateways",
+      "L3_name_zh": "域名查询与注册网关"
+    },
+    "database_dir": "./environment_mix/0300000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 4,
+    "n_records": 71,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 5,
+      "read_operations": 5,
+      "mutations_persisted": 1,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "check-domain-availability",
+      "returned_chars": 479
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

@@ -1,0 +1,394 @@
+{
+  "index": 260,
+  "local_files_dir": "./environment_mix/0260000",
+  "file_list": [
+    "./environment_mix/0260000/README.md",
+    "./environment_mix/0260000/external_user_fetches.json",
+    "./environment_mix/0260000/textract_jobs.json",
+    "./environment_mix/0260000/textract_results.json",
+    "./environment_mix/0260000/tool_invocations.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "tool_invocations.json": "36 rows",
+        "external_user_fetches.json": "12 rows",
+        "textract_jobs.json": "12 rows",
+        "textract_results.json": "12 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "Hello Tool",
+          "description": "Returns a simple \"hello\" payload and records the tool invocation. Raises AUTHORIZATION_ERROR if the caller is not permitted to invoke tools and QUOTA_EXCEEDED if the tool-invocation limit is reached.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          },
+          "implementation": "def Hello_Tool(**_extra):\n    import json, os, datetime, secrets, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0260000\" if __import__(\"os\").path.isdir(\"./environment_mix/0260000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _utcnow():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _isoz(dt):\n        if dt is None:\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return prefix + \"\".join(secrets.choice(alphabet) for _ in range(26))\n\n    def _parse_dt(s):\n        if not isinstance(s, str) or not s:\n            return None\n        try:\n            s2 = s[:-1] + \"+00:00\" if s.endswith(\"Z\") else s\n            dt = datetime.datetime.fromisoformat(s2)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _audit(tool_name, request_params, normalized_file_path, status, started_at=None, finished_at=None, duration_ms=None, response_payload=None, error_code=None, error_message=None):\n        invs = _load(\"tool_invocations.json\")\n        if not isinstance(invs, list):\n            invs = []\n        existing = {r.get(\"id\") for r in invs if isinstance(r, dict)}\n        inv_id = _gen_id(\"mcp_inv_\")\n        while inv_id in existing:\n            inv_id = _gen_id(\"mcp_inv_\")\n        now = _utcnow()\n        row = {\n            \"id\": inv_id,\n            \"tool_name\": tool_name,\n            \"request_params\": request_params,\n            \"normalized_file_path\": normalized_file_path,\n            \"status\": status,\n            \"response_payload\": response_payload,\n            \"error_code\": error_code,\n            \"error_message\": error_message,\n            \"started_at\": started_at,\n            \"finished_at\": finished_at,\n            \"duration_ms\": duration_ms,\n            \"created_at\": _isoz(now),\n            \"updated_at\": _isoz(now),\n        }\n        invs.append(row)\n        _save(\"tool_invocations.json\", invs)\n        return row\n\n    # Quota enforcement: datastore has no explicit quotas/rate limits; do not fabricate limits.\n    # Execute and record as a full lifecycle: received -> running -> succeeded.\n    t_start = time.time()\n    started = _utcnow()\n\n    inv = _audit(\n        tool_name=\"Hello Tool\",\n        request_params={},\n        normalized_file_path=None,\n        status=\"running\",\n        started_at=_isoz(started),\n        finished_at=None,\n        duration_ms=None,\n        response_payload=None,\n        error_code=None,\n        error_message=None,\n    )\n\n    # Succeed\n    msg = \"Hello from the MCP agent. Tools are available: Hello, Users, Textract.\"\n    finished = _utcnow()\n    duration_ms = int(round((time.time() - t_start) * 1000))\n    invs = _load(\"tool_invocations.json\")\n    if not isinstance(invs, list):\n        return _err(\"CONFLICT\", \"Invocation log is not readable\")\n    for i, r in enumerate(invs):\n        if isinstance(r, dict) and r.get(\"id\") == inv[\"id\"]:\n            r[\"status\"] = \"succeeded\"\n            r[\"response_payload\"] = msg\n            r[\"error_code\"] = None\n            r[\"error_message\"] = None\n            r[\"finished_at\"] = _isoz(finished)\n            r[\"duration_ms\"] = duration_ms\n            r[\"updated_at\"] = _isoz(_utcnow())\n            invs[i] = r\n            _save(\"tool_invocations.json\", invs)\n            return {\"tool_invocation\": r, \"hello\": msg}\n    return _err(\"NOT_FOUND\", \"Invocation disappeared during update\")\n",
+          "description_restored": true
+        },
+        {
+          "name": "Users Tool",
+          "description": "Fetches a list of users from the selected external provider (or requestUrl override), records the invocation, and returns a paged result set using cursor-based pagination (pass cursor to fetch the next page; limit controls page size) with optional sorting (sort/order). If useCache is enabled, we may return a previously cached response within cacheTtlSeconds unless refresh=true forces a fresh fetch; if invocationId is provided, the fetch is associated to that existing invocation. Raises VALIDATION_ERROR for invalid parameter values (including an invalid invocationId format, unsupported provider, negative/zero limit, or malformed requestUrl), NOT_FOUND if invocationId is well-formed but does not exist, AUTHORIZATION_ERROR if access is not allowed, and UPSTREAM_ERROR when the external provider cannot be reached or returns an error.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "useCache": {
+                "type": "boolean",
+                "description": "Whether to use a cached users response when available"
+              },
+              "cacheTtlSeconds": {
+                "type": "integer",
+                "description": "Time-to-live in seconds to cache the users response"
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "jsonplaceholder",
+                  "unknown"
+                ],
+                "description": "Which external users provider to fetch from"
+              },
+              "requestUrl": {
+                "type": "string",
+                "description": "Override URL to fetch users from (defaults to the provider's standard endpoint)"
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of users to return"
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque cursor for paginating the users list"
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "id",
+                  "name",
+                  "username",
+                  "email"
+                ],
+                "description": "Field to sort returned users by"
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order for the users list"
+              },
+              "refresh": {
+                "type": "boolean",
+                "description": "If true, bypass cache and force a fresh fetch"
+              },
+              "invocationId": {
+                "type": "string",
+                "pattern": "^mcp_inv_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "Optional existing tool invocation id to associate this fetch with"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def Users_Tool(useCache=None, cacheTtlSeconds=None, provider=None, requestUrl=None, limit=None, cursor=None, sort=None, order=None, refresh=None, invocationId=None, **_extra):\n    import json, os, datetime, secrets, time, hashlib, urllib.request, urllib.error\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0260000\" if __import__(\"os\").path.isdir(\"./environment_mix/0260000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _utcnow():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _isoz(dt):\n        if dt is None:\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt(s):\n        if not isinstance(s, str) or not s:\n            return None\n        try:\n            s2 = s[:-1] + \"+00:00\" if s.endswith(\"Z\") else s\n            dt = datetime.datetime.fromisoformat(s2)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return prefix + \"\".join(secrets.choice(alphabet) for _ in range(26))\n\n    def _stable_cache_key(p, url):\n        return hashlib.sha256((p + \"|\" + url).encode(\"utf-8\")).hexdigest()\n\n    def _decode_cursor(c):\n        if c is None:\n            return 0\n        if not isinstance(c, str):\n            return None\n        if not c.startswith(\"o:\"):\n            return None\n        try:\n            n = int(c[2:])\n            if n < 0:\n                return None\n            return n\n        except Exception:\n            return None\n\n    def _encode_cursor(offset):\n        return \"o:\" + str(offset)\n\n    # Defaults & validation\n    if useCache is None:\n        useCache = True\n    if refresh is None:\n        refresh = False\n    if cacheTtlSeconds is None:\n        cacheTtlSeconds = 300\n    if provider is None:\n        provider = \"jsonplaceholder\"\n    if limit is None:\n        limit = 50\n    if order is None:\n        order = \"asc\"\n\n    if not isinstance(useCache, bool):\n        return _err(\"VALIDATION_ERROR\", \"useCache must be a boolean\")\n    if not isinstance(refresh, bool):\n        return _err(\"VALIDATION_ERROR\", \"refresh must be a boolean\")\n    if not isinstance(cacheTtlSeconds, int):\n        return _err(\"VALIDATION_ERROR\", \"cacheTtlSeconds must be an integer\")\n    if cacheTtlSeconds < 0 or cacheTtlSeconds > 86400:\n        return _err(\"VALIDATION_ERROR\", \"cacheTtlSeconds must be between 0 and 86400\")\n    if provider not in (\"jsonplaceholder\", \"unknown\"):\n        return _err(\"VALIDATION_ERROR\", \"provider is not a valid enum value\")\n    if requestUrl is not None and not isinstance(requestUrl, str):\n        return _err(\"VALIDATION_ERROR\", \"requestUrl must be a string\")\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n    if sort is not None and sort not in (\"id\", \"name\", \"username\", \"email\"):\n        return _err(\"VALIDATION_ERROR\", \"sort is not a valid enum value\")\n    if order not in (\"asc\", \"desc\"):\n        return _err(\"VALIDATION_ERROR\", \"order is not a valid enum value\")\n    if invocationId is not None and not isinstance(invocationId, str):\n        return _err(\"VALIDATION_ERROR\", \"invocationId must be a string\")\n\n    default_url = \"https://jsonplaceholder.typicode.com/users\" if provider == \"jsonplaceholder\" else \"https://example.invalid/users\"\n    url = requestUrl if requestUrl else default_url\n\n    # Create or reuse invocation\n    invs = _load(\"tool_invocations.json\")\n    if not isinstance(invs, list):\n        invs = []\n\n    now = _utcnow()\n    inv_row = None\n    if invocationId:\n        inv_row = next((r for r in invs if isinstance(r, dict) and r.get(\"id\") == invocationId), None)\n        if inv_row is None:\n            return _err(\"NOT_FOUND\", \"invocationId not found\")\n        if inv_row.get(\"tool_name\") != \"Users Tool\":\n            return _err(\"CONFLICT\", \"invocationId exists but is not a Users Tool invocation\")\n        if inv_row.get(\"request_params\") != {}:\n            return _err(\"CONFLICT\", \"Users Tool invocation request_params must be {}\")\n        if inv_row.get(\"status\") in (\"succeeded\", \"failed\"):\n            return _err(\"INVALID_TRANSITION\", \"Invocation is terminal and cannot be re-run\")\n        inv_id = invocationId\n    else:\n        existing = {r.get(\"id\") for r in invs if isinstance(r, dict)}\n        inv_id = _gen_id(\"mcp_inv_\")\n        while inv_id in existing:\n            inv_id = _gen_id(\"mcp_inv_\")\n        inv_row = {\n            \"id\": inv_id,\n            \"tool_name\": \"Users Tool\",\n            \"request_params\": {},\n            \"normalized_file_path\": None,\n            \"status\": \"received\",\n            \"response_payload\": None,\n            \"error_code\": None,\n            \"error_message\": None,\n            \"started_at\": None,\n            \"finished_at\": None,\n            \"duration_ms\": None,\n            \"created_at\": _isoz(now),\n            \"updated_at\": _isoz(now),\n        }\n        invs.append(inv_row)\n        _save(\"tool_invocations.json\", invs)\n\n    # Transition invocation received -> running (or keep running)\n    invs = _load(\"tool_invocations.json\")\n    if not isinstance(invs, list):\n        return _err(\"CONFLICT\", \"Invocation log is not readable\")\n    for i, r in enumerate(invs):\n        if isinstance(r, dict) and r.get(\"id\") == inv_id:\n            if r.get(\"status\") == \"received\":\n                r[\"status\"] = \"running\"\n                r[\"started_at\"] = r.get(\"started_at\") or _isoz(_utcnow())\n                r[\"updated_at\"] = _isoz(_utcnow())\n                invs[i] = r\n                _save(\"tool_invocations.json\", invs)\n            elif r.get(\"status\") == \"running\":\n                if not r.get(\"started_at\"):\n                    r[\"started_at\"] = _isoz(_utcnow())\n                    r[\"updated_at\"] = _isoz(_utcnow())\n                    invs[i] = r\n                    _save(\"tool_invocations.json\", invs)\n            elif r.get(\"status\") in (\"succeeded\", \"failed\"):\n                return _err(\"INVALID_TRANSITION\", \"Invocation is terminal and cannot be advanced\")\n            inv_row = r\n            break\n    else:\n        return _err(\"NOT_FOUND\", \"Tool invocation not found\")\n\n    started_dt = _parse_dt(inv_row.get(\"started_at\")) or _utcnow()\n    t0 = time.time()\n\n    # Must create exactly one external_user_fetches row per invocation_id\n    fetches = _load(\"external_user_fetches.json\")\n    if not isinstance(fetches, list):\n        fetches = []\n    existing_fetch = next((f for f in fetches if isinstance(f, dict) and f.get(\"invocation_id\") == inv_id), None)\n    if existing_fetch is not None:\n        return _err(\"CONFLICT\", \"An external_user_fetches row already exists for this invocation_id\")\n\n    # Cache lookup (can use any previous fetch with same cache_key and not expired)\n    cache_key = _stable_cache_key(provider, url)\n    cached_body = None\n    cached_row = None\n    if useCache and (not refresh):\n        for f in fetches:\n            if not isinstance(f, dict):\n                continue\n            if f.get(\"cache_key\") != cache_key:\n                continue\n            if f.get(\"status\") != \"succeeded\":\n                continue\n            exp = _parse_dt(f.get(\"cache_expires_at\"))\n            if exp is None:\n                continue\n            if exp > _utcnow() and isinstance(f.get(\"response_body\"), list):\n                cached_body = f.get(\"response_body\")\n                cached_row = f\n                break\n\n    # Create attempted fetch row\n    existing_ids = {r.get(\"id\") for r in fetches if isinstance(r, dict)}\n    fetch_id = _gen_id(\"mcp_usrfetch_\")\n    while fetch_id in existing_ids:\n        fetch_id = _gen_id(\"mcp_usrfetch_\")\n    created = _utcnow()\n    ttl = cacheTtlSeconds\n    expires = created + datetime.timedelta(seconds=ttl)\n    fetch_row = {\n        \"id\": fetch_id,\n        \"invocation_id\": inv_id,\n        \"provider\": provider,\n        \"request_url\": url,\n        \"http_status\": None,\n        \"response_body\": None,\n        \"etag\": None,\n        \"fetched_at\": None,\n        \"cache_key\": cache_key,\n        \"cache_ttl_seconds\": ttl,\n        \"cache_expires_at\": _isoz(expires),\n        \"status\": \"attempted\",\n        \"error_message\": None,\n        \"created_at\": _isoz(created),\n        \"updated_at\": _isoz(created),\n    }\n    fetches.append(fetch_row)\n    _save(\"external_user_fetches.json\", fetches)\n\n    # If cached, mark fetch as succeeded without calling upstream (still records invocation-triggered \"fetch\")\n    users = None\n    http_status = None\n    etag = None\n    fetched_at = _utcnow()\n    if cached_body is not None:\n        users = cached_body\n        http_status = 200\n        etag = cached_row.get(\"etag\")\n        fetch_row[\"status\"] = \"succeeded\"\n        fetch_row[\"http_status\"] = http_status\n        fetch_row[\"response_body\"] = users\n        fetch_row[\"etag\"] = etag\n        fetch_row[\"fetched_at\"] = _isoz(fetched_at)\n        fetch_row[\"updated_at\"] = _isoz(_utcnow())\n        fetch_row[\"error_message\"] = None\n        # persist update\n        fetches = _load(\"external_user_fetches.json\")\n        for i, r in enumerate(fetches):\n            if isinstance(r, dict) and r.get(\"id\") == fetch_id:\n                fetches[i] = fetch_row\n                _save(\"external_user_fetches.json\", fetches)\n                break\n    else:\n        # Perform external request (best-effort; offline errors become EXTERNAL_API_ERROR)\n        try:\n            req = urllib.request.Request(url, method=\"GET\", headers={\"User-Agent\": \"mcp-server/1.0\"})\n            with urllib.request.urlopen(req, timeout=10) as resp:\n                http_status = int(getattr(resp, \"status\", 200))\n                body_bytes = resp.read()\n                etag = resp.headers.get(\"ETag\")\n            try:\n                users = json.loads(body_bytes.decode(\"utf-8\"))\n            except Exception:\n                users = None\n                raise ValueError(\"Invalid JSON response from provider\")\n            if not isinstance(users, list):\n                raise ValueError(\"Provider response was not a JSON array\")\n            fetch_row[\"status\"] = \"succeeded\"\n            fetch_row[\"http_status\"] = http_status\n            fetch_row[\"response_body\"] = users\n            fetch_row[\"etag\"] = etag\n            fetch_row[\"fetched_at\"] = _isoz(fetched_at)\n            fetch_row[\"updated_at\"] = _isoz(_utcnow())\n            fetch_row[\"error_message\"] = None\n        except urllib.error.HTTPError as e:\n            fetch_row[\"status\"] = \"failed\"\n            fetch_row[\"http_status\"] = int(getattr(e, \"code\", 0) or 0) or None\n            fetch_row[\"response_body\"] = None\n            fetch_row[\"etag\"] = None\n            fetch_row[\"fetched_at\"] = _isoz(fetched_at)\n            fetch_row[\"updated_at\"] = _isoz(_utcnow())\n            fetch_row[\"error_message\"] = f\"Upstream HTTPError: {getattr(e, 'code', None)}\"\n            users = None\n        except (urllib.error.URLError, ValueError, TimeoutError) as e:\n            fetch_row[\"status\"] = \"failed\"\n            fetch_row[\"http_status\"] = None\n            fetch_row[\"response_body\"] = None\n            fetch_row[\"etag\"] = None\n            fetch_row[\"fetched_at\"] = _isoz(fetched_at)\n            fetch_row[\"updated_at\"] = _isoz(_utcnow())\n            fetch_row[\"error_message\"] = str(e) or \"Upstream request failed\"\n            users = None\n\n        # persist fetch row final state\n        fetches = _load(\"external_user_fetches.json\")\n        if not isinstance(fetches, list):\n            return _err(\"CONFLICT\", \"Fetch log is not readable\")\n        for i, r in enumerate(fetches):\n            if isinstance(r, dict) and r.get(\"id\") == fetch_id:\n                fetches[i] = fetch_row\n                _save(\"external_user_fetches.json\", fetches)\n                break\n\n    # If fetch failed, invocation fails\n    if users is None:\n        finished = _utcnow()\n        duration_ms = int(round((time.time() - t0) * 1000))\n        invs = _load(\"tool_invocations.json\")\n        for i, r in enumerate(invs):\n            if isinstance(r, dict) and r.get(\"id\") == inv_id:\n                if r.get(\"status\") not in (\"running\", \"received\"):\n                    return _err(\"INVALID_TRANSITION\", \"Invocation is not in a mutable state\")\n                r[\"status\"] = \"failed\"\n                r[\"response_payload\"] = None\n                r[\"error_code\"] = \"EXTERNAL_API_ERROR\"\n                r[\"error_message\"] = fetch_row.get(\"error_message\") or \"External provider fetch failed\"\n                r[\"finished_at\"] = _isoz(finished)\n                r[\"duration_ms\"] = duration_ms\n                r[\"updated_at\"] = _isoz(_utcnow())\n                invs[i] = r\n                _save(\"tool_invocations.json\", invs)\n                return {\"tool_invocation\": r, \"external_user_fetch\": fetch_row}\n        return _err(\"NOT_FOUND\", \"Tool invocation not found\")\n\n    # Sort/paginate\n    if sort is not None:\n        def _key(u):\n            v = u.get(sort) if isinstance(u, dict) else None\n            return (v is None, v)\n        users_sorted = sorted(users, key=_key, reverse=(order == \"desc\"))\n    else:\n        users_sorted = list(users)\n\n    offset = _decode_cursor(cursor)\n    if offset is None:\n        return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n    total = len(users_sorted)\n    page = users_sorted[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = _encode_cursor(next_offset) if has_more else None\n\n    # Invocation succeeds\n    response_payload = {\n        \"users\": page,\n        \"page\": {\"limit\": limit, \"cursor\": cursor, \"nextCursor\": next_cursor, \"hasMore\": has_more, \"total\": total},\n        \"source\": \"cache\" if cached_body is not None else \"live\",\n        \"provider\": provider,\n        \"requestUrl\": url,\n    }\n    finished = _utcnow()\n    duration_ms = int(round((time.time() - t0) * 1000))\n    invs = _load(\"tool_invocations.json\")\n    for i, r in enumerate(invs):\n        if isinstance(r, dict) and r.get(\"id\") == inv_id:\n            if r.get(\"status\") not in (\"running\", \"received\"):\n                return _err(\"INVALID_TRANSITION\", \"Invocation is not in a mutable state\")\n            r[\"status\"] = \"succeeded\"\n            r[\"response_payload\"] = response_payload\n            r[\"error_code\"] = None\n            r[\"error_message\"] = None\n            r[\"finished_at\"] = _isoz(finished)\n            r[\"duration_ms\"] = duration_ms\n            if not r.get(\"started_at\"):\n                r[\"started_at\"] = _isoz(started_dt)\n            r[\"updated_at\"] = _isoz(_utcnow())\n            invs[i] = r\n            _save(\"tool_invocations.json\", invs)\n            return {\n                \"tool_invocation\": r,\n                \"external_user_fetch\": fetch_row,\n                \"users\": page,\n                \"page\": {\"limit\": limit, \"nextCursor\": next_cursor, \"hasMore\": has_more, \"total\": total},\n            }\n    return _err(\"NOT_FOUND\", \"Tool invocation not found\")\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "Textract Tool",
+          "description": "Submits the specified filePath for AWS Textract analysis, records the invocation, and returns a Textract job tracker including current status and any extracted results when available (subsequent reads return updated status/results until completion or failure). Raises VALIDATION_ERROR if filePath is missing/empty or not a supported input, NOT_FOUND if the referenced path cannot be accessed, AUTHORIZATION_ERROR if Textract submission is not permitted, QUOTA_EXCEEDED if submission/job limits are exceeded, and UPSTREAM_ERROR if AWS Textract rejects the request or the job transitions to a terminal error state.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "filePath": {
+                "type": "string",
+                "description": "The local path to the image file to be uploaded"
+              }
+            },
+            "required": [
+              "filePath"
+            ]
+          },
+          "implementation": "def Textract_Tool(filePath, **_extra):\n    import json, os, datetime, secrets, time, hashlib, mimetypes\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0260000\" if __import__(\"os\").path.isdir(\"./environment_mix/0260000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _utcnow():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _isoz(dt):\n        if dt is None:\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return prefix + \"\".join(secrets.choice(alphabet) for _ in range(26))\n\n    # Validate input (per tool schema)\n    if not isinstance(filePath, str):\n        return _err(\"VALIDATION_ERROR\", \"filePath must be a string\")\n    if not filePath.strip():\n        return _err(\"VALIDATION_ERROR\", \"filePath is required and must be non-empty\")\n\n    try:\n        normalized_path = os.path.abspath(os.path.expanduser(filePath))\n    except Exception:\n        return _err(\"VALIDATION_ERROR\", \"filePath could not be normalized\")\n\n    ext = os.path.splitext(normalized_path)[1].lower().lstrip(\".\")\n    supported = {\"pdf\", \"png\", \"jpg\", \"jpeg\", \"tiff\", \"tif\"}\n    if ext not in supported:\n        return _err(\"VALIDATION_ERROR\", \"Unsupported file type\", supportedExtensions=sorted(supported))\n\n    # Create invocation row in received\n    invs = _load(\"tool_invocations.json\")\n    if not isinstance(invs, list):\n        invs = []\n    existing = {r.get(\"id\") for r in invs if isinstance(r, dict)}\n    inv_id = _gen_id(\"mcp_inv_\")\n    while inv_id in existing:\n        inv_id = _gen_id(\"mcp_inv_\")\n    now = _utcnow()\n    inv_row = {\n        \"id\": inv_id,\n        \"tool_name\": \"Textract Tool\",\n        \"request_params\": {\"filePath\": filePath},\n        \"normalized_file_path\": normalized_path,\n        \"status\": \"received\",\n        \"response_payload\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"duration_ms\": None,\n        \"created_at\": _isoz(now),\n        \"updated_at\": _isoz(now),\n    }\n    invs.append(inv_row)\n    _save(\"tool_invocations.json\", invs)\n\n    # Transition invocation -> running\n    invs = _load(\"tool_invocations.json\")\n    for i, r in enumerate(invs):\n        if isinstance(r, dict) and r.get(\"id\") == inv_id:\n            r[\"status\"] = \"running\"\n            r[\"started_at\"] = _isoz(_utcnow())\n            r[\"updated_at\"] = _isoz(_utcnow())\n            invs[i] = r\n            _save(\"tool_invocations.json\", invs)\n            inv_row = r\n            break\n\n    t0 = time.time()\n\n    # Must create exactly one textract_jobs row linked by invocation_id\n    jobs = _load(\"textract_jobs.json\")\n    if not isinstance(jobs, list):\n        jobs = []\n    if any(isinstance(j, dict) and j.get(\"invocation_id\") == inv_id for j in jobs):\n        return _err(\"CONFLICT\", \"A textract_jobs row already exists for this invocation_id\")\n\n    job_id = _gen_id(\"mcp_txj_\")\n    existing_job_ids = {r.get(\"id\") for r in jobs if isinstance(r, dict)}\n    while job_id in existing_job_ids:\n        job_id = _gen_id(\"mcp_txj_\")\n\n    job_created = _utcnow()\n    job_row = {\n        \"id\": job_id,\n        \"invocation_id\": inv_id,\n        \"file_path\": filePath,\n        \"file_sha256\": None,\n        \"content_type\": None,\n        \"file_size_bytes\": None,\n        \"textract_mode\": \"analyze_document\" if ext == \"pdf\" else \"detect_document_text\",\n        \"aws_region\": None,\n        \"aws_request_id\": None,\n        \"status\": \"queued\",\n        \"submitted_at\": None,\n        \"completed_at\": None,\n        \"error_message\": None,\n        \"created_at\": _isoz(job_created),\n        \"updated_at\": _isoz(job_created),\n    }\n    jobs.append(job_row)\n    _save(\"textract_jobs.json\", jobs)\n\n    # Try to read file; must fail with error_code FILE_NOT_FOUND if cannot be read\n    try:\n        with open(normalized_path, \"rb\") as f:\n            data = f.read()\n    except OSError:\n        # Mark job failed (queued -> failed is allowed)\n        jobs = _load(\"textract_jobs.json\")\n        for i, j in enumerate(jobs):\n            if isinstance(j, dict) and j.get(\"id\") == job_id:\n                j[\"status\"] = \"failed\"\n                j[\"error_message\"] = f\"FILE_NOT_FOUND: cannot open {normalized_path}\"\n                j[\"completed_at\"] = _isoz(_utcnow())\n                j[\"updated_at\"] = _isoz(_utcnow())\n                jobs[i] = j\n                _save(\"textract_jobs.json\", jobs)\n                job_row = j\n                break\n        # Mark invocation failed\n        invs = _load(\"tool_invocations.json\")\n        for i, r in enumerate(invs):\n            if isinstance(r, dict) and r.get(\"id\") == inv_id:\n                finished = _utcnow()\n                duration_ms = int(round((time.time() - t0) * 1000))\n                r[\"status\"] = \"failed\"\n                r[\"response_payload\"] = None\n                r[\"error_code\"] = \"FILE_NOT_FOUND\"\n                r[\"error_message\"] = f\"FILE_NOT_FOUND: cannot open {normalized_path}\"\n                r[\"finished_at\"] = _isoz(finished)\n                r[\"duration_ms\"] = duration_ms\n                r[\"updated_at\"] = _isoz(_utcnow())\n                invs[i] = r\n                _save(\"tool_invocations.json\", invs)\n                return {\"tool_invocation\": r, \"textract_job\": job_row}\n        return _err(\"NOT_FOUND\", \"Tool invocation not found\")\n\n    # Update job metadata (queued -> uploading -> processing -> succeeded)\n    size = len(data)\n    sha = hashlib.sha256(data).hexdigest()\n    ctype = mimetypes.guess_type(normalized_path)[0]\n    if ctype is None:\n        ctype = \"application/pdf\" if ext == \"pdf\" else (\"image/\" + (\"jpeg\" if ext in (\"jpg\", \"jpeg\") else (\"tiff\" if ext in (\"tif\", \"tiff\") else \"png\")))\n\n    jobs = _load(\"textract_jobs.json\")\n    for i, j in enumerate(jobs):\n        if isinstance(j, dict) and j.get(\"id\") == job_id:\n            if j.get(\"status\") != \"queued\":\n                return _err(\"INVALID_TRANSITION\", \"Textract job is not in queued state\")\n            j[\"status\"] = \"uploading\"\n            j[\"file_size_bytes\"] = size\n            j[\"file_sha256\"] = sha\n            j[\"content_type\"] = ctype\n            j[\"updated_at\"] = _isoz(_utcnow())\n            jobs[i] = j\n            _save(\"textract_jobs.json\", jobs)\n            job_row = j\n            break\n\n    jobs = _load(\"textract_jobs.json\")\n    for i, j in enumerate(jobs):\n        if isinstance(j, dict) and j.get(\"id\") == job_id:\n            if j.get(\"status\") != \"uploading\":\n                return _err(\"INVALID_TRANSITION\", \"Textract job is not in uploading state\")\n            j[\"status\"] = \"processing\"\n            j[\"submitted_at\"] = _isoz(_utcnow())\n            j[\"updated_at\"] = _isoz(_utcnow())\n            jobs[i] = j\n            _save(\"textract_jobs.json\", jobs)\n            job_row = j\n            break\n\n    # Offline \"Textract\": extract best-effort text for plain demonstration\n    extracted_text = None\n    confidence_avg = None\n    if ext == \"pdf\":\n        extracted_text = None  # no PDF parsing in stdlib\n    else:\n        # Not real OCR; store placeholder indicating the file was accepted and hashed.\n        extracted_text = None\n\n    raw_response = {\n        \"mode\": job_row.get(\"textract_mode\"),\n        \"note\": \"Offline backend: no AWS call performed; job marked succeeded after local file read.\",\n        \"file_sha256\": sha,\n        \"file_size_bytes\": size,\n        \"content_type\": ctype,\n    }\n\n    # Succeed the job\n    jobs = _load(\"textract_jobs.json\")\n    for i, j in enumerate(jobs):\n        if isinstance(j, dict) and j.get(\"id\") == job_id:\n            if j.get(\"status\") != \"processing\":\n                return _err(\"INVALID_TRANSITION\", \"Textract job is not in processing state\")\n            j[\"status\"] = \"succeeded\"\n            j[\"completed_at\"] = _isoz(_utcnow())\n            j[\"error_message\"] = None\n            j[\"updated_at\"] = _isoz(_utcnow())\n            jobs[i] = j\n            _save(\"textract_jobs.json\", jobs)\n            job_row = j\n            break\n\n    # Create results row only when job succeeded\n    results = _load(\"textract_results.json\")\n    if not isinstance(results, list):\n        results = []\n    # next version (monotonic); schema digest says v1 exists, but allow if missing\n    existing_versions = [r.get(\"result_version\") for r in results if isinstance(r, dict) and r.get(\"textract_job_id\") == job_id]\n    next_ver = 1\n    try:\n        if existing_versions:\n            next_ver = max(int(v) for v in existing_versions if isinstance(v, int) or (isinstance(v, str) and str(v).isdigit())) + 1\n    except Exception:\n        next_ver = 1\n    if any(isinstance(r, dict) and r.get(\"textract_job_id\") == job_id and r.get(\"result_version\") == next_ver for r in results):\n        return _err(\"CONFLICT\", \"Result version already exists for this job\")\n\n    txr_id = _gen_id(\"mcp_txr_\")\n    existing_txr_ids = {r.get(\"id\") for r in results if isinstance(r, dict)}\n    while txr_id in existing_txr_ids:\n        txr_id = _gen_id(\"mcp_txr_\")\n    r_now = _utcnow()\n    result_row = {\n        \"id\": txr_id,\n        \"textract_job_id\": job_id,\n        \"result_version\": next_ver,\n        \"raw_response\": raw_response,\n        \"extracted_text\": extracted_text,\n        \"blocks\": None,\n        \"confidence_avg\": confidence_avg,\n        \"created_at\": _isoz(r_now),\n        \"updated_at\": _isoz(r_now),\n    }\n    results.append(result_row)\n    _save(\"textract_results.json\", results)\n\n    # Mark invocation succeeded\n    invs = _load(\"tool_invocations.json\")\n    for i, r in enumerate(invs):\n        if isinstance(r, dict) and r.get(\"id\") == inv_id:\n            finished = _utcnow()\n            duration_ms = int(round((time.time() - t0) * 1000))\n            payload = {\n                \"textract_job_id\": job_id,\n                \"status\": job_row.get(\"status\"),\n                \"result_version\": result_row.get(\"result_version\"),\n                \"content_type\": ctype,\n                \"file_size_bytes\": size,\n                \"file_sha256\": sha,\n            }\n            r[\"status\"] = \"succeeded\"\n            r[\"response_payload\"] = payload\n            r[\"error_code\"] = None\n            r[\"error_message\"] = None\n            r[\"finished_at\"] = _isoz(finished)\n            r[\"duration_ms\"] = duration_ms\n            r[\"updated_at\"] = _isoz(_utcnow())\n            invs[i] = r\n            _save(\"tool_invocations.json\", invs)\n            return {\"tool_invocation\": r, \"textract_job\": job_row, \"textract_result\": result_row}\n    return _err(\"NOT_FOUND\", \"Tool invocation not found\")\n",
+          "description_restored": true
+        },
+        {
+          "name": "List Tool Invocations",
+          "description": "Lists recorded tool invocations with optional filtering and cursor-based pagination. Returns a page of invocations and a nextCursor when more results exist. Refuses with AUTHORIZATION_ERROR if the caller is not permitted to read invocation history.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "cursor": {
+                "type": "string",
+                "description": "Opaque cursor for paginating through tool invocations"
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of invocations to return"
+              },
+              "toolName": {
+                "type": "string",
+                "enum": [
+                  "Hello Tool",
+                  "Users Tool",
+                  "Textract Tool"
+                ],
+                "description": "Filter by tool name"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "received",
+                  "running",
+                  "succeeded",
+                  "failed"
+                ],
+                "description": "Filter by invocation status"
+              },
+              "createdAfter": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return invocations created after this timestamp (inclusive)"
+              },
+              "createdBefore": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return invocations created before this timestamp (exclusive)"
+              },
+              "invocationId": {
+                "type": "string",
+                "pattern": "^mcp_inv_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "If provided, returns only this invocation id (equivalent to fetching one)"
+              },
+              "includeResponsePayload": {
+                "type": "boolean",
+                "default": false,
+                "description": "When true, include response_payload in list items (may be large)"
+              },
+              "includeErrorDetails": {
+                "type": "boolean",
+                "default": true,
+                "description": "When true, include error_code and error_message when present"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def List_Tool_Invocations(cursor=None, limit=None, toolName=None, status=None, createdAfter=None, createdBefore=None, invocationId=None, includeResponsePayload=None, includeErrorDetails=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0260000\" if __import__(\"os\").path.isdir(\"./environment_mix/0260000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None, None\n        if not isinstance(s, str):\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be a date-time string\")\n        try:\n            s2 = s[:-1] + \"+00:00\" if s.endswith(\"Z\") else s\n            dt = datetime.datetime.fromisoformat(s2)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc), None\n        except Exception:\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be a date-time string\")\n\n    def _decode_cursor(c):\n        if c is None:\n            return 0\n        if not isinstance(c, str):\n            return None\n        if not c.startswith(\"o:\"):\n            return None\n        try:\n            n = int(c[2:])\n            return n if n >= 0 else None\n        except Exception:\n            return None\n\n    def _encode_cursor(n):\n        return \"o:\" + str(n)\n\n    if limit is None:\n        limit = 50\n    if includeResponsePayload is None:\n        includeResponsePayload = False\n    if includeErrorDetails is None:\n        includeErrorDetails = True\n\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n    if toolName is not None and toolName not in (\"Hello Tool\", \"Users Tool\", \"Textract Tool\"):\n        return _err(\"VALIDATION_ERROR\", \"toolName is not a valid enum value\")\n    if status is not None and status not in (\"received\", \"running\", \"succeeded\", \"failed\"):\n        return _err(\"VALIDATION_ERROR\", \"status is not a valid enum value\")\n    if not isinstance(includeResponsePayload, bool):\n        return _err(\"VALIDATION_ERROR\", \"includeResponsePayload must be a boolean\")\n    if not isinstance(includeErrorDetails, bool):\n        return _err(\"VALIDATION_ERROR\", \"includeErrorDetails must be a boolean\")\n    if invocationId is not None and not isinstance(invocationId, str):\n        return _err(\"VALIDATION_ERROR\", \"invocationId must be a string\")\n\n    dt_after, e = _parse_dt(createdAfter, \"createdAfter\")\n    if e: return e\n    dt_before, e = _parse_dt(createdBefore, \"createdBefore\")\n    if e: return e\n\n    invs = _load(\"tool_invocations.json\")\n    if not isinstance(invs, list):\n        invs = []\n\n    # Filter\n    rows = []\n    for r in invs:\n        if not isinstance(r, dict):\n            continue\n        if invocationId is not None and r.get(\"id\") != invocationId:\n            continue\n        if toolName is not None and r.get(\"tool_name\") != toolName:\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        created_dt, _ = _parse_dt(r.get(\"created_at\"), \"created_at\")\n        if dt_after is not None and (created_dt is None or created_dt < dt_after):\n            continue\n        if dt_before is not None and (created_dt is None or created_dt >= dt_before):\n            continue\n        rows.append(r)\n\n    # Sort by created_at desc (most recent first), stable fallback to id\n    def _sort_key(r):\n        d, _ = _parse_dt(r.get(\"created_at\"), \"created_at\")\n        return (d is None, d if d is not None else datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc), r.get(\"id\") or \"\")\n    rows.sort(key=_sort_key, reverse=True)\n\n    offset = _decode_cursor(cursor)\n    if offset is None:\n        return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n\n    total = len(rows)\n    page = rows[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = _encode_cursor(next_offset) if has_more else None\n\n    # Shape response items\n    items = []\n    for r in page:\n        item = dict(r)\n        if not includeResponsePayload:\n            item.pop(\"response_payload\", None)\n        if not includeErrorDetails:\n            item.pop(\"error_code\", None)\n            item.pop(\"error_message\", None)\n        items.append(item)\n\n    return {\"invocations\": items, \"page\": {\"limit\": limit, \"nextCursor\": next_cursor, \"hasMore\": has_more, \"total\": total}}\n"
+        },
+        {
+          "name": "Get Tool Invocation",
+          "description": "Fetches a single tool invocation by id, including timing fields, final status, and any response/error payload. Refuses with NOT_FOUND if the id does not exist or is not visible to the caller.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^mcp_inv_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "Tool invocation id"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def Get_Tool_Invocation(id, **_extra):\n    import json, os, datetime, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0260000\" if __import__(\"os\").path.isdir(\"./environment_mix/0260000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    # Accept id that may be passed as int by callers; coerce if safe\n    if isinstance(id, int):\n        return _err(\"VALIDATION_ERROR\", \"id must be a tool invocation id string, not an integer\")\n    if not isinstance(id, str):\n        return _err(\"VALIDATION_ERROR\", \"id must be a string\")\n    if not re.match(r\"^mcp_inv_[0-9A-HJKMNP-TV-Z]{26}$\", id):\n        return _err(\"VALIDATION_ERROR\", \"id does not match required pattern\")\n\n    invs = _load(\"tool_invocations.json\")\n    if not isinstance(invs, list):\n        invs = []\n    row = next((r for r in invs if isinstance(r, dict) and r.get(\"id\") == id), None)\n    if row is None:\n        return _err(\"NOT_FOUND\", \"Tool invocation not found\")\n    return {\"tool_invocation\": row}\n"
+        },
+        {
+          "name": "Update Tool Invocation Status",
+          "description": "Advances a tool invocation through its lifecycle and records runtime fields. Allows only declared forward transitions (received→running/failed, running→succeeded/failed). On succeeded, responsePayload must be provided and error fields must be null; on failed, errorMessage must be provided and responsePayload must be null. Sets finishedAt and durationMs when transitioning to a terminal state. Refuses with VALIDATION_ERROR for invalid transitions or inconsistent payloads.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^mcp_inv_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "Tool invocation id"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "received",
+                  "running",
+                  "succeeded",
+                  "failed"
+                ],
+                "description": "New status to set; must be a valid forward transition"
+              },
+              "startedAt": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Start timestamp (required when moving to running if not already set)"
+              },
+              "finishedAt": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Finish timestamp (required when moving to succeeded or failed)"
+              },
+              "durationMs": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Duration in milliseconds; must match (finishedAt-startedAt) within tolerance when terminal"
+              },
+              "responsePayload": {
+                "type": [
+                  "object",
+                  "string",
+                  "array",
+                  "number",
+                  "boolean",
+                  "null"
+                ],
+                "description": "Tool response payload; required when status becomes succeeded; must be null when failed"
+              },
+              "errorCode": {
+                "type": "string",
+                "description": "Machine-readable error code; allowed only when status becomes failed"
+              },
+              "errorMessage": {
+                "type": "string",
+                "description": "Human-readable error message; required when status becomes failed; must be null when succeeded"
+              }
+            },
+            "required": [
+              "id",
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def Update_Tool_Invocation_Status(id, status, startedAt=None, finishedAt=None, durationMs=None, responsePayload=None, errorCode=None, errorMessage=None, **_extra):\n    import json, os, datetime, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0260000\" if __import__(\"os\").path.isdir(\"./environment_mix/0260000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    transitions = {\n        \"received\": [\"running\", \"failed\"],\n        \"running\": [\"succeeded\", \"failed\"],\n        \"succeeded\": [],\n        \"failed\": [],\n    }\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None, None\n        if not isinstance(s, str):\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be an RFC3339 date-time string\")\n        try:\n            s2 = s[:-1] + \"+00:00\" if s.endswith(\"Z\") else s\n            dt = datetime.datetime.fromisoformat(s2)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc), None\n        except Exception:\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be an RFC3339 date-time string\")\n\n    def _isoz(dt):\n        if dt is None:\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    # Validate; be permissive with id passed incorrectly by callers in audit: if int, treat as NOT_FOUND not schema error\n    if not isinstance(id, str):\n        return _err(\"VALIDATION_ERROR\", \"id must be a string\")\n    if not re.match(r\"^mcp_inv_[0-9A-HJKMNP-TV-Z]{26}$\", id):\n        return _err(\"VALIDATION_ERROR\", \"id does not match required pattern\")\n\n    if not isinstance(status, str) or status not in (\"received\", \"running\", \"succeeded\", \"failed\"):\n        return _err(\"VALIDATION_ERROR\", \"status is not a valid enum value\")\n\n    dt_started, e = _parse_dt(startedAt, \"startedAt\")\n    if e: return e\n    dt_finished, e = _parse_dt(finishedAt, \"finishedAt\")\n    if e: return e\n\n    if durationMs is not None and (not isinstance(durationMs, int) or durationMs < 0):\n        return _err(\"VALIDATION_ERROR\", \"durationMs must be a non-negative integer\")\n\n    invs = _load(\"tool_invocations.json\")\n    if not isinstance(invs, list):\n        invs = []\n    idx = next((i for i, r in enumerate(invs) if isinstance(r, dict) and r.get(\"id\") == id), None)\n    if idx is None:\n        return _err(\"NOT_FOUND\", \"Tool invocation not found\")\n    row = invs[idx]\n    cur = row.get(\"status\")\n    if cur not in transitions:\n        return _err(\"CONFLICT\", \"Stored invocation status is invalid\")\n\n    # Enforce forward transitions unless idempotent same-state update of timestamps/updated_at\n    if status != cur:\n        if status not in transitions.get(cur, []):\n            return _err(\"INVALID_TRANSITION\", f\"Cannot transition tool invocation from {cur} to {status}\")\n    else:\n        # idempotent update allowed (e.g., setting startedAt when already running)\n        pass\n\n    # Business rules on terminal states\n    if status == \"succeeded\":\n        if responsePayload is None:\n            return _err(\"VALIDATION_ERROR\", \"responsePayload must be provided when status becomes succeeded\")\n        if errorCode is not None or errorMessage is not None:\n            return _err(\"VALIDATION_ERROR\", \"errorCode/errorMessage must be null when status becomes succeeded\")\n        if dt_finished is None and row.get(\"finished_at\") is None:\n            return _err(\"VALIDATION_ERROR\", \"finishedAt is required when status becomes succeeded\")\n    if status == \"failed\":\n        if not isinstance(errorMessage, str) or not errorMessage.strip():\n            return _err(\"VALIDATION_ERROR\", \"errorMessage must be provided when status becomes failed\")\n        if responsePayload is not None:\n            return _err(\"VALIDATION_ERROR\", \"responsePayload must be null when status becomes failed\")\n        if dt_finished is None and row.get(\"finished_at\") is None:\n            return _err(\"VALIDATION_ERROR\", \"finishedAt is required when status becomes failed\")\n\n    # startedAt required when moving to running if not already set\n    if status == \"running\" and row.get(\"started_at\") is None and dt_started is None:\n        return _err(\"VALIDATION_ERROR\", \"startedAt is required when moving to running if not already set\")\n\n    # Apply updates\n    now = datetime.datetime.now(datetime.timezone.utc)\n    if status != cur:\n        row[\"status\"] = status\n\n    if status == \"running\":\n        if row.get(\"started_at\") is None:\n            row[\"started_at\"] = _isoz(dt_started)\n        elif dt_started is not None:\n            # allow setting started_at if it was missing; if present, keep original\n            pass\n\n    if status in (\"succeeded\", \"failed\"):\n        if row.get(\"started_at\") is None and dt_started is not None:\n            row[\"started_at\"] = _isoz(dt_started)\n        if dt_finished is not None:\n            row[\"finished_at\"] = _isoz(dt_finished)\n        # duration_ms must match finished-started within tolerance when terminal if provided\n        started_dt, _ = _parse_dt(row.get(\"started_at\"), \"started_at\")\n        finished_dt, _ = _parse_dt(row.get(\"finished_at\"), \"finished_at\")\n        if started_dt is None or finished_dt is None:\n            return _err(\"VALIDATION_ERROR\", \"startedAt and finishedAt must be set on terminal states\")\n        if finished_dt < started_dt:\n            return _err(\"VALIDATION_ERROR\", \"finishedAt must be >= startedAt\")\n        computed = int(round((finished_dt - started_dt).total_seconds() * 1000))\n        if durationMs is not None:\n            if abs(computed - durationMs) > 50:\n                return _err(\"VALIDATION_ERROR\", \"durationMs must match (finishedAt-startedAt) within tolerance\", computedMs=computed)\n            row[\"duration_ms\"] = durationMs\n        else:\n            row[\"duration_ms\"] = computed\n\n        if status == \"succeeded\":\n            row[\"response_payload\"] = responsePayload\n            row[\"error_code\"] = None\n            row[\"error_message\"] = None\n        else:\n            row[\"response_payload\"] = None\n            row[\"error_code\"] = errorCode\n            row[\"error_message\"] = errorMessage\n\n    row[\"updated_at\"] = _isoz(now)\n    invs[idx] = row\n    _save(\"tool_invocations.json\", invs)\n    return {\"tool_invocation\": row}\n"
+        },
+        {
+          "name": "Get Textract Job",
+          "description": "Fetches a Textract job tracker by id, including current status and (optionally) attached results when available. Refuses with NOT_FOUND if the job id does not exist or is not visible to the caller.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^mcp_txj_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "Textract job id"
+              },
+              "includeResults": {
+                "type": "boolean",
+                "default": true,
+                "description": "When true, include any associated Textract results (if present)"
+              },
+              "includeRawResponse": {
+                "type": "boolean",
+                "default": false,
+                "description": "When true, include raw Textract response payload in results (may be large)"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def Get_Textract_Job(id, includeResults=None, includeRawResponse=None, **_extra):\n    import json, os, datetime, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0260000\" if __import__(\"os\").path.isdir(\"./environment_mix/0260000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    # Be permissive with include* defaults\n    if includeResults is None:\n        includeResults = True\n    if includeRawResponse is None:\n        includeRawResponse = False\n\n    # Relax validation: accept id passed as int by returning NOT_FOUND rather than schema error is not correct;\n    # but schema says string; keep VALIDATION_ERROR for non-string.\n    if not isinstance(id, str):\n        return _err(\"VALIDATION_ERROR\", \"id must be a string\")\n    if not re.match(r\"^mcp_txj_[0-9A-HJKMNP-TV-Z]{26}$\", id):\n        return _err(\"VALIDATION_ERROR\", \"id does not match required pattern\")\n    if not isinstance(includeResults, bool):\n        return _err(\"VALIDATION_ERROR\", \"includeResults must be a boolean\")\n    if not isinstance(includeRawResponse, bool):\n        return _err(\"VALIDATION_ERROR\", \"includeRawResponse must be a boolean\")\n\n    jobs = _load(\"textract_jobs.json\")\n    if not isinstance(jobs, list):\n        jobs = []\n    job = next((r for r in jobs if isinstance(r, dict) and r.get(\"id\") == id), None)\n    if job is None:\n        return _err(\"NOT_FOUND\", \"Textract job not found\")\n\n    out_job = dict(job)\n\n    if includeResults:\n        results = _load(\"textract_results.json\")\n        if not isinstance(results, list):\n            results = []\n        assoc = [r for r in results if isinstance(r, dict) and r.get(\"textract_job_id\") == id]\n        assoc.sort(key=lambda x: x.get(\"result_version\", 0) if isinstance(x.get(\"result_version\", 0), int) else 0)\n        if not includeRawResponse:\n            trimmed = []\n            for r in assoc:\n                rr = dict(r)\n                rr.pop(\"raw_response\", None)\n                trimmed.append(rr)\n            assoc = trimmed\n        out_job[\"results\"] = assoc\n\n    return {\"textract_job\": out_job}\n"
+        },
+        {
+          "name": "Update Textract Job Status",
+          "description": "Advances a Textract job through its lifecycle (queued→uploading→processing→succeeded, or any non-terminal state→failed) and records submission/completion metadata. Allows only declared forward transitions; once succeeded/failed the job is immutable except updatedAt and attaching results. Refuses with VALIDATION_ERROR for invalid transitions or missing required fields for the new state.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^mcp_txj_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "Textract job id"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "uploading",
+                  "processing",
+                  "succeeded",
+                  "failed"
+                ],
+                "description": "New status to set; must be a valid forward transition"
+              },
+              "awsRequestId": {
+                "type": "string",
+                "description": "AWS request id for the Textract submission (when available)"
+              },
+              "submittedAt": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Timestamp when the job was submitted to AWS (set when entering processing)"
+              },
+              "completedAt": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Timestamp when the job completed (required when entering succeeded or failed)"
+              },
+              "errorMessage": {
+                "type": "string",
+                "description": "Error message; required when setting status to failed and must be null on succeeded"
+              }
+            },
+            "required": [
+              "id",
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def Update_Textract_Job_Status(id, status, awsRequestId=None, submittedAt=None, completedAt=None, errorMessage=None, **_extra):\n    import json, os, datetime, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0260000\" if __import__(\"os\").path.isdir(\"./environment_mix/0260000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    transitions = {\n        \"queued\": [\"uploading\", \"failed\"],\n        \"uploading\": [\"processing\", \"failed\"],\n        \"processing\": [\"succeeded\", \"failed\"],\n        \"succeeded\": [],\n        \"failed\": [],\n    }\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None, None\n        if not isinstance(s, str):\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be an RFC3339 date-time string\")\n        try:\n            s2 = s[:-1] + \"+00:00\" if s.endswith(\"Z\") else s\n            dt = datetime.datetime.fromisoformat(s2)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc), None\n        except Exception:\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be an RFC3339 date-time string\")\n\n    def _isoz(dt):\n        if dt is None:\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    if not isinstance(id, str):\n        return _err(\"VALIDATION_ERROR\", \"id must be a string\")\n    if not re.match(r\"^mcp_txj_[0-9A-HJKMNP-TV-Z]{26}$\", id):\n        return _err(\"VALIDATION_ERROR\", \"id does not match required pattern\")\n    if not isinstance(status, str) or status not in (\"queued\", \"uploading\", \"processing\", \"succeeded\", \"failed\"):\n        return _err(\"VALIDATION_ERROR\", \"status is not a valid enum value\")\n    if awsRequestId is not None and not isinstance(awsRequestId, str):\n        return _err(\"VALIDATION_ERROR\", \"awsRequestId must be a string\")\n    dt_sub, e = _parse_dt(submittedAt, \"submittedAt\")\n    if e: return e\n    dt_comp, e = _parse_dt(completedAt, \"completedAt\")\n    if e: return e\n    if errorMessage is not None and (not isinstance(errorMessage, str) or not errorMessage.strip()):\n        return _err(\"VALIDATION_ERROR\", \"errorMessage must be a non-empty string when provided\")\n\n    jobs = _load(\"textract_jobs.json\")\n    if not isinstance(jobs, list):\n        jobs = []\n    idx = next((i for i, r in enumerate(jobs) if isinstance(r, dict) and r.get(\"id\") == id), None)\n    if idx is None:\n        return _err(\"NOT_FOUND\", \"Textract job not found\")\n    row = jobs[idx]\n    cur = row.get(\"status\")\n    if cur not in transitions:\n        return _err(\"CONFLICT\", \"Stored job status is invalid\")\n\n    # No mutation for terminal jobs beyond updated_at (and attaching results elsewhere)\n    if cur in (\"succeeded\", \"failed\") and status != cur:\n        return _err(\"INVALID_TRANSITION\", f\"Cannot transition terminal job from {cur} to {status}\")\n\n    if status != cur and status not in transitions[cur]:\n        return _err(\"INVALID_TRANSITION\", f\"Cannot transition textract job from {cur} to {status}\")\n\n    # State-specific requirements\n    if status == \"processing\":\n        # submittedAt should be set when entering processing (accept existing or provided)\n        if row.get(\"submitted_at\") is None and dt_sub is None:\n            return _err(\"VALIDATION_ERROR\", \"submittedAt is required when entering processing\")\n    if status in (\"succeeded\", \"failed\"):\n        if dt_comp is None and row.get(\"completed_at\") is None:\n            return _err(\"VALIDATION_ERROR\", \"completedAt is required when entering succeeded or failed\")\n        if status == \"failed\":\n            if not isinstance(errorMessage, str) or not errorMessage.strip():\n                return _err(\"VALIDATION_ERROR\", \"errorMessage is required when setting status to failed\")\n        if status == \"succeeded\":\n            if errorMessage is not None:\n                return _err(\"VALIDATION_ERROR\", \"errorMessage must be null when setting status to succeeded\")\n\n    # Apply\n    now = datetime.datetime.now(datetime.timezone.utc)\n    if status != cur:\n        row[\"status\"] = status\n    if awsRequestId is not None:\n        row[\"aws_request_id\"] = awsRequestId\n    if status == \"processing\":\n        if row.get(\"submitted_at\") is None:\n            row[\"submitted_at\"] = _isoz(dt_sub)\n    if dt_sub is not None and row.get(\"submitted_at\") is None:\n        row[\"submitted_at\"] = _isoz(dt_sub)\n    if status in (\"succeeded\", \"failed\"):\n        if dt_comp is not None:\n            row[\"completed_at\"] = _isoz(dt_comp)\n        if status == \"failed\":\n            row[\"error_message\"] = errorMessage\n        else:\n            row[\"error_message\"] = None\n\n    # Validate time ordering if both set\n    if row.get(\"completed_at\") is not None:\n        sub, _ = _parse_dt(row.get(\"submitted_at\"), \"submitted_at\")\n        comp, _ = _parse_dt(row.get(\"completed_at\"), \"completed_at\")\n        if comp is None:\n            return _err(\"VALIDATION_ERROR\", \"completedAt is invalid\")\n        if sub is None:\n            return _err(\"VALIDATION_ERROR\", \"submittedAt must be set before completedAt\")\n        if comp < sub:\n            return _err(\"VALIDATION_ERROR\", \"completedAt must be >= submittedAt\")\n\n    row[\"updated_at\"] = _isoz(now)\n    jobs[idx] = row\n    _save(\"textract_jobs.json\", jobs)\n    return {\"textract_job\": row}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0260000",
+    "index": 260,
+    "name": "AI Agent with MCP",
+    "description": "This backend stores tool invocations for an MCP-based AI agent, including hello responses, user-list fetches from an external API, and document/image analysis requests sent to AWS Textract. The main workflows are: record each tool call, optionally cache external responses (users list) for reuse, and",
+    "taxonomy": {
+      "L1_id": "L1-01",
+      "L1_name": "Search & Information Retrieval",
+      "L1_name_zh": "搜索与信息获取",
+      "L2_id": "L2-03",
+      "L2_name": "API Gateway & Aggregation",
+      "L2_name_zh": "API 网关与聚合",
+      "L3_name": "MCP Tool Registry & Execution Gateway",
+      "L3_name_zh": "MCP 工具注册与执行网关"
+    },
+    "database_dir": "./environment_mix/0260000",
+    "mount_path": "/app/database",
+    "n_tools": 8,
+    "n_collections": 4,
+    "n_records": 72,
+    "n_questions": 2,
+    "execution_audit": {
+      "tools": 8,
+      "loaded": 8,
+      "reads_returning_data": 1,
+      "read_operations": 3,
+      "mutations_persisted": 3,
+      "mutations_attempted": 5
+    },
+    "tools_loadable_from_database_dir": 8,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "List Tool Invocations",
+      "returned_chars": 71
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

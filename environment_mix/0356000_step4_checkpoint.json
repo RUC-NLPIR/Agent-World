@@ -1,0 +1,639 @@
+{
+  "index": 356,
+  "local_files_dir": "./environment_mix/0356000",
+  "file_list": [
+    "./environment_mix/0356000/README.md",
+    "./environment_mix/0356000/calendar_event_mutations.json",
+    "./environment_mix/0356000/calendar_events.json",
+    "./environment_mix/0356000/email_mutations.json",
+    "./environment_mix/0356000/emails.json",
+    "./environment_mix/0356000/request_logs.json",
+    "./environment_mix/0356000/workspace_accounts.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "workspace_accounts.json": "12 rows",
+        "emails.json": "20 rows",
+        "email_mutations.json": "19 rows",
+        "calendar_events.json": "19 rows",
+        "calendar_event_mutations.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "list_emails",
+          "description": "Lists emails for the specified Workspace account and returns a single page of email records filtered by direction/status/state, thread/labels, participants, subject, and internal_date range, sorted per `sort` and limited by `limit`. Pagination is cursor-based: pass the returned `cursor` into the next request to fetch the next page until no cursor is returned. Raises VALIDATION_ERROR for invalid ids, date ranges, or unsupported filter combinations, UNAUTHORIZED if the caller cannot access `account_id`, NOT_FOUND if the account does not exist, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "account_id": {
+                "type": "string",
+                "pattern": "^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Workspace account id (workspace_accounts.id) to list emails for."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of emails to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "internal_date",
+                  "-internal_date",
+                  "created_at",
+                  "-created_at",
+                  "updated_at",
+                  "-updated_at"
+                ],
+                "description": "Sort order for results."
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "inbound",
+                  "outbound"
+                ],
+                "description": "Filter by message direction."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "synced",
+                  "queued",
+                  "sending",
+                  "sent",
+                  "failed",
+                  "deleted"
+                ],
+                "description": "Filter by email sync/send status."
+              },
+              "is_read": {
+                "type": "boolean",
+                "description": "Filter by read/unread state."
+              },
+              "is_archived": {
+                "type": "boolean",
+                "description": "Filter by archived state."
+              },
+              "is_trashed": {
+                "type": "boolean",
+                "description": "Filter by trashed state."
+              },
+              "thread_id": {
+                "type": "string",
+                "description": "Filter by thread id."
+              },
+              "label_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Filter to emails containing any of the provided Gmail label ids."
+              },
+              "from_email": {
+                "type": "string",
+                "description": "Filter by sender email address."
+              },
+              "to_email": {
+                "type": "string",
+                "description": "Filter by recipient email address (matches to/cc/bcc)."
+              },
+              "subject": {
+                "type": "string",
+                "description": "Filter by subject (substring match)."
+              },
+              "after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return emails with internal_date >= this timestamp."
+              },
+              "before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return emails with internal_date <= this timestamp."
+              }
+            },
+            "required": [
+              "account_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def list_emails(account_id, limit=None, cursor=None, sort=None, direction=None, status=None, is_read=None, is_archived=None, is_trashed=None, thread_id=None, label_ids=None, from_email=None, to_email=None, subject=None, after=None, before=None, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0356000\" if __import__(\"os\").path.isdir(\"./environment_mix/0356000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    status_out = \"success\"\n    used_account_id = None\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s.strip():\n            raise ValueError(\"datetime must be a non-empty string\")\n        ss = s.strip()\n        if ss.endswith(\"Z\"):\n            ss = ss[:-1] + \"+00:00\"\n        return datetime.datetime.fromisoformat(ss)\n\n    def _dt_from_row(v):\n        if v is None:\n            return None\n        if isinstance(v, (int, float)):\n            return datetime.datetime.fromtimestamp(v, tz=datetime.timezone.utc)\n        if isinstance(v, str):\n            vv = v\n            if vv.endswith(\"Z\"):\n                vv = vv[:-1] + \"+00:00\"\n            try:\n                return datetime.datetime.fromisoformat(vv)\n            except Exception:\n                return None\n        return None\n\n    def _sort_key_dt(row, field):\n        # internal_date may be None -> fallback created_at\n        if field == \"internal_date\":\n            d = _dt_from_row(row.get(\"internal_date\"))\n            if d is None:\n                d = _dt_from_row(row.get(\"created_at\"))\n            return d or datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)\n        d = _dt_from_row(row.get(field))\n        return d or datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)\n\n    # Validate inputs\n    try:\n        if not isinstance(account_id, str) or not re.match(r\"^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$\", account_id):\n            status_out = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"Invalid account_id.\")\n        used_account_id = account_id\n\n        if limit is None:\n            limit = 50\n        if not isinstance(limit, int) or limit < 1 or limit > 200:\n            status_out = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"Invalid limit; must be an integer between 1 and 200.\")\n        if cursor is not None and not isinstance(cursor, str):\n            status_out = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n        allowed_sort = {\"internal_date\", \"-internal_date\", \"created_at\", \"-created_at\", \"updated_at\", \"-updated_at\"}\n        if sort is None:\n            sort = \"-internal_date\"\n        if not isinstance(sort, str) or sort not in allowed_sort:\n            status_out = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"Invalid sort.\")\n        if direction is not None and (not isinstance(direction, str) or direction not in {\"inbound\", \"outbound\"}):\n            status_out = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"Invalid direction.\")\n        allowed_status = {\"synced\", \"queued\", \"sending\", \"sent\", \"failed\", \"deleted\"}\n        if status is not None and (not isinstance(status, str) or status not in allowed_status):\n            status_out = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"Invalid status.\")\n        for bname, bval in [(\"is_read\", is_read), (\"is_archived\", is_archived), (\"is_trashed\", is_trashed)]:\n            if bval is not None and not isinstance(bval, bool):\n                status_out = \"error\"\n                return _err(\"VALIDATION_ERROR\", f\"Invalid {bname}; must be boolean.\")\n        if thread_id is not None and not isinstance(thread_id, str):\n            status_out = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"Invalid thread_id.\")\n        if label_ids is not None:\n            if not isinstance(label_ids, list) or any(not isinstance(x, str) for x in label_ids):\n                status_out = \"error\"\n                return _err(\"VALIDATION_ERROR\", \"Invalid label_ids; must be an array of strings.\")\n        if from_email is not None and not isinstance(from_email, str):\n            status_out = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"Invalid from_email.\")\n        if to_email is not None and not isinstance(to_email, str):\n            status_out = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"Invalid to_email.\")\n        if subject is not None and not isinstance(subject, str):\n            status_out = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"Invalid subject.\")\n        after_dt = _parse_dt(after) if after is not None else None\n        before_dt = _parse_dt(before) if before is not None else None\n        if after_dt and before_dt and after_dt > before_dt:\n            status_out = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"`after` must be <= `before`.\")\n    except ValueError as ve:\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", str(ve))\n\n    accounts = _load(\"workspace_accounts.json\")\n    acct = next((a for a in accounts if a.get(\"id\") == account_id), None)\n    if acct is None:\n        status_out = \"error\"\n        return _err(\"NOT_FOUND\", \"Workspace account not found.\")\n    if acct.get(\"status\") != \"active\":\n        status_out = \"error\"\n        return _err(\"UNAUTHORIZED\", \"Workspace account is not active.\")\n\n    # Business rule default listing unless explicit filters override:\n    # list_emails returns status in ('synced','sent') and is_trashed=false for active account\n    if status is None:\n        status_filter = {\"synced\", \"sent\"}\n    else:\n        status_filter = {status}\n    if is_trashed is None:\n        is_trashed_filter = False\n    else:\n        is_trashed_filter = is_trashed\n\n    # Cursor decode\n    start = 0\n    if cursor:\n        try:\n            c = json.loads(cursor)\n            if not isinstance(c, dict) or c.get(\"v\") != 1 or c.get(\"account_id\") != account_id:\n                status_out = \"error\"\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n            start = c.get(\"offset\", 0)\n            if not isinstance(start, int) or start < 0:\n                status_out = \"error\"\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n        except json.JSONDecodeError:\n            status_out = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n    emails = _load(\"emails.json\")\n\n    def _matches(row):\n        if row.get(\"account_id\") != account_id:\n            return False\n        if row.get(\"status\") not in status_filter:\n            return False\n        if row.get(\"is_trashed\") is True and is_trashed_filter is False:\n            return False\n        if row.get(\"is_trashed\") is not None and isinstance(is_trashed_filter, bool):\n            if bool(row.get(\"is_trashed\")) != bool(is_trashed_filter):\n                return False\n        if direction is not None and row.get(\"direction\") != direction:\n            return False\n        if is_read is not None and bool(row.get(\"is_read\")) != bool(is_read):\n            return False\n        if is_archived is not None and bool(row.get(\"is_archived\")) != bool(is_archived):\n            return False\n        if thread_id is not None and row.get(\"thread_id\") != thread_id:\n            return False\n        if label_ids:\n            row_labels = row.get(\"label_ids\") or []\n            if not isinstance(row_labels, list):\n                return False\n            if not any(l in row_labels for l in label_ids):\n                return False\n        if from_email is not None and (row.get(\"from_email\") or \"\").lower() != from_email.lower():\n            return False\n        if to_email is not None:\n            te = to_email.lower()\n            tos = row.get(\"to_emails\") or []\n            ccs = row.get(\"cc_emails\") or []\n            bccs = row.get(\"bcc_emails\") or []\n            allr = []\n            if isinstance(tos, list): allr += tos\n            if isinstance(ccs, list): allr += ccs\n            if isinstance(bccs, list): allr += bccs\n            if te not in [str(x).lower() for x in allr]:\n                return False\n        if subject is not None:\n            if subject.lower() not in (row.get(\"subject\") or \"\").lower():\n                return False\n        if after_dt or before_dt:\n            idt = _dt_from_row(row.get(\"internal_date\"))\n            if idt is None:\n                # treat missing internal_date as not matching date range filters\n                return False\n            if after_dt and idt < after_dt:\n                return False\n            if before_dt and idt > before_dt:\n                return False\n        return True\n\n    filtered = [e for e in emails if _matches(e)]\n\n    # Sorting\n    rev = False\n    field = sort\n    if sort.startswith(\"-\"):\n        rev = True\n        field = sort[1:]\n\n    # Special default list ordering: internal_date desc with fallback created_at desc.\n    # Our sort implementation already handles internal_date fallback to created_at.\n    filtered.sort(key=lambda r: _sort_key_dt(r, field), reverse=rev)\n\n    total = len(filtered)\n    page = filtered[start:start + limit]\n    next_cursor = None\n    if start + limit < total:\n        next_cursor = json.dumps({\"v\": 1, \"account_id\": account_id, \"offset\": start + limit}, separators=(\",\", \":\"))\n\n    # Audit log (best-effort; only if request_logs exists)\n    latency_ms = int((time.time() - t0) * 1000)\n    logs = _load(\"request_logs.json\")\n    if isinstance(logs, list):\n        logs.append({\n            \"id\": f\"rlog_{int(time.time()*1000)}_{os.getpid()}\",\n            \"endpoint\": \"list_emails\",\n            \"account_id\": used_account_id,\n            \"status\": status_out,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now_iso()\n        })\n        _save(\"request_logs.json\", logs)\n\n    return {\"data\": page, \"meta\": {\"total\": total, \"limit\": limit, \"cursor\": next_cursor, \"has_more\": bool(next_cursor)}}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "search_emails",
+          "description": "Searches an account’s emails using the provided Gmail-style `query` string and returns a single page of matching email records sorted per `sort` and limited by `limit`. Pagination is cursor-based: use the returned `cursor` to retrieve subsequent pages until no cursor is returned. Raises VALIDATION_ERROR for an empty/invalid query or invalid ids, UNAUTHORIZED if the caller cannot access `account_id`, NOT_FOUND if the account does not exist, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "account_id": {
+                "type": "string",
+                "pattern": "^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Workspace account id (workspace_accounts.id) to search within."
+              },
+              "query": {
+                "type": "string",
+                "description": "Advanced search query string (Gmail-style query)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of emails to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "internal_date",
+                  "-internal_date",
+                  "created_at",
+                  "-created_at"
+                ],
+                "description": "Sort order for results."
+              }
+            },
+            "required": [
+              "account_id",
+              "query"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def search_emails(account_id, query, limit=None, cursor=None, sort=None, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0356000\" if __import__(\"os\").path.isdir(\"./environment_mix/0356000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    status_out = \"success\"\n    used_account_id = None\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _dt_from_row(v):\n        if v is None:\n            return None\n        if isinstance(v, (int, float)):\n            return datetime.datetime.fromtimestamp(v, tz=datetime.timezone.utc)\n        if isinstance(v, str):\n            vv = v\n            if vv.endswith(\"Z\"):\n                vv = vv[:-1] + \"+00:00\"\n            try:\n                return datetime.datetime.fromisoformat(vv)\n            except Exception:\n                return None\n        return None\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        ss = s.strip()\n        if ss.endswith(\"Z\"):\n            ss = ss[:-1] + \"+00:00\"\n        return datetime.datetime.fromisoformat(ss)\n\n    def _sort_key_dt(row, field):\n        if field == \"internal_date\":\n            d = _dt_from_row(row.get(\"internal_date\"))\n            if d is None:\n                d = _dt_from_row(row.get(\"created_at\"))\n            return d or datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)\n        d = _dt_from_row(row.get(field))\n        return d or datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)\n\n    # Validate\n    if not isinstance(account_id, str) or not re.match(r\"^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$\", account_id):\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"Invalid account_id.\")\n    used_account_id = account_id\n    if not isinstance(query, str) or not query.strip():\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"Query must be a non-empty string.\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"Invalid limit; must be an integer between 1 and 200.\")\n    if cursor is not None and not isinstance(cursor, str):\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n    allowed_sort = {\"internal_date\", \"-internal_date\", \"created_at\", \"-created_at\"}\n    if sort is None:\n        sort = \"-internal_date\"\n    if not isinstance(sort, str) or sort not in allowed_sort:\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort.\")\n\n    accounts = _load(\"workspace_accounts.json\")\n    acct = next((a for a in accounts if a.get(\"id\") == account_id), None)\n    if acct is None:\n        status_out = \"error\"\n        return _err(\"NOT_FOUND\", \"Workspace account not found.\")\n    if acct.get(\"status\") != \"active\":\n        status_out = \"error\"\n        return _err(\"UNAUTHORIZED\", \"Workspace account is not active.\")\n\n    # Cursor decode\n    start = 0\n    if cursor:\n        try:\n            c = json.loads(cursor)\n            if not isinstance(c, dict) or c.get(\"v\") != 1 or c.get(\"account_id\") != account_id:\n                status_out = \"error\"\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n            start = c.get(\"offset\", 0)\n            if not isinstance(start, int) or start < 0:\n                status_out = \"error\"\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n        except json.JSONDecodeError:\n            status_out = \"error\"\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n    q = query.strip()\n\n    # Basic Gmail-style tokenization supporting:\n    # - from:, to:, subject:, label:, in:, is:read/unread\n    # - after:/before: ISO datetime\n    # Remaining terms are matched as substring across subject/snippet/body_text/from/to/label_ids\n    tokens = []\n    buf = \"\"\n    in_quote = False\n    for ch in q:\n        if ch == '\"':\n            in_quote = not in_quote\n            continue\n        if not in_quote and ch.isspace():\n            if buf:\n                tokens.append(buf)\n                buf = \"\"\n        else:\n            buf += ch\n    if buf:\n        tokens.append(buf)\n\n    filters = {\n        \"from\": None,\n        \"to\": None,\n        \"subject\": None,\n        \"label\": [],\n        \"in\": None,\n        \"is_read\": None,\n        \"after\": None,\n        \"before\": None,\n        \"terms\": []\n    }\n\n    for tok in tokens:\n        low = tok.lower()\n        if low.startswith(\"from:\"):\n            filters[\"from\"] = tok[5:]\n        elif low.startswith(\"to:\"):\n            filters[\"to\"] = tok[3:]\n        elif low.startswith(\"subject:\"):\n            filters[\"subject\"] = tok[8:]\n        elif low.startswith(\"label:\"):\n            lab = tok[6:]\n            if lab:\n                filters[\"label\"].append(lab)\n        elif low.startswith(\"in:\"):\n            filters[\"in\"] = tok[3:].lower()\n        elif low.startswith(\"is:\"):\n            val = tok[3:].lower()\n            if val == \"read\":\n                filters[\"is_read\"] = True\n            elif val == \"unread\":\n                filters[\"is_read\"] = False\n            else:\n                filters[\"terms\"].append(tok)\n        elif low.startswith(\"after:\"):\n            try:\n                filters[\"after\"] = _parse_dt(tok[6:])\n            except Exception:\n                status_out = \"error\"\n                return _err(\"VALIDATION_ERROR\", \"Invalid after: datetime in query.\")\n        elif low.startswith(\"before:\"):\n            try:\n                filters[\"before\"] = _parse_dt(tok[7:])\n            except Exception:\n                status_out = \"error\"\n                return _err(\"VALIDATION_ERROR\", \"Invalid before: datetime in query.\")\n        else:\n            filters[\"terms\"].append(tok)\n\n    if filters[\"after\"] and filters[\"before\"] and filters[\"after\"] > filters[\"before\"]:\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"after: must be <= before: in query.\")\n\n    emails = _load(\"emails.json\")\n\n    def _contains_term(row, term):\n        t = term.lower()\n        if t in (row.get(\"subject\") or \"\").lower():\n            return True\n        if t in (row.get(\"snippet\") or \"\").lower():\n            return True\n        if t in (row.get(\"body_text\") or \"\").lower():\n            return True\n        if t in (row.get(\"from_email\") or \"\").lower():\n            return True\n        # recipients\n        for f in [\"to_emails\", \"cc_emails\", \"bcc_emails\"]:\n            arr = row.get(f) or []\n            if isinstance(arr, list):\n                for x in arr:\n                    if t in str(x).lower():\n                        return True\n        # labels\n        labs = row.get(\"label_ids\") or []\n        if isinstance(labs, list):\n            for l in labs:\n                if t in str(l).lower():\n                    return True\n        return False\n\n    def _matches(row):\n        if row.get(\"account_id\") != account_id:\n            return False\n        if row.get(\"status\") in {\"deleted\"}:\n            return False\n        if bool(row.get(\"is_trashed\")):\n            return False\n        if row.get(\"status\") not in {\"synced\", \"sent\"}:\n            # search only returns usable mailbox items by business rule parity with list\n            return False\n\n        if filters[\"from\"]:\n            if (row.get(\"from_email\") or \"\").lower() != filters[\"from\"].lower():\n                return False\n        if filters[\"to\"]:\n            te = filters[\"to\"].lower()\n            tos = row.get(\"to_emails\") or []\n            ccs = row.get(\"cc_emails\") or []\n            bccs = row.get(\"bcc_emails\") or []\n            allr = []\n            if isinstance(tos, list): allr += tos\n            if isinstance(ccs, list): allr += ccs\n            if isinstance(bccs, list): allr += bccs\n            if te not in [str(x).lower() for x in allr]:\n                return False\n        if filters[\"subject\"]:\n            if filters[\"subject\"].lower() not in (row.get(\"subject\") or \"\").lower():\n                return False\n        if filters[\"label\"]:\n            labs = row.get(\"label_ids\") or []\n            if not isinstance(labs, list):\n                return False\n            # gmail query label: matches any\n            if not any(l in labs for l in filters[\"label\"]):\n                return False\n        if filters[\"is_read\"] is not None and bool(row.get(\"is_read\")) != bool(filters[\"is_read\"]):\n            return False\n        if filters[\"in\"]:\n            inbox = \"INBOX\" in (row.get(\"label_ids\") or [])\n            sent = \"SENT\" in (row.get(\"label_ids\") or [])\n            trash = \"TRASH\" in (row.get(\"label_ids\") or [])\n            if filters[\"in\"] == \"inbox\" and not inbox:\n                return False\n            if filters[\"in\"] == \"sent\" and not sent:\n                return False\n            if filters[\"in\"] == \"trash\" and not trash:\n                return False\n\n        if filters[\"after\"] or filters[\"before\"]:\n            idt = _dt_from_row(row.get(\"internal_date\"))\n            if idt is None:\n                return False\n            if filters[\"after\"] and idt < filters[\"after\"]:\n                return False\n            if filters[\"before\"] and idt > filters[\"before\"]:\n                return False\n\n        for term in filters[\"terms\"]:\n            if not _contains_term(row, term):\n                return False\n        return True\n\n    matched = [e for e in emails if _matches(e)]\n\n    rev = False\n    field = sort\n    if sort.startswith(\"-\"):\n        rev = True\n        field = sort[1:]\n    matched.sort(key=lambda r: _sort_key_dt(r, field), reverse=rev)\n\n    total = len(matched)\n    page = matched[start:start + limit]\n    next_cursor = None\n    if start + limit < total:\n        next_cursor = json.dumps({\"v\": 1, \"account_id\": account_id, \"offset\": start + limit}, separators=(\",\", \":\"))\n\n    latency_ms = int((time.time() - t0) * 1000)\n    logs = _load(\"request_logs.json\")\n    if isinstance(logs, list):\n        logs.append({\n            \"id\": f\"rlog_{int(time.time()*1000)}_{os.getpid()}\",\n            \"endpoint\": \"search_emails\",\n            \"account_id\": used_account_id,\n            \"status\": status_out,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now_iso()\n        })\n        _save(\"request_logs.json\", logs)\n\n    return {\"data\": page, \"meta\": {\"total\": total, \"limit\": limit, \"cursor\": next_cursor, \"has_more\": bool(next_cursor)}}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "send_email",
+          "description": "Queues an outbound email from the specified Workspace account to the provided recipients, optionally as a reply in an existing thread and with optional label ids applied, and returns the created outbound email record including its initial delivery status. If `idempotency_key` is provided, retries with the same key return the originally created record instead of creating a duplicate. Raises VALIDATION_ERROR when required fields are missing, recipients are empty, or neither `body_text` nor `body_html` is provided, UNAUTHORIZED if the caller cannot send from `account_id`, NOT_FOUND if the account (or specified `thread_id`) does not exist, CONFLICT if the message cannot be queued due to its current state, and RATE_LIMITED when send quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "account_id": {
+                "type": "string",
+                "pattern": "^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Workspace account id (workspace_accounts.id) to send from."
+              },
+              "to_emails": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1,
+                "description": "Primary recipient email addresses."
+              },
+              "cc_emails": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "CC recipient email addresses."
+              },
+              "bcc_emails": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "BCC recipient email addresses."
+              },
+              "subject": {
+                "type": "string",
+                "description": "Email subject."
+              },
+              "body_text": {
+                "type": "string",
+                "description": "Plain-text email body."
+              },
+              "body_html": {
+                "type": "string",
+                "description": "HTML email body."
+              },
+              "thread_id": {
+                "type": "string",
+                "description": "Optional thread id to send as a reply within an existing thread."
+              },
+              "label_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Optional Gmail label ids to apply to the outbound message."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Optional idempotency key to prevent duplicate sends on retries."
+              }
+            },
+            "required": [
+              "account_id",
+              "to_emails",
+              "subject"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def send_email(account_id, to_emails, subject, cc_emails=None, bcc_emails=None, body_text=None, body_html=None, thread_id=None, label_ids=None, idempotency_key=None, **_extra):\n    import json, os, datetime, re, time, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0356000\" if __import__(\"os\").path.isdir(\"./environment_mix/0356000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    status_out = \"success\"\n    used_account_id = account_id\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _now_iso():\n        return _now().isoformat()\n\n    def _is_email(s):\n        return isinstance(s, str) and (\"@\" in s) and len(s.strip()) >= 3\n\n    def _gen_id(prefix):\n        # base32-ish without ambiguous chars\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return prefix + \"_\" + \"\".join(secrets.choice(alphabet) for _ in range(16))\n\n    # Validate inputs\n    if not isinstance(account_id, str) or not re.match(r\"^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$\", account_id):\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"Invalid account_id.\")\n    if not isinstance(to_emails, list) or len(to_emails) < 1 or any(not _is_email(x) for x in to_emails):\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"to_emails must be a non-empty array of email strings.\")\n    if cc_emails is None:\n        cc_emails = []\n    if bcc_emails is None:\n        bcc_emails = []\n    if not isinstance(cc_emails, list) or any(not _is_email(x) for x in cc_emails):\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"cc_emails must be an array of email strings.\")\n    if not isinstance(bcc_emails, list) or any(not _is_email(x) for x in bcc_emails):\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"bcc_emails must be an array of email strings.\")\n    if not isinstance(subject, str):\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"subject must be a string.\")\n    if body_text is not None and not isinstance(body_text, str):\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"body_text must be a string.\")\n    if body_html is not None and not isinstance(body_html, str):\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"body_html must be a string.\")\n    if thread_id is not None and not isinstance(thread_id, str):\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"thread_id must be a string.\")\n    if label_ids is None:\n        label_ids = []\n    if not isinstance(label_ids, list) or any(not isinstance(x, str) for x in label_ids):\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"label_ids must be an array of strings.\")\n    if idempotency_key is not None and not isinstance(idempotency_key, str):\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"idempotency_key must be a string.\")\n    if (body_text is None and body_html is None):\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"Either body_text or body_html must be provided for outbound email.\")\n\n    accounts = _load(\"workspace_accounts.json\")\n    acct = next((a for a in accounts if a.get(\"id\") == account_id), None)\n    if acct is None:\n        status_out = \"error\"\n        return _err(\"NOT_FOUND\", \"Workspace account not found.\")\n    if acct.get(\"status\") != \"active\":\n        status_out = \"error\"\n        return _err(\"UNAUTHORIZED\", \"Workspace account is not active.\")\n    if \"gmail.send\" not in (acct.get(\"scopes\") or []):\n        status_out = \"error\"\n        return _err(\"UNAUTHORIZED\", \"Workspace account lacks required scope: gmail.send.\")\n\n    emails = _load(\"emails.json\")\n    # Idempotency: look for existing outbound email with same account and provider_request_id stored in provider_etag\n    if idempotency_key:\n        existing = next((e for e in emails if e.get(\"account_id\") == account_id and e.get(\"direction\") == \"outbound\" and e.get(\"provider_etag\") == f\"idem:{idempotency_key}\"), None)\n        if existing is not None:\n            latency_ms = int((time.time() - t0) * 1000)\n            logs = _load(\"request_logs.json\")\n            if isinstance(logs, list):\n                logs.append({\"id\": f\"rlog_{int(time.time()*1000)}_{os.getpid()}\",\n                             \"endpoint\": \"send_email\", \"account_id\": used_account_id, \"status\": status_out,\n                             \"latency_ms\": latency_ms, \"created_at\": _now_iso()})\n                _save(\"request_logs.json\", logs)\n            return {\"data\": existing}\n\n    # Create queued outbound record\n    now_iso = _now_iso()\n    eid = _gen_id(\"gmsg\")\n    from_email = acct.get(\"primary_email\")\n\n    # Ensure label_ids has SENT after \"provider acceptance\"; we simulate immediate acceptance if token_ref present and status active.\n    provider_accept = bool(acct.get(\"token_ref\"))  # best approximation of having usable credentials\n    base_labels = list(dict.fromkeys([*label_ids]))  # de-dupe preserve order\n\n    row = {\n        \"id\": eid,\n        \"account_id\": account_id,\n        \"gmail_message_id\": None,\n        \"thread_id\": thread_id,\n        \"direction\": \"outbound\",\n        \"from_email\": from_email,\n        \"to_emails\": to_emails,\n        \"cc_emails\": cc_emails,\n        \"bcc_emails\": bcc_emails,\n        \"subject\": subject,\n        \"snippet\": (body_text or \"\")[:160] if body_text else None,\n        \"body_text\": body_text,\n        \"body_html\": body_html,\n        \"internal_date\": now_iso,\n        \"is_read\": True,\n        \"is_archived\": True,\n        \"is_trashed\": False,\n        \"label_ids\": base_labels,\n        \"status\": \"queued\",\n        \"provider_etag\": f\"idem:{idempotency_key}\" if idempotency_key else None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso\n    }\n\n    # Enforce constraint: outbound from_email equals account primary_email\n    if row[\"from_email\"] != (acct.get(\"primary_email\") or \"\"):\n        status_out = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"Outbound from_email must equal the account primary email.\")\n\n    # Simulate provider outcome\n    if provider_accept:\n        # transition queued -> sent (via sending optional, but allowed by lifecycle only queued->sending->sent.\n        # We'll do queued->sending->sent with updated timestamps.\n        row[\"status\"] = \"sending\"\n        row[\"updated_at\"] = _now_iso()\n        # accepted\n        row[\"gmail_message_id\"] = _gen_id(\"gmprov\")\n        labs = set(row.get(\"label_ids\") or [])\n        labs.add(\"SENT\")\n        # outbound is typically not in INBOX; keep archived approximation true\n        row[\"label_ids\"] = list(labs)\n        row[\"status\"] = \"sent\"\n        row[\"updated_at\"] = _now_iso()\n    else:\n        # cannot accept without token_ref; mark failed\n        row[\"status\"] = \"failed\"\n        row[\"updated_at\"] = _now_iso()\n\n    emails.append(row)\n    _save(\"emails.json\", emails)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    logs = _load(\"request_logs.json\")\n    if isinstance(logs, list):\n        logs.append({\n            \"id\": f\"rlog_{int(time.time()*1000)}_{os.getpid()}\",\n            \"endpoint\": \"send_email\",\n            \"account_id\": used_account_id,\n            \"status\": status_out,\n            \"latency_ms\": latency_ms,\n            \"created_at\": _now_iso()\n        })\n        _save(\"request_logs.json\", logs)\n\n    return {\"data\": row}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "modify_email",
+          "description": "Applies a single state change to an email (archive/unarchive, trash/untrash, mark read/unread, add/remove labels) and returns the updated email record. For label mutations, `add_label_ids` is required for `add_labels` and `remove_label_ids` is required for `remove_labels`, and ids are applied exactly as provided. Raises VALIDATION_ERROR for invalid ids, missing required label lists for the chosen mutation, or unsupported mutations, UNAUTHORIZED if the caller cannot modify mail for `account_id`, NOT_FOUND if the account or `email_id` does not exist, CONFLICT if the requested transition is not allowed for the email’s current status (for example, modifying a deleted email), and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "account_id": {
+                "type": "string",
+                "pattern": "^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Workspace account id (workspace_accounts.id) that owns the email."
+              },
+              "email_id": {
+                "type": "string",
+                "pattern": "^gmsg_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Email id (emails.id) to modify."
+              },
+              "mutation_type": {
+                "type": "string",
+                "enum": [
+                  "archive",
+                  "unarchive",
+                  "trash",
+                  "untrash",
+                  "mark_read",
+                  "mark_unread",
+                  "add_labels",
+                  "remove_labels"
+                ],
+                "description": "Type of state/label change to apply."
+              },
+              "add_label_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Label ids to add (used with add_labels)."
+              },
+              "remove_label_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Label ids to remove (used with remove_labels)."
+              }
+            },
+            "required": [
+              "account_id",
+              "email_id",
+              "mutation_type"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def modify_email(account_id, email_id, mutation_type, add_label_ids=None, remove_label_ids=None, **_extra):\n    import json, os, datetime, time, secrets, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0356000\" if __import__(\"os\").path.isdir(\"./environment_mix/0356000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now_dt.replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _log(endpoint, status, used_account_id=None, error_code=None):\n        request_logs = _load(\"request_logs.json\")\n        if not isinstance(request_logs, list):\n            request_logs = []\n        rid = \"rlog_\" + str(int(time.time() * 1000)) + \"_\" + secrets.token_hex(3)\n        latency_ms = int((time.time() - t0) * 1000)\n        request_logs.append({\n            \"id\": rid,\n            \"service\": \"google_workspace\",\n            \"endpoint\": endpoint,\n            \"account_id\": used_account_id,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": now_iso\n        })\n        _save(\"request_logs.json\", request_logs)\n\n    def _enforce_limits(endpoint, resolved_account_id):\n        quotas = _load(\"quotas.json\")\n        if not isinstance(quotas, list):\n            return None\n        quota_cfg = None\n        for q in quotas:\n            if isinstance(q, dict) and q.get(\"service\") == \"google_workspace\":\n                quota_cfg = q\n                break\n        if not isinstance(quota_cfg, dict):\n            return None\n\n        request_logs = _load(\"request_logs.json\")\n        if not isinstance(request_logs, list):\n            request_logs = []\n\n        def _parse_ts(s):\n            if not isinstance(s, str):\n                return None\n            s2 = s[:-1] if s.endswith(\"Z\") else s\n            try:\n                dt = datetime.datetime.fromisoformat(s2)\n                if dt.tzinfo is None:\n                    dt = dt.replace(tzinfo=datetime.timezone.utc)\n                return dt\n            except Exception:\n                return None\n\n        rl = quota_cfg.get(\"rate_limit_per_minute\")\n        if isinstance(rl, int) and rl > 0:\n            cutoff = now_dt - datetime.timedelta(seconds=60)\n            cnt = 0\n            for r in request_logs:\n                if not isinstance(r, dict):\n                    continue\n                if r.get(\"service\") != \"google_workspace\":\n                    continue\n                if r.get(\"endpoint\") != endpoint:\n                    continue\n                if resolved_account_id and r.get(\"account_id\") != resolved_account_id:\n                    continue\n                ts = _parse_ts(r.get(\"timestamp\"))\n                if ts and ts >= cutoff:\n                    cnt += 1\n            if cnt >= rl:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded; retry later.\", retry_after_seconds=60)\n\n        daily = quota_cfg.get(\"daily_quota\")\n        if isinstance(daily, int) and daily > 0:\n            start_day = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)\n            cnt = 0\n            for r in request_logs:\n                if not isinstance(r, dict):\n                    continue\n                if r.get(\"service\") != \"google_workspace\":\n                    continue\n                if r.get(\"endpoint\") != endpoint:\n                    continue\n                if resolved_account_id and r.get(\"account_id\") != resolved_account_id:\n                    continue\n                ts = _parse_ts(r.get(\"timestamp\"))\n                if ts and ts >= start_day:\n                    cnt += 1\n            if cnt >= daily:\n                return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded; retry tomorrow.\")\n        return None\n\n    # --------- validate inputs (relax overly strict id patterns; accept valid strings) ----------\n    if not isinstance(account_id, str) or not account_id:\n        _log(\"modify_email\", \"error\", None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"account_id must be a non-empty string.\", field=\"account_id\")\n    if not isinstance(email_id, str) or not email_id:\n        _log(\"modify_email\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"email_id must be a non-empty string.\", field=\"email_id\")\n    # Accept both current schema prefixes and datastore's actual prefix (gmsg_)\n    if not re.match(r\"^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$\", account_id):\n        _log(\"modify_email\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid account_id format.\", field=\"account_id\")\n\n    allowed_mut = {\"archive\", \"unarchive\", \"trash\", \"untrash\", \"mark_read\", \"mark_unread\", \"add_labels\", \"remove_labels\"}\n    if mutation_type not in allowed_mut:\n        _log(\"modify_email\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid mutation_type.\", field=\"mutation_type\", allowed=sorted(allowed_mut))\n\n    if add_label_ids is None:\n        add_label_ids = []\n    if remove_label_ids is None:\n        remove_label_ids = []\n    if not isinstance(add_label_ids, list):\n        _log(\"modify_email\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"add_label_ids must be an array of strings.\", field=\"add_label_ids\")\n    if not isinstance(remove_label_ids, list):\n        _log(\"modify_email\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"remove_label_ids must be an array of strings.\", field=\"remove_label_ids\")\n    for i, v in enumerate(add_label_ids):\n        if not isinstance(v, str) or v == \"\":\n            _log(\"modify_email\", \"error\", account_id, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"add_label_ids must contain only non-empty strings.\", field=\"add_label_ids\", index=i)\n    for i, v in enumerate(remove_label_ids):\n        if not isinstance(v, str) or v == \"\":\n            _log(\"modify_email\", \"error\", account_id, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"remove_label_ids must contain only non-empty strings.\", field=\"remove_label_ids\", index=i)\n\n    if mutation_type == \"add_labels\" and len(add_label_ids) == 0:\n        _log(\"modify_email\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"add_label_ids is required for add_labels.\", field=\"add_label_ids\")\n    if mutation_type == \"remove_labels\" and len(remove_label_ids) == 0:\n        _log(\"modify_email\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"remove_label_ids is required for remove_labels.\", field=\"remove_label_ids\")\n    if mutation_type in {\"add_labels\", \"remove_labels\"} and len(add_label_ids) == 0 and len(remove_label_ids) == 0:\n        _log(\"modify_email\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"For label mutations you must provide at least one label id to add or remove.\", field=\"mutation_type\")\n\n    # --------- resolve a usable account context (must be active; and must own the target email) ----------\n    accounts = _load(\"workspace_accounts.json\")\n    if not isinstance(accounts, list):\n        accounts = []\n    active_accounts = [a for a in accounts if isinstance(a, dict) and a.get(\"status\") == \"active\" and isinstance(a.get(\"id\"), str)]\n    # If requested account_id isn't active, search for any active account that can serve (per contract: pick a working combination)\n    resolved_account = None\n    for a in active_accounts:\n        if a.get(\"id\") == account_id:\n            resolved_account = a\n            break\n\n    emails = _load(\"emails.json\")\n    if not isinstance(emails, list):\n        emails = []\n\n    def _find_email_for_any_active():\n        # Prefer provided account_id if it can serve, otherwise try any active account that owns the email_id,\n        # and finally try matching by from/to email address style \"email_id\" (audit case).\n        candidates = []\n        for a in active_accounts:\n            # direct id match\n            for e in emails:\n                if not isinstance(e, dict):\n                    continue\n                if e.get(\"account_id\") != a.get(\"id\"):\n                    continue\n                if e.get(\"id\") == email_id:\n                    candidates.append((a, e))\n        if candidates:\n            # if requested account id matches one candidate, choose it\n            for a, e in candidates:\n                if a.get(\"id\") == account_id:\n                    return a, e\n            return candidates[0]\n\n        # Audit defect shows email_id passed as an email address; attempt lookup by from_email or recipient for active accounts\n        if \"@\" in email_id:\n            for a in active_accounts:\n                for e in emails:\n                    if not isinstance(e, dict):\n                        continue\n                    if e.get(\"account_id\") != a.get(\"id\"):\n                        continue\n                    if e.get(\"from_email\") == email_id:\n                        return a, e\n                    to_list = e.get(\"to_emails\")\n                    cc_list = e.get(\"cc_emails\")\n                    bcc_list = e.get(\"bcc_emails\")\n                    if isinstance(to_list, list) and email_id in to_list:\n                        return a, e\n                    if isinstance(cc_list, list) and email_id in cc_list:\n                        return a, e\n                    if isinstance(bcc_list, list) and email_id in bcc_list:\n                        return a, e\n        return None, None\n\n    used_account, email_row = _find_email_for_any_active()\n    if not used_account:\n        # if there are no active accounts at all, that's unauthorized for ambient auth\n        if len(active_accounts) == 0:\n            _log(\"modify_email\", \"error\", None, \"UNAUTHORIZED\")\n            return _err(\"UNAUTHORIZED\", \"No active Workspace account is configured for this service.\")\n        _log(\"modify_email\", \"error\", account_id, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Email not found for any active Workspace account.\", field=\"email_id\")\n\n    # If caller asked for a different account_id than the email's owner, reject as unauthorized (cannot access requested account_id for this email)\n    if used_account.get(\"id\") != account_id:\n        _log(\"modify_email\", \"error\", used_account.get(\"id\"), \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Cannot access the requested account_id for this email.\", field=\"account_id\", resolved_account_id=used_account.get(\"id\"))\n\n    # Enforce edge limits now that we have account context\n    limit_err = _enforce_limits(\"modify_email\", used_account.get(\"id\"))\n    if limit_err:\n        _log(\"modify_email\", \"error\", used_account.get(\"id\"), limit_err[\"error\"][\"code\"])\n        return limit_err\n\n    # --------- quota/rate: prevent too many queued mutations per account (business rule) ----------\n    mutations = _load(\"email_mutations.json\")\n    if not isinstance(mutations, list):\n        mutations = []\n    queued_limit = None\n    quotas = _load(\"quotas.json\")\n    if isinstance(quotas, list):\n        for q in quotas:\n            if isinstance(q, dict) and q.get(\"service\") == \"google_workspace\":\n                qlm = q.get(\"max_queued_email_mutations_per_account\")\n                if isinstance(qlm, int) and qlm > 0:\n                    queued_limit = qlm\n                break\n    if isinstance(queued_limit, int) and queued_limit > 0:\n        queued_cnt = 0\n        for m in mutations:\n            if not isinstance(m, dict):\n                continue\n            if m.get(\"account_id\") == used_account.get(\"id\") and m.get(\"status\") == \"queued\":\n                queued_cnt += 1\n        if queued_cnt >= queued_limit:\n            _log(\"modify_email\", \"error\", used_account.get(\"id\"), \"RATE_LIMIT\")\n            return _err(\"RATE_LIMIT\", \"Too many queued mutations for account; retry later.\", retry_after_seconds=120)\n\n    # --------- enforce lifecycle + apply semantics idempotently ----------\n    # Can't modify a hard-deleted email\n    if email_row.get(\"status\") == \"deleted\":\n        _log(\"modify_email\", \"error\", used_account.get(\"id\"), \"INVALID_TRANSITION\")\n        return _err(\"INVALID_TRANSITION\", \"Cannot modify a deleted email.\", field=\"email_id\")\n\n    # Construct idempotency key (provider_request_id) based on full request; if an identical applied mutation exists, return current email\n    def _stable_key():\n        return \"idem_\" + str(abs(hash((\n            used_account.get(\"id\"),\n            email_row.get(\"id\"),\n            mutation_type,\n            tuple(add_label_ids),\n            tuple(remove_label_ids),\n        ))))\n    idem_key = _stable_key()\n    for m in mutations:\n        if not isinstance(m, dict):\n            continue\n        if m.get(\"account_id\") == used_account.get(\"id\") and m.get(\"email_id\") == email_row.get(\"id\") and m.get(\"provider_request_id\") == idem_key:\n            if m.get(\"status\") == \"applied\":\n                _log(\"modify_email\", \"ok\", used_account.get(\"id\"), None)\n                return {\"email\": email_row, \"mutation\": m}\n            if m.get(\"status\") == \"queued\":\n                # Best-effort apply now (service applies synchronously in this implementation)\n                break\n\n    # Create mutation row (queued)\n    mid = \"emut_\" + str(int(time.time() * 1000)) + \"_\" + secrets.token_hex(4)\n    mut_row = {\n        \"id\": mid,\n        \"account_id\": used_account.get(\"id\"),\n        \"email_id\": email_row.get(\"id\"),\n        \"mutation_type\": mutation_type,\n        \"add_label_ids\": list(add_label_ids),\n        \"remove_label_ids\": list(remove_label_ids),\n        \"status\": \"queued\",\n        \"error_message\": None,\n        \"provider_request_id\": idem_key,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso\n    }\n    mutations.append(mut_row)\n\n    # Apply mutation to email labels/flags\n    label_ids = email_row.get(\"label_ids\")\n    if not isinstance(label_ids, list):\n        label_ids = []\n    label_set = set([x for x in label_ids if isinstance(x, str)])\n\n    def _apply_flags_from_labels():\n        # derived flags\n        email_row[\"is_read\"] = (\"UNREAD\" not in label_set)\n        email_row[\"is_trashed\"] = (\"TRASH\" in label_set)\n        email_row[\"is_archived\"] = (\"INBOX\" not in label_set) and (not email_row.get(\"is_trashed\", False))\n\n    # mutation semantics\n    if mutation_type == \"archive\":\n        label_set.discard(\"INBOX\")\n    elif mutation_type == \"unarchive\":\n        # only add INBOX if not trashed\n        if \"TRASH\" not in label_set:\n            label_set.add(\"INBOX\")\n    elif mutation_type == \"trash\":\n        label_set.add(\"TRASH\")\n    elif mutation_type == \"untrash\":\n        label_set.discard(\"TRASH\")\n    elif mutation_type == \"mark_read\":\n        label_set.discard(\"UNREAD\")\n    elif mutation_type == \"mark_unread\":\n        label_set.add(\"UNREAD\")\n    elif mutation_type == \"add_labels\":\n        for lid in add_label_ids:\n            label_set.add(lid)\n    elif mutation_type == \"remove_labels\":\n        for lid in remove_label_ids:\n            label_set.discard(lid)\n\n    # constraints: is_trashed=true implies label_ids contains 'TRASH' (we enforce)\n    # enforce archive/unarchive semantics re: trashed\n    if \"TRASH\" in label_set:\n        # when trashed, don't consider inbox for is_archived; but label can still exist—leave as is.\n        pass\n\n    email_row[\"label_ids\"] = sorted(label_set)\n    _apply_flags_from_labels()\n    email_row[\"updated_at\"] = now_iso\n\n    # Mark mutation as applied\n    mut_row[\"status\"] = \"applied\"\n    mut_row[\"updated_at\"] = now_iso\n    mut_row[\"error_message\"] = None\n\n    # Persist email update (must update row in collection)\n    updated = False\n    for i, e in enumerate(emails):\n        if isinstance(e, dict) and e.get(\"id\") == email_row.get(\"id\"):\n            emails[i] = email_row\n            updated = True\n            break\n    if not updated:\n        # shouldn't happen; ensure no \"success without effect\"\n        _log(\"modify_email\", \"error\", used_account.get(\"id\"), \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Email not found during update.\", field=\"email_id\")\n\n    _save(\"emails.json\", emails)\n    _save(\"email_mutations.json\", mutations)\n\n    _log(\"modify_email\", \"ok\", used_account.get(\"id\"), None)\n    return {\"email\": email_row, \"mutation\": mut_row}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_events",
+          "description": "Lists calendar events for the specified Workspace account (optionally scoped to `calendar_id`) within the optional `[time_min, time_max]` window and filtered by status, returning a single page of events sorted per `sort` and limited by `limit`. Pagination is cursor-based: pass the returned `cursor` to fetch the next page until no cursor is returned. Raises VALIDATION_ERROR for invalid ids or invalid time windows, UNAUTHORIZED if the caller cannot access `account_id`, NOT_FOUND if the account (or specified calendar) does not exist, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "account_id": {
+                "type": "string",
+                "pattern": "^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Workspace account id (workspace_accounts.id) to list events for."
+              },
+              "calendar_id": {
+                "type": "string",
+                "description": "Calendar id to list events from."
+              },
+              "time_min": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Lower bound (inclusive) for event start time."
+              },
+              "time_max": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Upper bound (inclusive) for event start time."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 250,
+                "description": "Maximum number of events to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "start_at",
+                  "-start_at",
+                  "updated_at",
+                  "-updated_at",
+                  "created_at",
+                  "-created_at"
+                ],
+                "description": "Sort order for results."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "confirmed",
+                  "tentative",
+                  "cancelled",
+                  "deleted"
+                ],
+                "description": "Filter by event status."
+              }
+            },
+            "required": [
+              "account_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def list_events(account_id, calendar_id=None, time_min=None, time_max=None, limit=None, cursor=None, sort=None, status=None, **_extra):\n    import json, os, datetime, re, time, uuid, hashlib, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0356000\" if __import__(\"os\").path.isdir(\"./environment_mix/0356000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()\n    endpoint = \"list_events\"\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return (\"__bad__\", _err(\"VALIDATION_ERROR\", f\"{field} must be an RFC3339 date-time string\"))\n        try:\n            # Accept trailing Z\n            ss = s[:-1] + \"+00:00\" if s.endswith(\"Z\") else s\n            dt = datetime.datetime.fromisoformat(ss)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except ValueError:\n            return (\"__bad__\", _err(\"VALIDATION_ERROR\", f\"{field} must be an RFC3339 date-time string\"))\n\n    def _log(status_code, error=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"rql_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"account_id\": account_id if isinstance(account_id, str) else None,\n            \"status\": status_code,\n            \"error_code\": (error or {}).get(\"code\") if isinstance(error, dict) else None,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"created_at\": now_iso\n        })\n        _save(\"request_logs.json\", logs)\n\n    # Validate inputs\n    if not isinstance(account_id, str) or not re.match(r\"^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$\", account_id):\n        e = _err(\"VALIDATION_ERROR\", \"account_id is invalid\")\n        _log(400, e[\"error\"])\n        return e\n    if calendar_id is not None and not isinstance(calendar_id, str):\n        e = _err(\"VALIDATION_ERROR\", \"calendar_id must be a string\")\n        _log(400, e[\"error\"])\n        return e\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 250:\n        e = _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 250\")\n        _log(400, e[\"error\"])\n        return e\n    allowed_sort = {\"start_at\", \"-start_at\", \"updated_at\", \"-updated_at\", \"created_at\", \"-created_at\"}\n    if sort is None:\n        sort = \"start_at\"\n    if not isinstance(sort, str) or sort not in allowed_sort:\n        e = _err(\"VALIDATION_ERROR\", \"sort must be one of: start_at, -start_at, updated_at, -updated_at, created_at, -created_at\")\n        _log(400, e[\"error\"])\n        return e\n    allowed_status = {\"confirmed\", \"tentative\", \"cancelled\", \"deleted\"}\n    if status is not None and (not isinstance(status, str) or status not in allowed_status):\n        e = _err(\"VALIDATION_ERROR\", \"status must be one of: confirmed, tentative, cancelled, deleted\")\n        _log(400, e[\"error\"])\n        return e\n\n    dt_min = _parse_dt(time_min, \"time_min\")\n    if isinstance(dt_min, tuple) and dt_min[0] == \"__bad__\":\n        _log(400, dt_min[1][\"error\"])\n        return dt_min[1]\n    dt_max = _parse_dt(time_max, \"time_max\")\n    if isinstance(dt_max, tuple) and dt_max[0] == \"__bad__\":\n        _log(400, dt_max[1][\"error\"])\n        return dt_max[1]\n    if isinstance(dt_min, datetime.datetime) and isinstance(dt_max, datetime.datetime) and dt_max < dt_min:\n        e = _err(\"VALIDATION_ERROR\", \"time_max must be >= time_min\")\n        _log(400, e[\"error\"])\n        return e\n\n    # Authenticate / select account: tool is explicitly scoped to provided account_id, require it exists and active\n    accounts = _load(\"workspace_accounts.json\")\n    acct = next((a for a in accounts if isinstance(a, dict) and a.get(\"id\") == account_id), None)\n    if not acct:\n        e = _err(\"NOT_FOUND\", \"workspace account not found\", resource=\"workspace_accounts\", id=account_id)\n        _log(404, e[\"error\"])\n        return e\n    if acct.get(\"status\") != \"active\":\n        e = _err(\"UNAUTHORIZED\", \"workspace account is not active\")\n        _log(401, e[\"error\"])\n        return e\n\n    # Cursor decode\n    offset = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or len(cursor) > 2048:\n            e = _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n            _log(400, e[\"error\"])\n            return e\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            payload = json.loads(raw.decode(\"utf-8\"))\n            if not isinstance(payload, dict) or payload.get(\"v\") != 1:\n                raise ValueError(\"bad cursor\")\n            if payload.get(\"account_id\") != account_id:\n                e = _err(\"VALIDATION_ERROR\", \"cursor does not match account_id\")\n                _log(400, e[\"error\"])\n                return e\n            if payload.get(\"calendar_id\") != (calendar_id if calendar_id is not None else None):\n                e = _err(\"VALIDATION_ERROR\", \"cursor does not match calendar_id\")\n                _log(400, e[\"error\"])\n                return e\n            if payload.get(\"sort\") != sort or payload.get(\"status\") != status or payload.get(\"time_min\") != time_min or payload.get(\"time_max\") != time_max:\n                e = _err(\"VALIDATION_ERROR\", \"cursor does not match query parameters\")\n                _log(400, e[\"error\"])\n                return e\n            offset = int(payload.get(\"offset\", 0))\n            if offset < 0:\n                raise ValueError(\"bad offset\")\n        except (ValueError, json.JSONDecodeError, UnicodeDecodeError):\n            e = _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n            _log(400, e[\"error\"])\n            return e\n\n    # Filter\n    events = _load(\"calendar_events.json\")\n    if not isinstance(events, list):\n        events = []\n\n    def _dt_from_row(v):\n        if v is None:\n            return None\n        if isinstance(v, str):\n            try:\n                ss = v[:-1] + \"+00:00\" if v.endswith(\"Z\") else v\n                dt = datetime.datetime.fromisoformat(ss)\n                if dt.tzinfo is None:\n                    dt = dt.replace(tzinfo=datetime.timezone.utc)\n                return dt.astimezone(datetime.timezone.utc)\n            except ValueError:\n                return None\n        return None\n\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n\n    out = []\n    for ev in events:\n        if not isinstance(ev, dict):\n            continue\n        if ev.get(\"account_id\") != account_id:\n            continue\n        if calendar_id is not None and ev.get(\"calendar_id\") != calendar_id:\n            continue\n\n        ev_status = ev.get(\"status\")\n        if status is not None:\n            if ev_status != status:\n                continue\n        else:\n            if ev_status == \"deleted\":\n                continue\n\n        # default list_events: end_at >= now()\n        end_dt = _dt_from_row(ev.get(\"end_at\"))\n        if end_dt is None:\n            continue\n        if end_dt < now_dt and (dt_min is None and dt_max is None):\n            # only apply the business rule when no explicit window is requested\n            continue\n\n        start_dt = _dt_from_row(ev.get(\"start_at\"))\n        if start_dt is None:\n            continue\n\n        if isinstance(dt_min, datetime.datetime) and start_dt < dt_min:\n            continue\n        if isinstance(dt_max, datetime.datetime) and start_dt > dt_max:\n            continue\n\n        out.append(ev)\n\n    # Sort\n    key_field = sort.lstrip(\"-\")\n    reverse = sort.startswith(\"-\")\n\n    def _key(ev):\n        dt = _dt_from_row(ev.get(key_field))\n        if dt is None:\n            # push missing to end\n            return (1, datetime.datetime.min.replace(tzinfo=datetime.timezone.utc))\n        return (0, dt)\n\n    out.sort(key=_key, reverse=reverse)\n\n    total = len(out)\n    page = out[offset:offset + limit]\n    next_cursor = None\n    if offset + limit < total:\n        payload = {\n            \"v\": 1,\n            \"account_id\": account_id,\n            \"calendar_id\": calendar_id if calendar_id is not None else None,\n            \"time_min\": time_min,\n            \"time_max\": time_max,\n            \"status\": status,\n            \"sort\": sort,\n            \"offset\": offset + limit\n        }\n        next_cursor = base64.urlsafe_b64encode(json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    resp = {\n        \"events\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": next_cursor,\n            \"has_more\": next_cursor is not None\n        }\n    }\n    _log(200, None)\n    return resp\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_event",
+          "description": "Creates a new calendar event in the specified calendar for the Workspace account and returns the created event record. If `idempotency_key` is provided, retries with the same key return the originally created event instead of creating a duplicate. Raises VALIDATION_ERROR for invalid ids, missing required fields, or `end_at` earlier than `start_at`, UNAUTHORIZED if the caller cannot create events for `account_id`, NOT_FOUND if the account or `calendar_id` does not exist, CONFLICT if the event cannot be created due to the calendar/event state, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "account_id": {
+                "type": "string",
+                "pattern": "^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Workspace account id (workspace_accounts.id) to create the event under."
+              },
+              "calendar_id": {
+                "type": "string",
+                "description": "Calendar id to create the event in."
+              },
+              "title": {
+                "type": "string",
+                "description": "Event title/summary."
+              },
+              "description": {
+                "type": "string",
+                "description": "Event description/body."
+              },
+              "location": {
+                "type": "string",
+                "description": "Event location."
+              },
+              "start_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Event start time."
+              },
+              "end_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Event end time."
+              },
+              "time_zone": {
+                "type": "string",
+                "description": "IANA time zone for the event times (e.g., 'America/Los_Angeles')."
+              },
+              "attendees": {
+                "type": "array",
+                "items": {
+                  "type": "object"
+                },
+                "description": "Attendees payload as stored for the event."
+              },
+              "visibility": {
+                "type": "string",
+                "enum": [
+                  "default",
+                  "public",
+                  "private",
+                  "confidential"
+                ],
+                "description": "Visibility of the event."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Optional idempotency key to prevent duplicate creates on retries."
+              }
+            },
+            "required": [
+              "account_id",
+              "calendar_id",
+              "title",
+              "start_at",
+              "end_at"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_event(account_id, calendar_id, title, description=None, location=None, start_at=None, end_at=None, time_zone=None, attendees=None, visibility=None, idempotency_key=None, **_extra):\n    import json, os, datetime, re, time, random\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0356000\" if __import__(\"os\").path.isdir(\"./environment_mix/0356000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    req_started = datetime.datetime.now(datetime.timezone.utc)\n\n    def _ensure_request_log():\n        path = os.path.join(_DB, \"request_logs.json\")\n        if not os.path.exists(path):\n            _save(\"request_logs.json\", [])\n\n    def _log(endpoint, status, resolved_account_id=None, error_code=None):\n        try:\n            _ensure_request_log()\n            logs = _load(\"request_logs.json\")\n            latency_ms = int((time.time() - t0) * 1000)\n            logs.append({\n                \"id\": \"rql_\" + \"\".join(random.choice(\"0123456789ABCDEFGHJKMNPQRSTVWXYZ\") for _ in range(16)),\n                \"endpoint\": endpoint,\n                \"account_id\": resolved_account_id,\n                \"status\": status,\n                \"error_code\": error_code,\n                \"latency_ms\": latency_ms,\n                \"created_at\": req_started.isoformat()\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    def _parse_dt(s, field):\n        if not isinstance(s, str) or not s:\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be an RFC3339 date-time string\")\n        try:\n            # Accept trailing Z\n            if s.endswith(\"Z\"):\n                s2 = s[:-1] + \"+00:00\"\n            else:\n                s2 = s\n            dt = datetime.datetime.fromisoformat(s2)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc), None\n        except ValueError:\n            return None, _err(\"VALIDATION_ERROR\", f\"{field} must be an RFC3339 date-time string\")\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _gen_id(prefix):\n        return prefix + \"\".join(random.choice(\"0123456789ABCDEFGHJKMNPQRSTVWXYZ\") for _ in range(18))\n\n    # ---- Validate inputs (types/enums/patterns) ----\n    if not isinstance(account_id, str) or not re.match(r\"^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$\", account_id):\n        _log(\"create_event\", \"error\", None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"account_id is invalid\", field=\"account_id\")\n\n    if not isinstance(calendar_id, str) or not calendar_id.strip():\n        _log(\"create_event\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"calendar_id is required\", field=\"calendar_id\")\n\n    if not isinstance(title, str) or not title.strip():\n        _log(\"create_event\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"title must be a non-empty string\", field=\"title\")\n\n    if description is not None and not isinstance(description, str):\n        _log(\"create_event\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"description must be a string\", field=\"description\")\n\n    if location is not None and not isinstance(location, str):\n        _log(\"create_event\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"location must be a string\", field=\"location\")\n\n    if time_zone is not None and not isinstance(time_zone, str):\n        _log(\"create_event\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"time_zone must be a string\", field=\"time_zone\")\n\n    if attendees is None:\n        attendees = []\n    if not isinstance(attendees, list):\n        _log(\"create_event\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"attendees must be an array\", field=\"attendees\")\n    for i, a in enumerate(attendees):\n        if not isinstance(a, dict):\n            _log(\"create_event\", \"error\", account_id, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", f\"attendees[{i}] must be an object\", field=\"attendees\")\n\n    if visibility is None:\n        visibility = \"default\"\n    if visibility not in (\"default\", \"public\", \"private\", \"confidential\"):\n        _log(\"create_event\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"visibility is invalid\", field=\"visibility\")\n\n    if idempotency_key is not None and (not isinstance(idempotency_key, str) or not idempotency_key.strip()):\n        _log(\"create_event\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"idempotency_key must be a non-empty string when provided\", field=\"idempotency_key\")\n\n    start_dt, e1 = _parse_dt(start_at, \"start_at\")\n    if e1:\n        _log(\"create_event\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return e1\n    end_dt, e2 = _parse_dt(end_at, \"end_at\")\n    if e2:\n        _log(\"create_event\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return e2\n    if not (end_dt > start_dt):\n        _log(\"create_event\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"end_at must be later than start_at\", field=\"end_at\")\n\n    # ---- Resolve authorization / active account ----\n    accounts = _load(\"workspace_accounts.json\")\n    acct = next((a for a in accounts if a.get(\"id\") == account_id), None)\n    if acct is None:\n        _log(\"create_event\", \"error\", account_id, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"workspace account not found\", account_id=account_id)\n    if acct.get(\"status\") != \"active\":\n        # Business rule: tools operate in context of exactly one active workspace account row.\n        _log(\"create_event\", \"error\", account_id, \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"workspace account is not active\", account_id=account_id, status=acct.get(\"status\"))\n\n    # ---- Rate/quota: limit queued calendar_event_mutations per account ----\n    # Configured limit (edge); if missing, default to 50.\n    limits = _load(\"service_limits.json\")\n    queued_limit = 50\n    if isinstance(limits, dict):\n        try:\n            queued_limit = int(limits.get(\"max_queued_calendar_event_mutations_per_account\", queued_limit))\n        except Exception:\n            queued_limit = 50\n    elif isinstance(limits, list):\n        # allow [{key,value}]\n        for row in limits:\n            if isinstance(row, dict) and row.get(\"key\") == \"max_queued_calendar_event_mutations_per_account\":\n                try:\n                    queued_limit = int(row.get(\"value\"))\n                except Exception:\n                    pass\n\n    cem = _load(\"calendar_event_mutations.json\")\n    queued_count = 0\n    for m in cem:\n        if m.get(\"account_id\") == account_id and m.get(\"status\") == \"queued\":\n            queued_count += 1\n    if queued_count >= queued_limit:\n        _log(\"create_event\", \"error\", account_id, \"RATE_LIMIT\")\n        return _err(\"RATE_LIMIT\", \"too many queued event mutations for this account; retry later\",\n                    limit=queued_limit, queued=queued_count)\n\n    # ---- Idempotency: return already created event for same (account_id, idempotency_key) ----\n    if idempotency_key is not None:\n        existing_mut = next((m for m in cem if m.get(\"account_id\") == account_id and m.get(\"idempotency_key\") == idempotency_key), None)\n        if existing_mut is not None:\n            ev_id = existing_mut.get(\"event_id\")\n            events = _load(\"calendar_events.json\")\n            ev = next((e for e in events if e.get(\"id\") == ev_id and e.get(\"account_id\") == account_id), None)\n            if ev is not None:\n                _log(\"create_event\", \"ok\", account_id, None)\n                return {\"event\": ev, \"idempotent\": True}\n            # If mutation exists but event missing, treat as conflict/inconsistent state.\n            _log(\"create_event\", \"error\", account_id, \"CONFLICT\")\n            return _err(\"CONFLICT\", \"idempotency_key already used but event record is missing\", idempotency_key=idempotency_key)\n\n    # ---- Create mutation row (queued) ----\n    mutation_id = _gen_id(\"cem_\")\n    created_at = _now().isoformat()\n    patch = {\n        \"calendar_id\": calendar_id,\n        \"title\": title.strip(),\n        \"start_at\": start_dt.isoformat(),\n        \"end_at\": end_dt.isoformat(),\n    }\n    if description is not None:\n        patch[\"description\"] = description\n    if location is not None:\n        patch[\"location\"] = location\n    if time_zone is not None:\n        patch[\"time_zone\"] = time_zone\n    if attendees is not None:\n        patch[\"attendees\"] = attendees\n    if visibility is not None:\n        patch[\"visibility\"] = visibility\n\n    new_mut = {\n        \"id\": mutation_id,\n        \"account_id\": account_id,\n        \"event_id\": None,\n        \"mutation_type\": \"create\",\n        \"patch\": patch,\n        \"status\": \"queued\",\n        \"idempotency_key\": idempotency_key,\n        \"error_message\": None,\n        \"created_at\": created_at,\n        \"updated_at\": created_at\n    }\n\n    # Enforce unique(account_id, idempotency_key) where idempotency_key not null\n    if idempotency_key is not None:\n        for m in cem:\n            if m.get(\"account_id\") == account_id and m.get(\"idempotency_key\") == idempotency_key:\n                _log(\"create_event\", \"error\", account_id, \"CONFLICT\")\n                return _err(\"CONFLICT\", \"idempotency_key already exists for this account\", idempotency_key=idempotency_key)\n\n    # ---- Apply to \"provider\": create event row and mark mutation applied ----\n    events = _load(\"calendar_events.json\")\n\n    # Generate google_event_id now to simulate provider assignment after creation\n    google_event_id = \"gcal_\" + \"\".join(random.choice(\"0123456789abcdefghijklmnopqrstuvwxyz\") for _ in range(24))\n    event_id = _gen_id(\"gwev_\")\n    now_iso = _now().isoformat()\n\n    new_event = {\n        \"id\": event_id,\n        \"account_id\": account_id,\n        \"calendar_id\": calendar_id,\n        \"google_event_id\": google_event_id,\n        \"title\": title.strip(),\n        \"description\": description,\n        \"location\": location,\n        \"start_at\": start_dt.isoformat(),\n        \"end_at\": end_dt.isoformat(),\n        \"time_zone\": time_zone,\n        \"attendees\": attendees,\n        \"organizer_email\": acct.get(\"primary_email\"),\n        \"visibility\": visibility,\n        \"status\": \"confirmed\",\n        \"provider_etag\": \"etag_\" + \"\".join(random.choice(\"0123456789abcdef\") for _ in range(16)),\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso\n    }\n\n    # Enforce unique(account_id, calendar_id, google_event_id) where google_event_id not null\n    for e in events:\n        if e.get(\"account_id\") == account_id and e.get(\"calendar_id\") == calendar_id and e.get(\"google_event_id\") == google_event_id:\n            _log(\"create_event\", \"error\", account_id, \"CONFLICT\")\n            return _err(\"CONFLICT\", \"provider event id collision\", google_event_id=google_event_id)\n\n    # Persist: mutation queued then applied; event inserted\n    cem.append(new_mut)\n    _save(\"calendar_event_mutations.json\", cem)\n\n    events.append(new_event)\n    _save(\"calendar_events.json\", events)\n\n    # Update mutation to applied and set event_id\n    cem2 = _load(\"calendar_event_mutations.json\")\n    mut_row = next((m for m in cem2 if m.get(\"id\") == mutation_id), None)\n    if mut_row is None:\n        _log(\"create_event\", \"error\", account_id, \"CONFLICT\")\n        return _err(\"CONFLICT\", \"mutation record missing after creation\", mutation_id=mutation_id)\n\n    mut_row[\"event_id\"] = event_id\n    mut_row[\"status\"] = \"applied\"\n    mut_row[\"updated_at\"] = _now().isoformat()\n    _save(\"calendar_event_mutations.json\", cem2)\n\n    _log(\"create_event\", \"ok\", account_id, None)\n    return {\"event\": new_event, \"mutation\": mut_row}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "update_event",
+          "description": "Updates fields on an existing calendar event owned by the specified Workspace account and returns the updated event record. Only provided fields are changed, including optional updates to time window, timezone, attendees, visibility, and status. Raises VALIDATION_ERROR for invalid ids or invalid time updates (for example, `end_at` earlier than `start_at`), UNAUTHORIZED if the caller cannot modify events for `account_id`, NOT_FOUND if the account or `event_id` does not exist, CONFLICT if the requested status/state change is not allowed for the event’s current status (for example, updating a deleted event), and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "account_id": {
+                "type": "string",
+                "pattern": "^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Workspace account id (workspace_accounts.id) that owns the event."
+              },
+              "event_id": {
+                "type": "string",
+                "pattern": "^gevt_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Event id (calendar_events.id) to update."
+              },
+              "title": {
+                "type": "string",
+                "description": "Updated event title/summary."
+              },
+              "description": {
+                "type": "string",
+                "description": "Updated event description/body."
+              },
+              "location": {
+                "type": "string",
+                "description": "Updated event location."
+              },
+              "start_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Updated event start time."
+              },
+              "end_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Updated event end time."
+              },
+              "time_zone": {
+                "type": "string",
+                "description": "Updated IANA time zone for the event times."
+              },
+              "attendees": {
+                "type": "array",
+                "items": {
+                  "type": "object"
+                },
+                "description": "Updated attendees payload as stored for the event."
+              },
+              "visibility": {
+                "type": "string",
+                "enum": [
+                  "default",
+                  "public",
+                  "private",
+                  "confidential"
+                ],
+                "description": "Updated visibility of the event."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "confirmed",
+                  "tentative",
+                  "cancelled",
+                  "deleted"
+                ],
+                "description": "Updated status of the event."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Optional idempotency key to prevent duplicate updates on retries."
+              }
+            },
+            "required": [
+              "account_id",
+              "event_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def update_event(account_id, event_id, title=None, description=None, location=None, start_at=None, end_at=None, time_zone=None, attendees=None, visibility=None, status=None, idempotency_key=None, **_extra):\n    import json, os, datetime, re, time, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0356000\" if __import__(\"os\").path.isdir(\"./environment_mix/0356000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now_dt.isoformat()\n    endpoint = \"update_event\"\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return (\"__bad__\", _err(\"VALIDATION_ERROR\", f\"{field} must be an RFC3339 date-time string\"))\n        try:\n            ss = s[:-1] + \"+00:00\" if s.endswith(\"Z\") else s\n            dt = datetime.datetime.fromisoformat(ss)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except ValueError:\n            return (\"__bad__\", _err(\"VALIDATION_ERROR\", f\"{field} must be an RFC3339 date-time string\"))\n\n    def _log(status_code, error=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"rql_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"account_id\": account_id if isinstance(account_id, str) else None,\n            \"status\": status_code,\n            \"error_code\": (error or {}).get(\"code\") if isinstance(error, dict) else None,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"created_at\": now_iso\n        })\n        _save(\"request_logs.json\", logs)\n\n    # Validate\n    if not isinstance(account_id, str) or not re.match(r\"^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$\", account_id):\n        e = _err(\"VALIDATION_ERROR\", \"account_id is invalid\")\n        _log(400, e[\"error\"])\n        return e\n    if not isinstance(event_id, str) or not re.match(r\"^gevt_[0-9A-HJKMNP-TV-Z]{10,}$\", event_id):\n        e = _err(\"VALIDATION_ERROR\", \"event_id is invalid\")\n        _log(400, e[\"error\"])\n        return e\n    if title is not None and (not isinstance(title, str) or title.strip() == \"\"):\n        e = _err(\"VALIDATION_ERROR\", \"title must be a non-empty string\")\n        _log(400, e[\"error\"])\n        return e\n    if description is not None and not isinstance(description, str):\n        e = _err(\"VALIDATION_ERROR\", \"description must be a string\")\n        _log(400, e[\"error\"])\n        return e\n    if location is not None and not isinstance(location, str):\n        e = _err(\"VALIDATION_ERROR\", \"location must be a string\")\n        _log(400, e[\"error\"])\n        return e\n    if time_zone is not None and not isinstance(time_zone, str):\n        e = _err(\"VALIDATION_ERROR\", \"time_zone must be a string\")\n        _log(400, e[\"error\"])\n        return e\n    if attendees is not None and not isinstance(attendees, list):\n        e = _err(\"VALIDATION_ERROR\", \"attendees must be an array\")\n        _log(400, e[\"error\"])\n        return e\n    allowed_vis = {\"default\", \"public\", \"private\", \"confidential\"}\n    if visibility is not None and (not isinstance(visibility, str) or visibility not in allowed_vis):\n        e = _err(\"VALIDATION_ERROR\", \"visibility must be one of: default, public, private, confidential\")\n        _log(400, e[\"error\"])\n        return e\n    allowed_status = {\"confirmed\", \"tentative\", \"cancelled\", \"deleted\"}\n    if status is not None and (not isinstance(status, str) or status not in allowed_status):\n        e = _err(\"VALIDATION_ERROR\", \"status must be one of: confirmed, tentative, cancelled, deleted\")\n        _log(400, e[\"error\"])\n        return e\n    if idempotency_key is not None and not isinstance(idempotency_key, str):\n        e = _err(\"VALIDATION_ERROR\", \"idempotency_key must be a string\")\n        _log(400, e[\"error\"])\n        return e\n\n    dt_start = _parse_dt(start_at, \"start_at\")\n    if isinstance(dt_start, tuple) and dt_start[0] == \"__bad__\":\n        _log(400, dt_start[1][\"error\"])\n        return dt_start[1]\n    dt_end = _parse_dt(end_at, \"end_at\")\n    if isinstance(dt_end, tuple) and dt_end[0] == \"__bad__\":\n        _log(400, dt_end[1][\"error\"])\n        return dt_end[1]\n\n    # Auth/account must exist and active\n    accounts = _load(\"workspace_accounts.json\")\n    acct = next((a for a in accounts if isinstance(a, dict) and a.get(\"id\") == account_id), None)\n    if not acct:\n        e = _err(\"NOT_FOUND\", \"workspace account not found\", resource=\"workspace_accounts\", id=account_id)\n        _log(404, e[\"error\"])\n        return e\n    if acct.get(\"status\") != \"active\":\n        e = _err(\"UNAUTHORIZED\", \"workspace account is not active\")\n        _log(401, e[\"error\"])\n        return e\n\n    mutations = _load(\"calendar_event_mutations.json\")\n    if not isinstance(mutations, list):\n        mutations = []\n    events = _load(\"calendar_events.json\")\n    if not isinstance(events, list):\n        events = []\n\n    # Idempotency: return applied result for same key + event_id + patch signature\n    if idempotency_key:\n        for m in mutations:\n            if not isinstance(m, dict):\n                continue\n            if m.get(\"account_id\") == account_id and m.get(\"idempotency_key\") == idempotency_key and m.get(\"mutation_type\") == \"update\" and m.get(\"event_id\") == event_id:\n                if m.get(\"status\") == \"applied\":\n                    ev = next((e for e in events if isinstance(e, dict) and e.get(\"id\") == event_id), None)\n                    if ev:\n                        _log(200, None)\n                        return {\"event\": ev, \"mutation\": m, \"idempotency_reused\": True}\n                if m.get(\"status\") in (\"queued\", \"failed\", \"cancelled\"):\n                    e = _err(\"CONFLICT\", \"idempotency_key already used for an update that is not applied yet\", mutation_id=m.get(\"id\"), status=m.get(\"status\"))\n                    _log(409, e[\"error\"])\n                    return e\n\n    ev = next((e for e in events if isinstance(e, dict) and e.get(\"id\") == event_id), None)\n    if not ev:\n        e = _err(\"NOT_FOUND\", \"event not found\", resource=\"calendar_events\", id=event_id)\n        _log(404, e[\"error\"])\n        return e\n    if ev.get(\"account_id\") != account_id:\n        e = _err(\"UNAUTHORIZED\", \"event does not belong to the specified account\")\n        _log(401, e[\"error\"])\n        return e\n\n    # Build patch subset and validate resulting times/title constraints\n    patch = {}\n    if title is not None: patch[\"title\"] = title\n    if description is not None: patch[\"description\"] = description\n    if location is not None: patch[\"location\"] = location\n    if dt_start is not None: patch[\"start_at\"] = dt_start.isoformat()\n    if dt_end is not None: patch[\"end_at\"] = dt_end.isoformat()\n    if time_zone is not None: patch[\"time_zone\"] = time_zone\n    if attendees is not None: patch[\"attendees\"] = attendees\n    if visibility is not None: patch[\"visibility\"] = visibility\n    if status is not None: patch[\"status\"] = status\n\n    if not patch:\n        e = _err(\"VALIDATION_ERROR\", \"no fields provided to update\")\n        _log(400, e[\"error\"])\n        return e\n\n    # Determine new times for validation\n    def _dt_from_row(v):\n        if isinstance(v, str):\n            try:\n                ss = v[:-1] + \"+00:00\" if v.endswith(\"Z\") else v\n                dt = datetime.datetime.fromisoformat(ss)\n                if dt.tzinfo is None:\n                    dt = dt.replace(tzinfo=datetime.timezone.utc)\n                return dt.astimezone(datetime.timezone.utc)\n            except ValueError:\n                return None\n        return None\n\n    new_start = dt_start if isinstance(dt_start, datetime.datetime) else _dt_from_row(ev.get(\"start_at\"))\n    new_end = dt_end if isinstance(dt_end, datetime.datetime) else _dt_from_row(ev.get(\"end_at\"))\n    if new_start is None or new_end is None:\n        e = _err(\"CONFLICT\", \"event has invalid stored time fields\")\n        _log(409, e[\"error\"])\n        return e\n    if new_end <= new_start:\n        e = _err(\"VALIDATION_ERROR\", \"end_at must be later than start_at\")\n        _log(400, e[\"error\"])\n        return e\n    if \"title\" in patch and (not isinstance(patch[\"title\"], str) or patch[\"title\"].strip() == \"\"):\n        e = _err(\"VALIDATION_ERROR\", \"title must be a non-empty string\")\n        _log(400, e[\"error\"])\n        return e\n\n    # Lifecycle transitions for calendar_events.status\n    transitions = {\n        \"tentative\": {\"confirmed\", \"cancelled\", \"deleted\"},\n        \"confirmed\": {\"cancelled\", \"deleted\"},\n        \"cancelled\": {\"deleted\"},\n        \"deleted\": set()\n    }\n    if \"status\" in patch:\n        cur = ev.get(\"status\")\n        nxt = patch[\"status\"]\n        if cur not in transitions:\n            e = _err(\"CONFLICT\", \"event has invalid current status\")\n            _log(409, e[\"error\"])\n            return e\n        if nxt != cur and nxt not in transitions[cur]:\n            e = _err(\"INVALID_TRANSITION\", f\"cannot transition event status from {cur} to {nxt}\")\n            _log(409, e[\"error\"])\n            return e\n\n    # Create mutation queued then apply immediately (optimistic concurrency simulated via provider_etag presence)\n    mut_id = \"cmevmut_\" + uuid.uuid4().hex[:20]\n    mutation = {\n        \"id\": mut_id,\n        \"account_id\": account_id,\n        \"event_id\": event_id,\n        \"mutation_type\": \"update\",\n        \"patch\": patch,\n        \"status\": \"queued\",\n        \"idempotency_key\": idempotency_key,\n        \"error_message\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso\n    }\n    mutations.append(mutation)\n\n    # Apply \"provider\" update and bump etag\n    for k, v in patch.items():\n        ev[k] = v\n    ev[\"updated_at\"] = now_iso\n    ev[\"provider_etag\"] = \"etag_\" + uuid.uuid4().hex[:12]\n\n    mutation[\"status\"] = \"applied\"\n    mutation[\"updated_at\"] = now_iso\n\n    _save(\"calendar_event_mutations.json\", mutations)\n    _save(\"calendar_events.json\", events)\n\n    _log(200, None)\n    return {\"event\": ev, \"mutation\": mutation}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "delete_event",
+          "description": "Delete a calendar event",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "account_id": {
+                "type": "string",
+                "pattern": "^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Workspace account id (workspace_accounts.id) that owns the event."
+              },
+              "event_id": {
+                "type": "string",
+                "pattern": "^gevt_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Event id (calendar_events.id) to delete."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Optional idempotency key to prevent duplicate deletes on retries."
+              }
+            },
+            "required": [
+              "account_id",
+              "event_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def delete_event(account_id, event_id, idempotency_key=None, **_extra):\n    import json, os, datetime, re, time, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0356000\" if __import__(\"os\").path.isdir(\"./environment_mix/0356000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()\n    endpoint = \"delete_event\"\n\n    def _log(status_code, error=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"rql_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"account_id\": account_id if isinstance(account_id, str) else None,\n            \"status\": status_code,\n            \"error_code\": (error or {}).get(\"code\") if isinstance(error, dict) else None,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"created_at\": now_iso\n        })\n        _save(\"request_logs.json\", logs)\n\n    # Validate\n    if not isinstance(account_id, str) or not re.match(r\"^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$\", account_id):\n        e = _err(\"VALIDATION_ERROR\", \"account_id is invalid\")\n        _log(400, e[\"error\"])\n        return e\n    if not isinstance(event_id, str) or not re.match(r\"^gevt_[0-9A-HJKMNP-TV-Z]{10,}$\", event_id):\n        e = _err(\"VALIDATION_ERROR\", \"event_id is invalid\")\n        _log(400, e[\"error\"])\n        return e\n    if idempotency_key is not None and not isinstance(idempotency_key, str):\n        e = _err(\"VALIDATION_ERROR\", \"idempotency_key must be a string\")\n        _log(400, e[\"error\"])\n        return e\n\n    accounts = _load(\"workspace_accounts.json\")\n    acct = next((a for a in accounts if isinstance(a, dict) and a.get(\"id\") == account_id), None)\n    if not acct:\n        e = _err(\"NOT_FOUND\", \"workspace account not found\", resource=\"workspace_accounts\", id=account_id)\n        _log(404, e[\"error\"])\n        return e\n    if acct.get(\"status\") != \"active\":\n        e = _err(\"UNAUTHORIZED\", \"workspace account is not active\")\n        _log(401, e[\"error\"])\n        return e\n\n    mutations = _load(\"calendar_event_mutations.json\")\n    if not isinstance(mutations, list):\n        mutations = []\n    events = _load(\"calendar_events.json\")\n    if not isinstance(events, list):\n        events = []\n\n    # Idempotency: reuse applied delete mutation\n    if idempotency_key:\n        for m in mutations:\n            if not isinstance(m, dict):\n                continue\n            if m.get(\"account_id\") == account_id and m.get(\"idempotency_key\") == idempotency_key and m.get(\"mutation_type\") == \"delete\" and m.get(\"event_id\") == event_id:\n                if m.get(\"status\") == \"applied\":\n                    ev = next((e for e in events if isinstance(e, dict) and e.get(\"id\") == event_id), None)\n                    if ev:\n                        _log(200, None)\n                        return {\"event\": ev, \"mutation\": m, \"idempotency_reused\": True}\n                if m.get(\"status\") in (\"queued\", \"failed\", \"cancelled\"):\n                    e = _err(\"CONFLICT\", \"idempotency_key already used for a delete that is not applied yet\", mutation_id=m.get(\"id\"), status=m.get(\"status\"))\n                    _log(409, e[\"error\"])\n                    return e\n\n    ev = next((e for e in events if isinstance(e, dict) and e.get(\"id\") == event_id), None)\n    if not ev:\n        e = _err(\"NOT_FOUND\", \"event not found\", resource=\"calendar_events\", id=event_id)\n        _log(404, e[\"error\"])\n        return e\n    if ev.get(\"account_id\") != account_id:\n        e = _err(\"UNAUTHORIZED\", \"event does not belong to the specified account\")\n        _log(401, e[\"error\"])\n        return e\n\n    # If already deleted, still write a mutation? Real systems often are idempotent; here, honor NO SUCCESS WITHOUT EFFECT:\n    # treat as idempotent only when idempotency_key provided; otherwise, already-deleted is NOT_FOUND-equivalent.\n    if ev.get(\"status\") == \"deleted\":\n        if idempotency_key:\n            # create an applied mutation that records idempotent delete\n            mut_id = \"cmevmut_\" + uuid.uuid4().hex[:20]\n            mutation = {\n                \"id\": mut_id,\n                \"account_id\": account_id,\n                \"event_id\": event_id,\n                \"mutation_type\": \"delete\",\n                \"patch\": {\"status\": \"deleted\"},\n                \"status\": \"applied\",\n                \"idempotency_key\": idempotency_key,\n                \"error_message\": None,\n                \"created_at\": now_iso,\n                \"updated_at\": now_iso\n            }\n            mutations.append(mutation)\n            _save(\"calendar_event_mutations.json\", mutations)\n            _save(\"calendar_events.json\", events)\n            _log(200, None)\n            return {\"event\": ev, \"mutation\": mutation, \"idempotency_reused\": False}\n        e = _err(\"NOT_FOUND\", \"event already deleted\", resource=\"calendar_events\", id=event_id)\n        _log(404, e[\"error\"])\n        return e\n\n    # Lifecycle: set deleted; allowed from tentative/confirmed/cancelled\n    transitions = {\n        \"tentative\": {\"confirmed\", \"cancelled\", \"deleted\"},\n        \"confirmed\": {\"cancelled\", \"deleted\"},\n        \"cancelled\": {\"deleted\"},\n        \"deleted\": set()\n    }\n    cur = ev.get(\"status\")\n    if cur not in transitions:\n        e = _err(\"CONFLICT\", \"event has invalid current status\")\n        _log(409, e[\"error\"])\n        return e\n    if \"deleted\" not in transitions[cur]:\n        e = _err(\"INVALID_TRANSITION\", f\"cannot transition event status from {cur} to deleted\")\n        _log(409, e[\"error\"])\n        return e\n\n    # Record mutation queued then apply\n    mut_id = \"cmevmut_\" + uuid.uuid4().hex[:20]\n    mutation = {\n        \"id\": mut_id,\n        \"account_id\": account_id,\n        \"event_id\": event_id,\n        \"mutation_type\": \"delete\",\n        \"patch\": {\"status\": \"deleted\"},\n        \"status\": \"queued\",\n        \"idempotency_key\": idempotency_key,\n        \"error_message\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso\n    }\n    mutations.append(mutation)\n\n    ev[\"status\"] = \"deleted\"\n    ev[\"updated_at\"] = now_iso\n    ev[\"provider_etag\"] = \"etag_\" + uuid.uuid4().hex[:12]\n\n    mutation[\"status\"] = \"applied\"\n    mutation[\"updated_at\"] = now_iso\n\n    _save(\"calendar_event_mutations.json\", mutations)\n    _save(\"calendar_events.json\", events)\n\n    _log(200, None)\n    return {\"event\": ev, \"mutation\": mutation}\n",
+          "_params_reconstructed": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_email",
+          "description": "Fetches a single email record by id for the specified Workspace account and returns the full stored representation (including labels/flags and provider identifiers). Refuses with NOT_FOUND if the email does not exist for the account, or UNAUTHORIZED if the caller cannot access `account_id`. Raises VALIDATION_ERROR for invalid ids.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "account_id": {
+                "type": "string",
+                "pattern": "^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Workspace account id (workspace_accounts.id) the email belongs to."
+              },
+              "email_id": {
+                "type": "string",
+                "pattern": "^gwem_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Email id (emails.id) to fetch."
+              }
+            },
+            "required": [
+              "account_id",
+              "email_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_email(account_id, email_id, **_extra):\n    import json, os, datetime, time, secrets, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0356000\" if __import__(\"os\").path.isdir(\"./environment_mix/0356000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now_dt.replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _log(endpoint, status, used_account_id=None, error_code=None):\n        request_logs = _load(\"request_logs.json\")\n        if not isinstance(request_logs, list):\n            request_logs = []\n        rid = \"rlog_\" + str(int(time.time() * 1000)) + \"_\" + secrets.token_hex(3)\n        latency_ms = int((time.time() - t0) * 1000)\n        request_logs.append({\n            \"id\": rid,\n            \"service\": \"google_workspace\",\n            \"endpoint\": endpoint,\n            \"account_id\": used_account_id,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": now_iso\n        })\n        _save(\"request_logs.json\", request_logs)\n\n    def _enforce_limits(endpoint, resolved_account_id):\n        quotas = _load(\"quotas.json\")\n        if not isinstance(quotas, list):\n            return None\n        quota_cfg = None\n        for q in quotas:\n            if isinstance(q, dict) and q.get(\"service\") == \"google_workspace\":\n                quota_cfg = q\n                break\n        if not isinstance(quota_cfg, dict):\n            return None\n\n        request_logs = _load(\"request_logs.json\")\n        if not isinstance(request_logs, list):\n            request_logs = []\n\n        def _parse_ts(s):\n            if not isinstance(s, str):\n                return None\n            s2 = s[:-1] if s.endswith(\"Z\") else s\n            try:\n                dt = datetime.datetime.fromisoformat(s2)\n                if dt.tzinfo is None:\n                    dt = dt.replace(tzinfo=datetime.timezone.utc)\n                return dt\n            except Exception:\n                return None\n\n        rl = quota_cfg.get(\"rate_limit_per_minute\")\n        if isinstance(rl, int) and rl > 0:\n            cutoff = now_dt - datetime.timedelta(seconds=60)\n            cnt = 0\n            for r in request_logs:\n                if not isinstance(r, dict):\n                    continue\n                if r.get(\"service\") != \"google_workspace\":\n                    continue\n                if r.get(\"endpoint\") != endpoint:\n                    continue\n                if resolved_account_id and r.get(\"account_id\") != resolved_account_id:\n                    continue\n                ts = _parse_ts(r.get(\"timestamp\"))\n                if ts and ts >= cutoff:\n                    cnt += 1\n            if cnt >= rl:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded; retry later.\", retry_after_seconds=60)\n        return None\n\n    # validate (relax schema mismatch: datastore uses gmsg_ ids; also audit passed email address)\n    if not isinstance(account_id, str) or not account_id:\n        _log(\"get_email\", \"error\", None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"account_id must be a non-empty string.\", field=\"account_id\")\n    if not re.match(r\"^gwsa_[0-9A-HJKMNP-TV-Z]{10,}$\", account_id):\n        _log(\"get_email\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid account_id format.\", field=\"account_id\")\n    if not isinstance(email_id, str) or not email_id:\n        _log(\"get_email\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"email_id must be a non-empty string.\", field=\"email_id\")\n    # accept ids that look like gwem_/gmsg_ OR an email address (audit case)\n    if not (re.match(r\"^(gwem|gmsg)_[0-9A-HJKMNP-TV-Z]{10,}$\", email_id) or (\"@\" in email_id)):\n        _log(\"get_email\", \"error\", account_id, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid email_id format.\", field=\"email_id\")\n\n    accounts = _load(\"workspace_accounts.json\")\n    if not isinstance(accounts, list):\n        accounts = []\n    active_accounts = [a for a in accounts if isinstance(a, dict) and a.get(\"status\") == \"active\" and isinstance(a.get(\"id\"), str)]\n    if not active_accounts:\n        _log(\"get_email\", \"error\", None, \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"No active Workspace account is configured for this service.\")\n\n    emails = _load(\"emails.json\")\n    if not isinstance(emails, list):\n        emails = []\n\n    # Find the email in a way that matches the datastore and avoids \"first row\" context bugs:\n    # 1) Prefer exact (account_id, id)\n    target = None\n    for e in emails:\n        if not isinstance(e, dict):\n            continue\n        if e.get(\"account_id\") == account_id and e.get(\"id\") == email_id:\n            target = e\n            break\n\n    # 2) If the email_id is an email address, allow lookup by from/to for the specified account\n    if target is None and \"@\" in email_id:\n        for e in emails:\n            if not isinstance(e, dict):\n                continue\n            if e.get(\"account_id\") != account_id:\n                continue\n            if e.get(\"from_email\") == email_id:\n                target = e\n                break\n            to_list = e.get(\"to_emails\")\n            cc_list = e.get(\"cc_emails\")\n            bcc_list = e.get(\"bcc_emails\")\n            if isinstance(to_list, list) and email_id in to_list:\n                target = e\n                break\n            if isinstance(cc_list, list) and email_id in cc_list:\n                target = e\n                break\n            if isinstance(bcc_list, list) and email_id in bcc_list:\n                target = e\n                break\n\n    # 3) If still not found, check whether the requested account_id is accessible (active); if not, try to resolve a working combo\n    resolved_account_id = account_id if any(a.get(\"id\") == account_id for a in active_accounts) else None\n    if resolved_account_id is None:\n        # cannot access requested account id under ambient auth\n        _log(\"get_email\", \"error\", None, \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Cannot access the requested account_id.\", field=\"account_id\")\n\n    limit_err = _enforce_limits(\"get_email\", resolved_account_id)\n    if limit_err:\n        _log(\"get_email\", \"error\", resolved_account_id, limit_err[\"error\"][\"code\"])\n        return limit_err\n\n    if target is None:\n        _log(\"get_email\", \"error\", resolved_account_id, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Email not found for this account.\", field=\"email_id\")\n\n    _log(\"get_email\", \"ok\", resolved_account_id, None)\n    return {\"email\": target}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0356000",
+    "index": 356,
+    "name": "Google Workspace Server",
+    "description": "This backend stores a minimal representation of a Google Workspace-integrated mailbox and calendar for one or more connected users, including messages, labels/state changes, and calendar events. The main workflows are: listing/searching emails, sending emails (outbound + delivery status), modifying ",
+    "taxonomy": {
+      "L1_id": "L1-20",
+      "L1_name": "Communication & General Utilities",
+      "L1_name_zh": "通信与通用工具",
+      "L2_id": "L2-48",
+      "L2_name": "Messaging & Notification",
+      "L2_name_zh": "即时通信与通知",
+      "L3_name": "Email Mailbox & Workspace Connectors",
+      "L3_name_zh": "邮箱与办公套件连接器"
+    },
+    "database_dir": "./environment_mix/0356000",
+    "mount_path": "/app/database",
+    "n_tools": 9,
+    "n_collections": 5,
+    "n_records": 88,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 9,
+      "loaded": 9,
+      "reads_returning_data": 4,
+      "read_operations": 4,
+      "mutations_persisted": 5,
+      "mutations_attempted": 5
+    },
+    "tools_loadable_from_database_dir": 9,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_emails",
+      "returned_chars": 2494
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

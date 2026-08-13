@@ -1,0 +1,826 @@
+{
+  "index": 136,
+  "local_files_dir": "./environment_mix/0136000",
+  "file_list": [
+    "./environment_mix/0136000/README.md",
+    "./environment_mix/0136000/authors.json",
+    "./environment_mix/0136000/papers.json",
+    "./environment_mix/0136000/request_logs.json",
+    "./environment_mix/0136000/research_areas.json",
+    "./environment_mix/0136000/tasks.json",
+    "./environment_mix/0136000/venues.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "research_areas.json": "18 rows",
+        "tasks.json": "18 rows",
+        "authors.json": "18 rows",
+        "venues.json": "17 rows",
+        "papers.json": "22 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "search_research_areas",
+          "description": "Searches PapersWithCode research areas by area name and returns a paginated list of matching areas; pagination is controlled by page and items_per_page. Raises VALIDATION_ERROR if name is empty or if page/items_per_page are not positive integers. Raises RATE_LIMITED if request quotas are exceeded and UNAUTHORIZED if the caller is not permitted to use the service.",
+          "parameters": {
+            "properties": {
+              "name": {
+                "title": "Name",
+                "type": "string"
+              },
+              "page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 1,
+                "title": "Page"
+              },
+              "items_per_page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 20,
+                "title": "Items Per Page"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "title": "search_research_areasArguments",
+            "type": "object"
+          },
+          "implementation": "def search_research_areas(name, page=None, items_per_page=None, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _norm_str(s):\n        s = s.strip()\n        s = re.sub(r\"\\s+\", \" \", s)\n        return s\n\n    def _log(status_code, status, message=None, extra=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": f\"req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"service\": \"paperswithcode\",\n            \"endpoint\": \"search_research_areas\",\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"status\": status,\n            \"status_code\": status_code,\n            \"message\": message,\n        }\n        if isinstance(extra, dict):\n            row.update(extra)\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _check_limits():\n        # If no quotas config exists, allow.\n        quotas = _load(\"quotas.json\")\n        if not isinstance(quotas, list):\n            return None\n        if len(quotas) == 0:\n            return None\n        # Find a usable quota row for this service; pick first active matching.\n        q = None\n        for r in quotas:\n            if isinstance(r, dict) and r.get(\"service\") in (None, \"paperswithcode\") and r.get(\"status\", \"active\") == \"active\":\n                q = r\n                break\n        if not q:\n            return None\n\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n\n        # Rate limit: requests_per_minute\n        rpm = q.get(\"requests_per_minute\")\n        if isinstance(rpm, int) and rpm > 0:\n            cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=60)\n            recent = 0\n            for lr in logs:\n                if not isinstance(lr, dict):\n                    continue\n                if lr.get(\"service\") != \"paperswithcode\":\n                    continue\n                ts = lr.get(\"timestamp\")\n                if isinstance(ts, str):\n                    try:\n                        dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                    except Exception:\n                        continue\n                    if dt >= cutoff:\n                        recent += 1\n            if recent >= rpm:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit=rpm, window_seconds=60)\n\n        # Daily quota: requests_per_day\n        rpd = q.get(\"requests_per_day\")\n        if isinstance(rpd, int) and rpd > 0:\n            cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=1)\n            recent = 0\n            for lr in logs:\n                if not isinstance(lr, dict):\n                    continue\n                if lr.get(\"service\") != \"paperswithcode\":\n                    continue\n                ts = lr.get(\"timestamp\")\n                if isinstance(ts, str):\n                    try:\n                        dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                    except Exception:\n                        continue\n                    if dt >= cutoff:\n                        recent += 1\n            if recent >= rpd:\n                return _err(\"QUOTA_EXCEEDED\", \"Request quota exceeded.\", limit=rpd, window_seconds=86400)\n\n        return None\n\n    # Auth is ambient; if there is an authz config and none allows access, return UNAUTHORIZED.\n    # We interpret absence of auth config as allowed.\n    authz = _load(\"authz.json\")\n    if isinstance(authz, list) and len(authz) > 0:\n        allowed = any(isinstance(r, dict) and r.get(\"service\") in (None, \"paperswithcode\") and r.get(\"status\", \"active\") == \"active\" for r in authz)\n        if not allowed:\n            _log(401, \"error\", \"Unauthorized\")\n            return _err(\"UNAUTHORIZED\", \"Caller is not permitted to use the service.\")\n\n    lim = _check_limits()\n    if lim:\n        _log(429, \"error\", lim[\"error\"][\"message\"])\n        return lim\n\n    # Validate inputs\n    if not isinstance(name, str):\n        _log(400, \"error\", \"Validation error: name must be a string\")\n        return _err(\"VALIDATION_ERROR\", \"name must be a string.\")\n    qname = _norm_str(name)\n    if qname == \"\":\n        _log(400, \"error\", \"Validation error: name must not be empty\")\n        return _err(\"VALIDATION_ERROR\", \"name must not be empty.\")\n\n    if page is None:\n        page = 1\n    if items_per_page is None:\n        items_per_page = 20\n\n    if not isinstance(page, int) or page <= 0:\n        _log(400, \"error\", \"Validation error: page must be a positive integer\")\n        return _err(\"VALIDATION_ERROR\", \"page must be a positive integer.\")\n    if not isinstance(items_per_page, int) or items_per_page <= 0:\n        _log(400, \"error\", \"Validation error: items_per_page must be a positive integer\")\n        return _err(\"VALIDATION_ERROR\", \"items_per_page must be a positive integer.\")\n\n    items_per_page = min(items_per_page, 100)\n\n    # Load and filter\n    areas = _load(\"research_areas.json\")\n    if not isinstance(areas, list):\n        areas = []\n\n    qlow = qname.lower()\n    matches = []\n    for a in areas:\n        if not isinstance(a, dict):\n            continue\n        st = a.get(\"status\")\n        if st not in (\"active\", \"deprecated\"):\n            continue\n        slug = a.get(\"slug\")\n        aname = a.get(\"name\")\n        if isinstance(slug, str) and slug.lower() == qlow:\n            matches.append(a)\n            continue\n        if isinstance(aname, str) and qlow in aname.lower():\n            matches.append(a)\n            continue\n\n    # Sort: stable, by name then id\n    def _k(r):\n        n = r.get(\"name\")\n        i = r.get(\"id\")\n        return ((n or \"\").lower(), i or \"\")\n    matches.sort(key=_k)\n\n    total = len(matches)\n    start = (page - 1) * items_per_page\n    end = start + items_per_page\n    page_rows = matches[start:end] if start < total else []\n    has_more = end < total\n    next_cursor = page + 1 if has_more else None\n\n    resp = {\n        \"data\": page_rows,\n        \"meta\": {\n            \"page\": page,\n            \"items_per_page\": items_per_page,\n            \"total\": total,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n        },\n    }\n    _log(200, \"ok\")\n    return resp\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_research_area",
+          "description": "Returns the research area record for the provided area_id, including its stored metadata. Raises NOT_FOUND if no research area exists for area_id and VALIDATION_ERROR if area_id is empty or malformed. Raises RATE_LIMITED on quota exhaustion and UNAUTHORIZED if access is not allowed.",
+          "parameters": {
+            "properties": {
+              "area_id": {
+                "title": "Area Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "area_id"
+            ],
+            "title": "get_research_areaArguments",
+            "type": "object"
+          },
+          "implementation": "def get_research_area(area_id, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code, status, message=None, extra=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": f\"req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"service\": \"paperswithcode\",\n            \"endpoint\": \"get_research_area\",\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"status\": status,\n            \"status_code\": status_code,\n            \"message\": message,\n        }\n        if isinstance(extra, dict):\n            row.update(extra)\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _check_limits():\n        quotas = _load(\"quotas.json\")\n        if not isinstance(quotas, list):\n            return None\n        if len(quotas) == 0:\n            return None\n        q = None\n        for r in quotas:\n            if isinstance(r, dict) and r.get(\"service\") in (None, \"paperswithcode\") and r.get(\"status\", \"active\") == \"active\":\n                q = r\n                break\n        if not q:\n            return None\n\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n\n        rpm = q.get(\"requests_per_minute\")\n        if isinstance(rpm, int) and rpm > 0:\n            cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=60)\n            recent = 0\n            for lr in logs:\n                if not isinstance(lr, dict):\n                    continue\n                if lr.get(\"service\") != \"paperswithcode\":\n                    continue\n                ts = lr.get(\"timestamp\")\n                if isinstance(ts, str):\n                    try:\n                        dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                    except Exception:\n                        continue\n                    if dt >= cutoff:\n                        recent += 1\n            if recent >= rpm:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit=rpm, window_seconds=60)\n\n        rpd = q.get(\"requests_per_day\")\n        if isinstance(rpd, int) and rpd > 0:\n            cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=1)\n            recent = 0\n            for lr in logs:\n                if not isinstance(lr, dict):\n                    continue\n                if lr.get(\"service\") != \"paperswithcode\":\n                    continue\n                ts = lr.get(\"timestamp\")\n                if isinstance(ts, str):\n                    try:\n                        dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                    except Exception:\n                        continue\n                    if dt >= cutoff:\n                        recent += 1\n            if recent >= rpd:\n                return _err(\"QUOTA_EXCEEDED\", \"Request quota exceeded.\", limit=rpd, window_seconds=86400)\n        return None\n\n    authz = _load(\"authz.json\")\n    if isinstance(authz, list) and len(authz) > 0:\n        allowed = any(isinstance(r, dict) and r.get(\"service\") in (None, \"paperswithcode\") and r.get(\"status\", \"active\") == \"active\" for r in authz)\n        if not allowed:\n            _log(401, \"error\", \"Unauthorized\")\n            return _err(\"UNAUTHORIZED\", \"Caller is not permitted to use the service.\")\n\n    lim = _check_limits()\n    if lim:\n        _log(429, \"error\", lim[\"error\"][\"message\"])\n        return lim\n\n    if not isinstance(area_id, str):\n        _log(400, \"error\", \"Validation error: area_id must be a string\")\n        return _err(\"VALIDATION_ERROR\", \"area_id must be a string.\")\n    aid = area_id.strip()\n    if aid == \"\":\n        _log(400, \"error\", \"Validation error: area_id must not be empty\")\n        return _err(\"VALIDATION_ERROR\", \"area_id must not be empty.\")\n    # Basic \"malformed\" check: allow url-safe-ish ids and upstream-like ids, reject whitespace.\n    if re.search(r\"\\s\", aid):\n        _log(400, \"error\", \"Validation error: area_id malformed\")\n        return _err(\"VALIDATION_ERROR\", \"area_id is malformed.\")\n\n    areas = _load(\"research_areas.json\")\n    if not isinstance(areas, list):\n        areas = []\n    found = None\n    for a in areas:\n        if isinstance(a, dict) and a.get(\"id\") == aid:\n            found = a\n            break\n\n    if not found or found.get(\"status\") == \"deleted\":\n        _log(404, \"error\", \"Not found\")\n        return _err(\"NOT_FOUND\", \"Research area not found.\", area_id=aid)\n\n    _log(200, \"ok\")\n    return {\"data\": found}\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_research_area_tasks",
+          "description": "Lists tasks associated with the given research area_id and returns a paginated result set controlled by page and items_per_page. Raises NOT_FOUND if the research area does not exist, and VALIDATION_ERROR if area_id is empty or page/items_per_page are not positive integers. Raises RATE_LIMITED when quota limits are exceeded and UNAUTHORIZED when the caller lacks access.",
+          "parameters": {
+            "properties": {
+              "area_id": {
+                "title": "Area Id",
+                "type": "string"
+              },
+              "page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 1,
+                "title": "Page"
+              },
+              "items_per_page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 20,
+                "title": "Items Per Page"
+              }
+            },
+            "required": [
+              "area_id"
+            ],
+            "title": "list_research_area_tasksArguments",
+            "type": "object"
+          },
+          "implementation": "def list_research_area_tasks(area_id, page=None, items_per_page=None, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code, status, message=None, extra=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": f\"req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"service\": \"paperswithcode\",\n            \"endpoint\": \"list_research_area_tasks\",\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"status\": status,\n            \"status_code\": status_code,\n            \"message\": message,\n        }\n        if isinstance(extra, dict):\n            row.update(extra)\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _check_limits():\n        quotas = _load(\"quotas.json\")\n        if not isinstance(quotas, list):\n            return None\n        if len(quotas) == 0:\n            return None\n        q = None\n        for r in quotas:\n            if isinstance(r, dict) and r.get(\"service\") in (None, \"paperswithcode\") and r.get(\"status\", \"active\") == \"active\":\n                q = r\n                break\n        if not q:\n            return None\n\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n\n        rpm = q.get(\"requests_per_minute\")\n        if isinstance(rpm, int) and rpm > 0:\n            cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=60)\n            recent = 0\n            for lr in logs:\n                if not isinstance(lr, dict):\n                    continue\n                if lr.get(\"service\") != \"paperswithcode\":\n                    continue\n                ts = lr.get(\"timestamp\")\n                if isinstance(ts, str):\n                    try:\n                        dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                    except Exception:\n                        continue\n                    if dt >= cutoff:\n                        recent += 1\n            if recent >= rpm:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit=rpm, window_seconds=60)\n\n        rpd = q.get(\"requests_per_day\")\n        if isinstance(rpd, int) and rpd > 0:\n            cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=1)\n            recent = 0\n            for lr in logs:\n                if not isinstance(lr, dict):\n                    continue\n                if lr.get(\"service\") != \"paperswithcode\":\n                    continue\n                ts = lr.get(\"timestamp\")\n                if isinstance(ts, str):\n                    try:\n                        dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                    except Exception:\n                        continue\n                    if dt >= cutoff:\n                        recent += 1\n            if recent >= rpd:\n                return _err(\"QUOTA_EXCEEDED\", \"Request quota exceeded.\", limit=rpd, window_seconds=86400)\n\n        return None\n\n    authz = _load(\"authz.json\")\n    if isinstance(authz, list) and len(authz) > 0:\n        allowed = any(isinstance(r, dict) and r.get(\"service\") in (None, \"paperswithcode\") and r.get(\"status\", \"active\") == \"active\" for r in authz)\n        if not allowed:\n            _log(401, \"error\", \"Unauthorized\")\n            return _err(\"UNAUTHORIZED\", \"Caller is not permitted to use the service.\")\n\n    lim = _check_limits()\n    if lim:\n        _log(429, \"error\", lim[\"error\"][\"message\"])\n        return lim\n\n    if not isinstance(area_id, str):\n        _log(400, \"error\", \"Validation error: area_id must be a string\")\n        return _err(\"VALIDATION_ERROR\", \"area_id must be a string.\")\n    aid = area_id.strip()\n    if aid == \"\":\n        _log(400, \"error\", \"Validation error: area_id must not be empty\")\n        return _err(\"VALIDATION_ERROR\", \"area_id must not be empty.\")\n    if re.search(r\"\\s\", aid):\n        _log(400, \"error\", \"Validation error: area_id malformed\")\n        return _err(\"VALIDATION_ERROR\", \"area_id is malformed.\")\n\n    if page is None:\n        page = 1\n    if items_per_page is None:\n        items_per_page = 20\n    if not isinstance(page, int) or page <= 0:\n        _log(400, \"error\", \"Validation error: page must be a positive integer\")\n        return _err(\"VALIDATION_ERROR\", \"page must be a positive integer.\")\n    if not isinstance(items_per_page, int) or items_per_page <= 0:\n        _log(400, \"error\", \"Validation error: items_per_page must be a positive integer\")\n        return _err(\"VALIDATION_ERROR\", \"items_per_page must be a positive integer.\")\n    items_per_page = min(items_per_page, 100)\n\n    # Verify area exists and not deleted (NOT_FOUND if does not exist; deleted treated as not found for this endpoint)\n    areas = _load(\"research_areas.json\")\n    if not isinstance(areas, list):\n        areas = []\n    area_row = None\n    for a in areas:\n        if isinstance(a, dict) and a.get(\"id\") == aid:\n            area_row = a\n            break\n    if not area_row or area_row.get(\"status\") == \"deleted\":\n        _log(404, \"error\", \"Not found\")\n        return _err(\"NOT_FOUND\", \"Research area not found.\", area_id=aid)\n\n    tasks = _load(\"tasks.json\")\n    if not isinstance(tasks, list):\n        tasks = []\n    rows = []\n    for t in tasks:\n        if not isinstance(t, dict):\n            continue\n        if t.get(\"area_id\") != aid:\n            continue\n        if t.get(\"status\") == \"deleted\":\n            continue\n        rows.append(t)\n\n    # Sort by name then id\n    rows.sort(key=lambda r: ((r.get(\"name\") or \"\").lower(), r.get(\"id\") or \"\"))\n\n    total = len(rows)\n    start = (page - 1) * items_per_page\n    end = start + items_per_page\n    page_rows = rows[start:end] if start < total else []\n    has_more = end < total\n    next_cursor = page + 1 if has_more else None\n\n    _log(200, \"ok\")\n    return {\n        \"data\": page_rows,\n        \"meta\": {\n            \"area_id\": aid,\n            \"page\": page,\n            \"items_per_page\": items_per_page,\n            \"total\": total,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n        },\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "search_authors",
+          "description": "Searches paper authors by full_name and returns a paginated list of author matches; pagination uses page and items_per_page. Raises VALIDATION_ERROR if full_name is empty or if page/items_per_page are not positive integers. Raises RATE_LIMITED if quotas are exceeded and UNAUTHORIZED if the caller is not permitted.",
+          "parameters": {
+            "properties": {
+              "full_name": {
+                "title": "Full Name",
+                "type": "string"
+              },
+              "page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 1,
+                "title": "Page"
+              },
+              "items_per_page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 20,
+                "title": "Items Per Page"
+              }
+            },
+            "required": [
+              "full_name"
+            ],
+            "title": "search_authorsArguments",
+            "type": "object"
+          },
+          "implementation": "def search_authors(full_name, page=None, items_per_page=None, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code, status, message=None, extra=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": f\"req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"service\": \"paperswithcode\",\n            \"endpoint\": \"search_authors\",\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"status\": status,\n            \"status_code\": status_code,\n            \"message\": message,\n        }\n        if isinstance(extra, dict):\n            row.update(extra)\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _check_limits():\n        quotas = _load(\"quotas.json\")\n        if not isinstance(quotas, list):\n            return None\n        if len(quotas) == 0:\n            return None\n        q = None\n        for r in quotas:\n            if isinstance(r, dict) and r.get(\"service\") in (None, \"paperswithcode\") and r.get(\"status\", \"active\") == \"active\":\n                q = r\n                break\n        if not q:\n            return None\n\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n\n        rpm = q.get(\"requests_per_minute\")\n        if isinstance(rpm, int) and rpm > 0:\n            cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=60)\n            recent = 0\n            for lr in logs:\n                if not isinstance(lr, dict):\n                    continue\n                if lr.get(\"service\") != \"paperswithcode\":\n                    continue\n                ts = lr.get(\"timestamp\")\n                if isinstance(ts, str):\n                    try:\n                        dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                    except Exception:\n                        continue\n                    if dt >= cutoff:\n                        recent += 1\n            if recent >= rpm:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit=rpm, window_seconds=60)\n\n        rpd = q.get(\"requests_per_day\")\n        if isinstance(rpd, int) and rpd > 0:\n            cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=1)\n            recent = 0\n            for lr in logs:\n                if not isinstance(lr, dict):\n                    continue\n                if lr.get(\"service\") != \"paperswithcode\":\n                    continue\n                ts = lr.get(\"timestamp\")\n                if isinstance(ts, str):\n                    try:\n                        dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                    except Exception:\n                        continue\n                    if dt >= cutoff:\n                        recent += 1\n            if recent >= rpd:\n                return _err(\"QUOTA_EXCEEDED\", \"Request quota exceeded.\", limit=rpd, window_seconds=86400)\n\n        return None\n\n    authz = _load(\"authz.json\")\n    if isinstance(authz, list) and len(authz) > 0:\n        allowed = any(isinstance(r, dict) and r.get(\"service\") in (None, \"paperswithcode\") and r.get(\"status\", \"active\") == \"active\" for r in authz)\n        if not allowed:\n            _log(401, \"error\", \"Unauthorized\")\n            return _err(\"UNAUTHORIZED\", \"Caller is not permitted to use the service.\")\n\n    lim = _check_limits()\n    if lim:\n        _log(429, \"error\", lim[\"error\"][\"message\"])\n        return lim\n\n    if not isinstance(full_name, str):\n        _log(400, \"error\", \"Validation error: full_name must be a string\")\n        return _err(\"VALIDATION_ERROR\", \"full_name must be a string.\")\n    q = full_name.strip()\n    q = re.sub(r\"\\s+\", \" \", q)\n    if q == \"\":\n        _log(400, \"error\", \"Validation error: full_name must not be empty\")\n        return _err(\"VALIDATION_ERROR\", \"full_name must not be empty.\")\n\n    if page is None:\n        page = 1\n    if items_per_page is None:\n        items_per_page = 20\n    if not isinstance(page, int) or page <= 0:\n        _log(400, \"error\", \"Validation error: page must be a positive integer\")\n        return _err(\"VALIDATION_ERROR\", \"page must be a positive integer.\")\n    if not isinstance(items_per_page, int) or items_per_page <= 0:\n        _log(400, \"error\", \"Validation error: items_per_page must be a positive integer\")\n        return _err(\"VALIDATION_ERROR\", \"items_per_page must be a positive integer.\")\n    items_per_page = min(items_per_page, 100)\n\n    qnorm = q.lower()\n\n    authors = _load(\"authors.json\")\n    if not isinstance(authors, list):\n        authors = []\n\n    matches = []\n    for a in authors:\n        if not isinstance(a, dict):\n            continue\n        if a.get(\"status\") == \"deleted\":\n            continue\n        nn = a.get(\"normalized_name\")\n        fn = a.get(\"full_name\")\n        # Prefer normalized_name match; fallback to full_name if missing.\n        target = nn if isinstance(nn, str) else (fn.lower() if isinstance(fn, str) else \"\")\n        if qnorm in target:\n            matches.append(a)\n\n    # Sort by full_name then id\n    matches.sort(key=lambda r: ((r.get(\"full_name\") or \"\").lower(), r.get(\"id\") or \"\"))\n\n    total = len(matches)\n    start = (page - 1) * items_per_page\n    end = start + items_per_page\n    page_rows = matches[start:end] if start < total else []\n    has_more = end < total\n    next_cursor = page + 1 if has_more else None\n\n    _log(200, \"ok\")\n    return {\n        \"data\": page_rows,\n        \"meta\": {\n            \"page\": page,\n            \"items_per_page\": items_per_page,\n            \"total\": total,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n        },\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_paper_author",
+          "description": "Returns the author record for the provided author_id. Raises NOT_FOUND if no author exists for author_id and VALIDATION_ERROR if author_id is empty or malformed. Raises RATE_LIMITED on quota exhaustion and UNAUTHORIZED if access is not allowed.",
+          "parameters": {
+            "properties": {
+              "author_id": {
+                "title": "Author Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "author_id"
+            ],
+            "title": "get_paper_authorArguments",
+            "type": "object"
+          },
+          "implementation": "def get_paper_author(author_id, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    _endpoint = \"get_paper_author\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_ts_any(row):\n        if not isinstance(row, dict):\n            return None\n        ts = row.get(\"timestamp\") or row.get(\"created_at\")\n        if isinstance(ts, str) and ts:\n            try:\n                return datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                return None\n        return None\n\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        return logs if isinstance(logs, list) else []\n\n    def _enforce_limits():\n        cfg = _load(\"service_config.json\")\n        if not isinstance(cfg, dict):\n            cfg = {}\n        rl = cfg.get(\"rate_limit_per_minute\")\n        quota = cfg.get(\"quota_per_day\")\n        logs = _load_logs()\n        now = datetime.datetime.utcnow()\n\n        if isinstance(rl, int) and rl > 0:\n            cutoff = now - datetime.timedelta(seconds=60)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= rl:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit_per_minute=rl)\n\n        if isinstance(quota, int) and quota > 0:\n            cutoff = now - datetime.timedelta(days=1)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= quota:\n                    return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\", quota_per_day=quota)\n\n        return None\n\n    def _log(status, error_code=None):\n        logs = _load_logs()\n        logs.append(\n            {\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": _endpoint,\n                \"timestamp\": _now_iso(),\n                \"status\": status,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - _t0) * 1000),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    # Validate\n    if not isinstance(author_id, str) or not author_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"author_id must be a non-empty string.\", author_id=author_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    author_id = author_id.strip()\n\n    lim = _enforce_limits()\n    if lim:\n        _log(\"error\", lim[\"error\"][\"code\"])\n        return lim\n\n    # Resolve author; accept slight id-prefix drift in incoming ids (audit shows pwc_aut_ vs store pwc_auth_)\n    authors = _load(\"authors.json\")\n    if not isinstance(authors, list):\n        authors = []\n\n    def _id_variants(aid):\n        v = {aid}\n        if \"pwc_aut_\" in aid:\n            v.add(aid.replace(\"pwc_aut_\", \"pwc_auth_\", 1))\n        if \"pwc_auth_\" in aid:\n            v.add(aid.replace(\"pwc_auth_\", \"pwc_aut_\", 1))\n        return v\n\n    lookup_ids = _id_variants(author_id)\n    by_id = {a.get(\"id\"): a for a in authors if isinstance(a, dict) and isinstance(a.get(\"id\"), str)}\n    found = None\n    for vid in lookup_ids:\n        if vid in by_id:\n            found = by_id[vid]\n            break\n\n    if not found or found.get(\"status\") == \"deleted\":\n        e = _err(\"NOT_FOUND\", \"Author not found.\", author_id=author_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    # Follow merges to canonical author\n    if found.get(\"status\") == \"merged\":\n        canon_id = found.get(\"merged_into_author_id\")\n        if not isinstance(canon_id, str) or not canon_id:\n            e = _err(\"CONFLICT\", \"Author is merged but has no canonical author id.\", author_id=found.get(\"id\"))\n            _log(\"error\", e[\"error\"][\"code\"])\n            return e\n        canon = by_id.get(canon_id)\n        if not canon or canon.get(\"status\") == \"deleted\":\n            e = _err(\"CONFLICT\", \"Canonical author for merged author is missing or deleted.\", canonical_author_id=canon_id)\n            _log(\"error\", e[\"error\"][\"code\"])\n            return e\n        _log(\"ok\")\n        return {\"author\": canon}\n\n    _log(\"ok\")\n    return {\"author\": found}\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_papers_by_author_id",
+          "description": "Lists papers linked to the given author_id and returns a paginated list controlled by page and items_per_page. Raises NOT_FOUND if the author does not exist, and VALIDATION_ERROR if author_id is empty or page/items_per_page are not positive integers. Raises RATE_LIMITED when quota limits are exceeded and UNAUTHORIZED when the caller lacks access.",
+          "parameters": {
+            "properties": {
+              "author_id": {
+                "title": "Author Id",
+                "type": "string"
+              },
+              "page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 1,
+                "title": "Page"
+              },
+              "items_per_page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 20,
+                "title": "Items Per Page"
+              }
+            },
+            "required": [
+              "author_id"
+            ],
+            "title": "list_papers_by_author_idArguments",
+            "type": "object"
+          },
+          "implementation": "def list_papers_by_author_id(author_id, page=None, items_per_page=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    _endpoint = \"list_papers_by_author_id\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_ts_any(row):\n        if not isinstance(row, dict):\n            return None\n        ts = row.get(\"timestamp\") or row.get(\"created_at\")\n        if isinstance(ts, str) and ts:\n            try:\n                return datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                return None\n        return None\n\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        return logs if isinstance(logs, list) else []\n\n    def _enforce_limits():\n        cfg = _load(\"service_config.json\")\n        if not isinstance(cfg, dict):\n            cfg = {}\n        rl = cfg.get(\"rate_limit_per_minute\")\n        quota = cfg.get(\"quota_per_day\")\n        logs = _load_logs()\n        now = datetime.datetime.utcnow()\n\n        if isinstance(rl, int) and rl > 0:\n            cutoff = now - datetime.timedelta(seconds=60)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= rl:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit_per_minute=rl)\n\n        if isinstance(quota, int) and quota > 0:\n            cutoff = now - datetime.timedelta(days=1)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= quota:\n                    return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\", quota_per_day=quota)\n\n        return None\n\n    def _log(status, error_code=None):\n        logs = _load_logs()\n        logs.append(\n            {\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": _endpoint,\n                \"timestamp\": _now_iso(),\n                \"status\": status,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - _t0) * 1000),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    # Validate\n    if not isinstance(author_id, str) or not author_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"author_id must be a non-empty string.\", author_id=author_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    author_id = author_id.strip()\n\n    if page is None:\n        page = 1\n    if items_per_page is None:\n        items_per_page = 20\n    if not isinstance(page, int) or page < 1:\n        e = _err(\"VALIDATION_ERROR\", \"page must be a positive integer.\", page=page)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if not isinstance(items_per_page, int) or items_per_page < 1:\n        e = _err(\"VALIDATION_ERROR\", \"items_per_page must be a positive integer.\", items_per_page=items_per_page)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if items_per_page > 100:\n        items_per_page = 100\n\n    lim = _enforce_limits()\n    if lim:\n        _log(\"error\", lim[\"error\"][\"code\"])\n        return lim\n\n    authors = _load(\"authors.json\")\n    if not isinstance(authors, list):\n        authors = []\n\n    def _id_variants(aid):\n        v = {aid}\n        if \"pwc_aut_\" in aid:\n            v.add(aid.replace(\"pwc_aut_\", \"pwc_auth_\", 1))\n        if \"pwc_auth_\" in aid:\n            v.add(aid.replace(\"pwc_auth_\", \"pwc_aut_\", 1))\n        return v\n\n    lookup_ids = _id_variants(author_id)\n    by_id = {a.get(\"id\"): a for a in authors if isinstance(a, dict) and isinstance(a.get(\"id\"), str)}\n    author = None\n    for vid in lookup_ids:\n        if vid in by_id:\n            author = by_id[vid]\n            break\n\n    if not author or author.get(\"status\") == \"deleted\":\n        e = _err(\"NOT_FOUND\", \"Author not found.\", author_id=author_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    # Canonicalize merged authors for listing\n    canonical_ids = set()\n    if author.get(\"status\") == \"merged\":\n        canon_id = author.get(\"merged_into_author_id\")\n        if isinstance(canon_id, str) and canon_id and canon_id in by_id and by_id[canon_id].get(\"status\") != \"deleted\":\n            canonical_ids.add(canon_id)\n        else:\n            e = _err(\"CONFLICT\", \"Canonical author for merged author is missing or deleted.\", canonical_author_id=canon_id)\n            _log(\"error\", e[\"error\"][\"code\"])\n            return e\n    else:\n        canonical_ids.add(author.get(\"id\"))\n\n    papers = _load(\"papers.json\")\n    if not isinstance(papers, list):\n        papers = []\n\n    matched = []\n    for p in papers:\n        if not isinstance(p, dict):\n            continue\n        if p.get(\"status\") == \"deleted\":\n            continue\n        authors_list = p.get(\"authors\")\n        if not isinstance(authors_list, list):\n            continue\n        for link in authors_list:\n            if not isinstance(link, dict):\n                continue\n            aid = link.get(\"author_id\")\n            if aid in canonical_ids:\n                matched.append(p)\n                break\n\n    # Stable-ish ordering: newest published_at first, then created_at, then id\n    def _dt(s):\n        if not isinstance(s, str) or not s:\n            return None\n        try:\n            return datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n        except Exception:\n            return None\n\n    matched.sort(\n        key=lambda r: (\n            _dt(r.get(\"published_at\")) or _dt(r.get(\"created_at\")) or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),\n            r.get(\"id\") or \"\",\n        ),\n        reverse=True,\n    )\n\n    total = len(matched)\n    start = (page - 1) * items_per_page\n    end = start + items_per_page\n    page_rows = matched[start:end]\n    has_more = end < total\n\n    _log(\"ok\")\n    return {\n        \"papers\": page_rows,\n        \"page\": page,\n        \"items_per_page\": items_per_page,\n        \"total\": total,\n        \"has_more\": has_more,\n        \"next_page\": (page + 1) if has_more else None,\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_papers_by_author_name",
+          "description": "Lists papers for authors matching the provided author_name and returns a paginated list controlled by page and items_per_page. Raises VALIDATION_ERROR if author_name is empty or if page/items_per_page are not positive integers. Raises NOT_FOUND when no matching author (and therefore no papers) can be resolved for the supplied name, plus RATE_LIMITED and UNAUTHORIZED as applicable.",
+          "parameters": {
+            "properties": {
+              "author_name": {
+                "title": "Author Name",
+                "type": "string"
+              },
+              "page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 1,
+                "title": "Page"
+              },
+              "items_per_page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 20,
+                "title": "Items Per Page"
+              }
+            },
+            "required": [
+              "author_name"
+            ],
+            "title": "list_papers_by_author_nameArguments",
+            "type": "object"
+          },
+          "implementation": "def list_papers_by_author_name(author_name, page=None, items_per_page=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    _endpoint = \"list_papers_by_author_name\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_ts_any(row):\n        if not isinstance(row, dict):\n            return None\n        ts = row.get(\"timestamp\") or row.get(\"created_at\")\n        if isinstance(ts, str) and ts:\n            try:\n                return datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                return None\n        return None\n\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        return logs if isinstance(logs, list) else []\n\n    def _enforce_limits():\n        cfg = _load(\"service_config.json\")\n        if not isinstance(cfg, dict):\n            cfg = {}\n        rl = cfg.get(\"rate_limit_per_minute\")\n        quota = cfg.get(\"quota_per_day\")\n        logs = _load_logs()\n        now = datetime.datetime.utcnow()\n\n        if isinstance(rl, int) and rl > 0:\n            cutoff = now - datetime.timedelta(seconds=60)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= rl:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit_per_minute=rl)\n\n        if isinstance(quota, int) and quota > 0:\n            cutoff = now - datetime.timedelta(days=1)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= quota:\n                    return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\", quota_per_day=quota)\n\n        return None\n\n    def _log(status, error_code=None):\n        logs = _load_logs()\n        logs.append(\n            {\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": _endpoint,\n                \"timestamp\": _now_iso(),\n                \"status\": status,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - _t0) * 1000),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    # Validate\n    if not isinstance(author_name, str) or not author_name.strip():\n        e = _err(\"VALIDATION_ERROR\", \"author_name must be a non-empty string.\", author_name=author_name)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    author_name = author_name.strip()\n\n    if page is None:\n        page = 1\n    if items_per_page is None:\n        items_per_page = 20\n    if not isinstance(page, int) or page < 1:\n        e = _err(\"VALIDATION_ERROR\", \"page must be a positive integer.\", page=page)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if not isinstance(items_per_page, int) or items_per_page < 1:\n        e = _err(\"VALIDATION_ERROR\", \"items_per_page must be a positive integer.\", items_per_page=items_per_page)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if items_per_page > 100:\n        items_per_page = 100\n\n    lim = _enforce_limits()\n    if lim:\n        _log(\"error\", lim[\"error\"][\"code\"])\n        return lim\n\n    norm = author_name.lower().strip()\n\n    authors = _load(\"authors.json\")\n    if not isinstance(authors, list):\n        authors = []\n\n    # Match using normalized_name; exclude deleted\n    matched_authors = []\n    for a in authors:\n        if not isinstance(a, dict):\n            continue\n        if a.get(\"status\") == \"deleted\":\n            continue\n        nn = a.get(\"normalized_name\")\n        if isinstance(nn, str) and nn == norm:\n            matched_authors.append(a)\n\n    if not matched_authors:\n        e = _err(\"NOT_FOUND\", \"No matching author found for supplied name.\", author_name=author_name)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    by_id = {a.get(\"id\"): a for a in authors if isinstance(a, dict) and isinstance(a.get(\"id\"), str)}\n\n    # Canonicalize merges for listing (union)\n    canonical_ids = set()\n    for a in matched_authors:\n        if a.get(\"status\") == \"merged\":\n            canon_id = a.get(\"merged_into_author_id\")\n            if isinstance(canon_id, str) and canon_id and canon_id in by_id and by_id[canon_id].get(\"status\") != \"deleted\":\n                canonical_ids.add(canon_id)\n        else:\n            if isinstance(a.get(\"id\"), str):\n                canonical_ids.add(a.get(\"id\"))\n\n    papers = _load(\"papers.json\")\n    if not isinstance(papers, list):\n        papers = []\n\n    results = []\n    seen = set()\n    for p in papers:\n        if not isinstance(p, dict) or p.get(\"status\") == \"deleted\":\n            continue\n        authors_list = p.get(\"authors\")\n        if not isinstance(authors_list, list):\n            continue\n        ok = False\n        for link in authors_list:\n            if not isinstance(link, dict):\n                continue\n            if link.get(\"author_id\") in canonical_ids:\n                ok = True\n                break\n        if ok:\n            pid = p.get(\"id\")\n            if pid and pid not in seen:\n                seen.add(pid)\n                results.append(p)\n\n    def _dt(s):\n        if not isinstance(s, str) or not s:\n            return None\n        try:\n            return datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n        except Exception:\n            return None\n\n    results.sort(\n        key=lambda r: (\n            _dt(r.get(\"published_at\")) or _dt(r.get(\"created_at\")) or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),\n            r.get(\"id\") or \"\",\n        ),\n        reverse=True,\n    )\n\n    total = len(results)\n    start = (page - 1) * items_per_page\n    end = start + items_per_page\n    page_rows = results[start:end]\n    has_more = end < total\n\n    _log(\"ok\")\n    return {\n        \"papers\": page_rows,\n        \"page\": page,\n        \"items_per_page\": items_per_page,\n        \"total\": total,\n        \"has_more\": has_more,\n        \"next_page\": (page + 1) if has_more else None,\n        \"matched_author_ids\": sorted(list(canonical_ids)),\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_conferences",
+          "description": "Lists conferences and optionally filters by conference_name, returning a paginated list controlled by page and items_per_page. Raises VALIDATION_ERROR if page/items_per_page are not positive integers or if conference_name is provided but empty. Raises RATE_LIMITED if quotas are exceeded and UNAUTHORIZED if the caller is not permitted.",
+          "parameters": {
+            "properties": {
+              "conference_name": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Conference Name"
+              },
+              "page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 1,
+                "title": "Page"
+              },
+              "items_per_page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 20,
+                "title": "Items Per Page"
+              }
+            },
+            "title": "list_conferencesArguments",
+            "type": "object"
+          },
+          "implementation": "def list_conferences(conference_name=None, page=None, items_per_page=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"list_conferences\"\n\n    def _log(status, credential_id=None, error_code=None, meta=None):\n        logs = _load(\"request_logs.json\")\n        if isinstance(logs, list):\n            row = {\n                \"id\": f\"req_{int(time.time()*1000)}_{os.getpid()}\",\n                \"endpoint\": endpoint,\n                \"credential_id\": credential_id,\n                \"status\": status,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"created_at\": datetime.datetime.utcnow().isoformat() + \"Z\",\n            }\n            if isinstance(meta, dict):\n                row.update(meta)\n            logs.append(row)\n            _save(\"request_logs.json\", logs)\n\n    def _check_limits():\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list) or len(logs) == 0:\n            return None\n        now = datetime.datetime.utcnow()\n        cutoff = now - datetime.timedelta(seconds=60)\n        c = 0\n        for r in reversed(logs[-2000:]):\n            ts = r.get(\"created_at\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                rt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                continue\n            if rt < cutoff:\n                continue\n            if r.get(\"endpoint\") == endpoint:\n                c += 1\n        if c >= 120:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        return None\n\n    lim = _check_limits()\n    if lim:\n        _log(\"error\", error_code=lim[\"error\"][\"code\"])\n        return lim\n\n    # --- Validation ---\n    if conference_name is not None:\n        if not isinstance(conference_name, str):\n            e = _err(\"VALIDATION_ERROR\", \"conference_name must be a string or null.\", field=\"conference_name\")\n            _log(\"error\", error_code=e[\"error\"][\"code\"])\n            return e\n        if conference_name.strip() == \"\":\n            e = _err(\"VALIDATION_ERROR\", \"conference_name cannot be empty when provided.\", field=\"conference_name\")\n            _log(\"error\", error_code=e[\"error\"][\"code\"])\n            return e\n        conference_name = conference_name.strip()\n\n    if page is None:\n        page = 1\n    if items_per_page is None:\n        items_per_page = 20\n    if not isinstance(page, int) or page <= 0:\n        e = _err(\"VALIDATION_ERROR\", \"page must be a positive integer.\", field=\"page\")\n        _log(\"error\", error_code=e[\"error\"][\"code\"])\n        return e\n    if not isinstance(items_per_page, int) or items_per_page <= 0:\n        e = _err(\"VALIDATION_ERROR\", \"items_per_page must be a positive integer.\", field=\"items_per_page\")\n        _log(\"error\", error_code=e[\"error\"][\"code\"])\n        return e\n    items_per_page = max(1, min(int(items_per_page), 100))\n\n    venues = _load(\"venues.json\")\n    if not isinstance(venues, list):\n        e = _err(\"UNAUTHORIZED\", \"Service unavailable for this operation.\")\n        _log(\"error\", error_code=e[\"error\"][\"code\"])\n        return e\n\n    q = conference_name.lower() if isinstance(conference_name, str) else None\n    matched = []\n    for v in venues:\n        if not isinstance(v, dict):\n            continue\n        if v.get(\"venue_type\") != \"conference\":\n            continue\n        if v.get(\"status\") == \"deleted\":\n            continue\n        if q is not None:\n            name = v.get(\"name\")\n            if not isinstance(name, str) or q not in name.lower():\n                continue\n        matched.append(v)\n\n    # Sort by name asc then id\n    matched.sort(key=lambda x: ((x.get(\"name\") or \"\").lower(), x.get(\"id\") or \"\"))\n\n    total = len(matched)\n    start = (page - 1) * items_per_page\n    end = start + items_per_page\n    page_items = matched[start:end] if start < total else []\n    has_more = end < total\n    next_cursor = page + 1 if has_more else None\n\n    _log(\"ok\", meta={\"result_count\": len(page_items), \"total\": total})\n    return {\n        \"conferences\": page_items,\n        \"pagination\": {\n            \"page\": page,\n            \"items_per_page\": items_per_page,\n            \"total\": total,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n        },\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_conference",
+          "description": "Returns the conference record for the provided conference_id. Raises NOT_FOUND if no conference exists for conference_id and VALIDATION_ERROR if conference_id is empty or malformed. Raises RATE_LIMITED on quota exhaustion and UNAUTHORIZED if access is not allowed.",
+          "parameters": {
+            "properties": {
+              "conference_id": {
+                "title": "Conference Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "conference_id"
+            ],
+            "title": "get_conferenceArguments",
+            "type": "object"
+          },
+          "implementation": "def get_conference(conference_id, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_conference\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status, credential_id=None, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": f\"req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": _now_iso(),\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _enforce_limits():\n        cfg = _load(\"service_config.json\")\n        if not isinstance(cfg, dict):\n            cfg = {}\n        rl = cfg.get(\"rate_limit_per_minute\")\n        quota = cfg.get(\"quota_per_day\")\n\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n\n        now = datetime.datetime.utcnow()\n        if isinstance(rl, int) and rl > 0:\n            cutoff = now - datetime.timedelta(seconds=60)\n            c = 0\n            for r in reversed(logs[-5000:]):\n                ts = r.get(\"timestamp\")\n                if not isinstance(ts, str):\n                    continue\n                try:\n                    dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n            if c >= rl:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        if isinstance(quota, int) and quota > 0:\n            cutoff = now - datetime.timedelta(days=1)\n            c = 0\n            for r in reversed(logs[-20000:]):\n                ts = r.get(\"timestamp\")\n                if not isinstance(ts, str):\n                    continue\n                try:\n                    dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n            if c >= quota:\n                return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\")\n        return None\n\n    lim_err = _enforce_limits()\n    if lim_err:\n        _log(\"error\", error_code=lim_err[\"error\"][\"code\"])\n        return lim_err\n\n    if not isinstance(conference_id, str) or not conference_id.strip():\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"conference_id must be a non-empty string.\")\n    conference_id = conference_id.strip()\n\n    venues = _load(\"venues.json\")\n    if not isinstance(venues, list):\n        venues = []\n\n    conf = None\n    for v in venues:\n        if isinstance(v, dict) and v.get(\"id\") == conference_id:\n            conf = v\n            break\n\n    if not conf or conf.get(\"venue_type\") != \"conference\" or conf.get(\"status\") == \"deleted\":\n        _log(\"error\", error_code=\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Conference not found.\", conference_id=conference_id)\n\n    _log(\"ok\")\n    return {\"conference\": conf}\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_conference_proceedings",
+          "description": "Lists proceedings associated with the given conference_id and returns a paginated list controlled by page and items_per_page. Raises NOT_FOUND if the conference does not exist, and VALIDATION_ERROR if conference_id is empty or page/items_per_page are not positive integers. Raises RATE_LIMITED when quota limits are exceeded and UNAUTHORIZED when the caller lacks access.",
+          "parameters": {
+            "properties": {
+              "conference_id": {
+                "title": "Conference Id",
+                "type": "string"
+              },
+              "page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 1,
+                "title": "Page"
+              },
+              "items_per_page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 20,
+                "title": "Items Per Page"
+              }
+            },
+            "required": [
+              "conference_id"
+            ],
+            "title": "list_conference_proceedingsArguments",
+            "type": "object"
+          },
+          "implementation": "def list_conference_proceedings(conference_id, page=None, items_per_page=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"list_conference_proceedings\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status, credential_id=None, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": f\"req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"timestamp\": _now_iso(),\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _enforce_limits():\n        cfg = _load(\"service_config.json\")\n        if not isinstance(cfg, dict):\n            cfg = {}\n        rl = cfg.get(\"rate_limit_per_minute\")\n        quota = cfg.get(\"quota_per_day\")\n\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n\n        now = datetime.datetime.utcnow()\n        if isinstance(rl, int) and rl > 0:\n            cutoff = now - datetime.timedelta(seconds=60)\n            c = 0\n            for r in reversed(logs[-5000:]):\n                ts = r.get(\"timestamp\")\n                if not isinstance(ts, str):\n                    continue\n                try:\n                    dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n            if c >= rl:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        if isinstance(quota, int) and quota > 0:\n            cutoff = now - datetime.timedelta(days=1)\n            c = 0\n            for r in reversed(logs[-20000:]):\n                ts = r.get(\"timestamp\")\n                if not isinstance(ts, str):\n                    continue\n                try:\n                    dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n            if c >= quota:\n                return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\")\n        return None\n\n    lim_err = _enforce_limits()\n    if lim_err:\n        _log(\"error\", error_code=lim_err[\"error\"][\"code\"])\n        return lim_err\n\n    if not isinstance(conference_id, str) or not conference_id.strip():\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"conference_id must be a non-empty string.\")\n    conference_id = conference_id.strip()\n\n    if page is None:\n        page = 1\n    if items_per_page is None:\n        items_per_page = 20\n    if not isinstance(page, int) or page < 1:\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"page must be a positive integer (1-indexed).\")\n    if not isinstance(items_per_page, int) or items_per_page < 1:\n        _log(\"error\", error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"items_per_page must be a positive integer.\")\n    if items_per_page > 100:\n        items_per_page = 100\n\n    venues = _load(\"venues.json\")\n    if not isinstance(venues, list):\n        venues = []\n\n    conf = None\n    for v in venues:\n        if isinstance(v, dict) and v.get(\"id\") == conference_id:\n            conf = v\n            break\n    if not conf or conf.get(\"venue_type\") != \"conference\" or conf.get(\"status\") == \"deleted\":\n        _log(\"error\", error_code=\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Conference not found.\", conference_id=conference_id)\n\n    rows = []\n    for v in venues:\n        if not isinstance(v, dict):\n            continue\n        if v.get(\"venue_type\") != \"proceeding\":\n            continue\n        if v.get(\"conference_id\") != conference_id:\n            continue\n        if v.get(\"status\") == \"deleted\":\n            continue\n        rows.append(v)\n\n    def _sort_key(r):\n        y = r.get(\"year\")\n        yk = y if isinstance(y, int) else -1\n        nm = r.get(\"name\") or \"\"\n        return (-yk, nm.lower(), r.get(\"id\") or \"\")\n\n    rows.sort(key=_sort_key)\n\n    total = len(rows)\n    start = (page - 1) * items_per_page\n    end = start + items_per_page\n    page_rows = rows[start:end]\n    has_more = end < total\n\n    _log(\"ok\")\n    return {\n        \"proceedings\": page_rows,\n        \"pagination\": {\n            \"page\": page,\n            \"items_per_page\": items_per_page,\n            \"total\": total,\n            \"has_more\": has_more\n        }\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_conference_proceeding",
+          "description": "Returns the proceeding identified by conference_id and proceeding_id, including its stored metadata and links to related entities where available. Raises VALIDATION_ERROR if either ID is missing or not a string, NOT_FOUND if the conference does not exist or the proceeding is not found under that conference, and UNAUTHORIZED/FORBIDDEN if your credentials do not permit access. Raises RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "properties": {
+              "conference_id": {
+                "title": "Conference Id",
+                "type": "string"
+              },
+              "proceeding_id": {
+                "title": "Proceeding Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "conference_id",
+              "proceeding_id"
+            ],
+            "title": "get_conference_proceedingArguments",
+            "type": "object"
+          },
+          "implementation": "def get_conference_proceeding(conference_id, proceeding_id, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    _endpoint = \"get_conference_proceeding\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_ts_any(row):\n        if not isinstance(row, dict):\n            return None\n        ts = row.get(\"timestamp\") or row.get(\"created_at\")\n        if isinstance(ts, str) and ts:\n            try:\n                return datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                return None\n        return None\n\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        return logs if isinstance(logs, list) else []\n\n    def _enforce_limits():\n        cfg = _load(\"service_config.json\")\n        if not isinstance(cfg, dict):\n            cfg = {}\n        rl = cfg.get(\"rate_limit_per_minute\")\n        quota = cfg.get(\"quota_per_day\")\n        logs = _load_logs()\n        now = datetime.datetime.utcnow()\n\n        if isinstance(rl, int) and rl > 0:\n            cutoff = now - datetime.timedelta(seconds=60)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= rl:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit_per_minute=rl)\n\n        if isinstance(quota, int) and quota > 0:\n            cutoff = now - datetime.timedelta(days=1)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= quota:\n                    return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\", quota_per_day=quota)\n\n        return None\n\n    def _log(status, error_code=None):\n        logs = _load_logs()\n        logs.append(\n            {\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": _endpoint,\n                \"timestamp\": _now_iso(),\n                \"status\": status,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - _t0) * 1000),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    # Validate\n    if not isinstance(conference_id, str) or not conference_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"conference_id must be a non-empty string.\", conference_id=conference_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if not isinstance(proceeding_id, str) or not proceeding_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"proceeding_id must be a non-empty string.\", proceeding_id=proceeding_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    conference_id = conference_id.strip()\n    proceeding_id = proceeding_id.strip()\n\n    lim = _enforce_limits()\n    if lim:\n        _log(\"error\", lim[\"error\"][\"code\"])\n        return lim\n\n    venues = _load(\"venues.json\")\n    if not isinstance(venues, list):\n        venues = []\n\n    by_id = {v.get(\"id\"): v for v in venues if isinstance(v, dict) and isinstance(v.get(\"id\"), str)}\n\n    conf = by_id.get(conference_id)\n    if not conf or conf.get(\"status\") == \"deleted\" or conf.get(\"venue_type\") != \"conference\":\n        e = _err(\"NOT_FOUND\", \"Conference not found.\", conference_id=conference_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    proc = by_id.get(proceeding_id)\n    if not proc or proc.get(\"status\") == \"deleted\" or proc.get(\"venue_type\") != \"proceeding\":\n        e = _err(\"NOT_FOUND\", \"Proceeding not found.\", proceeding_id=proceeding_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    if proc.get(\"conference_id\") != conference_id:\n        e = _err(\n            \"NOT_FOUND\",\n            \"Proceeding not found under this conference.\",\n            conference_id=conference_id,\n            proceeding_id=proceeding_id,\n        )\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    _log(\"ok\")\n    return {\"conference\": conf, \"proceeding\": proc}\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_conference_papers",
+          "description": "Lists papers associated with the specified conference_id and proceeding_id and returns a paged collection using page (1-based) and items_per_page. Raises VALIDATION_ERROR when IDs are invalid, page/items_per_page are not integers, or page/items_per_page are less than 1; raises NOT_FOUND if the conference or proceeding cannot be resolved. Raises UNAUTHORIZED/FORBIDDEN for access violations and RATE_LIMITED when quotas are exceeded.",
+          "parameters": {
+            "properties": {
+              "conference_id": {
+                "title": "Conference Id",
+                "type": "string"
+              },
+              "proceeding_id": {
+                "title": "Proceeding Id",
+                "type": "string"
+              },
+              "page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 1,
+                "title": "Page"
+              },
+              "items_per_page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 20,
+                "title": "Items Per Page"
+              }
+            },
+            "required": [
+              "conference_id",
+              "proceeding_id"
+            ],
+            "title": "list_conference_papersArguments",
+            "type": "object"
+          },
+          "implementation": "def list_conference_papers(conference_id, proceeding_id, page=None, items_per_page=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    _endpoint = \"list_conference_papers\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_ts_any(row):\n        if not isinstance(row, dict):\n            return None\n        ts = row.get(\"timestamp\") or row.get(\"created_at\")\n        if isinstance(ts, str) and ts:\n            try:\n                return datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                return None\n        return None\n\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        return logs if isinstance(logs, list) else []\n\n    def _enforce_limits():\n        cfg = _load(\"service_config.json\")\n        if not isinstance(cfg, dict):\n            cfg = {}\n        rl = cfg.get(\"rate_limit_per_minute\")\n        quota = cfg.get(\"quota_per_day\")\n        logs = _load_logs()\n        now = datetime.datetime.utcnow()\n\n        if isinstance(rl, int) and rl > 0:\n            cutoff = now - datetime.timedelta(seconds=60)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= rl:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit_per_minute=rl)\n\n        if isinstance(quota, int) and quota > 0:\n            cutoff = now - datetime.timedelta(days=1)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= quota:\n                    return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\", quota_per_day=quota)\n\n        return None\n\n    def _log(status, error_code=None):\n        logs = _load_logs()\n        logs.append(\n            {\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": _endpoint,\n                \"timestamp\": _now_iso(),\n                \"status\": status,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - _t0) * 1000),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    # Validate\n    if not isinstance(conference_id, str) or not conference_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"conference_id must be a non-empty string.\", conference_id=conference_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if not isinstance(proceeding_id, str) or not proceeding_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"proceeding_id must be a non-empty string.\", proceeding_id=proceeding_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    conference_id = conference_id.strip()\n    proceeding_id = proceeding_id.strip()\n\n    if page is None:\n        page = 1\n    if items_per_page is None:\n        items_per_page = 20\n    if not isinstance(page, int) or page < 1:\n        e = _err(\"VALIDATION_ERROR\", \"page must be a positive integer.\", page=page)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if not isinstance(items_per_page, int) or items_per_page < 1:\n        e = _err(\"VALIDATION_ERROR\", \"items_per_page must be a positive integer.\", items_per_page=items_per_page)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if items_per_page > 100:\n        items_per_page = 100\n\n    lim = _enforce_limits()\n    if lim:\n        _log(\"error\", lim[\"error\"][\"code\"])\n        return lim\n\n    venues = _load(\"venues.json\")\n    if not isinstance(venues, list):\n        venues = []\n    by_id = {v.get(\"id\"): v for v in venues if isinstance(v, dict) and isinstance(v.get(\"id\"), str)}\n\n    conf = by_id.get(conference_id)\n    if not conf or conf.get(\"status\") == \"deleted\" or conf.get(\"venue_type\") != \"conference\":\n        e = _err(\"NOT_FOUND\", \"Conference not found.\", conference_id=conference_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    proc = by_id.get(proceeding_id)\n    if not proc or proc.get(\"status\") == \"deleted\" or proc.get(\"venue_type\") != \"proceeding\" or proc.get(\"conference_id\") != conference_id:\n        e = _err(\n            \"NOT_FOUND\",\n            \"Proceeding not found under this conference.\",\n            conference_id=conference_id,\n            proceeding_id=proceeding_id,\n        )\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    papers = _load(\"papers.json\")\n    if not isinstance(papers, list):\n        papers = []\n\n    rows = []\n    for p in papers:\n        if not isinstance(p, dict):\n            continue\n        if p.get(\"status\") == \"deleted\":\n            continue\n        if p.get(\"conference_id\") == conference_id and p.get(\"proceeding_id\") == proceeding_id:\n            rows.append(p)\n\n    def _dt(s):\n        if not isinstance(s, str) or not s:\n            return None\n        try:\n            return datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n        except Exception:\n            return None\n\n    rows.sort(\n        key=lambda r: (\n            _dt(r.get(\"published_at\")) or _dt(r.get(\"created_at\")) or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),\n            r.get(\"id\") or \"\",\n        ),\n        reverse=True,\n    )\n\n    total = len(rows)\n    start = (page - 1) * items_per_page\n    end = start + items_per_page\n    page_rows = rows[start:end]\n    has_more = end < total\n\n    _log(\"ok\")\n    return {\n        \"papers\": page_rows,\n        \"page\": page,\n        \"items_per_page\": items_per_page,\n        \"total\": total,\n        \"has_more\": has_more,\n        \"next_page\": (page + 1) if has_more else None,\n        \"conference_id\": conference_id,\n        \"proceeding_id\": proceeding_id,\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "search_papers",
+          "description": "Searches our mirrored PapersWithCode paper index by title, abstract, and/or arxiv_id and returns a paged list of matching papers using page (1-based) and items_per_page. Raises VALIDATION_ERROR if all search fields are null/empty, if arxiv_id/title/abstract are not strings, or if page/items_per_page are less than 1. Raises UNAUTHORIZED/FORBIDDEN for access violations and RATE_LIMITED when quotas are exceeded.",
+          "parameters": {
+            "properties": {
+              "abstract": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Abstract"
+              },
+              "title": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Title"
+              },
+              "arxiv_id": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Arxiv Id"
+              },
+              "page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 1,
+                "title": "Page"
+              },
+              "items_per_page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 20,
+                "title": "Items Per Page"
+              }
+            },
+            "title": "search_papersArguments",
+            "type": "object"
+          },
+          "implementation": "def search_papers(abstract=None, title=None, arxiv_id=None, page=None, items_per_page=None, **_extra):\n    import json, os, datetime, time, re, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    _endpoint = \"search_papers\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _get_client_key():\n        # Ambient authentication: identify caller deterministically from invocation context.\n        seed = repr(sorted(_extra.items()))\n        return hashlib.sha256(seed.encode(\"utf-8\")).hexdigest()[:32] or \"anonymous\"\n\n    def _log_and_return(payload, status=\"ok\", code=None):\n        latency_ms = int((time.time() - _t0) * 1000)\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": f\"req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": _endpoint,\n            \"client\": _get_client_key(),\n            \"status\": status,\n            \"error_code\": code,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": _now_iso(),\n        }\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n        return payload\n\n    def _enforce_limits():\n        # Simple observable service dynamics using request_logs.json if present.\n        # Rate limit: 120 requests per rolling 60 seconds per client.\n        # Quota: 10,000 requests per rolling 30 days per client.\n        client = _get_client_key()\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        now = datetime.datetime.utcnow()\n        win_rate = now - datetime.timedelta(seconds=60)\n        win_quota = now - datetime.timedelta(days=30)\n\n        def _parse_ts(s):\n            if not isinstance(s, str):\n                return None\n            try:\n                if s.endswith(\"Z\"):\n                    s = s[:-1]\n                return datetime.datetime.fromisoformat(s)\n            except Exception:\n                return None\n\n        recent_60 = 0\n        recent_30d = 0\n        for r in logs:\n            if not isinstance(r, dict) or r.get(\"client\") != client:\n                continue\n            ts = _parse_ts(r.get(\"timestamp\"))\n            if not ts:\n                continue\n            if ts >= win_rate:\n                recent_60 += 1\n            if ts >= win_quota:\n                recent_30d += 1\n\n        if recent_60 >= 120:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded. Please retry later.\", limit=\"120/min\", window_seconds=60)\n        if recent_30d >= 10000:\n            return _err(\"QUOTA_EXCEEDED\", \"Monthly request quota exceeded.\", limit=\"10000/30d\", window_days=30)\n        return None\n\n    rl = _enforce_limits()\n    if rl:\n        return _log_and_return(rl, status=\"error\", code=rl[\"error\"][\"code\"])\n\n    # Validate search fields\n    def _is_blank(x):\n        return x is None or (isinstance(x, str) and x.strip() == \"\")\n\n    if _is_blank(title) and _is_blank(abstract) and _is_blank(arxiv_id):\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"At least one of title, abstract, or arxiv_id must be provided.\"), status=\"error\", code=\"VALIDATION_ERROR\")\n\n    for k, v in ((\"title\", title), (\"abstract\", abstract), (\"arxiv_id\", arxiv_id)):\n        if v is not None and not isinstance(v, str):\n            return _log_and_return(_err(\"VALIDATION_ERROR\", f\"{k} must be a string or null.\"), status=\"error\", code=\"VALIDATION_ERROR\")\n\n    if page is None:\n        page = 1\n    if items_per_page is None:\n        items_per_page = 20\n    if not isinstance(page, int) or not isinstance(items_per_page, int):\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"page and items_per_page must be integers.\"), status=\"error\", code=\"VALIDATION_ERROR\")\n    if page < 1 or items_per_page < 1:\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"page and items_per_page must be >= 1 (1-based pagination).\"), status=\"error\", code=\"VALIDATION_ERROR\")\n    items_per_page = max(1, min(100, items_per_page))\n\n    def _normalize_arxiv(a):\n        if not isinstance(a, str):\n            return None\n        a = a.strip()\n        if a == \"\":\n            return None\n        # Drop version suffix like v2\n        m = re.match(r\"^(\\d{4}\\.\\d{4,5})(v\\d+)?$\", a)\n        if m:\n            return m.group(1)\n        # Old style\n        m = re.match(r\"^([a-zA-Z\\-]+\\/\\d{7})(v\\d+)?$\", a)\n        if m:\n            return m.group(1)\n        # If provided is like url or has vN, strip vN at end if present\n        a = re.sub(r\"(v\\d+)$\", \"\", a)\n        return a\n\n    q_title = title.strip().lower() if isinstance(title, str) and title.strip() != \"\" else None\n    q_abs = abstract.strip().lower() if isinstance(abstract, str) and abstract.strip() != \"\" else None\n    q_arxiv = _normalize_arxiv(arxiv_id) if isinstance(arxiv_id, str) and arxiv_id.strip() != \"\" else None\n\n    papers = _load(\"papers.json\")\n    if not isinstance(papers, list):\n        papers = []\n\n    matches = []\n    for p in papers:\n        if not isinstance(p, dict):\n            continue\n        if p.get(\"status\") == \"deleted\":\n            continue\n        # arxiv exact normalized\n        if q_arxiv:\n            pa = _normalize_arxiv(p.get(\"arxiv_id\")) if isinstance(p.get(\"arxiv_id\"), str) else None\n            if pa != q_arxiv:\n                continue\n        # title substring\n        if q_title:\n            pt = p.get(\"title\") or \"\"\n            if not isinstance(pt, str) or q_title not in pt.lower():\n                continue\n        # abstract substring\n        if q_abs:\n            pab = p.get(\"abstract\") or \"\"\n            if not isinstance(pab, str) or q_abs not in pab.lower():\n                continue\n        matches.append(p)\n\n    # Sort: most recently updated first, then created_at, then id\n    def _sort_key(p):\n        ua = p.get(\"updated_at\")\n        ca = p.get(\"created_at\")\n        return (\n            ua if isinstance(ua, str) else \"\",\n            ca if isinstance(ca, str) else \"\",\n            p.get(\"id\") or \"\",\n        )\n    matches.sort(key=_sort_key, reverse=True)\n\n    total = len(matches)\n    start = (page - 1) * items_per_page\n    end = start + items_per_page\n    page_items = matches[start:end] if start < total else []\n    has_more = end < total\n\n    # Cursor: simple next-page cursor\n    next_cursor = str(page + 1) if has_more else None\n\n    resp = {\n        \"papers\": page_items,\n        \"page\": page,\n        \"items_per_page\": items_per_page,\n        \"total\": total,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n    }\n    return _log_and_return(resp, status=\"ok\")\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_paper",
+          "description": "Returns the paper record for the given paper_id, including its core metadata and stored cross-links where available. Raises VALIDATION_ERROR if paper_id is missing or not a string, and NOT_FOUND if no paper exists with that ID in our mirror. Raises UNAUTHORIZED/FORBIDDEN for access violations and RATE_LIMITED when quotas are exceeded.",
+          "parameters": {
+            "properties": {
+              "paper_id": {
+                "title": "Paper Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "paper_id"
+            ],
+            "title": "get_paperArguments",
+            "type": "object"
+          },
+          "implementation": "def get_paper(paper_id, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    _endpoint = \"get_paper\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_ts_any(row):\n        if not isinstance(row, dict):\n            return None\n        ts = row.get(\"timestamp\") or row.get(\"created_at\")\n        if isinstance(ts, str) and ts:\n            try:\n                return datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                return None\n        return None\n\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        return logs if isinstance(logs, list) else []\n\n    def _enforce_limits():\n        cfg = _load(\"service_config.json\")\n        if not isinstance(cfg, dict):\n            cfg = {}\n        rl = cfg.get(\"rate_limit_per_minute\")\n        quota = cfg.get(\"quota_per_day\")\n        logs = _load_logs()\n        now = datetime.datetime.utcnow()\n\n        if isinstance(rl, int) and rl > 0:\n            cutoff = now - datetime.timedelta(seconds=60)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= rl:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit_per_minute=rl)\n\n        if isinstance(quota, int) and quota > 0:\n            cutoff = now - datetime.timedelta(days=1)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= quota:\n                    return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\", quota_per_day=quota)\n\n        return None\n\n    def _log(status, error_code=None):\n        logs = _load_logs()\n        logs.append(\n            {\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": _endpoint,\n                \"timestamp\": _now_iso(),\n                \"status\": status,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - _t0) * 1000),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    # Validate\n    if not isinstance(paper_id, str) or not paper_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"paper_id must be a non-empty string.\", paper_id=paper_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    paper_id = paper_id.strip()\n\n    lim = _enforce_limits()\n    if lim:\n        _log(\"error\", lim[\"error\"][\"code\"])\n        return lim\n\n    papers = _load(\"papers.json\")\n    if not isinstance(papers, list):\n        papers = []\n\n    paper = None\n    for p in papers:\n        if isinstance(p, dict) and p.get(\"id\") == paper_id:\n            paper = p\n            break\n\n    if not paper or paper.get(\"status\") == \"deleted\":\n        e = _err(\"NOT_FOUND\", \"Paper not found.\", paper_id=paper_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    _log(\"ok\")\n    return {\"paper\": paper}\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_paper_repositories",
+          "description": "Lists repositories linked to the given paper_id and returns a paged collection using page (1-based) and items_per_page. Raises VALIDATION_ERROR if paper_id is invalid or if page/items_per_page are not integers or less than 1, and NOT_FOUND if the paper_id does not exist. Raises UNAUTHORIZED/FORBIDDEN for access violations and RATE_LIMITED when quotas are exceeded.",
+          "parameters": {
+            "properties": {
+              "paper_id": {
+                "title": "Paper Id",
+                "type": "string"
+              },
+              "page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 1,
+                "title": "Page"
+              },
+              "items_per_page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 20,
+                "title": "Items Per Page"
+              }
+            },
+            "required": [
+              "paper_id"
+            ],
+            "title": "list_paper_repositoriesArguments",
+            "type": "object"
+          },
+          "implementation": "def list_paper_repositories(paper_id, page=None, items_per_page=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    _endpoint = \"list_paper_repositories\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_ts_any(row):\n        if not isinstance(row, dict):\n            return None\n        ts = row.get(\"timestamp\") or row.get(\"created_at\")\n        if isinstance(ts, str) and ts:\n            try:\n                return datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                return None\n        return None\n\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        return logs if isinstance(logs, list) else []\n\n    def _enforce_limits():\n        cfg = _load(\"service_config.json\")\n        if not isinstance(cfg, dict):\n            cfg = {}\n        rl = cfg.get(\"rate_limit_per_minute\")\n        quota = cfg.get(\"quota_per_day\")\n        logs = _load_logs()\n        now = datetime.datetime.utcnow()\n\n        if isinstance(rl, int) and rl > 0:\n            cutoff = now - datetime.timedelta(seconds=60)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= rl:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit_per_minute=rl)\n\n        if isinstance(quota, int) and quota > 0:\n            cutoff = now - datetime.timedelta(days=1)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= quota:\n                    return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\", quota_per_day=quota)\n\n        return None\n\n    def _log(status, error_code=None):\n        logs = _load_logs()\n        logs.append(\n            {\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": _endpoint,\n                \"timestamp\": _now_iso(),\n                \"status\": status,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - _t0) * 1000),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(paper_id, str) or not paper_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"paper_id must be a non-empty string.\", paper_id=paper_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    paper_id = paper_id.strip()\n\n    if page is None:\n        page = 1\n    if items_per_page is None:\n        items_per_page = 20\n    if not isinstance(page, int) or page < 1:\n        e = _err(\"VALIDATION_ERROR\", \"page must be a positive integer.\", page=page)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if not isinstance(items_per_page, int) or items_per_page < 1:\n        e = _err(\"VALIDATION_ERROR\", \"items_per_page must be a positive integer.\", items_per_page=items_per_page)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if items_per_page > 100:\n        items_per_page = 100\n\n    lim = _enforce_limits()\n    if lim:\n        _log(\"error\", lim[\"error\"][\"code\"])\n        return lim\n\n    papers = _load(\"papers.json\")\n    if not isinstance(papers, list):\n        papers = []\n\n    paper = None\n    for p in papers:\n        if isinstance(p, dict) and p.get(\"id\") == paper_id:\n            paper = p\n            break\n\n    if not paper or paper.get(\"status\") == \"deleted\":\n        e = _err(\"NOT_FOUND\", \"Paper not found.\", paper_id=paper_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    repos = paper.get(\"repositories\")\n    if not isinstance(repos, list):\n        repos = []\n\n    total = len(repos)\n    start = (page - 1) * items_per_page\n    end = start + items_per_page\n    page_rows = repos[start:end]\n    has_more = end < total\n\n    _log(\"ok\")\n    return {\n        \"repositories\": page_rows,\n        \"page\": page,\n        \"items_per_page\": items_per_page,\n        \"total\": total,\n        \"has_more\": has_more,\n        \"next_page\": (page + 1) if has_more else None,\n        \"paper_id\": paper_id,\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_paper_datasets",
+          "description": "Lists datasets linked to the given paper_id and returns a paged collection using page (1-based) and items_per_page. Raises VALIDATION_ERROR if paper_id is invalid or if page/items_per_page are not integers or less than 1, and NOT_FOUND if the paper_id does not exist. Raises UNAUTHORIZED/FORBIDDEN for access violations and RATE_LIMITED when quotas are exceeded.",
+          "parameters": {
+            "properties": {
+              "paper_id": {
+                "title": "Paper Id",
+                "type": "string"
+              },
+              "page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 1,
+                "title": "Page"
+              },
+              "items_per_page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 20,
+                "title": "Items Per Page"
+              }
+            },
+            "required": [
+              "paper_id"
+            ],
+            "title": "list_paper_datasetsArguments",
+            "type": "object"
+          },
+          "implementation": "def list_paper_datasets(paper_id, page=None, items_per_page=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    _endpoint = \"list_paper_datasets\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_ts_any(row):\n        if not isinstance(row, dict):\n            return None\n        ts = row.get(\"timestamp\") or row.get(\"created_at\")\n        if isinstance(ts, str) and ts:\n            try:\n                return datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                return None\n        return None\n\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        return logs if isinstance(logs, list) else []\n\n    def _enforce_limits():\n        cfg = _load(\"service_config.json\")\n        if not isinstance(cfg, dict):\n            cfg = {}\n        rl = cfg.get(\"rate_limit_per_minute\")\n        quota = cfg.get(\"quota_per_day\")\n        logs = _load_logs()\n        now = datetime.datetime.utcnow()\n\n        if isinstance(rl, int) and rl > 0:\n            cutoff = now - datetime.timedelta(seconds=60)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= rl:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit_per_minute=rl)\n\n        if isinstance(quota, int) and quota > 0:\n            cutoff = now - datetime.timedelta(days=1)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= quota:\n                    return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\", quota_per_day=quota)\n\n        return None\n\n    def _log(status, error_code=None):\n        logs = _load_logs()\n        logs.append(\n            {\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": _endpoint,\n                \"timestamp\": _now_iso(),\n                \"status\": status,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - _t0) * 1000),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(paper_id, str) or not paper_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"paper_id must be a non-empty string.\", paper_id=paper_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    paper_id = paper_id.strip()\n\n    if page is None:\n        page = 1\n    if items_per_page is None:\n        items_per_page = 20\n    if not isinstance(page, int) or page < 1:\n        e = _err(\"VALIDATION_ERROR\", \"page must be a positive integer.\", page=page)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if not isinstance(items_per_page, int) or items_per_page < 1:\n        e = _err(\"VALIDATION_ERROR\", \"items_per_page must be a positive integer.\", items_per_page=items_per_page)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if items_per_page > 100:\n        items_per_page = 100\n\n    lim = _enforce_limits()\n    if lim:\n        _log(\"error\", lim[\"error\"][\"code\"])\n        return lim\n\n    papers = _load(\"papers.json\")\n    if not isinstance(papers, list):\n        papers = []\n\n    paper = None\n    for p in papers:\n        if isinstance(p, dict) and p.get(\"id\") == paper_id:\n            paper = p\n            break\n\n    if not paper or paper.get(\"status\") == \"deleted\":\n        e = _err(\"NOT_FOUND\", \"Paper not found.\", paper_id=paper_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    datasets = paper.get(\"datasets\")\n    if not isinstance(datasets, list):\n        datasets = []\n\n    total = len(datasets)\n    start = (page - 1) * items_per_page\n    end = start + items_per_page\n    page_rows = datasets[start:end]\n    has_more = end < total\n\n    _log(\"ok\")\n    return {\n        \"datasets\": page_rows,\n        \"page\": page,\n        \"items_per_page\": items_per_page,\n        \"total\": total,\n        \"has_more\": has_more,\n        \"next_page\": (page + 1) if has_more else None,\n        \"paper_id\": paper_id,\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_paper_methods",
+          "description": "Lists methods linked to the given paper_id and returns a paged collection using page (1-based) and items_per_page. Raises VALIDATION_ERROR if paper_id is invalid or if page/items_per_page are not integers or less than 1, and NOT_FOUND if the paper_id does not exist. Raises UNAUTHORIZED/FORBIDDEN for access violations and RATE_LIMITED when quotas are exceeded.",
+          "parameters": {
+            "properties": {
+              "paper_id": {
+                "title": "Paper Id",
+                "type": "string"
+              },
+              "page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 1,
+                "title": "Page"
+              },
+              "items_per_page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 20,
+                "title": "Items Per Page"
+              }
+            },
+            "required": [
+              "paper_id"
+            ],
+            "title": "list_paper_methodsArguments",
+            "type": "object"
+          },
+          "implementation": "def list_paper_methods(paper_id, page=None, items_per_page=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    _endpoint = \"list_paper_methods\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_ts_any(row):\n        if not isinstance(row, dict):\n            return None\n        ts = row.get(\"timestamp\") or row.get(\"created_at\")\n        if isinstance(ts, str) and ts:\n            try:\n                return datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                return None\n        return None\n\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        return logs if isinstance(logs, list) else []\n\n    def _enforce_limits():\n        cfg = _load(\"service_config.json\")\n        if not isinstance(cfg, dict):\n            cfg = {}\n        rl = cfg.get(\"rate_limit_per_minute\")\n        quota = cfg.get(\"quota_per_day\")\n        logs = _load_logs()\n        now = datetime.datetime.utcnow()\n\n        if isinstance(rl, int) and rl > 0:\n            cutoff = now - datetime.timedelta(seconds=60)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= rl:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit_per_minute=rl)\n\n        if isinstance(quota, int) and quota > 0:\n            cutoff = now - datetime.timedelta(days=1)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= quota:\n                    return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\", quota_per_day=quota)\n\n        return None\n\n    def _log(status, error_code=None):\n        logs = _load_logs()\n        logs.append(\n            {\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": _endpoint,\n                \"timestamp\": _now_iso(),\n                \"status\": status,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - _t0) * 1000),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(paper_id, str) or not paper_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"paper_id must be a non-empty string.\", paper_id=paper_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    paper_id = paper_id.strip()\n\n    if page is None:\n        page = 1\n    if items_per_page is None:\n        items_per_page = 20\n    if not isinstance(page, int) or page < 1:\n        e = _err(\"VALIDATION_ERROR\", \"page must be a positive integer.\", page=page)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if not isinstance(items_per_page, int) or items_per_page < 1:\n        e = _err(\"VALIDATION_ERROR\", \"items_per_page must be a positive integer.\", items_per_page=items_per_page)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if items_per_page > 100:\n        items_per_page = 100\n\n    lim = _enforce_limits()\n    if lim:\n        _log(\"error\", lim[\"error\"][\"code\"])\n        return lim\n\n    papers = _load(\"papers.json\")\n    if not isinstance(papers, list):\n        papers = []\n\n    paper = None\n    for p in papers:\n        if isinstance(p, dict) and p.get(\"id\") == paper_id:\n            paper = p\n            break\n\n    if not paper or paper.get(\"status\") == \"deleted\":\n        e = _err(\"NOT_FOUND\", \"Paper not found.\", paper_id=paper_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    methods = paper.get(\"methods\")\n    if not isinstance(methods, list):\n        methods = []\n\n    total = len(methods)\n    start = (page - 1) * items_per_page\n    end = start + items_per_page\n    page_rows = methods[start:end]\n    has_more = end < total\n\n    _log(\"ok\")\n    return {\n        \"methods\": page_rows,\n        \"page\": page,\n        \"items_per_page\": items_per_page,\n        \"total\": total,\n        \"has_more\": has_more,\n        \"next_page\": (page + 1) if has_more else None,\n        \"paper_id\": paper_id,\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_paper_results",
+          "description": "Lists results linked to the given paper_id and returns a paged collection using page (1-based) and items_per_page. Raises VALIDATION_ERROR if paper_id is invalid or if page/items_per_page are not integers or less than 1, and NOT_FOUND if the paper_id does not exist. Raises UNAUTHORIZED/FORBIDDEN for access violations and RATE_LIMITED when quotas are exceeded.",
+          "parameters": {
+            "properties": {
+              "paper_id": {
+                "title": "Paper Id",
+                "type": "string"
+              },
+              "page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 1,
+                "title": "Page"
+              },
+              "items_per_page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 20,
+                "title": "Items Per Page"
+              }
+            },
+            "required": [
+              "paper_id"
+            ],
+            "title": "list_paper_resultsArguments",
+            "type": "object"
+          },
+          "implementation": "def list_paper_results(paper_id, page=None, items_per_page=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    _endpoint = \"list_paper_results\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_ts_any(row):\n        if not isinstance(row, dict):\n            return None\n        ts = row.get(\"timestamp\") or row.get(\"created_at\")\n        if isinstance(ts, str) and ts:\n            try:\n                return datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                return None\n        return None\n\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        return logs if isinstance(logs, list) else []\n\n    def _enforce_limits():\n        cfg = _load(\"service_config.json\")\n        if not isinstance(cfg, dict):\n            cfg = {}\n        rl = cfg.get(\"rate_limit_per_minute\")\n        quota = cfg.get(\"quota_per_day\")\n        logs = _load_logs()\n        now = datetime.datetime.utcnow()\n\n        if isinstance(rl, int) and rl > 0:\n            cutoff = now - datetime.timedelta(seconds=60)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= rl:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit_per_minute=rl)\n\n        if isinstance(quota, int) and quota > 0:\n            cutoff = now - datetime.timedelta(days=1)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= quota:\n                    return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\", quota_per_day=quota)\n\n        return None\n\n    def _log(status, error_code=None):\n        logs = _load_logs()\n        logs.append(\n            {\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": _endpoint,\n                \"timestamp\": _now_iso(),\n                \"status\": status,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - _t0) * 1000),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(paper_id, str) or not paper_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"paper_id must be a non-empty string.\", paper_id=paper_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    paper_id = paper_id.strip()\n\n    if page is None:\n        page = 1\n    if items_per_page is None:\n        items_per_page = 20\n    if not isinstance(page, int) or page < 1:\n        e = _err(\"VALIDATION_ERROR\", \"page must be a positive integer.\", page=page)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if not isinstance(items_per_page, int) or items_per_page < 1:\n        e = _err(\"VALIDATION_ERROR\", \"items_per_page must be a positive integer.\", items_per_page=items_per_page)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if items_per_page > 100:\n        items_per_page = 100\n\n    lim = _enforce_limits()\n    if lim:\n        _log(\"error\", lim[\"error\"][\"code\"])\n        return lim\n\n    papers = _load(\"papers.json\")\n    if not isinstance(papers, list):\n        papers = []\n\n    paper = None\n    for p in papers:\n        if isinstance(p, dict) and p.get(\"id\") == paper_id:\n            paper = p\n            break\n\n    if not paper or paper.get(\"status\") == \"deleted\":\n        e = _err(\"NOT_FOUND\", \"Paper not found.\", paper_id=paper_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    results = paper.get(\"results\")\n    if not isinstance(results, list):\n        results = []\n\n    total = len(results)\n    start = (page - 1) * items_per_page\n    end = start + items_per_page\n    page_rows = results[start:end]\n    has_more = end < total\n\n    _log(\"ok\")\n    return {\n        \"results\": page_rows,\n        \"page\": page,\n        \"items_per_page\": items_per_page,\n        \"total\": total,\n        \"has_more\": has_more,\n        \"next_page\": (page + 1) if has_more else None,\n        \"paper_id\": paper_id,\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_paper_tasks",
+          "description": "Lists tasks linked to the given paper_id and returns a paged collection using page (1-based) and items_per_page. Raises VALIDATION_ERROR if paper_id is invalid or if page/items_per_page are not integers or less than 1, and NOT_FOUND if the paper_id does not exist. Raises UNAUTHORIZED/FORBIDDEN for access violations and RATE_LIMITED when quotas are exceeded.",
+          "parameters": {
+            "properties": {
+              "paper_id": {
+                "title": "Paper Id",
+                "type": "string"
+              },
+              "page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 1,
+                "title": "Page"
+              },
+              "items_per_page": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": 20,
+                "title": "Items Per Page"
+              }
+            },
+            "required": [
+              "paper_id"
+            ],
+            "title": "list_paper_tasksArguments",
+            "type": "object"
+          },
+          "implementation": "def list_paper_tasks(paper_id, page=None, items_per_page=None, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    _endpoint = \"list_paper_tasks\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_ts_any(row):\n        if not isinstance(row, dict):\n            return None\n        ts = row.get(\"timestamp\") or row.get(\"created_at\")\n        if isinstance(ts, str) and ts:\n            try:\n                return datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                return None\n        return None\n\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        return logs if isinstance(logs, list) else []\n\n    def _enforce_limits():\n        cfg = _load(\"service_config.json\")\n        if not isinstance(cfg, dict):\n            cfg = {}\n        rl = cfg.get(\"rate_limit_per_minute\")\n        quota = cfg.get(\"quota_per_day\")\n        logs = _load_logs()\n        now = datetime.datetime.utcnow()\n\n        if isinstance(rl, int) and rl > 0:\n            cutoff = now - datetime.timedelta(seconds=60)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= rl:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit_per_minute=rl)\n\n        if isinstance(quota, int) and quota > 0:\n            cutoff = now - datetime.timedelta(days=1)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= quota:\n                    return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\", quota_per_day=quota)\n\n        return None\n\n    def _log(status, error_code=None):\n        logs = _load_logs()\n        logs.append(\n            {\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": _endpoint,\n                \"timestamp\": _now_iso(),\n                \"status\": status,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - _t0) * 1000),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(paper_id, str) or not paper_id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"paper_id must be a non-empty string.\", paper_id=paper_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    paper_id = paper_id.strip()\n\n    if page is None:\n        page = 1\n    if items_per_page is None:\n        items_per_page = 20\n    if not isinstance(page, int) or page < 1:\n        e = _err(\"VALIDATION_ERROR\", \"page must be a positive integer.\", page=page)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if not isinstance(items_per_page, int) or items_per_page < 1:\n        e = _err(\"VALIDATION_ERROR\", \"items_per_page must be a positive integer.\", items_per_page=items_per_page)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n    if items_per_page > 100:\n        items_per_page = 100\n\n    lim = _enforce_limits()\n    if lim:\n        _log(\"error\", lim[\"error\"][\"code\"])\n        return lim\n\n    papers = _load(\"papers.json\")\n    if not isinstance(papers, list):\n        papers = []\n\n    paper = None\n    for p in papers:\n        if isinstance(p, dict) and p.get(\"id\") == paper_id:\n            paper = p\n            break\n\n    if not paper or paper.get(\"status\") == \"deleted\":\n        e = _err(\"NOT_FOUND\", \"Paper not found.\", paper_id=paper_id)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    tasks = paper.get(\"tasks\")\n    if not isinstance(tasks, list):\n        tasks = []\n\n    total = len(tasks)\n    start = (page - 1) * items_per_page\n    end = start + items_per_page\n    page_rows = tasks[start:end]\n    has_more = end < total\n\n    _log(\"ok\")\n    return {\n        \"tasks\": page_rows,\n        \"page\": page,\n        \"items_per_page\": items_per_page,\n        \"total\": total,\n        \"has_more\": has_more,\n        \"next_page\": (page + 1) if has_more else None,\n        \"paper_id\": paper_id,\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "read_paper_from_url",
+          "description": "Resolves paper_url to a canonical paper in our stored URL mappings and returns an explanation/readout based on cached parsed content and enrichments when available. Raises VALIDATION_ERROR if paper_url is missing, not a string, or not a valid URL, and NOT_FOUND if the URL cannot be mapped to a known paper or no readable cached content exists for that mapping. Raises UNAUTHORIZED/FORBIDDEN for access violations and RATE_LIMITED when quotas are exceeded.",
+          "parameters": {
+            "properties": {
+              "paper_url": {
+                "title": "Paper Url",
+                "type": "string"
+              }
+            },
+            "required": [
+              "paper_url"
+            ],
+            "title": "read_paper_from_urlArguments",
+            "type": "object"
+          },
+          "implementation": "def read_paper_from_url(paper_url, **_extra):\n    import json, os, datetime, time, re, urllib.parse\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0136000\" if __import__(\"os\").path.isdir(\"./environment_mix/0136000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _t0 = time.time()\n    _endpoint = \"read_paper_from_url\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_ts_any(row):\n        if not isinstance(row, dict):\n            return None\n        ts = row.get(\"timestamp\") or row.get(\"created_at\")\n        if isinstance(ts, str) and ts:\n            try:\n                return datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                return None\n        return None\n\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        return logs if isinstance(logs, list) else []\n\n    def _enforce_limits():\n        cfg = _load(\"service_config.json\")\n        if not isinstance(cfg, dict):\n            cfg = {}\n        rl = cfg.get(\"rate_limit_per_minute\")\n        quota = cfg.get(\"quota_per_day\")\n        logs = _load_logs()\n        now = datetime.datetime.utcnow()\n\n        if isinstance(rl, int) and rl > 0:\n            cutoff = now - datetime.timedelta(seconds=60)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= rl:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", limit_per_minute=rl)\n\n        if isinstance(quota, int) and quota > 0:\n            cutoff = now - datetime.timedelta(days=1)\n            c = 0\n            for r in reversed(logs):\n                dt = _parse_ts_any(r)\n                if not dt:\n                    continue\n                if dt < cutoff:\n                    break\n                c += 1\n                if c >= quota:\n                    return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\", quota_per_day=quota)\n\n        return None\n\n    def _log(status, error_code=None):\n        logs = _load_logs()\n        logs.append(\n            {\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": _endpoint,\n                \"timestamp\": _now_iso(),\n                \"status\": status,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - _t0) * 1000),\n            }\n        )\n        _save(\"request_logs.json\", logs)\n\n    # Validate URL\n    if not isinstance(paper_url, str) or not paper_url.strip():\n        e = _err(\"VALIDATION_ERROR\", \"paper_url must be a non-empty string.\", paper_url=paper_url)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    raw = paper_url.strip()\n    try:\n        parsed = urllib.parse.urlparse(raw)\n    except Exception:\n        e = _err(\"VALIDATION_ERROR\", \"paper_url is not a valid URL.\", paper_url=paper_url)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    if parsed.scheme not in (\"http\", \"https\") or not parsed.netloc:\n        e = _err(\"VALIDATION_ERROR\", \"paper_url must be an absolute http(s) URL.\", paper_url=paper_url)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    lim = _enforce_limits()\n    if lim:\n        _log(\"error\", lim[\"error\"][\"code\"])\n        return lim\n\n    def _normalize_url(u):\n        p = urllib.parse.urlparse(u.strip())\n        scheme = p.scheme.lower()\n        netloc = p.netloc.lower()\n        if netloc.endswith(\":80\") and scheme == \"http\":\n            netloc = netloc[:-3]\n        if netloc.endswith(\":443\") and scheme == \"https\":\n            netloc = netloc[:-4]\n        path = urllib.parse.unquote(p.path or \"\")\n        path = re.sub(r\"/+\", \"/\", path).rstrip(\"/\")\n        if not path:\n            path = \"/\"\n        # drop query+fragment for canonical mapping (PWC typically treats them as non-semantic)\n        return urllib.parse.urlunparse((scheme, netloc, path, \"\", \"\", \"\"))\n\n    norm_url = _normalize_url(raw)\n\n    papers = _load(\"papers.json\")\n    if not isinstance(papers, list):\n        papers = []\n\n    resolved = None\n    resolved_reason = None\n\n    # 1) exact match on paper_url (normalized compare)\n    for p in papers:\n        if not isinstance(p, dict) or p.get(\"status\") == \"deleted\":\n            continue\n        pu = p.get(\"paper_url\")\n        if isinstance(pu, str) and pu.strip():\n            if _normalize_url(pu) == norm_url:\n                resolved = p\n                resolved_reason = \"paper_url\"\n                break\n\n    # 2) match in url_aliases (normalized)\n    if resolved is None:\n        for p in papers:\n            if not isinstance(p, dict) or p.get(\"status\") == \"deleted\":\n                continue\n            aliases = p.get(\"url_aliases\")\n            if not isinstance(aliases, list):\n                continue\n            for a in aliases:\n                if isinstance(a, str) and a.strip() and _normalize_url(a) == norm_url:\n                    resolved = p\n                    resolved_reason = \"url_aliases\"\n                    break\n            if resolved is not None:\n                break\n\n    # 3) detect arxiv id in URL and resolve by arxiv_id normalized (strip version)\n    def _norm_arxiv(a):\n        if not isinstance(a, str):\n            return None\n        a = a.strip()\n        if not a:\n            return None\n        a = re.sub(r\"^arxiv:\", \"\", a, flags=re.I)\n        a = a.split(\"v\", 1)[0] if re.match(r\"^\\d{4}\\.\\d{4,5}v\\d+$\", a) else a.split(\"v\", 1)[0] if re.match(r\"^[a-z\\-]+\\/\\d{7}v\\d+$\", a, flags=re.I) else a\n        return a.lower()\n\n    if resolved is None:\n        m = re.search(r\"(?:abs|pdf)/(\\d{4}\\.\\d{4,5})(?:v\\d+)?\", norm_url)\n        if not m:\n            m = re.search(r\"/(\\d{4}\\.\\d{4,5})(?:v\\d+)?(?:\\.pdf)?$\", norm_url)\n        arx = m.group(1).lower() if m else None\n        if arx:\n            for p in papers:\n                if not isinstance(p, dict) or p.get(\"status\") == \"deleted\":\n                    continue\n                if _norm_arxiv(p.get(\"arxiv_id\")) == arx:\n                    resolved = p\n                    resolved_reason = \"arxiv_url\"\n                    break\n\n    if resolved is None:\n        e = _err(\"NOT_FOUND\", \"URL could not be mapped to a known paper.\", paper_url=paper_url, normalized_url=norm_url)\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    # Optionally populate/update cached_read (mirror behaviour)\n    now_iso = _now_iso()\n    changed = False\n    cr = resolved.get(\"cached_read\")\n    if cr is None or not isinstance(cr, dict):\n        cr = {\n            \"source_url\": norm_url,\n            \"resolved_paper_id\": resolved.get(\"id\"),\n            \"extracted_text\": None,\n            \"summary\": None,\n            \"last_fetched_at\": None,\n            \"fetch_status\": \"never_fetched\",\n            \"error\": None,\n        }\n        resolved[\"cached_read\"] = cr\n        changed = True\n\n    # Update minimal cache metadata on read attempt (offline: mark fetched if we have extracted_text or summary already)\n    cr[\"source_url\"] = norm_url\n    cr[\"resolved_paper_id\"] = resolved.get(\"id\")\n    cr[\"last_fetched_at\"] = now_iso\n    if cr.get(\"extracted_text\") or cr.get(\"summary\"):\n        cr[\"fetch_status\"] = \"fetched\"\n        cr[\"error\"] = None\n    else:\n        # Keep \"never_fetched\" unless previously failed; but record we attempted\n        if cr.get(\"fetch_status\") not in (\"failed\", \"fetched\"):\n            cr[\"fetch_status\"] = \"never_fetched\"\n    changed = True\n\n    if changed:\n        # persist updated cached_read into papers.json\n        for i, p in enumerate(papers):\n            if isinstance(p, dict) and p.get(\"id\") == resolved.get(\"id\"):\n                papers[i] = resolved\n                break\n        _save(\"papers.json\", papers)\n\n    # Must have readable cached content to return; otherwise NOT_FOUND per rule\n    if not (isinstance(resolved.get(\"cached_read\"), dict) and (resolved[\"cached_read\"].get(\"extracted_text\") or resolved[\"cached_read\"].get(\"summary\"))):\n        e = _err(\n            \"NOT_FOUND\",\n            \"No readable cached content exists for this URL mapping.\",\n            paper_id=resolved.get(\"id\"),\n            resolution=resolved_reason,\n        )\n        _log(\"error\", e[\"error\"][\"code\"])\n        return e\n\n    _log(\"ok\")\n    return {\n        \"paper\": resolved,\n        \"resolution\": {\"normalized_url\": norm_url, \"matched_via\": resolved_reason, \"paper_id\": resolved.get(\"id\")},\n        \"readout\": resolved.get(\"cached_read\"),\n    }\n",
+          "description_restored": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0136000",
+    "index": 136,
+    "name": "PapersWithCode Client",
+    "description": "This backend mirrors key entities from PapersWithCode (research areas, tasks, authors, papers, conferences/proceedings) and their relationships, enabling search and detail retrieval. It also stores enrichments and cross-links (paper↔author, paper↔task, paper↔repo/dataset/method/result) to serve list",
+    "taxonomy": {
+      "L1_id": "L1-02",
+      "L1_name": "Academic & Scientific Research",
+      "L1_name_zh": "学术与科学研究",
+      "L2_id": "L2-04",
+      "L2_name": "Literature Search & Discovery",
+      "L2_name_zh": "文献检索与发现",
+      "L3_name": "Research Enrichment & Catalog Discovery",
+      "L3_name_zh": "研究内容增强与目录发现"
+    },
+    "database_dir": "./environment_mix/0136000",
+    "mount_path": "/app/database",
+    "n_tools": 20,
+    "n_collections": 5,
+    "n_records": 93,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 20,
+      "loaded": 20,
+      "reads_returning_data": 7,
+      "read_operations": 20,
+      "mutations_persisted": 0,
+      "mutations_attempted": 0
+    },
+    "tools_loadable_from_database_dir": 20,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "search_research_areas",
+      "returned_chars": 515
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

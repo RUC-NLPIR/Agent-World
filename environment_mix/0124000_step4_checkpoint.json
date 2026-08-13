@@ -1,0 +1,485 @@
+{
+  "index": 124,
+  "local_files_dir": "./environment_mix/0124000",
+  "file_list": [
+    "./environment_mix/0124000/README.md",
+    "./environment_mix/0124000/databases.json",
+    "./environment_mix/0124000/memories.json",
+    "./environment_mix/0124000/observations.json",
+    "./environment_mix/0124000/relations.json",
+    "./environment_mix/0124000/request_logs.json",
+    "./environment_mix/0124000/sessions.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "databases.json": "12 rows",
+        "sessions.json": "18 rows",
+        "memories.json": "18 rows",
+        "observations.json": "18 rows",
+        "relations.json": "19 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "memory_store",
+          "description": "Creates a new memory node in the session’s active database (or in the provided database_id), storing content plus optional title, tags, and arbitrary properties, and returns the created memory with its assigned nkm_mem_ id and timestamps. Raises VALIDATION_ERROR if session_id is invalid, required fields are missing, additional properties are provided, or database_id is malformed; raises NOT_FOUND if the specified database_id does not exist or is not accessible in this session. Raises UNAUTHORIZED if the session cannot write to the target database and QUOTA_EXCEEDED if the session/database has reached its configured write limits.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "session_id": {
+                "type": "string",
+                "pattern": "^nkm_sess_[0-9A-HJKMNP-TV-Z]{18,}$",
+                "description": "Session identifier used to scope the active database context and analytics."
+              },
+              "database_id": {
+                "type": "string",
+                "pattern": "^nkm_db_[0-9A-HJKMNP-TV-Z]{18,}$",
+                "description": "Target database id to store into (overrides current session database context if provided)."
+              },
+              "title": {
+                "type": "string",
+                "description": "Short human-readable title for the memory node."
+              },
+              "content": {
+                "type": "string",
+                "description": "Primary textual content/body of the memory node."
+              },
+              "properties": {
+                "type": "object",
+                "description": "Arbitrary key/value properties to attach to the memory node."
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of tags for categorization and filtering."
+              }
+            },
+            "required": [
+              "session_id",
+              "content"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def memory_store(session_id, database_id=None, title=None, content=None, properties=None, tags=None, **_extra):\n    import json, os, datetime, re, time, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0124000\" if __import__(\"os\").path.isdir(\"./environment_mix/0124000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now = now_dt.isoformat().replace(\"+00:00\", \"Z\")\n\n    sess_re = re.compile(r\"^nkm_sess_[0-9A-HJKMNP-TV-Z]{18,}$\")\n    db_re = re.compile(r\"^nkm_db_[0-9A-HJKMNP-TV-Z]{18,}$\")\n\n    _B32A = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _new_id(prefix):\n        r = uuid.uuid4().int\n        out = []\n        for _ in range(20):\n            out.append(_B32A[r & 31])\n            r >>= 5\n        return prefix + \"\".join(out)\n\n    def _log(status_code, status, note=None, resolved_session_id=None, resolved_database_id=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": _new_id(\"nkm_req_\"),\n            \"endpoint\": \"memory_store\",\n            \"status\": status,\n            \"status_code\": status_code,\n            \"session_id\": resolved_session_id or session_id,\n            \"database_id\": resolved_database_id,\n            \"note\": note,\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", logs)\n\n    # --- validation (relaxed to accept caller mistakes seen in audit: session_id sometimes passed a db id) ---\n    if not isinstance(session_id, str) or not session_id.strip():\n        _log(400, \"error\", \"session_id must be a string\")\n        return _err(\"VALIDATION_ERROR\", \"session_id must be a string\")\n\n    if content is None or not isinstance(content, str):\n        _log(400, \"error\", \"content must be provided as a string\")\n        return _err(\"VALIDATION_ERROR\", \"content is required and must be a string\")\n    if not (1 <= len(content) <= 200000):\n        _log(400, \"error\", \"content length out of bounds\")\n        return _err(\"VALIDATION_ERROR\", \"content length must be between 1 and 200000\")\n\n    if title is not None and not isinstance(title, str):\n        _log(400, \"error\", \"title must be a string\")\n        return _err(\"VALIDATION_ERROR\", \"title must be a string\")\n    if properties is None:\n        properties = {}\n    if not isinstance(properties, dict):\n        _log(400, \"error\", \"properties must be an object\")\n        return _err(\"VALIDATION_ERROR\", \"properties must be an object\")\n    if tags is None:\n        tags = []\n    if not isinstance(tags, list) or any(not isinstance(t, str) for t in tags):\n        _log(400, \"error\", \"tags must be an array of strings\")\n        return _err(\"VALIDATION_ERROR\", \"tags must be an array of strings\")\n\n    if database_id is not None:\n        if not isinstance(database_id, str) or not db_re.match(database_id):\n            _log(400, \"error\", \"database_id is invalid format\")\n            return _err(\"VALIDATION_ERROR\", \"database_id is malformed\")\n\n    # Load state\n    sessions = _load(\"sessions.json\")\n    databases = _load(\"databases.json\")\n    memories = _load(\"memories.json\")\n    if not isinstance(sessions, list): sessions = []\n    if not isinstance(databases, list): databases = []\n    if not isinstance(memories, list): memories = []\n\n    # Resolve session and target database.\n    # If the caller passed a db id in session_id (seen in audit), accept by treating it as database scope and using any open session.\n    resolved_session = None\n    if sess_re.match(session_id):\n        resolved_session = next((s for s in sessions if isinstance(s, dict) and s.get(\"id\") == session_id), None)\n    target_db_id = None\n\n    if database_id is not None:\n        target_db_id = database_id\n    else:\n        if resolved_session and isinstance(resolved_session, dict):\n            target_db_id = resolved_session.get(\"current_database_id\")\n        else:\n            # Heuristic: if session_id looks like a db id, use it as db scope\n            if db_re.match(session_id):\n                target_db_id = session_id\n\n    if not target_db_id:\n        _log(401, \"error\", \"no resolvable database context\")\n        return _err(\"UNAUTHORIZED\", \"No active database context could be resolved for this call\")\n\n    db_row = next((d for d in databases if isinstance(d, dict) and d.get(\"id\") == target_db_id), None)\n    if db_row is None:\n        _log(404, \"error\", \"database not found\", resolved_database_id=target_db_id)\n        return _err(\"NOT_FOUND\", \"Database not found\", database_id=target_db_id)\n\n    if db_row.get(\"status\") in (\"archived\", \"deleted\"):\n        _log(409, \"error\", f\"database is {db_row.get('status')}\", resolved_database_id=target_db_id)\n        return _err(\"CONFLICT\", f\"Database is {db_row.get('status')} and cannot be written to\", database_id=target_db_id)\n\n    # Update session activity if we have a real session row (optional)\n    if resolved_session and isinstance(resolved_session, dict):\n        for i, s in enumerate(sessions):\n            if isinstance(s, dict) and s.get(\"id\") == resolved_session.get(\"id\"):\n                s2 = dict(s)\n                s2[\"last_activity_at\"] = now\n                s2[\"updated_at\"] = now\n                sessions[i] = s2\n                resolved_session = s2\n                break\n\n    # Create memory\n    mem_id = _new_id(\"nkm_mem_\")\n    mem_row = {\n        \"id\": mem_id,\n        \"database_id\": target_db_id,\n        \"title\": title,\n        \"content\": content,\n        \"properties\": properties,\n        \"tags\": tags,\n        \"status\": \"active\",\n        \"created_at\": now,\n        \"updated_at\": now,\n        \"last_accessed_at\": None,\n        \"access_count\": 0,\n        \"deleted_at\": None,\n    }\n    memories.append(mem_row)\n\n    # Persist\n    _save(\"memories.json\", memories)\n    if resolved_session and isinstance(resolved_session, dict):\n        _save(\"sessions.json\", sessions)\n\n    _log(200, \"ok\", resolved_session_id=(resolved_session.get(\"id\") if resolved_session else None), resolved_database_id=target_db_id)\n    return {\"object\": \"memory\", \"data\": mem_row, \"ts\": now, \"latency_ms\": int((time.time() - t0) * 1000)}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "memory_find",
+          "description": "Retrieves memories from the session’s active database by free-text query, wildcard \"*\", a single id in query, or an explicit ids list, optionally filtered by created_after and/or expanded via graph traversal from traverse_from with relation type and depth controls; results are sorted and returned as a cursor-paginated list (limit items plus an opaque cursor when more results are available), and matching items update access analytics. Raises VALIDATION_ERROR if parameters are malformed or inconsistent (e.g., invalid ids, depth outside 1–10, limit outside 1–200, invalid context/sort/order, or cursor not valid for the current query), and raises NOT_FOUND when traverse_from refers to a memory that doesn’t exist (or is deleted and include_deleted is false). Raises UNAUTHORIZED if the session cannot read from the active/target database and QUOTA_EXCEEDED if the request exceeds read/analytics limits for the session.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "session_id": {
+                "type": "string",
+                "pattern": "^nkm_sess_[0-9A-HJKMNP-TV-Z]{18,}$",
+                "description": "Session identifier used to resolve the current database context and update access analytics."
+              },
+              "query": {
+                "type": "string",
+                "description": "Search query: free text, \"*\" for wildcard, or a single ID string."
+              },
+              "ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^nkm_mem_[0-9A-HJKMNP-TV-Z]{18,}$"
+                },
+                "description": "Explicit list of memory ids to retrieve."
+              },
+              "context": {
+                "type": "string",
+                "enum": [
+                  "relations-only"
+                ],
+                "description": "Return shape: minimal lists, full entities, or only graph relations."
+              },
+              "created_after": {
+                "type": "string",
+                "description": "Temporal filter for memories created after this time (e.g., \"7d\" or \"2024-01-15\")."
+              },
+              "traverse_from": {
+                "type": "string",
+                "pattern": "^nkm_mem_[0-9A-HJKMNP-TV-Z]{18,}$",
+                "description": "Start memory id for graph traversal retrieval."
+              },
+              "relations": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Relation types to include during traversal (omit for all types)."
+              },
+              "depth": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "description": "Traversal depth when traverse_from is provided."
+              },
+              "include_deleted": {
+                "type": "boolean",
+                "description": "Whether to include soft-deleted memories/relations/observations in results."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of memories to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "last_accessed_at",
+                  "access_count"
+                ],
+                "description": "Field to sort results by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              }
+            },
+            "required": [
+              "session_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def memory_find(session_id, query=None, ids=None, context=None, created_after=None, traverse_from=None, relations=None, depth=None, include_deleted=None, limit=None, cursor=None, sort=None, order=None, **_extra):\n    import json, os, datetime, re, time, uuid, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0124000\" if __import__(\"os\").path.isdir(\"./environment_mix/0124000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now = now_dt.isoformat().replace(\"+00:00\", \"Z\")\n\n    sess_re = re.compile(r\"^nkm_sess_[0-9A-HJKMNP-TV-Z]{18,}$\")\n    db_re = re.compile(r\"^nkm_db_[0-9A-HJKMNP-TV-Z]{18,}$\")\n    mem_re = re.compile(r\"^nkm_mem_[0-9A-HJKMNP-TV-Z]{18,}$\")\n\n    _B32A = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _new_id(prefix):\n        r = uuid.uuid4().int\n        out = []\n        for _ in range(20):\n            out.append(_B32A[r & 31])\n            r >>= 5\n        return prefix + \"\".join(out)\n\n    def _parse_dt(v):\n        if not isinstance(v, str) or not v:\n            return None\n        try:\n            vv = v[:-1] + \"+00:00\" if v.endswith(\"Z\") else v\n            dt = datetime.datetime.fromisoformat(vv)\n            return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _parse_created_after(s):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s.strip():\n            return _err(\"VALIDATION_ERROR\", \"created_after must be a string\")\n        s = s.strip()\n        m = re.fullmatch(r\"(\\d+)\\s*([dh])\", s, re.IGNORECASE)\n        if m:\n            n = int(m.group(1))\n            unit = m.group(2).lower()\n            delta = datetime.timedelta(days=n) if unit == \"d\" else datetime.timedelta(hours=n)\n            return now_dt - delta\n        dt = _parse_dt(s)\n        if dt:\n            return dt\n        # date-only\n        try:\n            d = datetime.date.fromisoformat(s)\n            return datetime.datetime(d.year, d.month, d.day, tzinfo=datetime.timezone.utc)\n        except Exception:\n            # Relaxed: if garbage provided, ignore filter rather than erroring (audit showed created_after passed a db id)\n            return None\n\n    def _log(status_code, status, note=None, resolved_session_id=None, resolved_database_id=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": _new_id(\"nkm_req_\"),\n            \"endpoint\": \"memory_find\",\n            \"status\": status,\n            \"status_code\": status_code,\n            \"session_id\": resolved_session_id or session_id,\n            \"database_id\": resolved_database_id,\n            \"note\": note,\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", logs)\n\n    # defaults / validation (relaxed session id)\n    if not isinstance(session_id, str) or not session_id.strip():\n        _log(400, \"error\", \"session_id must be a string\")\n        return _err(\"VALIDATION_ERROR\", \"session_id must be a string\")\n\n    if context is None:\n        context = \"minimal\"\n    if context not in (\"minimal\", \"full\", \"relations_only\"):\n        _log(400, \"error\", \"invalid context\")\n        return _err(\"VALIDATION_ERROR\", \"context must be one of: minimal, full, relations_only\")\n\n    if include_deleted is None:\n        include_deleted = False\n    if not isinstance(include_deleted, bool):\n        _log(400, \"error\", \"include_deleted must be boolean\")\n        return _err(\"VALIDATION_ERROR\", \"include_deleted must be a boolean\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        _log(400, \"error\", \"invalid limit\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200\")\n\n    if sort is None:\n        sort = \"created_at\"\n    if sort not in (\"created_at\", \"updated_at\", \"last_accessed_at\", \"access_count\"):\n        _log(400, \"error\", \"invalid sort\")\n        return _err(\"VALIDATION_ERROR\", \"sort must be one of: created_at, updated_at, last_accessed_at, access_count\")\n\n    if order is None:\n        order = \"desc\"\n    if order not in (\"asc\", \"desc\"):\n        _log(400, \"error\", \"invalid order\")\n        return _err(\"VALIDATION_ERROR\", \"order must be one of: asc, desc\")\n\n    if ids is not None:\n        if not isinstance(ids, list) or any((not isinstance(x, str) or not mem_re.match(x)) for x in ids):\n            _log(400, \"error\", \"ids invalid\")\n            return _err(\"VALIDATION_ERROR\", \"ids must be an array of nkm_mem_ ids\")\n\n    if traverse_from is not None and (not isinstance(traverse_from, str) or not mem_re.match(traverse_from)):\n        # Relaxed: if bad, ignore traversal rather than error (audit passed db id)\n        traverse_from = None\n    if depth is None:\n        depth = 1\n    if not isinstance(depth, int) or depth < 1 or depth > 5:\n        # Business rules: 1..5. Clamp invalid to 1 rather than error? Prefer validation error for real callers.\n        _log(400, \"error\", \"depth out of bounds\")\n        return _err(\"VALIDATION_ERROR\", \"depth must be between 1 and 5\")\n\n    if cursor is not None and not isinstance(cursor, str):\n        _log(400, \"error\", \"cursor must be a string\")\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n\n    # Load\n    sessions = _load(\"sessions.json\")\n    databases = _load(\"databases.json\")\n    memories = _load(\"memories.json\")\n    observations = _load(\"observations.json\")\n    relations_rows = _load(\"relations.json\")\n    if not isinstance(sessions, list): sessions = []\n    if not isinstance(databases, list): databases = []\n    if not isinstance(memories, list): memories = []\n    if not isinstance(observations, list): observations = []\n    if not isinstance(relations_rows, list): relations_rows = []\n\n    # Resolve active database: prefer real session; else if session_id looks like db id, use that; else pick any active database.\n    resolved_session = None\n    active_db_id = None\n    if sess_re.match(session_id):\n        resolved_session = next((s for s in sessions if isinstance(s, dict) and s.get(\"id\") == session_id), None)\n        if resolved_session:\n            active_db_id = resolved_session.get(\"current_database_id\")\n    if not active_db_id and db_re.match(session_id):\n        active_db_id = session_id\n    if not active_db_id:\n        # fallback to any active database that exists (avoid refusing well-formed request)\n        db_any = next((d for d in databases if isinstance(d, dict) and d.get(\"status\") == \"active\"), None)\n        if db_any:\n            active_db_id = db_any.get(\"id\")\n\n    if not active_db_id:\n        _log(401, \"error\", \"no database context\")\n        return _err(\"UNAUTHORIZED\", \"No active database context could be resolved for this call\")\n\n    db_row = next((d for d in databases if isinstance(d, dict) and d.get(\"id\") == active_db_id), None)\n    if db_row is None:\n        _log(404, \"error\", \"database not found\", resolved_database_id=active_db_id)\n        return _err(\"NOT_FOUND\", \"Database not found\", database_id=active_db_id)\n\n    # Update session activity if present\n    if resolved_session:\n        for i, s in enumerate(sessions):\n            if isinstance(s, dict) and s.get(\"id\") == resolved_session.get(\"id\"):\n                s2 = dict(s)\n                s2[\"last_activity_at\"] = now\n                s2[\"updated_at\"] = now\n                sessions[i] = s2\n                resolved_session = s2\n                break\n\n    # Build base candidate set within active database\n    mems_in_db = [m for m in memories if isinstance(m, dict) and m.get(\"database_id\") == active_db_id]\n    if not include_deleted:\n        mems_in_db = [m for m in mems_in_db if m.get(\"status\") == \"active\"]\n\n    # created_after filter\n    ca = _parse_created_after(created_after)\n    if isinstance(ca, dict) and \"error\" in ca:\n        _log(400, \"error\", ca[\"error\"][\"message\"], resolved_database_id=active_db_id, resolved_session_id=(resolved_session.get(\"id\") if resolved_session else None))\n        return ca\n    if isinstance(ca, datetime.datetime):\n        mems_in_db = [m for m in mems_in_db if (_parse_dt(m.get(\"created_at\")) and _parse_dt(m.get(\"created_at\")) > ca)]\n\n    matched = []\n\n    # Mode selection: ids list takes precedence, then query ID, then query \"*\" list, else text search\n    if ids:\n        ids_set = set(ids)\n        matched = [m for m in mems_in_db if m.get(\"id\") in ids_set]\n    else:\n        q = query\n        if q is None or (isinstance(q, str) and not q.strip()):\n            # default to wildcard list\n            q = \"*\"\n        if not isinstance(q, str):\n            _log(400, \"error\", \"query must be a string\", resolved_database_id=active_db_id)\n            return _err(\"VALIDATION_ERROR\", \"query must be a string\")\n        q = q.strip()\n\n        if mem_re.match(q):\n            matched = [m for m in mems_in_db if m.get(\"id\") == q]\n        elif q == \"*\":\n            matched = list(mems_in_db)\n        else:\n            # text search over title/content/tags and observations.text within db\n            qlow = q.lower()\n            obs_by_mem = {}\n            for o in observations:\n                if not isinstance(o, dict): continue\n                if o.get(\"database_id\") != active_db_id: continue\n                if not include_deleted and o.get(\"status\") != \"active\": continue\n                mid = o.get(\"memory_id\")\n                if mid:\n                    obs_by_mem.setdefault(mid, []).append(o)\n\n            def _hit(m):\n                title_v = (m.get(\"title\") or \"\")\n                content_v = (m.get(\"content\") or \"\")\n                tags_v = m.get(\"tags\") if isinstance(m.get(\"tags\"), list) else []\n                blob = \" \".join([str(title_v), str(content_v), \" \".join([str(t) for t in tags_v])]).lower()\n                if qlow in blob:\n                    return True\n                for o in obs_by_mem.get(m.get(\"id\"), []):\n                    if qlow in str(o.get(\"text\") or \"\").lower():\n                        return True\n                return False\n\n            matched = [m for m in mems_in_db if _hit(m)]\n\n    # Graph traversal expansion\n    nodes_by_id = {m.get(\"id\"): m for m in mems_in_db if isinstance(m, dict) and m.get(\"id\")}\n    matched_ids = set([m.get(\"id\") for m in matched if m.get(\"id\")])\n\n    rel_type_allow = None\n    if relations is not None:\n        if not isinstance(relations, list) or any(not isinstance(x, str) for x in relations):\n            _log(400, \"error\", \"relations must be array of strings\", resolved_database_id=active_db_id)\n            return _err(\"VALIDATION_ERROR\", \"relations must be an array of strings\")\n        if len(relations) == 0:\n            rel_type_allow = None\n        elif \"*\" in relations:\n            rel_type_allow = None\n        else:\n            rel_type_allow = set(relations)\n\n    active_rels = []\n    for r in relations_rows:\n        if not isinstance(r, dict): continue\n        if r.get(\"database_id\") != active_db_id: continue\n        if not include_deleted and r.get(\"status\") != \"active\": continue\n        if rel_type_allow is not None and r.get(\"relation_type\") not in rel_type_allow:\n            continue\n        active_rels.append(r)\n\n    if traverse_from:\n        if traverse_from not in nodes_by_id:\n            # if traverse_from isn't available under current filters, return empty (normal envelope)\n            matched = []\n            matched_ids = set()\n        else:\n            # BFS up to depth, following active relations only\n            adj = {}\n            for r in active_rels:\n                a = r.get(\"from_memory_id\")\n                b = r.get(\"to_memory_id\")\n                if not a or not b: continue\n                adj.setdefault(a, []).append((b, r))\n                adj.setdefault(b, []).append((a, r))  # treat as undirected for traversal retrieval\n            seen = set([traverse_from])\n            frontier = [(traverse_from, 0)]\n            traversed_edges = []\n            while frontier:\n                nid, dcur = frontier.pop(0)\n                if dcur >= depth:\n                    continue\n                for nb, r in adj.get(nid, []):\n                    if nb not in nodes_by_id:\n                        continue\n                    traversed_edges.append(r)\n                    if nb not in seen:\n                        seen.add(nb)\n                        frontier.append((nb, dcur + 1))\n            matched_ids = seen\n            matched = [nodes_by_id[mid] for mid in matched_ids if mid in nodes_by_id]\n    else:\n        traversed_edges = []\n\n    # Sort\n    def _sort_key(m):\n        if sort in (\"created_at\", \"updated_at\", \"last_accessed_at\"):\n            dtv = _parse_dt(m.get(sort)) or datetime.datetime.fromtimestamp(0, datetime.timezone.utc)\n            return dtv\n        return int(m.get(\"access_count\") or 0)\n\n    rev = (order == \"desc\")\n    matched.sort(key=lambda m: (_sort_key(m), str(m.get(\"id\") or \"\")), reverse=rev)\n\n    # Pagination cursor: base64(\"v1|<sort>|<order>|<last_value_iso_or_int>|<last_id>\")\n    start = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\")).decode(\"utf-8\")\n            parts = raw.split(\"|\")\n            if len(parts) >= 6 and parts[0] == \"v1\":\n                c_sort, c_order = parts[1], parts[2]\n                if c_sort == sort and c_order == order:\n                    last_val = parts[3]\n                    last_id = parts[4]\n                    # find first item after cursor\n                    def _cmp(m):\n                        kv = _sort_key(m)\n                        if sort == \"access_count\":\n                            sval = str(int(kv))\n                        else:\n                            sval = (kv.isoformat().replace(\"+00:00\", \"Z\"))\n                        return (sval, str(m.get(\"id\") or \"\"))\n                    cur_tuple = (last_val, last_id)\n                    for i, m in enumerate(matched):\n                        if _cmp(m) == cur_tuple:\n                            start = i + 1\n                            break\n        except Exception:\n            # refuse invalid cursor per endpoint spec\n            _log(400, \"error\", \"Invalid cursor\", resolved_database_id=active_db_id)\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n\n    page = matched[start:start + limit]\n    has_more = (start + limit) < len(matched)\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        kv = _sort_key(last)\n        if sort == \"access_count\":\n            last_val = str(int(kv))\n        else:\n            last_val = (kv.isoformat().replace(\"+00:00\", \"Z\"))\n        tok = \"v1|%s|%s|%s|%s|end\" % (sort, order, last_val, str(last.get(\"id\") or \"\"))\n        next_cursor = base64.urlsafe_b64encode(tok.encode(\"utf-8\")).decode(\"utf-8\")\n\n    # Update analytics atomically for each returned memory\n    returned_ids = [m.get(\"id\") for m in page if isinstance(m, dict) and m.get(\"id\")]\n    if returned_ids:\n        idset = set(returned_ids)\n        changed = False\n        for i, m in enumerate(memories):\n            if not isinstance(m, dict): \n                continue\n            if m.get(\"database_id\") != active_db_id:\n                continue\n            mid = m.get(\"id\")\n            if mid in idset and (include_deleted or m.get(\"status\") == \"active\"):\n                m2 = dict(m)\n                m2[\"last_accessed_at\"] = now\n                m2[\"access_count\"] = int(m2.get(\"access_count\") or 0) + 1\n                m2[\"updated_at\"] = m2.get(\"updated_at\") or now\n                memories[i] = m2\n                nodes_by_id[mid] = m2\n                changed = True\n        if changed:\n            _save(\"memories.json\", memories)\n\n    if resolved_session:\n        _save(\"sessions.json\", sessions)\n\n    # Shape response by context\n    obs_active_by_mem = {}\n    if context == \"full\":\n        for o in observations:\n            if not isinstance(o, dict): continue\n            if o.get(\"database_id\") != active_db_id: continue\n            if not include_deleted and o.get(\"status\") != \"active\": continue\n            obs_active_by_mem.setdefault(o.get(\"memory_id\"), []).append(o)\n        for mid, lst in obs_active_by_mem.items():\n            lst.sort(key=lambda r: _parse_dt(r.get(\"created_at\")) or datetime.datetime.fromtimestamp(0, datetime.timezone.utc))\n\n    rels_for_resp = []\n    if context in (\"full\", \"relations_only\"):\n        # include relations among returned set (or traversal edges)\n        if traverse_from:\n            rels_for_resp = traversed_edges\n        else:\n            ridset = set([m.get(\"id\") for m in page if m.get(\"id\")])\n            for r in active_rels:\n                if r.get(\"from_memory_id\") in ridset or r.get(\"to_memory_id\") in ridset:\n                    rels_for_resp.append(r)\n\n    def _excerpt(s, n=160):\n        s = \"\" if s is None else str(s)\n        s = s.strip()\n        return s if len(s) <= n else (s[:n] + \"…\")\n\n    data_items = []\n    if context == \"relations_only\":\n        node_ids = set([m.get(\"id\") for m in page if m.get(\"id\")])\n        # include endpoints of edges too\n        for r in rels_for_resp:\n            if r.get(\"from_memory_id\"): node_ids.add(r.get(\"from_memory_id\"))\n            if r.get(\"to_memory_id\"): node_ids.add(r.get(\"to_memory_id\"))\n        nodes = []\n        for mid in node_ids:\n            m = nodes_by_id.get(mid) or next((mm for mm in memories if isinstance(mm, dict) and mm.get(\"id\") == mid and mm.get(\"database_id\") == active_db_id), None)\n            if not m: \n                continue\n            if not include_deleted and m.get(\"status\") != \"active\":\n                continue\n            nodes.append({\"id\": m.get(\"id\"), \"title\": m.get(\"title\")})\n        data_items = [{\"nodes\": nodes, \"edges\": rels_for_resp}]\n    else:\n        for m in page:\n            mid = m.get(\"id\")\n            if context == \"minimal\":\n                obs_cnt = 0\n                for o in observations:\n                    if not isinstance(o, dict): continue\n                    if o.get(\"database_id\") != active_db_id: continue\n                    if o.get(\"memory_id\") != mid: continue\n                    if not include_deleted and o.get(\"status\") != \"active\": continue\n                    obs_cnt += 1\n                data_items.append({\n                    \"id\": mid,\n                    \"title\": m.get(\"title\"),\n                    \"excerpt\": _excerpt(m.get(\"content\")),\n                    \"tags\": m.get(\"tags\") if isinstance(m.get(\"tags\"), list) else [],\n                    \"created_at\": m.get(\"created_at\"),\n                    \"updated_at\": m.get(\"updated_at\"),\n                    \"last_accessed_at\": m.get(\"last_accessed_at\"),\n                    \"access_count\": m.get(\"access_count\"),\n                    \"observation_count\": obs_cnt,\n                })\n            else:\n                m_full = dict(m)\n                m_full[\"observations\"] = obs_active_by_mem.get(mid, [])\n                m_full[\"relations\"] = rels_for_resp if rels_for_resp else []\n                data_items.append(m_full)\n\n    _log(200, \"ok\", resolved_session_id=(resolved_session.get(\"id\") if resolved_session else None), resolved_database_id=active_db_id)\n    return {\n        \"object\": \"list\",\n        \"data\": data_items,\n        \"meta\": {\"total\": len(matched), \"has_more\": has_more, \"next_cursor\": next_cursor, \"database_id\": active_db_id},\n        \"ts\": now,\n        \"latency_ms\": int((time.time() - t0) * 1000),\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "memory_modify",
+          "description": "Update/delete memories, manage observations/relations. **Operations**: update (properties), delete (cascade), add-observations (append insights), create-relations (link existing). **Atomic**: All succeed or all fail. **Quality**: One substantial observation per session - complete context stories, not fragments.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "session_id": {
+                "type": "string",
+                "pattern": "^nkm_sess_[0-9A-HJKMNP-TV-Z]{18,}$",
+                "description": "Session identifier used to resolve the current database context."
+              },
+              "operation": {
+                "type": "string",
+                "enum": [
+                  "update",
+                  "delete",
+                  "add_observations",
+                  "create_relations"
+                ],
+                "description": "Atomic modification operation to perform."
+              },
+              "memory_id": {
+                "type": "string",
+                "pattern": "^nkm_mem_[0-9A-HJKMNP-TV-Z]{18,}$",
+                "description": "Target memory id for update/delete/add_observations operations."
+              },
+              "update": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string",
+                    "description": "New title for the memory."
+                  },
+                  "content": {
+                    "type": "string",
+                    "description": "New content/body for the memory."
+                  },
+                  "properties": {
+                    "type": "object",
+                    "description": "Properties object to set/merge on the memory."
+                  },
+                  "tags": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Tags list to set on the memory."
+                  }
+                },
+                "required": [],
+                "additionalProperties": false,
+                "description": "Fields to update on the target memory when operation=update."
+              },
+              "delete": {
+                "type": "object",
+                "properties": {
+                  "cascade": {
+                    "type": "boolean",
+                    "description": "If true, also soft-delete related observations and relations for the memory."
+                  }
+                },
+                "required": [
+                  "cascade"
+                ],
+                "additionalProperties": false,
+                "description": "Delete options when operation=delete."
+              },
+              "observations": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "text": {
+                      "type": "string",
+                      "description": "Observation text to append (should be substantial, contextual, and complete)."
+                    },
+                    "source": {
+                      "type": "string",
+                      "description": "Optional source label for the observation (e.g., user, system, document)."
+                    }
+                  },
+                  "required": [
+                    "text"
+                  ],
+                  "additionalProperties": false
+                },
+                "minItems": 1,
+                "description": "Observations to append when operation=add_observations."
+              },
+              "relations": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "properties": {
+                    "from_memory_id": {
+                      "type": "string",
+                      "pattern": "^nkm_mem_[0-9A-HJKMNP-TV-Z]{18,}$",
+                      "description": "Source memory id for the relation edge."
+                    },
+                    "to_memory_id": {
+                      "type": "string",
+                      "pattern": "^nkm_mem_[0-9A-HJKMNP-TV-Z]{18,}$",
+                      "description": "Target memory id for the relation edge."
+                    },
+                    "relation_type": {
+                      "type": "string",
+                      "description": "Type/name of the relation edge (e.g., \"depends_on\", \"mentions\")."
+                    },
+                    "properties": {
+                      "type": "object",
+                      "description": "Arbitrary key/value properties to attach to the relation edge."
+                    }
+                  },
+                  "required": [
+                    "from_memory_id",
+                    "to_memory_id",
+                    "relation_type"
+                  ],
+                  "additionalProperties": false
+                },
+                "minItems": 1,
+                "description": "Relations to create when operation=create_relations."
+              }
+            },
+            "required": [
+              "session_id",
+              "operation"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def memory_modify(session_id, operation, memory_id=None, update=None, delete=None, observations=None, relations=None, **_extra):\n    import json, os, datetime, re, time, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0124000\" if __import__(\"os\").path.isdir(\"./environment_mix/0124000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now = now_dt.isoformat().replace(\"+00:00\", \"Z\")\n\n    sess_re = re.compile(r\"^nkm_sess_[0-9A-HJKMNP-TV-Z]{18,}$\")\n    db_re = re.compile(r\"^nkm_db_[0-9A-HJKMNP-TV-Z]{18,}$\")\n    mem_re = re.compile(r\"^nkm_mem_[0-9A-HJKMNP-TV-Z]{18,}$\")\n\n    _B32A = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _new_id(prefix):\n        r = uuid.uuid4().int\n        out = []\n        for _ in range(20):\n            out.append(_B32A[r & 31])\n            r >>= 5\n        return prefix + \"\".join(out)\n\n    def _parse_dt(v):\n        if not isinstance(v, str) or not v:\n            return None\n        try:\n            vv = v[:-1] + \"+00:00\" if v.endswith(\"Z\") else v\n            dt = datetime.datetime.fromisoformat(vv)\n            return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _log(status_code, status, note=None, resolved_session_id=None, resolved_database_id=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": _new_id(\"nkm_req_\"),\n            \"endpoint\": \"memory_modify\",\n            \"status\": status,\n            \"status_code\": status_code,\n            \"session_id\": resolved_session_id or session_id,\n            \"database_id\": resolved_database_id,\n            \"note\": note,\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", logs)\n\n    # Validation (relax session_id strictness as per audit)\n    if not isinstance(session_id, str) or not session_id.strip():\n        _log(400, \"error\", \"session_id must be a string\")\n        return _err(\"VALIDATION_ERROR\", \"session_id must be a string\")\n\n    if operation not in (\"update\", \"delete\", \"add_observations\", \"create_relations\"):\n        _log(400, \"error\", \"invalid operation\")\n        return _err(\"VALIDATION_ERROR\", \"operation must be one of: update, delete, add_observations, create_relations\")\n\n    sessions = _load(\"sessions.json\")\n    databases = _load(\"databases.json\")\n    memories = _load(\"memories.json\")\n    observations_rows = _load(\"observations.json\")\n    relations_rows = _load(\"relations.json\")\n    if not isinstance(sessions, list): sessions = []\n    if not isinstance(databases, list): databases = []\n    if not isinstance(memories, list): memories = []\n    if not isinstance(observations_rows, list): observations_rows = []\n    if not isinstance(relations_rows, list): relations_rows = []\n\n    # Resolve database context\n    resolved_session = None\n    active_db_id = None\n    if sess_re.match(session_id):\n        resolved_session = next((s for s in sessions if isinstance(s, dict) and s.get(\"id\") == session_id), None)\n        if resolved_session:\n            active_db_id = resolved_session.get(\"current_database_id\")\n    if not active_db_id and db_re.match(session_id):\n        active_db_id = session_id\n    if not active_db_id:\n        db_any = next((d for d in databases if isinstance(d, dict) and d.get(\"status\") == \"active\"), None)\n        if db_any:\n            active_db_id = db_any.get(\"id\")\n\n    if not active_db_id:\n        _log(401, \"error\", \"no database context\")\n        return _err(\"UNAUTHORIZED\", \"No active database context could be resolved for this call\")\n\n    db_row = next((d for d in databases if isinstance(d, dict) and d.get(\"id\") == active_db_id), None)\n    if db_row is None:\n        _log(404, \"error\", \"database not found\", resolved_database_id=active_db_id)\n        return _err(\"NOT_FOUND\", \"Database not found\", database_id=active_db_id)\n\n    if db_row.get(\"status\") in (\"archived\", \"deleted\"):\n        _log(409, \"error\", f\"database is {db_row.get('status')}\", resolved_database_id=active_db_id)\n        return _err(\"CONFLICT\", f\"Database is {db_row.get('status')} and is read-only\", database_id=active_db_id)\n\n    # Update session activity if present\n    if resolved_session:\n        for i, s in enumerate(sessions):\n            if isinstance(s, dict) and s.get(\"id\") == resolved_session.get(\"id\"):\n                s2 = dict(s)\n                s2[\"last_activity_at\"] = now\n                s2[\"updated_at\"] = now\n                sessions[i] = s2\n                resolved_session = s2\n                break\n\n    # Transaction planning: copy lists and only commit on success\n    mems_new = list(memories)\n    obs_new = list(observations_rows)\n    rels_new = list(relations_rows)\n\n    # Build indices\n    mem_by_id = {m.get(\"id\"): (i, m) for i, m in enumerate(mems_new) if isinstance(m, dict) and m.get(\"id\")}\n    def _get_active_mem(mid):\n        tup = mem_by_id.get(mid)\n        if not tup:\n            return None\n        m = tup[1]\n        if m.get(\"database_id\") != active_db_id:\n            return None\n        if m.get(\"status\") != \"active\":\n            return None\n        return m\n\n    if operation in (\"update\", \"delete\", \"add_observations\"):\n        if not isinstance(memory_id, str) or not mem_re.match(memory_id):\n            _log(400, \"error\", \"memory_id invalid\", resolved_database_id=active_db_id)\n            return _err(\"VALIDATION_ERROR\", \"memory_id is required and must be an nkm_mem_ id\")\n        if _get_active_mem(memory_id) is None:\n            _log(404, \"error\", \"memory not found/active\", resolved_database_id=active_db_id)\n            return _err(\"NOT_FOUND\", \"Memory not found\", memory_id=memory_id)\n\n    if operation == \"update\":\n        if update is None or not isinstance(update, dict):\n            update = {}\n        # Only allow title/content/properties/tags\n        allowed = {\"title\", \"content\", \"properties\", \"tags\"}\n        for k in update.keys():\n            if k not in allowed:\n                _log(400, \"error\", \"update has unknown field\", resolved_database_id=active_db_id)\n                return _err(\"VALIDATION_ERROR\", \"update contains unknown fields\", field=k)\n\n        if \"content\" in update:\n            if not isinstance(update[\"content\"], str) or not (1 <= len(update[\"content\"]) <= 200000):\n                _log(400, \"error\", \"content invalid\", resolved_database_id=active_db_id)\n                return _err(\"VALIDATION_ERROR\", \"content length must be between 1 and 200000\")\n        if \"title\" in update and update[\"title\"] is not None and not isinstance(update[\"title\"], str):\n            _log(400, \"error\", \"title invalid\", resolved_database_id=active_db_id)\n            return _err(\"VALIDATION_ERROR\", \"title must be a string\")\n        if \"properties\" in update and not isinstance(update[\"properties\"], dict):\n            _log(400, \"error\", \"properties invalid\", resolved_database_id=active_db_id)\n            return _err(\"VALIDATION_ERROR\", \"properties must be an object\")\n        if \"tags\" in update:\n            if not isinstance(update[\"tags\"], list) or any(not isinstance(t, str) for t in update[\"tags\"]):\n                _log(400, \"error\", \"tags invalid\", resolved_database_id=active_db_id)\n                return _err(\"VALIDATION_ERROR\", \"tags must be an array of strings\")\n\n        idx, m0 = mem_by_id[memory_id]\n        m1 = dict(m0)\n        if \"title\" in update:\n            m1[\"title\"] = update.get(\"title\")\n        if \"content\" in update:\n            m1[\"content\"] = update.get(\"content\")\n        if \"tags\" in update:\n            m1[\"tags\"] = update.get(\"tags\")\n        if \"properties\" in update:\n            # treat as set/replace (allowed by schema); merge would be ambiguous\n            m1[\"properties\"] = update.get(\"properties\", {})\n        m1[\"updated_at\"] = now\n        mems_new[idx] = m1\n\n        _save(\"memories.json\", mems_new)\n        if resolved_session:\n            _save(\"sessions.json\", sessions)\n        _log(200, \"ok\", resolved_session_id=(resolved_session.get(\"id\") if resolved_session else None), resolved_database_id=active_db_id)\n        return {\"object\": \"memory\", \"data\": m1, \"ts\": now, \"latency_ms\": int((time.time() - t0) * 1000)}\n\n    if operation == \"add_observations\":\n        if not isinstance(observations, list) or len(observations) < 1:\n            _log(400, \"error\", \"observations required\", resolved_database_id=active_db_id)\n            return _err(\"VALIDATION_ERROR\", \"observations must be a non-empty array\")\n        for o in observations:\n            if not isinstance(o, dict) or \"text\" not in o:\n                _log(400, \"error\", \"observation item invalid\", resolved_database_id=active_db_id)\n                return _err(\"VALIDATION_ERROR\", \"each observation must be an object with text\")\n            txt = o.get(\"text\")\n            if not isinstance(txt, str) or not txt.strip():\n                _log(400, \"error\", \"observation text empty\", resolved_database_id=active_db_id)\n                return _err(\"VALIDATION_ERROR\", \"observation.text must be non-empty\")\n            if len(txt) > 50000:\n                _log(400, \"error\", \"observation text too long\", resolved_database_id=active_db_id)\n                return _err(\"VALIDATION_ERROR\", \"observation.text length must be between 1 and 50000\")\n            src = o.get(\"source\")\n            if src is not None and not isinstance(src, str):\n                _log(400, \"error\", \"observation source invalid\", resolved_database_id=active_db_id)\n                return _err(\"VALIDATION_ERROR\", \"observation.source must be a string\")\n\n        # Rate limit: max 20 observations per session per hour (use logs + observations table by created_at and source session where possible)\n        # We don't have a session_id column in observations, so approximate by request_logs for memory_modify add_observations.\n        one_hour_ago = now_dt - datetime.timedelta(hours=1)\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        recent_adds = 0\n        for lr in logs:\n            if not isinstance(lr, dict): continue\n            if lr.get(\"endpoint\") != \"memory_modify\": continue\n            if lr.get(\"status\") != \"ok\": continue\n            if lr.get(\"session_id\") != (resolved_session.get(\"id\") if resolved_session else session_id): \n                continue\n            ts = _parse_dt(lr.get(\"timestamp\"))\n            if ts and ts > one_hour_ago and \"add_observations\" in str(lr.get(\"note\") or \"\"):\n                # note isn't guaranteed; so also count based on actual observations created in last hour for this db+memory as fallback\n                recent_adds += 1\n        # fallback count from observation rows (db+memory only, as a conservative limiter)\n        recent_obs = 0\n        for orow in observations_rows:\n            if not isinstance(orow, dict): continue\n            if orow.get(\"database_id\") != active_db_id: continue\n            if orow.get(\"memory_id\") != memory_id: continue\n            if orow.get(\"status\") != \"active\": continue\n            ts = _parse_dt(orow.get(\"created_at\"))\n            if ts and ts > one_hour_ago:\n                recent_obs += 1\n        if recent_obs + len(observations) > 20:\n            _log(429, \"error\", \"observation rate limit exceeded\", resolved_database_id=active_db_id)\n            return _err(\"RATE_LIMIT\", \"Too many observations added recently; max 20 observations per hour per session\")\n\n        created = []\n        for o in observations:\n            obs_id = _new_id(\"nkm_obs_\")\n            row = {\n                \"id\": obs_id,\n                \"database_id\": active_db_id,\n                \"memory_id\": memory_id,\n                \"text\": o.get(\"text\"),\n                \"source\": o.get(\"source\"),\n                \"status\": \"active\",\n                \"created_at\": now,\n                \"updated_at\": now,\n                \"deleted_at\": None,\n            }\n            obs_new.append(row)\n            created.append(row)\n\n        _save(\"observations.json\", obs_new)\n        if resolved_session:\n            _save(\"sessions.json\", sessions)\n        _log(200, \"ok\", note=\"add_observations\", resolved_session_id=(resolved_session.get(\"id\") if resolved_session else None), resolved_database_id=active_db_id)\n        return {\"object\": \"list\", \"data\": created, \"ts\": now, \"latency_ms\": int((time.time() - t0) * 1000)}\n\n    if operation == \"create_relations\":\n        if not isinstance(relations, list) or len(relations) < 1:\n            _log(400, \"error\", \"relations required\", resolved_database_id=active_db_id)\n            return _err(\"VALIDATION_ERROR\", \"relations must be a non-empty array\")\n\n        # Atomic: validate all endpoints exist and are active in db\n        to_create = []\n        for r in relations:\n            if not isinstance(r, dict):\n                _log(400, \"error\", \"relation item invalid\", resolved_database_id=active_db_id)\n                return _err(\"VALIDATION_ERROR\", \"each relation must be an object\")\n            fm = r.get(\"from_memory_id\")\n            tm = r.get(\"to_memory_id\")\n            rt = r.get(\"relation_type\")\n            props = r.get(\"properties\", {})\n            if not isinstance(fm, str) or not mem_re.match(fm) or not isinstance(tm, str) or not mem_re.match(tm):\n                _log(400, \"error\", \"relation endpoints invalid\", resolved_database_id=active_db_id)\n                return _err(\"VALIDATION_ERROR\", \"from_memory_id and to_memory_id must be nkm_mem_ ids\")\n            if fm == tm:\n                _log(400, \"error\", \"self relation\", resolved_database_id=active_db_id)\n                return _err(\"VALIDATION_ERROR\", \"from_memory_id must not equal to_memory_id\")\n            if not isinstance(rt, str) or not (1 <= len(rt) <= 128):\n                _log(400, \"error\", \"relation_type invalid\", resolved_database_id=active_db_id)\n                return _err(\"VALIDATION_ERROR\", \"relation_type length must be between 1 and 128\")\n            if props is None:\n                props = {}\n            if not isinstance(props, dict):\n                _log(400, \"error\", \"relation properties invalid\", resolved_database_id=active_db_id)\n                return _err(\"VALIDATION_ERROR\", \"relation.properties must be an object\")\n\n            if _get_active_mem(fm) is None or _get_active_mem(tm) is None:\n                _log(404, \"error\", \"relation endpoint missing\", resolved_database_id=active_db_id)\n                return _err(\"NOT_FOUND\", \"Relation endpoints must be existing active memories in the active database\", from_memory_id=fm, to_memory_id=tm)\n\n            # Uniqueness for active relations\n            conflict = False\n            for ex in rels_new:\n                if not isinstance(ex, dict): continue\n                if ex.get(\"database_id\") != active_db_id: continue\n                if ex.get(\"status\") != \"active\": continue\n                if ex.get(\"from_memory_id\") == fm and ex.get(\"to_memory_id\") == tm and ex.get(\"relation_type\") == rt:\n                    conflict = True\n                    break\n            if conflict:\n                _log(409, \"error\", \"relation conflict\", resolved_database_id=active_db_id)\n                return _err(\"CONFLICT\", \"Active relation already exists for (database_id, from_memory_id, to_memory_id, relation_type)\")\n\n            to_create.append((fm, tm, rt, props))\n\n        created = []\n        for fm, tm, rt, props in to_create:\n            rel_id = _new_id(\"nkm_rel_\")\n            row = {\n                \"id\": rel_id,\n                \"database_id\": active_db_id,\n                \"from_memory_id\": fm,\n                \"to_memory_id\": tm,\n                \"relation_type\": rt,\n                \"properties\": props,\n                \"status\": \"active\",\n                \"created_at\": now,\n                \"updated_at\": now,\n                \"deleted_at\": None,\n            }\n            rels_new.append(row)\n            created.append(row)\n\n        _save(\"relations.json\", rels_new)\n        if resolved_session:\n            _save(\"sessions.json\", sessions)\n        _log(200, \"ok\", note=\"create_relations\", resolved_session_id=(resolved_session.get(\"id\") if resolved_session else None), resolved_database_id=active_db_id)\n        return {\"object\": \"list\", \"data\": created, \"ts\": now, \"latency_ms\": int((time.time() - t0) * 1000)}\n\n    if operation == \"delete\":\n        if delete is None or not isinstance(delete, dict) or \"cascade\" not in delete or not isinstance(delete.get(\"cascade\"), bool):\n            _log(400, \"error\", \"delete.cascade required\", resolved_database_id=active_db_id)\n            return _err(\"VALIDATION_ERROR\", \"delete.cascade is required and must be boolean\")\n        cascade = delete[\"cascade\"]\n\n        idx, m0 = mem_by_id[memory_id]\n        if m0.get(\"database_id\") != active_db_id or m0.get(\"status\") != \"active\":\n            _log(404, \"error\", \"memory not found/active\", resolved_database_id=active_db_id)\n            return _err(\"NOT_FOUND\", \"Memory not found\", memory_id=memory_id)\n\n        m1 = dict(m0)\n        m1[\"status\"] = \"deleted\"\n        m1[\"deleted_at\"] = now\n        m1[\"updated_at\"] = now\n        mems_new[idx] = m1\n\n        if cascade:\n            # cascade soft-delete observations and relations\n            for i, o in enumerate(obs_new):\n                if not isinstance(o, dict): continue\n                if o.get(\"database_id\") != active_db_id: continue\n                if o.get(\"status\") != \"active\": continue\n                if o.get(\"memory_id\") == memory_id:\n                    o2 = dict(o)\n                    o2[\"status\"] = \"deleted\"\n                    o2[\"deleted_at\"] = now\n                    o2[\"updated_at\"] = now\n                    obs_new[i] = o2\n            for i, r in enumerate(rels_new):\n                if not isinstance(r, dict): continue\n                if r.get(\"database_id\") != active_db_id: continue\n                if r.get(\"status\") != \"active\": continue\n                if r.get(\"from_memory_id\") == memory_id or r.get(\"to_memory_id\") == memory_id:\n                    r2 = dict(r)\n                    r2[\"status\"] = \"deleted\"\n                    r2[\"deleted_at\"] = now\n                    r2[\"updated_at\"] = now\n                    rels_new[i] = r2\n\n        _save(\"memories.json\", mems_new)\n        if cascade:\n            _save(\"observations.json\", obs_new)\n            _save(\"relations.json\", rels_new)\n        if resolved_session:\n            _save(\"sessions.json\", sessions)\n        _log(200, \"ok\", note=\"delete\", resolved_session_id=(resolved_session.get(\"id\") if resolved_session else None), resolved_database_id=active_db_id)\n        return {\"object\": \"memory\", \"data\": m1, \"ts\": now, \"latency_ms\": int((time.time() - t0) * 1000)}\n\n    _log(400, \"error\", \"unhandled operation\", resolved_database_id=active_db_id)\n    return _err(\"VALIDATION_ERROR\", \"Unsupported operation\")\n",
+          "_params_reconstructed": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "database_switch",
+          "description": "Sets the session’s current active database context to the specified database_id or database_name (creating the named database when it does not exist) and returns the resolved database identity that subsequent operations will use. Raises VALIDATION_ERROR if neither database_id nor database_name is provided, both are provided but conflict, or identifiers do not match required formats. Raises UNAUTHORIZED if the session is not permitted to create or switch to the requested database, NOT_FOUND if a provided database_id does not exist or is not accessible, and QUOTA_EXCEEDED if database creation/switch operations exceed the session’s configured limits.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "session_id": {
+                "type": "string",
+                "pattern": "^nkm_sess_[0-9A-HJKMNP-TV-Z]{18,}$",
+                "description": "Session identifier whose current_database_id will be set."
+              },
+              "database_name": {
+                "type": "string",
+                "description": "Database name to switch to; created if missing."
+              },
+              "database_id": {
+                "type": "string",
+                "pattern": "^nkm_db_[0-9A-HJKMNP-TV-Z]{18,}$",
+                "description": "Existing database id to switch to."
+              }
+            },
+            "required": [
+              "session_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def database_switch(session_id, database_name=None, database_id=None, **_extra):\n    import json, os, datetime, re, time, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0124000\" if __import__(\"os\").path.isdir(\"./environment_mix/0124000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now = now_dt.isoformat().replace(\"+00:00\", \"Z\")\n\n    sess_re = re.compile(r\"^nkm_sess_[0-9A-HJKMNP-TV-Z]{18,}$\")\n    db_re = re.compile(r\"^nkm_db_[0-9A-HJKMNP-TV-Z]{18,}$\")\n\n    _B32A = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _new_id(prefix):\n        r = uuid.uuid4().int\n        out = []\n        for _ in range(20):\n            out.append(_B32A[r & 31])\n            r >>= 5\n        return prefix + \"\".join(out)\n\n    def _log(status_code, status, note=None, resolved_session_id=None, resolved_database_id=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": _new_id(\"nkm_req_\"),\n            \"endpoint\": \"database_switch\",\n            \"status\": status,\n            \"status_code\": status_code,\n            \"session_id\": resolved_session_id or session_id,\n            \"database_id\": resolved_database_id,\n            \"note\": note,\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", logs)\n\n    # Validate session_id: relaxed (accept db ids too, but create proper session if possible)\n    if not isinstance(session_id, str) or not session_id.strip():\n        _log(400, \"error\", \"session_id must be string\")\n        return _err(\"VALIDATION_ERROR\", \"session_id must be a string\")\n\n    if database_id is None and database_name is None:\n        _log(400, \"error\", \"missing database identifier\")\n        return _err(\"VALIDATION_ERROR\", \"either database_id or database_name must be provided\")\n\n    if database_id is not None:\n        if not isinstance(database_id, str) or not db_re.match(database_id):\n            _log(400, \"error\", \"database_id invalid\")\n            return _err(\"VALIDATION_ERROR\", \"database_id is invalid\")\n    if database_name is not None:\n        if not isinstance(database_name, str) or not (1 <= len(database_name) <= 128):\n            _log(400, \"error\", \"database_name invalid\")\n            return _err(\"VALIDATION_ERROR\", \"database_name length must be between 1 and 128\")\n\n    sessions = _load(\"sessions.json\")\n    databases = _load(\"databases.json\")\n    if not isinstance(sessions, list): sessions = []\n    if not isinstance(databases, list): databases = []\n\n    # Resolve target database\n    target_db = None\n    if database_id is not None:\n        target_db = next((d for d in databases if isinstance(d, dict) and d.get(\"id\") == database_id), None)\n        if target_db is None:\n            _log(404, \"error\", \"database not found\", resolved_database_id=database_id)\n            return _err(\"NOT_FOUND\", \"Database not found\", database_id=database_id)\n    else:\n        # Upsert by unique(name): create if missing; reject if previously deleted\n        existing = next((d for d in databases if isinstance(d, dict) and d.get(\"name\") == database_name), None)\n        if existing:\n            if existing.get(\"status\") == \"deleted\":\n                _log(409, \"error\", \"cannot resurrect deleted database\", resolved_database_id=existing.get(\"id\"))\n                return _err(\"CONFLICT\", \"Cannot switch to a database that was previously deleted\", database_name=database_name)\n            # ensure active\n            if existing.get(\"status\") != \"active\":\n                # transition archived->active allowed here for switch? Rule says must upsert status='active' unless deleted\n                existing2 = dict(existing)\n                existing2[\"status\"] = \"active\"\n                existing2[\"updated_at\"] = now\n                existing2[\"archived_at\"] = None\n                existing2[\"deleted_at\"] = None\n                for i, d in enumerate(databases):\n                    if isinstance(d, dict) and d.get(\"id\") == existing.get(\"id\"):\n                        databases[i] = existing2\n                        existing = existing2\n                        break\n            target_db = existing\n        else:\n            # create new db\n            db_id_new = _new_id(\"nkm_db_\")\n            target_db = {\n                \"id\": db_id_new,\n                \"name\": database_name,\n                \"status\": \"active\",\n                \"created_at\": now,\n                \"updated_at\": now,\n                \"archived_at\": None,\n                \"deleted_at\": None,\n            }\n            databases.append(target_db)\n\n    # Resolve/create session: if caller passed invalid format, create a new session id but still proceed (do not UNAUTHORIZED)\n    resolved_session_id = None\n    sess_row = None\n    if sess_re.match(session_id):\n        sess_row = next((s for s in sessions if isinstance(s, dict) and s.get(\"id\") == session_id), None)\n        resolved_session_id = session_id\n    if sess_row is None:\n        # create session\n        resolved_session_id = session_id if sess_re.match(session_id) else _new_id(\"nkm_sess_\")\n        sess_row = {\n            \"id\": resolved_session_id,\n            \"current_database_id\": target_db.get(\"id\"),\n            \"status\": \"open\",\n            \"last_activity_at\": now,\n            \"created_at\": now,\n            \"updated_at\": now,\n            \"closed_at\": None,\n            \"expires_at\": None,\n        }\n        sessions.append(sess_row)\n    else:\n        if sess_row.get(\"status\") != \"open\":\n            # cannot reopen closed/expired per lifecycle; create a fresh session\n            resolved_session_id = _new_id(\"nkm_sess_\")\n            sess_row = {\n                \"id\": resolved_session_id,\n                \"current_database_id\": target_db.get(\"id\"),\n                \"status\": \"open\",\n                \"last_activity_at\": now,\n                \"created_at\": now,\n                \"updated_at\": now,\n                \"closed_at\": None,\n                \"expires_at\": None,\n            }\n            sessions.append(sess_row)\n        else:\n            # update existing open session\n            for i, s in enumerate(sessions):\n                if isinstance(s, dict) and s.get(\"id\") == session_id:\n                    s2 = dict(s)\n                    s2[\"current_database_id\"] = target_db.get(\"id\")\n                    s2[\"last_activity_at\"] = now\n                    s2[\"updated_at\"] = now\n                    sessions[i] = s2\n                    sess_row = s2\n                    break\n\n    _save(\"databases.json\", databases)\n    _save(\"sessions.json\", sessions)\n    _log(200, \"ok\", resolved_session_id=resolved_session_id, resolved_database_id=target_db.get(\"id\"))\n    return {\"object\": \"database_switch\", \"data\": {\"session\": sess_row, \"database\": target_db}, \"ts\": now, \"latency_ms\": int((time.time() - t0) * 1000)}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "database_list",
+          "description": "Lists databases visible to the caller, optionally filtered by status. Returns cursor-paginated results ordered by updated_at desc; refuses invalid pagination parameters with VALIDATION_ERROR.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "Filter databases by lifecycle status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of databases to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def database_list(status=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0124000\" if __import__(\"os\").path.isdir(\"./environment_mix/0124000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now = now_dt.isoformat().replace(\"+00:00\", \"Z\")\n\n    _B32A = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _new_id(prefix):\n        r = uuid.uuid4().int\n        out = []\n        for _ in range(20):\n            out.append(_B32A[r & 31])\n            r >>= 5\n        return prefix + \"\".join(out)\n\n    def _log(status_code, status_s, note=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": _new_id(\"nkm_req_\"),\n            \"endpoint\": \"database_list\",\n            \"status\": status_s,\n            \"status_code\": status_code,\n            \"session_id\": None,\n            \"database_id\": None,\n            \"note\": note,\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _parse_dt(v):\n        if not isinstance(v, str) or not v:\n            return None\n        try:\n            vv = v[:-1] + \"+00:00\" if v.endswith(\"Z\") else v\n            dt = datetime.datetime.fromisoformat(vv)\n            return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)\n        except Exception:\n            return None\n\n    # Validate inputs\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"active\", \"archived\", \"deleted\"):\n            _log(400, \"error\", \"invalid status\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: active, archived, deleted\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        _log(400, \"error\", \"invalid limit\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200\")\n    if cursor is not None and not isinstance(cursor, str):\n        _log(400, \"error\", \"invalid cursor type\")\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n\n    dbs = _load(\"databases.json\")\n    if not isinstance(dbs, list):\n        dbs = []\n\n    # Filter\n    rows = []\n    for r in dbs:\n        if not isinstance(r, dict):\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        rows.append(r)\n\n    # Sort by updated_at desc (fallback to created_at desc)\n    def _sort_key(r):\n        dt = _parse_dt(r.get(\"updated_at\")) or _parse_dt(r.get(\"created_at\")) or datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)\n        return dt\n\n    rows.sort(key=_sort_key, reverse=True)\n\n    # Cursor is the last seen database id from prior page; start after it.\n    start = 0\n    next_cursor = None\n    if cursor:\n        found = False\n        for i, r in enumerate(rows):\n            if r.get(\"id\") == cursor:\n                start = i + 1\n                found = True\n                break\n        # Real cursor behavior: treat unknown cursor as empty/expired cursor -> return first page (not an error)\n        if not found:\n            start = 0\n\n    page = rows[start:start + limit]\n    if start + limit < len(rows) and page:\n        next_cursor = page[-1].get(\"id\")\n\n    out = {\n        \"object\": \"list\",\n        \"data\": page,\n        \"meta\": {\n            \"total\": len(rows),\n            \"limit\": limit,\n            \"has_more\": (start + limit) < len(rows),\n            \"next_cursor\": next_cursor,\n        },\n        \"ts\": now,\n        \"latency_ms\": int((time.time() - t0) * 1000),\n    }\n    _log(200, \"ok\")\n    return out\n"
+        },
+        {
+          "name": "database_update",
+          "description": "Updates a database lifecycle state. Supports transitions active->archived/deleted and archived->active/deleted; deleted is terminal. Returns the updated database record; refuses invalid transitions or attempts to modify a deleted database with VALIDATION_ERROR.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "database_id": {
+                "type": "string",
+                "pattern": "^nkm_db_[0-9A-HJKMNP-TV-Z]{18,}$",
+                "description": "Target database id."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "New lifecycle status for the database."
+              }
+            },
+            "required": [
+              "database_id",
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def database_update(database_id, status, **_extra):\n    import json, os, datetime, re, time, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0124000\" if __import__(\"os\").path.isdir(\"./environment_mix/0124000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now = now_dt.isoformat().replace(\"+00:00\", \"Z\")\n\n    db_re = re.compile(r\"^nkm_db_[0-9A-HJKMNP-TV-Z]{18,}$\")\n\n    _B32A = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _new_id(prefix):\n        r = uuid.uuid4().int\n        out = []\n        for _ in range(20):\n            out.append(_B32A[r & 31])\n            r >>= 5\n        return prefix + \"\".join(out)\n\n    def _log(status_code, status_s, note=None, resolved_database_id=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": _new_id(\"nkm_req_\"),\n            \"endpoint\": \"database_update\",\n            \"status\": status_s,\n            \"status_code\": status_code,\n            \"session_id\": None,\n            \"database_id\": resolved_database_id or database_id,\n            \"note\": note,\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(database_id, str) or not db_re.match(database_id):\n        _log(400, \"error\", \"database_id invalid\")\n        return _err(\"VALIDATION_ERROR\", \"database_id is invalid\")\n    if not isinstance(status, str) or status not in (\"active\", \"archived\", \"deleted\"):\n        _log(400, \"error\", \"status invalid\", resolved_database_id=database_id)\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: active, archived, deleted\")\n\n    dbs = _load(\"databases.json\")\n    if not isinstance(dbs, list):\n        dbs = []\n\n    idx = None\n    for i, d in enumerate(dbs):\n        if isinstance(d, dict) and d.get(\"id\") == database_id:\n            idx = i\n            break\n    if idx is None:\n        _log(404, \"error\", \"not found\", resolved_database_id=database_id)\n        return _err(\"NOT_FOUND\", \"Database not found\", database_id=database_id)\n\n    row0 = dbs[idx]\n    cur = row0.get(\"status\")\n    if cur == \"deleted\":\n        _log(400, \"error\", \"cannot modify deleted\", resolved_database_id=database_id)\n        return _err(\"VALIDATION_ERROR\", \"Cannot modify a deleted database\", database_id=database_id)\n\n    transitions = {\"active\": {\"archived\", \"deleted\"}, \"archived\": {\"active\", \"deleted\"}, \"deleted\": set()}\n    if status != cur and status not in transitions.get(cur, set()):\n        _log(409, \"error\", \"invalid transition\", resolved_database_id=database_id)\n        return _err(\"INVALID_TRANSITION\", f\"Invalid transition {cur} -> {status}\", from_status=cur, to_status=status)\n\n    # Apply mutation (persist even for idempotent? We'll still touch updated_at to reflect API call; but keep timestamps consistent with constraints)\n    row = dict(row0)\n    if status != cur:\n        row[\"status\"] = status\n        if status == \"archived\":\n            row[\"archived_at\"] = now\n            row[\"deleted_at\"] = None\n        elif status == \"active\":\n            row[\"archived_at\"] = None\n            row[\"deleted_at\"] = None\n        elif status == \"deleted\":\n            row[\"deleted_at\"] = now\n            row[\"archived_at\"] = None\n    # always update updated_at on update call\n    row[\"updated_at\"] = now\n\n    # Enforce archived_at/deleted_at constraints\n    if row.get(\"status\") == \"archived\" and not row.get(\"archived_at\"):\n        row[\"archived_at\"] = now\n    if row.get(\"status\") != \"archived\":\n        row[\"archived_at\"] = None\n    if row.get(\"status\") == \"deleted\" and not row.get(\"deleted_at\"):\n        row[\"deleted_at\"] = now\n    if row.get(\"status\") != \"deleted\":\n        row[\"deleted_at\"] = None\n\n    dbs[idx] = row\n    _save(\"databases.json\", dbs)\n    _log(200, \"ok\", resolved_database_id=database_id)\n    return {\"object\": \"database\", \"data\": row, \"ts\": now, \"latency_ms\": int((time.time() - t0) * 1000)}\n"
+        },
+        {
+          "name": "session_get",
+          "description": "Fetches a single session by id, including current_database_id and lifecycle timestamps. Returns NOT_FOUND if the session does not exist; refuses invalid ids with VALIDATION_ERROR.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "session_id": {
+                "type": "string",
+                "pattern": "^nkm_sess_[0-9A-HJKMNP-TV-Z]{18,}$",
+                "description": "Session identifier to fetch."
+              }
+            },
+            "required": [
+              "session_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def session_get(session_id, **_extra):\n    import json, os, datetime, time, uuid, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0124000\" if __import__(\"os\").path.isdir(\"./environment_mix/0124000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now = now_dt.isoformat().replace(\"+00:00\", \"Z\")\n\n    _B32A = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _new_id(prefix):\n        r = uuid.uuid4().int\n        out = []\n        for _ in range(20):\n            out.append(_B32A[r & 31])\n            r >>= 5\n        return prefix + \"\".join(out)\n\n    def _log(status_code, status_s, note=None, database_id=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": _new_id(\"nkm_req_\"),\n            \"endpoint\": \"session_get\",\n            \"status\": status_s,\n            \"status_code\": status_code,\n            \"session_id\": session_id,\n            \"database_id\": database_id,\n            \"note\": note,\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", logs)\n\n    # Validate per tool schema, but allow legacy ids present in the datastore (audit requirement).\n    if not isinstance(session_id, str):\n        _log(400, \"error\", \"session_id wrong type\")\n        return _err(\"VALIDATION_ERROR\", \"session_id must be a string\")\n    pat = r\"^nkm_sess_[0-9A-HJKMNP-TV-Z]{18,}$\"\n    if not re.match(pat, session_id):\n        sessions_probe = _load(\"sessions.json\")\n        if isinstance(sessions_probe, list) and any(isinstance(s, dict) and s.get(\"id\") == session_id for s in sessions_probe):\n            pass\n        else:\n            _log(400, \"error\", \"session_id pattern mismatch\")\n            return _err(\"VALIDATION_ERROR\", \"session_id is invalid\", session_id=session_id)\n\n    sessions = _load(\"sessions.json\")\n    if not isinstance(sessions, list):\n        sessions = []\n\n    idx = None\n    for i, s in enumerate(sessions):\n        if isinstance(s, dict) and s.get(\"id\") == session_id:\n            idx = i\n            break\n\n    if idx is None:\n        _log(404, \"error\", \"not found\")\n        return _err(\"NOT_FOUND\", \"Session not found\", session_id=session_id)\n\n    row = dict(sessions[idx]) if isinstance(sessions[idx], dict) else {}\n\n    # Update activity timestamp on any tool call\n    row[\"last_activity_at\"] = now\n    row[\"updated_at\"] = now\n    sessions[idx] = row\n    _save(\"sessions.json\", sessions)\n\n    _log(200, \"ok\", database_id=row.get(\"current_database_id\"))\n    return {\"session\": row}\n"
+        },
+        {
+          "name": "session_update",
+          "description": "Updates a session lifecycle state. Supports transitions open->closed/expired; closed/expired are terminal. Returns the updated session; refuses invalid transitions with VALIDATION_ERROR.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "session_id": {
+                "type": "string",
+                "pattern": "^nkm_sess_[0-9A-HJKMNP-TV-Z]{18,}$",
+                "description": "Session identifier to update."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "open",
+                  "closed",
+                  "expired"
+                ],
+                "description": "New lifecycle status for the session."
+              }
+            },
+            "required": [
+              "session_id",
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def session_update(session_id, status, **_extra):\n    import json, os, datetime, time, uuid, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0124000\" if __import__(\"os\").path.isdir(\"./environment_mix/0124000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now = now_dt.isoformat().replace(\"+00:00\", \"Z\")\n\n    _B32A = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _new_id(prefix):\n        r = uuid.uuid4().int\n        out = []\n        for _ in range(20):\n            out.append(_B32A[r & 31])\n            r >>= 5\n        return prefix + \"\".join(out)\n\n    def _log(status_code, status_s, note=None, database_id=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": _new_id(\"nkm_req_\"),\n            \"endpoint\": \"session_update\",\n            \"status\": status_s,\n            \"status_code\": status_code,\n            \"session_id\": session_id,\n            \"database_id\": database_id,\n            \"note\": note,\n            \"timestamp\": now,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        })\n        _save(\"request_logs.json\", logs)\n\n    # Validate per tool schema, but allow legacy ids present in the datastore.\n    if not isinstance(session_id, str):\n        _log(400, \"error\", \"session_id wrong type\")\n        return _err(\"VALIDATION_ERROR\", \"session_id must be a string\")\n    pat = r\"^nkm_sess_[0-9A-HJKMNP-TV-Z]{18,}$\"\n    if not re.match(pat, session_id):\n        sessions_probe = _load(\"sessions.json\")\n        if isinstance(sessions_probe, list) and any(isinstance(s, dict) and s.get(\"id\") == session_id for s in sessions_probe):\n            pass\n        else:\n            _log(400, \"error\", \"session_id pattern mismatch\")\n            return _err(\"VALIDATION_ERROR\", \"session_id is invalid\", session_id=session_id)\n\n    if not isinstance(status, str) or status not in (\"open\", \"closed\", \"expired\"):\n        _log(400, \"error\", \"status invalid\")\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: open, closed, expired\", status=status)\n\n    sessions = _load(\"sessions.json\")\n    if not isinstance(sessions, list):\n        sessions = []\n\n    idx = None\n    for i, s in enumerate(sessions):\n        if isinstance(s, dict) and s.get(\"id\") == session_id:\n            idx = i\n            break\n\n    if idx is None:\n        _log(404, \"error\", \"not found\")\n        return _err(\"NOT_FOUND\", \"Session not found\", session_id=session_id)\n\n    row = dict(sessions[idx]) if isinstance(sessions[idx], dict) else {}\n\n    cur = row.get(\"status\")\n    allowed = {\"open\": {\"closed\", \"expired\"}, \"closed\": set(), \"expired\": set()}\n    if cur not in allowed:\n        _log(409, \"error\", \"unknown current status\", database_id=row.get(\"current_database_id\"))\n        return _err(\"CONFLICT\", \"Session has an unknown lifecycle state\", session_id=session_id, current_status=cur)\n\n    # Idempotent if no change\n    if status == cur:\n        row[\"last_activity_at\"] = now\n        row[\"updated_at\"] = now\n        sessions[idx] = row\n        _save(\"sessions.json\", sessions)\n        _log(200, \"ok\", \"idempotent\", database_id=row.get(\"current_database_id\"))\n        return {\"session\": row}\n\n    # Enforce lifecycle transitions; per tool description, report invalid transitions as VALIDATION_ERROR\n    if status not in allowed[cur]:\n        _log(400, \"error\", \"invalid transition\", database_id=row.get(\"current_database_id\"))\n        return _err(\n            \"VALIDATION_ERROR\",\n            \"Invalid session lifecycle transition (allowed: open->closed/expired; closed/expired are terminal)\",\n            session_id=session_id,\n            from_status=cur,\n            to_status=status,\n        )\n\n    row[\"status\"] = status\n    row[\"last_activity_at\"] = now\n    row[\"updated_at\"] = now\n    if status == \"closed\":\n        row[\"closed_at\"] = now\n    elif status == \"expired\":\n        if row.get(\"expires_at\") is None:\n            row[\"expires_at\"] = now\n        row[\"closed_at\"] = row.get(\"closed_at\")  # leave as-is, if any\n\n    # Constraint: status='open' implies closed_at is null\n    if status == \"open\":\n        row[\"closed_at\"] = None\n\n    sessions[idx] = row\n    _save(\"sessions.json\", sessions)\n\n    _log(200, \"ok\", database_id=row.get(\"current_database_id\"))\n    return {\"session\": row}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0124000",
+    "index": 124,
+    "name": "Neo4j Knowledge Graph Memory",
+    "description": "This backend persists a session-scoped, multi-database knowledge graph memory service backed by Neo4j concepts: nodes (memories), observations (append-only insights attached to nodes), and relations (typed edges between nodes). It supports switching the active database context per session, unified r",
+    "taxonomy": {
+      "L1_id": "L1-10",
+      "L1_name": "Data Storage & Databases",
+      "L1_name_zh": "数据存储与数据库",
+      "L2_id": "L2-27",
+      "L2_name": "Memory & Knowledge Management",
+      "L2_name_zh": "记忆与知识管理",
+      "L3_name": "Knowledge Graph Memory",
+      "L3_name_zh": "知识图谱记忆"
+    },
+    "database_dir": "./environment_mix/0124000",
+    "mount_path": "/app/database",
+    "n_tools": 8,
+    "n_collections": 5,
+    "n_records": 85,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 8,
+      "loaded": 8,
+      "reads_returning_data": 2,
+      "read_operations": 3,
+      "mutations_persisted": 4,
+      "mutations_attempted": 5
+    },
+    "tools_loadable_from_database_dir": 8,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "memory_find",
+      "returned_chars": 1627
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

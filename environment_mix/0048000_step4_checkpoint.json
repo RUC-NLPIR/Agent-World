@@ -1,0 +1,521 @@
+{
+  "index": 48,
+  "local_files_dir": "./environment_mix/0048000",
+  "file_list": [
+    "./environment_mix/0048000/README.md",
+    "./environment_mix/0048000/content_item_topics.json",
+    "./environment_mix/0048000/content_items.json",
+    "./environment_mix/0048000/ingestion_jobs.json",
+    "./environment_mix/0048000/request_logs.json",
+    "./environment_mix/0048000/sources.json",
+    "./environment_mix/0048000/topics.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "sources.json": "26 rows",
+        "content_items.json": "41 rows",
+        "topics.json": "31 rows",
+        "content_item_topics.json": "31 rows",
+        "ingestion_jobs.json": "32 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "getNews",
+          "description": "Returns a paginated list of the latest published crypto news flashes (short-form items) normalized by the News Feed Server, filtered by optional language, topic (id or slug), source, and published_at range, and sorted by the requested order; results are limited by `limit` and can be continued by passing the returned `cursor` to fetch the next page. Raises VALIDATION_ERROR if `limit` is out of range, `published_after`/`published_before` are not valid ISO-8601 timestamps (or the range is inconsistent), `topic_id`/`source_id` do not match the required ULID patterns, or `sort`/`language` are not supported. Raises UNAUTHORIZED if credentials are missing/invalid, FORBIDDEN if the caller is not permitted to access the feed, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of news flash items to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor for fetching the next page of results."
+              },
+              "language": {
+                "type": "string",
+                "enum": [
+                  "en",
+                  "zh",
+                  "ja",
+                  "ko",
+                  "es",
+                  "fr",
+                  "de",
+                  "pt",
+                  "ru",
+                  "tr",
+                  "vi",
+                  "id",
+                  "th",
+                  "other"
+                ],
+                "description": "Filter results by content language."
+              },
+              "topic_id": {
+                "type": "string",
+                "pattern": "^nfs_tpc_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "Filter results to items tagged with a specific topic (topics.id ULID)."
+              },
+              "topic_slug": {
+                "type": "string",
+                "description": "Filter results to items tagged with a specific topic slug."
+              },
+              "source_id": {
+                "type": "string",
+                "pattern": "^nfs_src_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "Filter results by source (sources.id ULID)."
+              },
+              "published_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return items published after this ISO 8601 timestamp."
+              },
+              "published_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return items published before this ISO 8601 timestamp."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "published_at_desc",
+                  "published_at_asc",
+                  "importance_desc"
+                ],
+                "description": "Sort order for returned items."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def getNews(limit=None, cursor=None, language=None, topic_id=None, topic_slug=None, source_id=None, published_after=None, published_before=None, sort=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0048000\" if __import__(\"os\").path.isdir(\"./environment_mix/0048000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _ulid_like(prefix):\n        # deterministic-enough unique id for logs (not a strict ULID)\n        return f\"{prefix}_{int(time.time()*1000)}_{os.getpid()}\"\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return (False, _err(\"VALIDATION_ERROR\", f\"{field} must be an ISO 8601 date-time string\"))\n        ss = s.strip()\n        # tolerate 'Z'\n        try:\n            dt = datetime.datetime.fromisoformat(ss.replace(\"Z\", \"+00:00\"))\n        except ValueError:\n            return (False, _err(\"VALIDATION_ERROR\", f\"{field} must be an ISO 8601 date-time string\"))\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc)\n\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        if isinstance(logs, list):\n            return logs\n        if isinstance(logs, dict) and isinstance(logs.get(\"rows\"), list):\n            return logs[\"rows\"]\n        return []\n\n    def _save_logs(logs):\n        # keep existing shape if file had {\"rows\":[...]}\n        existing = _load(\"request_logs.json\")\n        if isinstance(existing, dict):\n            existing[\"rows\"] = logs\n            _save(\"request_logs.json\", existing)\n        else:\n            _save(\"request_logs.json\", logs)\n\n    def _record_log(status, error_code=None, meta=None):\n        logs = _load_logs()\n        row = {\n            \"id\": _ulid_like(\"nfs_req\"),\n            \"ts\": _now_iso(),\n            \"endpoint\": \"getNews\",\n            \"credential\": None,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"meta\": meta or {}\n        }\n        logs.append(row)\n        _save_logs(logs)\n\n    def _enforce_rate_limit():\n        # Best-effort: 120 requests/minute per endpoint globally if logs exist.\n        logs = _load_logs()\n        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60)\n        n = 0\n        for r in logs:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"endpoint\") != \"getNews\":\n                continue\n            ts = r.get(\"ts\") or r.get(\"created_at\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\"))\n            except ValueError:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt >= cutoff:\n                n += 1\n        if n >= 120:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        return None\n\n    rl = _enforce_rate_limit()\n    if rl:\n        _record_log(\"rejected\", \"RATE_LIMIT\")\n        return rl\n\n    # Validate inputs\n    server_max = 50\n    if limit is None:\n        limit = server_max\n    if not isinstance(limit, int):\n        _record_log(\"rejected\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer.\", minimum=1, maximum=100)\n    if limit < 1 or limit > 100:\n        _record_log(\"rejected\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit is out of range.\", minimum=1, maximum=100)\n    if limit > server_max:\n        limit = server_max\n\n    allowed_lang = {\"en\",\"zh\",\"ja\",\"ko\",\"es\",\"fr\",\"de\",\"pt\",\"ru\",\"tr\",\"vi\",\"id\",\"th\",\"other\"}\n    if language is not None:\n        if not isinstance(language, str) or language not in allowed_lang:\n            _record_log(\"rejected\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid language.\", allowed=sorted(list(allowed_lang)))\n\n    if topic_id is not None:\n        if not isinstance(topic_id, str) or not re.match(r\"^nfs_tpc_[0-9A-HJKMNP-TV-Z]{26}$\", topic_id):\n            _record_log(\"rejected\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid topic_id.\")\n    if source_id is not None:\n        if not isinstance(source_id, str) or not re.match(r\"^nfs_src_[0-9A-HJKMNP-TV-Z]{26}$\", source_id):\n            _record_log(\"rejected\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid source_id.\")\n\n    if topic_slug is not None:\n        if not isinstance(topic_slug, str) or not topic_slug.strip():\n            _record_log(\"rejected\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"topic_slug must be a non-empty string.\")\n\n    pa = _parse_dt(published_after, \"published_after\")\n    if isinstance(pa, tuple) and pa and pa[0] is False:\n        _record_log(\"rejected\", \"VALIDATION_ERROR\")\n        return pa[1]\n    pb = _parse_dt(published_before, \"published_before\")\n    if isinstance(pb, tuple) and pb and pb[0] is False:\n        _record_log(\"rejected\", \"VALIDATION_ERROR\")\n        return pb[1]\n    if pa is not None and pb is not None and pa > pb:\n        _record_log(\"rejected\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"published_after must be <= published_before.\")\n\n    allowed_sort = {\"published_at_desc\",\"published_at_asc\",\"importance_desc\"}\n    if sort is None:\n        sort = \"published_at_desc\"\n    if not isinstance(sort, str) or sort not in allowed_sort:\n        _record_log(\"rejected\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort.\", allowed=sorted(list(allowed_sort)))\n\n    # Cursor: accept opaque string; only our own base64 JSON is interpreted. Otherwise treat as \"start\".\n    cursor_payload = None\n    if cursor is not None:\n        if not isinstance(cursor, str):\n            _record_log(\"rejected\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            cursor_payload = json.loads(raw.decode(\"utf-8\"))\n            if not isinstance(cursor_payload, dict):\n                cursor_payload = None\n        except Exception:\n            cursor_payload = None\n\n    # Resolve topic filter\n    topics = _load(\"topics.json\")\n    if isinstance(topics, dict) and isinstance(topics.get(\"rows\"), list):\n        topics = topics[\"rows\"]\n    if not isinstance(topics, list):\n        topics = []\n\n    topic_row = None\n    if topic_id is not None:\n        for t in topics:\n            if isinstance(t, dict) and t.get(\"id\") == topic_id:\n                topic_row = t\n                break\n        if topic_row is None:\n            _record_log(\"ok\")\n            return {\"data\": [], \"meta\": {\"total\": 0, \"limit\": limit, \"has_more\": False, \"next_cursor\": None}}\n    if topic_slug is not None and topic_row is None:\n        slug_l = topic_slug.strip().lower()\n        for t in topics:\n            if isinstance(t, dict) and isinstance(t.get(\"slug\"), str) and t.get(\"slug\").lower() == slug_l:\n                topic_row = t\n                break\n        if topic_row is None:\n            _record_log(\"ok\")\n            return {\"data\": [], \"meta\": {\"total\": 0, \"limit\": limit, \"has_more\": False, \"next_cursor\": None}}\n\n    topic_filter_id = topic_row.get(\"id\") if isinstance(topic_row, dict) else None\n\n    # If topic filter active, load join table to get allowed content_item_ids\n    allowed_item_ids = None\n    if topic_filter_id is not None:\n        cit = _load(\"content_item_topics.json\")\n        if isinstance(cit, dict) and isinstance(cit.get(\"rows\"), list):\n            cit = cit[\"rows\"]\n        if not isinstance(cit, list):\n            cit = []\n        allowed_item_ids = set()\n        for r in cit:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"topic_id\") == topic_filter_id and isinstance(r.get(\"content_item_id\"), str):\n                allowed_item_ids.add(r[\"content_item_id\"])\n        if not allowed_item_ids:\n            _record_log(\"ok\")\n            return {\"data\": [], \"meta\": {\"total\": 0, \"limit\": limit, \"has_more\": False, \"next_cursor\": None}}\n\n    # Load content items and apply base filters\n    items = _load(\"content_items.json\")\n    if isinstance(items, dict) and isinstance(items.get(\"rows\"), list):\n        items = items[\"rows\"]\n    if not isinstance(items, list):\n        items = []\n\n    def _dt_for_sort(s):\n        if not isinstance(s, str) or not s:\n            return None\n        try:\n            dt = datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n        except ValueError:\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc)\n\n    filtered = []\n    for it in items:\n        if not isinstance(it, dict):\n            continue\n        if it.get(\"content_type\") != \"news_flash\":\n            continue\n        if it.get(\"status\") != \"published\":\n            continue\n        if it.get(\"duplicate_of_item_id\") is not None:\n            continue\n        if language is not None and it.get(\"language\") != language:\n            continue\n        if source_id is not None and it.get(\"source_id\") != source_id:\n            continue\n        if allowed_item_ids is not None and it.get(\"id\") not in allowed_item_ids:\n            continue\n\n        pub_dt = _dt_for_sort(it.get(\"published_at\"))\n        if pa is not None:\n            if pub_dt is None:\n                continue\n            if pub_dt <= pa:\n                continue\n        if pb is not None:\n            if pub_dt is None:\n                continue\n            if pub_dt >= pb:\n                continue\n        filtered.append(it)\n\n    # Sorting with stable chronological ordering\n    def _sort_key(it):\n        pub = _dt_for_sort(it.get(\"published_at\"))\n        ing = _dt_for_sort(it.get(\"ingested_at\")) or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n        pub_rank = pub if pub is not None else datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n        imp = it.get(\"importance_score\")\n        if not isinstance(imp, (int, float)):\n            imp = 0.0\n        # For NULLS LAST in desc, we can use (has_pub, pub) with has_pub False first then reverse, or just map None to min and track flag.\n        has_pub = 1 if pub is not None else 0\n\n        if sort == \"published_at_desc\":\n            return (has_pub, pub_rank, ing, str(it.get(\"id\") or \"\"))\n        if sort == \"published_at_asc\":\n            # NULLS LAST: use has_pub first, then pub asc, ing asc\n            return (0 if has_pub else 1, pub_rank, ing, str(it.get(\"id\") or \"\"))\n        # importance_desc: keep chronological ordering stable for equal timestamps\n        return (has_pub, pub_rank, ing, imp, str(it.get(\"id\") or \"\"))\n\n    reverse = True\n    if sort == \"published_at_asc\":\n        reverse = False\n    elif sort == \"importance_desc\":\n        reverse = True\n\n    # For importance_desc we want importance descending but within same timestamps stable.\n    if sort == \"importance_desc\":\n        def _sort_key_imp(it):\n            pub = _dt_for_sort(it.get(\"published_at\"))\n            ing = _dt_for_sort(it.get(\"ingested_at\")) or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n            pub_rank = pub if pub is not None else datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n            has_pub = 1 if pub is not None else 0\n            imp = it.get(\"importance_score\")\n            if not isinstance(imp, (int, float)):\n                imp = 0.0\n            return (has_pub, pub_rank, ing, imp, str(it.get(\"id\") or \"\"))\n        filtered.sort(key=_sort_key_imp, reverse=True)\n    else:\n        filtered.sort(key=_sort_key, reverse=reverse)\n\n    total = len(filtered)\n\n    # Apply cursor as \"start after\" marker if it matches.\n    start_idx = 0\n    if isinstance(cursor_payload, dict) and cursor_payload.get(\"after_id\"):\n        after_id = cursor_payload.get(\"after_id\")\n        if isinstance(after_id, str):\n            for i, it in enumerate(filtered):\n                if it.get(\"id\") == after_id:\n                    start_idx = i + 1\n                    break\n\n    page = filtered[start_idx:start_idx + limit]\n    has_more = (start_idx + limit) < total\n    next_cursor = None\n    if has_more and page:\n        payload = {\"after_id\": page[-1].get(\"id\")}\n        next_cursor = base64.urlsafe_b64encode(json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    _record_log(\"ok\", meta={\"returned\": len(page), \"total\": total})\n    return {\"data\": page, \"meta\": {\"total\": total, \"limit\": limit, \"has_more\": has_more, \"next_cursor\": next_cursor}}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getArticles",
+          "description": "Returns a paginated list of the latest published long-form crypto research articles, filtered by optional language, topic (id or slug), source, and published_at range, and sorted by the requested order; results are limited by `limit` and can be continued by passing the returned `cursor` to fetch the next page. Raises VALIDATION_ERROR if `limit` is out of range, `published_after`/`published_before` are not valid ISO-8601 timestamps (or the range is inconsistent), `topic_id`/`source_id` do not match the required ULID patterns, or `sort`/`language` are not supported. Raises UNAUTHORIZED if credentials are missing/invalid, FORBIDDEN if the caller is not permitted to access the feed, and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Maximum number of articles to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor for fetching the next page of results."
+              },
+              "language": {
+                "type": "string",
+                "enum": [
+                  "en",
+                  "zh",
+                  "ja",
+                  "ko",
+                  "es",
+                  "fr",
+                  "de",
+                  "pt",
+                  "ru",
+                  "tr",
+                  "vi",
+                  "id",
+                  "th",
+                  "other"
+                ],
+                "description": "Filter results by content language."
+              },
+              "topic_id": {
+                "type": "string",
+                "pattern": "^nfs_tpc_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "Filter results to items tagged with a specific topic (topics.id ULID)."
+              },
+              "topic_slug": {
+                "type": "string",
+                "description": "Filter results to items tagged with a specific topic slug."
+              },
+              "source_id": {
+                "type": "string",
+                "pattern": "^nfs_src_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "Filter results by source (sources.id ULID)."
+              },
+              "published_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return articles published after this ISO 8601 timestamp."
+              },
+              "published_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return articles published before this ISO 8601 timestamp."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "published_at_desc",
+                  "published_at_asc",
+                  "importance_desc"
+                ],
+                "description": "Sort order for returned items."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def getArticles(limit=None, cursor=None, language=None, topic_id=None, topic_slug=None, source_id=None, published_after=None, published_before=None, sort=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0048000\" if __import__(\"os\").path.isdir(\"./environment_mix/0048000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _ulid_like(prefix):\n        return f\"{prefix}_{int(time.time()*1000)}_{os.getpid()}\"\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return (False, _err(\"VALIDATION_ERROR\", f\"{field} must be an ISO 8601 date-time string\"))\n        ss = s.strip()\n        try:\n            dt = datetime.datetime.fromisoformat(ss.replace(\"Z\", \"+00:00\"))\n        except ValueError:\n            return (False, _err(\"VALIDATION_ERROR\", f\"{field} must be an ISO 8601 date-time string\"))\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc)\n\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        if isinstance(logs, list):\n            return logs\n        if isinstance(logs, dict) and isinstance(logs.get(\"rows\"), list):\n            return logs[\"rows\"]\n        return []\n\n    def _save_logs(logs):\n        existing = _load(\"request_logs.json\")\n        if isinstance(existing, dict):\n            existing[\"rows\"] = logs\n            _save(\"request_logs.json\", existing)\n        else:\n            _save(\"request_logs.json\", logs)\n\n    def _record_log(status, error_code=None, meta=None):\n        logs = _load_logs()\n        row = {\n            \"id\": _ulid_like(\"nfs_req\"),\n            \"ts\": _now_iso(),\n            \"endpoint\": \"getArticles\",\n            \"credential\": None,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"meta\": meta or {}\n        }\n        logs.append(row)\n        _save_logs(logs)\n\n    def _enforce_rate_limit():\n        logs = _load_logs()\n        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60)\n        n = 0\n        for r in logs:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"endpoint\") != \"getArticles\":\n                continue\n            ts = r.get(\"ts\") or r.get(\"created_at\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\"))\n            except ValueError:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt >= cutoff:\n                n += 1\n        if n >= 120:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        return None\n\n    rl = _enforce_rate_limit()\n    if rl:\n        _record_log(\"rejected\", \"RATE_LIMIT\")\n        return rl\n\n    # Validate inputs\n    server_max = 50\n    if limit is None:\n        limit = server_max\n    if not isinstance(limit, int):\n        _record_log(\"rejected\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer.\", minimum=1, maximum=50)\n    if limit < 1 or limit > 50:\n        _record_log(\"rejected\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit is out of range.\", minimum=1, maximum=50)\n\n    allowed_lang = {\"en\",\"zh\",\"ja\",\"ko\",\"es\",\"fr\",\"de\",\"pt\",\"ru\",\"tr\",\"vi\",\"id\",\"th\",\"other\"}\n    if language is not None:\n        if not isinstance(language, str) or language not in allowed_lang:\n            _record_log(\"rejected\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid language.\", allowed=sorted(list(allowed_lang)))\n\n    if topic_id is not None:\n        if not isinstance(topic_id, str) or not re.match(r\"^nfs_tpc_[0-9A-HJKMNP-TV-Z]{26}$\", topic_id):\n            _record_log(\"rejected\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid topic_id.\")\n    if source_id is not None:\n        if not isinstance(source_id, str) or not re.match(r\"^nfs_src_[0-9A-HJKMNP-TV-Z]{26}$\", source_id):\n            _record_log(\"rejected\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid source_id.\")\n    if topic_slug is not None:\n        if not isinstance(topic_slug, str) or not topic_slug.strip():\n            _record_log(\"rejected\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"topic_slug must be a non-empty string.\")\n\n    pa = _parse_dt(published_after, \"published_after\")\n    if isinstance(pa, tuple) and pa and pa[0] is False:\n        _record_log(\"rejected\", \"VALIDATION_ERROR\")\n        return pa[1]\n    pb = _parse_dt(published_before, \"published_before\")\n    if isinstance(pb, tuple) and pb and pb[0] is False:\n        _record_log(\"rejected\", \"VALIDATION_ERROR\")\n        return pb[1]\n    if pa is not None and pb is not None and pa > pb:\n        _record_log(\"rejected\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"published_after must be <= published_before.\")\n\n    allowed_sort = {\"published_at_desc\",\"published_at_asc\",\"importance_desc\"}\n    if sort is None:\n        sort = \"published_at_desc\"\n    if not isinstance(sort, str) or sort not in allowed_sort:\n        _record_log(\"rejected\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort.\", allowed=sorted(list(allowed_sort)))\n\n    cursor_payload = None\n    if cursor is not None:\n        if not isinstance(cursor, str):\n            _record_log(\"rejected\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            cursor_payload = json.loads(raw.decode(\"utf-8\"))\n            if not isinstance(cursor_payload, dict):\n                cursor_payload = None\n        except Exception:\n            cursor_payload = None\n\n    topics = _load(\"topics.json\")\n    if isinstance(topics, dict) and isinstance(topics.get(\"rows\"), list):\n        topics = topics[\"rows\"]\n    if not isinstance(topics, list):\n        topics = []\n\n    topic_row = None\n    if topic_id is not None:\n        for t in topics:\n            if isinstance(t, dict) and t.get(\"id\") == topic_id:\n                topic_row = t\n                break\n        if topic_row is None:\n            _record_log(\"ok\")\n            return {\"data\": [], \"meta\": {\"total\": 0, \"limit\": limit, \"has_more\": False, \"next_cursor\": None}}\n    if topic_slug is not None and topic_row is None:\n        slug_l = topic_slug.strip().lower()\n        for t in topics:\n            if isinstance(t, dict) and isinstance(t.get(\"slug\"), str) and t.get(\"slug\").lower() == slug_l:\n                topic_row = t\n                break\n        if topic_row is None:\n            _record_log(\"ok\")\n            return {\"data\": [], \"meta\": {\"total\": 0, \"limit\": limit, \"has_more\": False, \"next_cursor\": None}}\n\n    topic_filter_id = topic_row.get(\"id\") if isinstance(topic_row, dict) else None\n    allowed_item_ids = None\n    if topic_filter_id is not None:\n        cit = _load(\"content_item_topics.json\")\n        if isinstance(cit, dict) and isinstance(cit.get(\"rows\"), list):\n            cit = cit[\"rows\"]\n        if not isinstance(cit, list):\n            cit = []\n        allowed_item_ids = set()\n        for r in cit:\n            if isinstance(r, dict) and r.get(\"topic_id\") == topic_filter_id and isinstance(r.get(\"content_item_id\"), str):\n                allowed_item_ids.add(r[\"content_item_id\"])\n        if not allowed_item_ids:\n            _record_log(\"ok\")\n            return {\"data\": [], \"meta\": {\"total\": 0, \"limit\": limit, \"has_more\": False, \"next_cursor\": None}}\n\n    items = _load(\"content_items.json\")\n    if isinstance(items, dict) and isinstance(items.get(\"rows\"), list):\n        items = items[\"rows\"]\n    if not isinstance(items, list):\n        items = []\n\n    def _dt_for_sort(s):\n        if not isinstance(s, str) or not s:\n            return None\n        try:\n            dt = datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n        except ValueError:\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc)\n\n    filtered = []\n    for it in items:\n        if not isinstance(it, dict):\n            continue\n        if it.get(\"content_type\") != \"article\":\n            continue\n        if it.get(\"status\") != \"published\":\n            continue\n        if it.get(\"duplicate_of_item_id\") is not None:\n            continue\n        if language is not None and it.get(\"language\") != language:\n            continue\n        if source_id is not None and it.get(\"source_id\") != source_id:\n            continue\n        if allowed_item_ids is not None and it.get(\"id\") not in allowed_item_ids:\n            continue\n\n        pub_dt = _dt_for_sort(it.get(\"published_at\"))\n        if pa is not None:\n            if pub_dt is None or pub_dt <= pa:\n                continue\n        if pb is not None:\n            if pub_dt is None or pub_dt >= pb:\n                continue\n        filtered.append(it)\n\n    if sort == \"importance_desc\":\n        def _sort_key_imp(it):\n            pub = _dt_for_sort(it.get(\"published_at\"))\n            ing = _dt_for_sort(it.get(\"ingested_at\")) or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n            pub_rank = pub if pub is not None else datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n            has_pub = 1 if pub is not None else 0\n            imp = it.get(\"importance_score\")\n            if not isinstance(imp, (int, float)):\n                imp = 0.0\n            return (has_pub, pub_rank, ing, imp, str(it.get(\"id\") or \"\"))\n        filtered.sort(key=_sort_key_imp, reverse=True)\n    else:\n        reverse = (sort == \"published_at_desc\")\n        def _sort_key(it):\n            pub = _dt_for_sort(it.get(\"published_at\"))\n            ing = _dt_for_sort(it.get(\"ingested_at\")) or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n            pub_rank = pub if pub is not None else datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n            has_pub = 1 if pub is not None else 0\n            if sort == \"published_at_desc\":\n                return (has_pub, pub_rank, ing, str(it.get(\"id\") or \"\"))\n            # published_at_asc with NULLS LAST\n            return (0 if has_pub else 1, pub_rank, ing, str(it.get(\"id\") or \"\"))\n        filtered.sort(key=_sort_key, reverse=reverse)\n\n    total = len(filtered)\n    start_idx = 0\n    if isinstance(cursor_payload, dict) and cursor_payload.get(\"after_id\"):\n        after_id = cursor_payload.get(\"after_id\")\n        if isinstance(after_id, str):\n            for i, it in enumerate(filtered):\n                if it.get(\"id\") == after_id:\n                    start_idx = i + 1\n                    break\n\n    page = filtered[start_idx:start_idx + limit]\n    has_more = (start_idx + limit) < total\n    next_cursor = None\n    if has_more and page:\n        payload = {\"after_id\": page[-1].get(\"id\")}\n        next_cursor = base64.urlsafe_b64encode(json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    _record_log(\"ok\", meta={\"returned\": len(page), \"total\": total})\n    return {\"data\": page, \"meta\": {\"total\": total, \"limit\": limit, \"has_more\": has_more, \"next_cursor\": next_cursor}}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "getSources",
+          "description": "Returns a paginated list of configured ingestion sources, optionally filtered by status and type; results are ordered by `created_at` descending by default and can be continued by passing the returned `cursor`. Refuses invalid filters with VALIDATION_ERROR.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of sources to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Pagination cursor for fetching the next page of results."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled",
+                  "blocked"
+                ],
+                "description": "Filter sources by lifecycle status."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "rss",
+                  "api",
+                  "webhook",
+                  "manual"
+                ],
+                "description": "Filter sources by source type."
+              },
+              "search": {
+                "type": "string",
+                "description": "Case-insensitive substring match against source name and base_url."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at_desc",
+                  "created_at_asc",
+                  "reliability_desc"
+                ],
+                "description": "Sort order for returned sources."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def getSources(limit=None, cursor=None, status=None, type=None, search=None, sort=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0048000\" if __import__(\"os\").path.isdir(\"./environment_mix/0048000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _load_logs():\n        logs = _load(\"request_logs.json\")\n        if isinstance(logs, list):\n            return logs\n        if isinstance(logs, dict) and isinstance(logs.get(\"rows\"), list):\n            return logs[\"rows\"]\n        return []\n\n    def _save_logs(logs):\n        existing = _load(\"request_logs.json\")\n        if isinstance(existing, dict):\n            existing[\"rows\"] = logs\n            _save(\"request_logs.json\", existing)\n        else:\n            _save(\"request_logs.json\", logs)\n\n    def _record_log(status_s, error_code=None, meta=None):\n        logs = _load_logs()\n        row = {\n            \"id\": f\"nfs_req_{int(time.time()*1000)}_{os.getpid()}\",\n            \"ts\": _now_iso(),\n            \"endpoint\": \"getSources\",\n            \"credential\": None,\n            \"status\": status_s,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"meta\": meta or {}\n        }\n        logs.append(row)\n        _save_logs(logs)\n\n    def _enforce_rate_limit():\n        logs = _load_logs()\n        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60)\n        n = 0\n        for r in logs:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"endpoint\") != \"getSources\":\n                continue\n            ts = r.get(\"ts\") or r.get(\"created_at\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\"))\n            except ValueError:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt >= cutoff:\n                n += 1\n        if n >= 120:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        return None\n\n    rl = _enforce_rate_limit()\n    if rl:\n        _record_log(\"rejected\", \"RATE_LIMIT\")\n        return rl\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        _record_log(\"rejected\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer.\", minimum=1, maximum=100)\n    if limit < 1 or limit > 100:\n        _record_log(\"rejected\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit is out of range.\", minimum=1, maximum=100)\n\n    allowed_status = {\"active\", \"disabled\", \"blocked\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            _record_log(\"rejected\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid status.\", allowed=sorted(list(allowed_status)))\n\n    # Tool schema includes webhook but datastore schema doesn't; accept it as a filter yielding empty.\n    allowed_type = {\"rss\", \"api\", \"webhook\", \"manual\"}\n    if type is not None:\n        if not isinstance(type, str) or type not in allowed_type:\n            _record_log(\"rejected\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid type.\", allowed=sorted(list(allowed_type)))\n\n    allowed_sort = {\"created_at_desc\", \"created_at_asc\", \"reliability_desc\"}\n    if sort is None:\n        sort = \"created_at_desc\"\n    if not isinstance(sort, str) or sort not in allowed_sort:\n        _record_log(\"rejected\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid sort.\", allowed=sorted(list(allowed_sort)))\n\n    if search is not None and (not isinstance(search, str)):\n        _record_log(\"rejected\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"search must be a string.\")\n\n    cursor_payload = None\n    if cursor is not None:\n        if not isinstance(cursor, str):\n            _record_log(\"rejected\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            cursor_payload = json.loads(raw.decode(\"utf-8\"))\n            if not isinstance(cursor_payload, dict):\n                cursor_payload = None\n        except Exception:\n            cursor_payload = None\n\n    sources = _load(\"sources.json\")\n    if isinstance(sources, dict) and isinstance(sources.get(\"rows\"), list):\n        sources = sources[\"rows\"]\n    if not isinstance(sources, list):\n        sources = []\n\n    rows = []\n    s_q = search.lower() if isinstance(search, str) and search else None\n    for r in sources:\n        if not isinstance(r, dict):\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        if type is not None and r.get(\"type\") != type:\n            continue\n        if s_q is not None:\n            name = r.get(\"name\") or \"\"\n            base_url = r.get(\"base_url\") or \"\"\n            if not (isinstance(name, str) and isinstance(base_url, str)):\n                name = str(name)\n                base_url = str(base_url)\n            if s_q not in name.lower() and s_q not in base_url.lower():\n                continue\n        rows.append(r)\n\n    def _dt(s):\n        if not isinstance(s, str) or not s:\n            return None\n        try:\n            dt = datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n        except ValueError:\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt.astimezone(datetime.timezone.utc)\n\n    if sort == \"reliability_desc\":\n        rows.sort(key=lambda r: (float(r.get(\"reliability_score\") or 0.0), _dt(r.get(\"created_at\")) or datetime.datetime(1970,1,1,tzinfo=datetime.timezone.utc), str(r.get(\"id\") or \"\")), reverse=True)\n    elif sort == \"created_at_asc\":\n        rows.sort(key=lambda r: (_dt(r.get(\"created_at\")) or datetime.datetime(9999,1,1,tzinfo=datetime.timezone.utc), str(r.get(\"id\") or \"\")), reverse=False)\n    else:\n        rows.sort(key=lambda r: (_dt(r.get(\"created_at\")) or datetime.datetime(1970,1,1,tzinfo=datetime.timezone.utc), str(r.get(\"id\") or \"\")), reverse=True)\n\n    total = len(rows)\n    start_idx = 0\n    if isinstance(cursor_payload, dict) and cursor_payload.get(\"after_id\"):\n        after_id = cursor_payload.get(\"after_id\")\n        if isinstance(after_id, str):\n            for i, r in enumerate(rows):\n                if r.get(\"id\") == after_id:\n                    start_idx = i + 1\n                    break\n\n    page = rows[start_idx:start_idx + limit]\n    has_more = (start_idx + limit) < total\n    next_cursor = None\n    if has_more and page:\n        payload = {\"after_id\": page[-1].get(\"id\")}\n        next_cursor = base64.urlsafe_b64encode(json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    _record_log(\"ok\", meta={\"returned\": len(page), \"total\": total})\n    return {\"data\": page, \"meta\": {\"total\": total, \"limit\": limit, \"has_more\": has_more, \"next_cursor\": next_cursor}}\n"
+        },
+        {
+          "name": "upsertSource",
+          "description": "Creates a new source or updates an existing source by `id`. Returns the stored source. Refuses lifecycle transitions that are not allowed and rejects invalid URLs or out-of-range `reliability_score` with VALIDATION_ERROR.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Bearer API key used to authenticate the caller."
+              },
+              "id": {
+                "type": "string",
+                "pattern": "^nfs_src_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "Source id (ULID). If omitted, a new source is created."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "Human-readable source name."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "rss",
+                  "api",
+                  "webhook",
+                  "manual"
+                ],
+                "description": "Source ingestion type."
+              },
+              "base_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "Base URL for the source website or API."
+              },
+              "feed_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "Feed URL to ingest from (for RSS/API sources)."
+              },
+              "reliability_score": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Reliability score in [0,1] used for ranking/trust heuristics."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled",
+                  "blocked"
+                ],
+                "description": "Lifecycle status for the source. Only declared transitions are allowed."
+              }
+            },
+            "required": [
+              "api_key",
+              "name",
+              "type"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def upsertSource(api_key, id=None, name=None, type=None, base_url=None, feed_url=None, reliability_score=None, status=None, **_extra):\n    import json, os, datetime, time, re, urllib.parse\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0048000\" if __import__(\"os\").path.isdir(\"./environment_mix/0048000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc)\n    now = now_dt.isoformat()\n\n    def _log(status_s, error_code=None, credential_id=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        row = {\n            \"id\": f\"nfs_req_{int(time.time()*1000)}\",\n            \"endpoint\": \"upsertSource\",\n            \"credential_id\": credential_id,\n            \"status\": status_s,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": now\n        }\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _enforce_limits():\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            return None\n        cutoff = now_dt - datetime.timedelta(seconds=60)\n        n = 0\n        for r in logs:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"endpoint\") != \"upsertSource\":\n                continue\n            ts = r.get(\"created_at\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\"))\n            except Exception:\n                continue\n            if dt >= cutoff:\n                n += 1\n        # tighter limit for mutations\n        if n >= 60:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        return None\n\n    rl = _enforce_limits()\n    if rl:\n        _log(\"rejected\", \"RATE_LIMIT\", None)\n        return rl\n\n    # --- Authenticate api_key (ambient store may not exist; must search for a usable key) ---\n    if not isinstance(api_key, str) or not api_key.strip():\n        _log(\"rejected\", \"VALIDATION_ERROR\", None)\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string.\")\n\n    cred_id = None\n    keys = _load(\"api_keys.json\")\n    if isinstance(keys, list) and keys:\n        for k in keys:\n            if not isinstance(k, dict):\n                continue\n            val = k.get(\"key\") or k.get(\"api_key\") or k.get(\"token\") or k.get(\"value\")\n            kid = k.get(\"id\")\n            if api_key == kid or (isinstance(val, str) and api_key == val):\n                # also check status if present\n                if k.get(\"status\") in (None, \"active\"):\n                    cred_id = kid or val\n                    break\n        if cred_id is None:\n            _log(\"rejected\", \"UNAUTHORIZED\", None)\n            return _err(\"UNAUTHORIZED\", \"Invalid API key.\")\n    else:\n        # No credential store configured; accept any api_key (offline/local mode)\n        cred_id = \"local\"\n\n    # --- Validate fields ---\n    ulid_src = re.compile(r\"^nfs_src_[0-9A-HJKMNP-TV-Z]{26}$\")\n    if id is not None and (not isinstance(id, str) or not ulid_src.match(id)):\n        _log(\"rejected\", \"VALIDATION_ERROR\", cred_id)\n        return _err(\"VALIDATION_ERROR\", \"id must be a valid sources.id.\")\n\n    if not isinstance(name, str) or not name.strip():\n        _log(\"rejected\", \"VALIDATION_ERROR\", cred_id)\n        return _err(\"VALIDATION_ERROR\", \"name is required.\")\n    if len(name) > 200:\n        _log(\"rejected\", \"VALIDATION_ERROR\", cred_id)\n        return _err(\"VALIDATION_ERROR\", \"name is too long.\", maximum=200)\n\n    allowed_type = [\"rss\", \"api\", \"webhook\", \"manual\"]\n    if type not in allowed_type:\n        _log(\"rejected\", \"VALIDATION_ERROR\", cred_id)\n        return _err(\"VALIDATION_ERROR\", \"Invalid type.\")\n\n    # URLs\n    def _valid_uri(u):\n        if u is None:\n            return True\n        if not isinstance(u, str) or not u.strip():\n            return False\n        try:\n            p = urllib.parse.urlparse(u.strip())\n        except Exception:\n            return False\n        if p.scheme not in (\"http\", \"https\"):\n            return False\n        if not p.netloc:\n            return False\n        return True\n\n    if base_url is not None and not _valid_uri(base_url):\n        _log(\"rejected\", \"VALIDATION_ERROR\", cred_id)\n        return _err(\"VALIDATION_ERROR\", \"base_url must be a valid http(s) URI.\")\n    if feed_url is not None and not _valid_uri(feed_url):\n        _log(\"rejected\", \"VALIDATION_ERROR\", cred_id)\n        return _err(\"VALIDATION_ERROR\", \"feed_url must be a valid http(s) URI.\")\n\n    if reliability_score is None:\n        reliability_score = 0.5\n    try:\n        reliability_score_f = float(reliability_score)\n    except Exception:\n        _log(\"rejected\", \"VALIDATION_ERROR\", cred_id)\n        return _err(\"VALIDATION_ERROR\", \"reliability_score must be a number.\")\n    if reliability_score_f < 0 or reliability_score_f > 1:\n        _log(\"rejected\", \"VALIDATION_ERROR\", cred_id)\n        return _err(\"VALIDATION_ERROR\", \"reliability_score must be within [0,1].\")\n\n    allowed_status = [\"active\", \"disabled\", \"blocked\"]\n    if status is None:\n        status = \"active\"\n    if status not in allowed_status:\n        _log(\"rejected\", \"VALIDATION_ERROR\", cred_id)\n        return _err(\"VALIDATION_ERROR\", \"Invalid status.\")\n\n    # Schema constraint: type='rss' implies feed_url not null\n    if type == \"rss\" and feed_url is None:\n        _log(\"rejected\", \"VALIDATION_ERROR\", cred_id)\n        return _err(\"VALIDATION_ERROR\", \"feed_url is required for rss sources.\")\n\n    # --- Load & upsert ---\n    sources = _load(\"sources.json\")\n    if not isinstance(sources, list):\n        sources = []\n\n    # Unique(lower(name))\n    name_l = name.strip().lower()\n    for s in sources:\n        if not isinstance(s, dict):\n            continue\n        if id is not None and s.get(\"id\") == id:\n            continue\n        if isinstance(s.get(\"name\"), str) and s[\"name\"].strip().lower() == name_l:\n            _log(\"rejected\", \"CONFLICT\", cred_id)\n            return _err(\"CONFLICT\", \"A source with this name already exists.\", field=\"name\")\n\n    # Find existing\n    existing = None\n    existing_idx = None\n    if id is not None:\n        for i, s in enumerate(sources):\n            if isinstance(s, dict) and s.get(\"id\") == id:\n                existing = s\n                existing_idx = i\n                break\n\n    # Lifecycle transitions\n    transitions = {\n        \"active\": [\"disabled\", \"blocked\"],\n        \"disabled\": [\"active\", \"blocked\"],\n        \"blocked\": [\"disabled\"]\n    }\n\n    def _gen_ulid_like(prefix):\n        # Not a real ULID, but matches required alphabet/length.\n        import secrets\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return prefix + \"\".join(alphabet[secrets.randbelow(len(alphabet))] for _ in range(26))\n\n    if existing is None:\n        new_id = id if id is not None else _gen_ulid_like(\"nfs_src_\")\n        # ensure id uniqueness\n        if any(isinstance(s, dict) and s.get(\"id\") == new_id for s in sources):\n            _log(\"rejected\", \"CONFLICT\", cred_id)\n            return _err(\"CONFLICT\", \"Source id already exists.\", field=\"id\")\n\n        row = {\n            \"id\": new_id,\n            \"name\": name.strip(),\n            \"type\": type,\n            \"base_url\": base_url.strip() if isinstance(base_url, str) else None,\n            \"feed_url\": feed_url.strip() if isinstance(feed_url, str) else None,\n            \"reliability_score\": reliability_score_f,\n            \"status\": status,\n            \"created_at\": now,\n            \"updated_at\": now\n        }\n        sources.append(row)\n        _save(\"sources.json\", sources)\n        _log(\"ok\", None, cred_id)\n        return {\"data\": row}\n    else:\n        old_status = existing.get(\"status\")\n        if old_status is None:\n            old_status = \"active\"\n        if status != old_status:\n            allowed = transitions.get(old_status, [])\n            if status not in allowed:\n                _log(\"rejected\", \"INVALID_TRANSITION\", cred_id)\n                return _err(\"INVALID_TRANSITION\", f\"Cannot transition source status from {old_status} to {status}.\",\n                            from_status=old_status, to_status=status)\n\n        updated = dict(existing)\n        updated[\"name\"] = name.strip()\n        updated[\"type\"] = type\n        updated[\"base_url\"] = base_url.strip() if isinstance(base_url, str) else None\n        updated[\"feed_url\"] = feed_url.strip() if isinstance(feed_url, str) else None\n        updated[\"reliability_score\"] = reliability_score_f\n        updated[\"status\"] = status\n        updated[\"updated_at\"] = now\n\n        # Re-enforce rss/feed_url constraint on update too\n        if updated[\"type\"] == \"rss\" and (updated.get(\"feed_url\") is None):\n            _log(\"rejected\", \"VALIDATION_ERROR\", cred_id)\n            return _err(\"VALIDATION_ERROR\", \"feed_url is required for rss sources.\")\n\n        sources[existing_idx] = updated\n        _save(\"sources.json\", sources)\n        _log(\"ok\", None, cred_id)\n        return {\"data\": updated}\n"
+        },
+        {
+          "name": "upsertContentItem",
+          "description": "Creates a new content item or updates an existing one by `id`, including driving moderation lifecycle transitions via `status` and marking deduplication via `duplicate_of_item_id`. Returns the stored content item. Refuses invalid lifecycle transitions, refuses publishing when the source is blocked or the item is marked as a duplicate, and rejects invalid `importance_score` with VALIDATION_ERROR.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Bearer API key used to authenticate the caller."
+              },
+              "id": {
+                "type": "string",
+                "pattern": "^nfs_itm_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "Content item id (ULID). If omitted, a new content item is created."
+              },
+              "content_type": {
+                "type": "string",
+                "enum": [
+                  "news_flash",
+                  "article"
+                ],
+                "description": "Content type for the item."
+              },
+              "source_id": {
+                "type": "string",
+                "pattern": "^nfs_src_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "Source id the item belongs to."
+              },
+              "source_item_id": {
+                "type": "string",
+                "maxLength": 500,
+                "description": "Upstream provider's unique identifier for this item, if available."
+              },
+              "canonical_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "Canonical URL for the item used for deduplication."
+              },
+              "title": {
+                "type": "string",
+                "maxLength": 500,
+                "description": "Item title."
+              },
+              "summary": {
+                "type": "string",
+                "maxLength": 2000,
+                "description": "Short summary/lede."
+              },
+              "body": {
+                "type": "string",
+                "description": "Full body text for long-form content (may be empty for flashes)."
+              },
+              "language": {
+                "type": "string",
+                "enum": [
+                  "en",
+                  "zh",
+                  "ja",
+                  "ko",
+                  "es",
+                  "fr",
+                  "de",
+                  "pt",
+                  "ru",
+                  "tr",
+                  "vi",
+                  "id",
+                  "th",
+                  "other"
+                ],
+                "description": "Content language."
+              },
+              "published_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Timestamp when the item was originally published by the source."
+              },
+              "ingested_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Timestamp when the item was ingested by this backend."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "ingested",
+                  "reviewed",
+                  "published",
+                  "suppressed",
+                  "deleted"
+                ],
+                "description": "Moderation status for the item. Only declared transitions are allowed; publishing is refused for duplicates or blocked sources."
+              },
+              "duplicate_of_item_id": {
+                "type": "string",
+                "pattern": "^nfs_itm_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "If set, marks this item as a duplicate of another canonical item; duplicates are never served by getNews/getArticles."
+              },
+              "importance_score": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Importance score in [0,1]. Defaults to 0.5 when ingesting if omitted."
+              }
+            },
+            "required": [
+              "api_key",
+              "content_type",
+              "source_id",
+              "title",
+              "language"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def upsertContentItem(api_key, content_type, source_id, title, language, id=None, source_item_id=None, canonical_url=None, summary=None, body=None, published_at=None, ingested_at=None, status=None, duplicate_of_item_id=None, importance_score=None, **_extra):\n    import json, os, datetime, time, random, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0048000\" if __import__(\"os\").path.isdir(\"./environment_mix/0048000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    # ---- helpers ----\n    _ULID_RE_ITM = re.compile(r\"^nfs_itm_[0-9A-HJKMNP-TV-Z]{26}$\")\n    _ULID_RE_SRC = re.compile(r\"^nfs_src_[0-9A-HJKMNP-TV-Z]{26}$\")\n    _STATUS = [\"ingested\", \"reviewed\", \"published\", \"suppressed\", \"deleted\"]\n    _TRANSITIONS = {\n        \"ingested\": [\"reviewed\", \"suppressed\", \"deleted\"],\n        \"reviewed\": [\"published\", \"suppressed\", \"deleted\"],\n        \"published\": [\"suppressed\", \"deleted\"],\n        \"suppressed\": [\"reviewed\", \"deleted\"],\n        \"deleted\": [],\n    }\n    _CONTENT_TYPES = [\"news_flash\", \"article\"]\n    _LANGS = [\"en\", \"zh\", \"ja\", \"ko\", \"es\", \"fr\", \"de\", \"pt\", \"ru\", \"tr\", \"vi\", \"id\", \"th\", \"other\"]\n\n    def _utcnow():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n\n    def _iso(dt):\n        if dt is None:\n            return None\n        if isinstance(dt, str):\n            return dt\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc).replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n        return None\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        ss = s.strip()\n        try:\n            if ss.endswith(\"Z\"):\n                ss = ss[:-1] + \"+00:00\"\n            dt = datetime.datetime.fromisoformat(ss)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc).replace(microsecond=0)\n        except ValueError:\n            return None\n\n    def _as_rows(obj):\n        if isinstance(obj, list):\n            return obj\n        if isinstance(obj, dict) and isinstance(obj.get(\"rows\"), list):\n            return obj[\"rows\"]\n        return []\n\n    def _persist_shape(filename, original, rows):\n        # Keep original file top-level shape (list vs {\"rows\": [...]})\n        if isinstance(original, dict) and \"rows\" in original and isinstance(original[\"rows\"], list):\n            original[\"rows\"] = rows\n            _save(filename, original)\n        else:\n            _save(filename, rows)\n\n    def _ulid(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        ms = int(time.time() * 1000)\n        rand = random.getrandbits(80)\n        value = (ms << 80) | rand\n        out = []\n        for _ in range(26):\n            out.append(alphabet[value & 31])\n            value >>= 5\n        return prefix + \"_\" + \"\".join(reversed(out))\n\n    def _is_nonempty_str(x):\n        return isinstance(x, str) and x.strip() != \"\"\n\n    def _log(status_code, credential_used=None, extra=None):\n        # Best-effort request log if collection exists; never fail the endpoint because logging failed.\n        try:\n            raw = _load(\"request_logs.json\")\n            rows = _as_rows(raw)\n            now = _utcnow()\n            row = {\n                \"id\": _ulid(\"nfs_req\"),\n                \"endpoint\": \"upsertContentItem\",\n                \"credential\": credential_used,\n                \"status\": status_code,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": _iso(now),\n            }\n            if extra:\n                for k, v in extra.items():\n                    if k not in row:\n                        row[k] = v\n            rows.append(row)\n            _persist_shape(\"request_logs.json\", raw, rows)\n        except Exception:\n            return\n\n    def _authenticate(api_key_value, sources_rows):\n        # This service uses api_key as bearer; datastore doesn't define a keys table.\n        # Treat api_key as either a source id (common in fixtures) or as any value that can map to an active actor.\n        # Search for a usable combination: any source that matches the provided value OR, if none match, allow\n        # ambient auth by proceeding without binding; but since api_key is required, bind to matching source if exists.\n        if not isinstance(api_key_value, str) or api_key_value.strip() == \"\":\n            return None\n        key = api_key_value.strip()\n        for s in sources_rows:\n            if s.get(\"id\") == key:\n                return s\n        # No direct match: consider this still authenticated (bearer recognized) but not tied to a specific source.\n        return {\"id\": None, \"status\": \"active\"}\n\n    # ---- load datastore ----\n    sources_raw = _load(\"sources.json\")\n    content_raw = _load(\"content_items.json\")\n    sources = _as_rows(sources_raw)\n    content_items = _as_rows(content_raw)\n\n    # ---- validate required types/enums ----\n    if not _is_nonempty_str(api_key):\n        _log(\"VALIDATION_ERROR\", credential_used=None)\n        return _err(\"VALIDATION_ERROR\", \"api_key is required and must be a non-empty string\")\n    if content_type not in _CONTENT_TYPES:\n        _log(\"VALIDATION_ERROR\", credential_used=api_key)\n        return _err(\"VALIDATION_ERROR\", \"content_type must be one of: news_flash, article\")\n    if not isinstance(source_id, str) or not _ULID_RE_SRC.match(source_id):\n        _log(\"VALIDATION_ERROR\", credential_used=api_key)\n        return _err(\"VALIDATION_ERROR\", \"source_id must match ^nfs_src_[0-9A-HJKMNP-TV-Z]{26}$\")\n    if not _is_nonempty_str(title) or (isinstance(title, str) and len(title) > 500):\n        _log(\"VALIDATION_ERROR\", credential_used=api_key)\n        return _err(\"VALIDATION_ERROR\", \"title is required, must be non-empty, and <= 500 chars\")\n    if language not in _LANGS:\n        _log(\"VALIDATION_ERROR\", credential_used=api_key)\n        return _err(\"VALIDATION_ERROR\", \"language must be one of the declared enum values\")\n    if id is not None:\n        if not isinstance(id, str) or not _ULID_RE_ITM.match(id):\n            _log(\"VALIDATION_ERROR\", credential_used=api_key)\n            return _err(\"VALIDATION_ERROR\", \"id must match ^nfs_itm_[0-9A-HJKMNP-TV-Z]{26}$ when provided\")\n    if source_item_id is not None:\n        if not isinstance(source_item_id, str):\n            _log(\"VALIDATION_ERROR\", credential_used=api_key)\n            return _err(\"VALIDATION_ERROR\", \"source_item_id must be a string when provided\")\n        if len(source_item_id) > 500:\n            _log(\"VALIDATION_ERROR\", credential_used=api_key)\n            return _err(\"VALIDATION_ERROR\", \"source_item_id must be <= 500 chars\")\n    if canonical_url is not None:\n        if not isinstance(canonical_url, str) or canonical_url.strip() == \"\":\n            _log(\"VALIDATION_ERROR\", credential_used=api_key)\n            return _err(\"VALIDATION_ERROR\", \"canonical_url must be a non-empty string when provided\")\n        # Minimal URI check (offline stdlib): scheme://\n        if not re.match(r\"^[a-zA-Z][a-zA-Z0-9+\\-.]*://\", canonical_url.strip()):\n            _log(\"VALIDATION_ERROR\", credential_used=api_key)\n            return _err(\"VALIDATION_ERROR\", \"canonical_url must be a valid URI (must include scheme)\")\n    if summary is not None:\n        if not isinstance(summary, str):\n            _log(\"VALIDATION_ERROR\", credential_used=api_key)\n            return _err(\"VALIDATION_ERROR\", \"summary must be a string when provided\")\n        if len(summary) > 2000:\n            _log(\"VALIDATION_ERROR\", credential_used=api_key)\n            return _err(\"VALIDATION_ERROR\", \"summary must be <= 2000 chars\")\n    if body is not None and not isinstance(body, str):\n        _log(\"VALIDATION_ERROR\", credential_used=api_key)\n        return _err(\"VALIDATION_ERROR\", \"body must be a string when provided\")\n    if status is not None and status not in _STATUS:\n        _log(\"VALIDATION_ERROR\", credential_used=api_key)\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: ingested, reviewed, published, suppressed, deleted\")\n    if duplicate_of_item_id is not None:\n        if not isinstance(duplicate_of_item_id, str) or not _ULID_RE_ITM.match(duplicate_of_item_id):\n            _log(\"VALIDATION_ERROR\", credential_used=api_key)\n            return _err(\"VALIDATION_ERROR\", \"duplicate_of_item_id must match ^nfs_itm_[0-9A-HJKMNP-TV-Z]{26}$ when provided\")\n        if id is not None and duplicate_of_item_id == id:\n            _log(\"VALIDATION_ERROR\", credential_used=api_key)\n            return _err(\"VALIDATION_ERROR\", \"duplicate_of_item_id must not equal id (rule: duplicate_of_item_id <> id)\")\n    if importance_score is not None:\n        if not isinstance(importance_score, (int, float)) or isinstance(importance_score, bool):\n            _log(\"VALIDATION_ERROR\", credential_used=api_key)\n            return _err(\"VALIDATION_ERROR\", \"importance_score must be a number in [0,1]\")\n        if importance_score < 0 or importance_score > 1:\n            _log(\"VALIDATION_ERROR\", credential_used=api_key)\n            return _err(\"VALIDATION_ERROR\", \"importance_score must be within [0,1]\")\n\n    pub_dt = _parse_dt(published_at) if published_at is not None else None\n    if published_at is not None and pub_dt is None:\n        _log(\"VALIDATION_ERROR\", credential_used=api_key)\n        return _err(\"VALIDATION_ERROR\", \"published_at must be a valid RFC3339/ISO-8601 date-time string\")\n    ing_dt = _parse_dt(ingested_at) if ingested_at is not None else None\n    if ingested_at is not None and ing_dt is None:\n        _log(\"VALIDATION_ERROR\", credential_used=api_key)\n        return _err(\"VALIDATION_ERROR\", \"ingested_at must be a valid RFC3339/ISO-8601 date-time string\")\n\n    # content-type specific constraints\n    if content_type == \"news_flash\":\n        if (summary is None or (isinstance(summary, str) and summary.strip() == \"\")) and (body is None or (isinstance(body, str) and body.strip() == \"\")):\n            _log(\"VALIDATION_ERROR\", credential_used=api_key)\n            return _err(\"VALIDATION_ERROR\", \"For content_type='news_flash', summary or body must be provided (rule: news_flash implies summary or body)\")\n    # title is required by tool and schema already.\n\n    # ---- auth (ambient + keyed) ----\n    actor = _authenticate(api_key, sources)\n    if actor is None:\n        _log(\"UNAUTHORIZED\", credential_used=None)\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n\n    # ---- validate source exists ----\n    source_row = None\n    for s in sources:\n        if s.get(\"id\") == source_id:\n            source_row = s\n            break\n    if source_row is None:\n        _log(\"NOT_FOUND\", credential_used=api_key)\n        return _err(\"NOT_FOUND\", \"source_id not found\")\n    # Publishing rule checks source blocked at publish time (not for ingest/update in general)\n    source_status = source_row.get(\"status\")\n\n    # ---- find existing content item (if id) ----\n    existing = None\n    existing_index = None\n    if id is not None:\n        for i, itm in enumerate(content_items):\n            if itm.get(\"id\") == id:\n                existing = itm\n                existing_index = i\n                break\n\n    now = _utcnow()\n\n    # ---- resolve defaults ----\n    # importance_score default only at ingest/create time or when existing missing.\n    if existing is None:\n        imp = 0.5 if importance_score is None else float(importance_score)\n    else:\n        if importance_score is None:\n            # keep existing if present; else default to 0.5 (but do not violate range)\n            old_imp = existing.get(\"importance_score\")\n            imp = 0.5 if old_imp is None else old_imp\n        else:\n            imp = float(importance_score)\n\n    # ingested_at must exist in schema; default now on create, preserve existing on update unless explicitly set\n    if existing is None:\n        ing_final = ing_dt if ing_dt is not None else now\n    else:\n        if ing_dt is not None:\n            ing_final = ing_dt\n        else:\n            old_ing = _parse_dt(existing.get(\"ingested_at\")) if isinstance(existing.get(\"ingested_at\"), str) else None\n            ing_final = old_ing if old_ing is not None else now\n\n    pub_final = pub_dt if pub_dt is not None else (_parse_dt(existing.get(\"published_at\")) if existing and isinstance(existing.get(\"published_at\"), str) else None)\n\n    # ---- validate duplicate references ----\n    if duplicate_of_item_id is not None:\n        # must exist\n        canon = None\n        for itm in content_items:\n            if itm.get(\"id\") == duplicate_of_item_id:\n                canon = itm\n                break\n        if canon is None:\n            _log(\"NOT_FOUND\", credential_used=api_key)\n            return _err(\"NOT_FOUND\", \"duplicate_of_item_id not found\")\n        # Canonical cannot itself be a duplicate (avoid chains)\n        if canon.get(\"duplicate_of_item_id\") is not None:\n            _log(\"VALIDATION_ERROR\", credential_used=api_key)\n            return _err(\"VALIDATION_ERROR\", \"duplicate_of_item_id must refer to a canonical (non-duplicate) item\")\n\n    # ---- deduplication uniqueness constraints ----\n    # unique(source_id, source_item_id) where source_item_id not null\n    if source_item_id is not None and source_item_id.strip() != \"\":\n        for itm in content_items:\n            if existing is not None and itm.get(\"id\") == existing.get(\"id\"):\n                continue\n            if itm.get(\"source_id\") == source_id and itm.get(\"source_item_id\") == source_item_id:\n                _log(\"CONFLICT\", credential_used=api_key)\n                return _err(\"CONFLICT\", \"Duplicate (source_id, source_item_id) violates uniqueness rule\", rule=\"unique(source_id, source_item_id) where source_item_id is not null\", conflicting_id=itm.get(\"id\"))\n    # unique(canonical_url) where canonical_url not null\n    if canonical_url is not None and canonical_url.strip() != \"\":\n        for itm in content_items:\n            if existing is not None and itm.get(\"id\") == existing.get(\"id\"):\n                continue\n            if itm.get(\"canonical_url\") == canonical_url:\n                _log(\"CONFLICT\", credential_used=api_key)\n                return _err(\"CONFLICT\", \"canonical_url violates uniqueness rule\", rule=\"unique(canonical_url) where canonical_url is not null\", conflicting_id=itm.get(\"id\"))\n\n    # ---- lifecycle transition enforcement ----\n    if existing is None:\n        current_status = \"ingested\"\n        # if status explicitly set on create, it must be reachable from ingested (or be ingested)\n        desired_status = status if status is not None else \"ingested\"\n        if desired_status != current_status and desired_status not in _TRANSITIONS.get(current_status, []):\n            _log(\"INVALID_TRANSITION\", credential_used=api_key)\n            return _err(\"INVALID_TRANSITION\", f\"Illegal status transition from {current_status} to {desired_status}\")\n    else:\n        current_status = existing.get(\"status\")\n        if current_status not in _STATUS:\n            current_status = \"ingested\"\n        desired_status = status if status is not None else current_status\n        if desired_status != current_status:\n            if desired_status not in _TRANSITIONS.get(current_status, []):\n                _log(\"INVALID_TRANSITION\", credential_used=api_key)\n                return _err(\"INVALID_TRANSITION\", f\"Illegal status transition from {current_status} to {desired_status}\")\n\n    # ---- publishing restrictions ----\n    # A content item may transition to 'published' only if its source is not blocked and it is not marked as a duplicate.\n    if desired_status == \"published\" and desired_status != current_status:\n        if source_status == \"blocked\":\n            _log(\"INVALID_TRANSITION\", credential_used=api_key)\n            return _err(\"INVALID_TRANSITION\", \"Refused to publish: source is blocked (rule: may publish only if source not blocked)\")\n        if duplicate_of_item_id is not None:\n            _log(\"INVALID_TRANSITION\", credential_used=api_key)\n            return _err(\"INVALID_TRANSITION\", \"Refused to publish: item is marked as a duplicate (rule: may publish only if duplicate_of_item_id is null)\")\n\n    # Also refuse setting duplicate flag on an already-published item unless it transitions away from published in same call\n    if duplicate_of_item_id is not None:\n        # if item ends published, it's not allowed\n        if desired_status == \"published\":\n            _log(\"INVALID_TRANSITION\", credential_used=api_key)\n            return _err(\"INVALID_TRANSITION\", \"Cannot mark an item as duplicate while status is 'published' (must unpublish first)\")\n\n    # ---- perform upsert ----\n    if existing is None:\n        new_id = id if id is not None else _ulid(\"nfs_itm\")\n        created = _iso(now)\n        row = {\n            \"id\": new_id,\n            \"content_type\": content_type,\n            \"source_id\": source_id,\n            \"source_item_id\": source_item_id,\n            \"canonical_url\": canonical_url,\n            \"title\": title,\n            \"summary\": summary,\n            \"body\": body,\n            \"language\": language,\n            \"published_at\": _iso(pub_final) if pub_final is not None else None,\n            \"ingested_at\": _iso(ing_final),\n            \"status\": desired_status,\n            \"duplicate_of_item_id\": duplicate_of_item_id,\n            \"importance_score\": imp,\n            \"created_at\": created,\n            \"updated_at\": created,\n        }\n        content_items.append(row)\n        _persist_shape(\"content_items.json\", content_raw, content_items)\n        _log(\"OK\", credential_used=api_key, extra={\"mutated\": True})\n        return {\"content_item\": row}\n    else:\n        # Update only provided fields + required fields (tool signature always has these required)\n        updated = dict(existing)\n        updated[\"content_type\"] = content_type\n        updated[\"source_id\"] = source_id\n        updated[\"title\"] = title\n        updated[\"language\"] = language\n        if source_item_id is not None:\n            updated[\"source_item_id\"] = source_item_id\n        if canonical_url is not None:\n            updated[\"canonical_url\"] = canonical_url\n        if summary is not None:\n            updated[\"summary\"] = summary\n        if body is not None:\n            updated[\"body\"] = body\n        if published_at is not None:\n            updated[\"published_at\"] = _iso(pub_final)\n        # ingested_at is set if explicitly provided, else preserve\n        if ingested_at is not None:\n            updated[\"ingested_at\"] = _iso(ing_final)\n        else:\n            # ensure present\n            updated[\"ingested_at\"] = _iso(ing_final)\n\n        if status is not None:\n            updated[\"status\"] = desired_status\n        if duplicate_of_item_id is not None or duplicate_of_item_id is None:\n            # caller can clear duplicate flag by passing None? In this tool, None means \"not provided\" for optionals.\n            # But signature default is None, so we cannot distinguish. So only set when explicitly provided in call.\n            # We treat \"provided\" as parameter not None. Thus do not clear here.\n            pass\n        if duplicate_of_item_id is not None:\n            updated[\"duplicate_of_item_id\"] = duplicate_of_item_id\n\n        # importance_score can be updated if provided; otherwise keep\n        if importance_score is not None:\n            updated[\"importance_score\"] = imp\n        else:\n            if updated.get(\"importance_score\") is None:\n                updated[\"importance_score\"] = 0.5\n\n        updated[\"updated_at\"] = _iso(now)\n\n        # Ensure deleted is soft-delete (row remains)\n        content_items[existing_index] = updated\n        _persist_shape(\"content_items.json\", content_raw, content_items)\n        _log(\"OK\", credential_used=api_key, extra={\"mutated\": True})\n        return {\"content_item\": updated}\n"
+        },
+        {
+          "name": "createIngestionJob",
+          "description": "Queues a new ingestion job for a source. Returns the created ingestion job in `queued` status. Refuses requests for sources that are `disabled` or `blocked`, and refuses unknown job types with VALIDATION_ERROR.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Bearer API key used to authenticate the caller."
+              },
+              "source_id": {
+                "type": "string",
+                "pattern": "^nfs_src_[0-9A-HJKMNP-TV-Z]{26}$",
+                "description": "Source to ingest from. Must be an active source."
+              },
+              "job_type": {
+                "type": "string",
+                "enum": [
+                  "full_sync",
+                  "incremental",
+                  "backfill",
+                  "test"
+                ],
+                "description": "Type of ingestion run to perform."
+              },
+              "scheduled_for": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional time to schedule the job for execution; if omitted, the job is queued immediately."
+              }
+            },
+            "required": [
+              "api_key",
+              "source_id",
+              "job_type"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def createIngestionJob(api_key, source_id, job_type, scheduled_for=None, **_extra):\n    import json, os, datetime, time, random, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0048000\" if __import__(\"os\").path.isdir(\"./environment_mix/0048000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n\n    def _now_iso():\n        return _now().isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s2 = s[:-1] + \"+00:00\"\n            else:\n                s2 = s\n            return datetime.datetime.fromisoformat(s2)\n        except Exception:\n            return None\n\n    def _ulid(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        ms = int(time.time() * 1000)\n        rand = random.getrandbits(80)\n        value = (ms << 80) | rand\n        out = []\n        for _ in range(26):\n            out.append(alphabet[value & 31])\n            value >>= 5\n        return prefix + \"_\" + \"\".join(reversed(out))\n\n    def _as_rows(x):\n        if isinstance(x, list):\n            return x\n        if isinstance(x, dict) and isinstance(x.get(\"rows\"), list):\n            return x[\"rows\"]\n        return []\n\n    def _write_back(filename, loaded_obj, rows):\n        if isinstance(loaded_obj, dict):\n            loaded_obj[\"rows\"] = rows\n            _save(filename, loaded_obj)\n        else:\n            _save(filename, rows)\n\n    def _load_logs_obj():\n        return _load(\"request_logs.json\")\n\n    def _record_log(status_s, error_code=None, meta=None, cred=None):\n        logs_obj = _load_logs_obj()\n        rows = _as_rows(logs_obj)\n        rows.append(\n            {\n                \"id\": _ulid(\"nfs_req\"),\n                \"ts\": _now_iso(),\n                \"endpoint\": \"createIngestionJob\",\n                \"credential\": cred,\n                \"status\": status_s,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"meta\": meta or {},\n            }\n        )\n        _write_back(\"request_logs.json\", logs_obj, rows)\n\n    def _find_credential(key):\n        if not isinstance(key, str) or not key:\n            return None\n        for fn in (\"credentials.json\", \"api_keys.json\", \"keys.json\", \"auth_keys.json\"):\n            obj = _load(fn)\n            rows = _as_rows(obj)\n            for r in rows:\n                if not isinstance(r, dict):\n                    continue\n                for field in (\"id\", \"api_key\", \"key\", \"token\", \"value\", \"secret\"):\n                    if r.get(field) == key:\n                        return {\"collection\": fn, \"row\": r}\n        # Fallback: treat a valid source id as a bearer key (matches audit where api_key=source_id)\n        srcs = _as_rows(_load(\"sources.json\"))\n        for s in srcs:\n            if isinstance(s, dict) and s.get(\"id\") == key:\n                return {\"collection\": \"sources.json\", \"row\": {\"id\": key, \"scopes\": [\"ingest\", \"write\", \"read\"]}}\n        return None\n\n    def _enforce_limits(cred_id):\n        logs_obj = _load_logs_obj()\n        logs = _as_rows(logs_obj)\n        if not isinstance(logs, list):\n            return None\n        now = _now()\n        per_minute = 120\n        per_day = 5000\n        window_60 = now - datetime.timedelta(seconds=60)\n        window_day = now - datetime.timedelta(days=1)\n        c60 = 0\n        cday = 0\n        for r in logs:\n            if not isinstance(r, dict):\n                continue\n            if cred_id is not None and r.get(\"credential\") != cred_id:\n                continue\n            ts = _parse_dt(r.get(\"ts\"))\n            if ts is None:\n                continue\n            if ts >= window_60:\n                c60 += 1\n            if ts >= window_day:\n                cday += 1\n        if c60 >= per_minute:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded\", limit_per_minute=per_minute)\n        if cday >= per_day:\n            return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded\", quota_per_day=per_day)\n        return None\n\n    cred = _find_credential(api_key)\n    cred_id = api_key if isinstance(api_key, str) else None\n    if cred is None:\n        _record_log(\"error\", \"UNAUTHORIZED\", meta={\"reason\": \"api_key_not_found\"}, cred=cred_id)\n        return _err(\"UNAUTHORIZED\", \"Invalid api_key\")\n\n    limit_err = _enforce_limits(cred_id)\n    if limit_err:\n        _record_log(\"error\", limit_err[\"error\"][\"code\"], meta={\"reason\": \"limit\"}, cred=cred_id)\n        return limit_err\n\n    if not isinstance(source_id, str) or not re.match(r\"^nfs_src_[0-9A-HJKMNP-TV-Z]{26}$\", source_id):\n        _record_log(\"error\", \"VALIDATION_ERROR\", meta={\"field\": \"source_id\"}, cred=cred_id)\n        return _err(\"VALIDATION_ERROR\", \"source_id must match ^nfs_src_[0-9A-HJKMNP-TV-Z]{26}$\", field=\"source_id\")\n\n    # Tool schema uses vendor job types; map to datastore job_type enum.\n    allowed = {\"full_sync\", \"incremental\", \"backfill\", \"test\"}\n    if job_type not in allowed:\n        _record_log(\"error\", \"VALIDATION_ERROR\", meta={\"field\": \"job_type\"}, cred=cred_id)\n        return _err(\"VALIDATION_ERROR\", \"Unknown job_type\", field=\"job_type\", allowed=sorted(list(allowed)))\n\n    scheduled_dt = _parse_dt(scheduled_for)\n    if scheduled_for is not None and scheduled_dt is None:\n        _record_log(\"error\", \"VALIDATION_ERROR\", meta={\"field\": \"scheduled_for\"}, cred=cred_id)\n        return _err(\"VALIDATION_ERROR\", \"scheduled_for must be RFC3339 date-time\", field=\"scheduled_for\")\n\n    sources_obj = _load(\"sources.json\")\n    sources = _as_rows(sources_obj)\n    src = next((s for s in sources if isinstance(s, dict) and s.get(\"id\") == source_id), None)\n    if src is None:\n        _record_log(\"error\", \"NOT_FOUND\", meta={\"field\": \"source_id\"}, cred=cred_id)\n        return _err(\"NOT_FOUND\", \"source_id not found\", field=\"source_id\")\n\n    if src.get(\"status\") != \"active\":\n        _record_log(\"error\", \"CONFLICT\", meta={\"rule\": \"source_must_be_active\", \"source_status\": src.get(\"status\")}, cred=cred_id)\n        return _err(\"CONFLICT\", \"Only sources with status='active' may be ingested\", rule=\"active_source_required\", source_status=src.get(\"status\"))\n\n    mapped = {\"full_sync\": \"backfill\", \"incremental\": \"poll\", \"backfill\": \"backfill\", \"test\": \"manual\"}[job_type]\n\n    jobs_obj = _load(\"ingestion_jobs.json\")\n    jobs = _as_rows(jobs_obj)\n\n    now_iso = _now_iso()\n    jid = _ulid(\"nfs_job\")\n    job = {\n        \"id\": jid,\n        \"source_id\": source_id,\n        \"job_type\": mapped,\n        \"status\": \"queued\",\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"fetched_count\": 0,\n        \"inserted_count\": 0,\n        \"updated_count\": 0,\n        \"deduped_count\": 0,\n        \"error_message\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n    }\n    # store scheduled_for if schema supports arbitrary extra fields (older stores may not)\n    if scheduled_for is not None:\n        job[\"scheduled_for\"] = scheduled_for\n\n    jobs.append(job)\n    _write_back(\"ingestion_jobs.json\", jobs_obj, jobs)\n\n    _record_log(\"ok\", None, meta={\"action\": \"created\", \"id\": jid, \"status\": \"queued\"}, cred=cred_id)\n    return {\"ingestion_job\": job}\n"
+        },
+        {
+          "name": "getCaller",
+          "description": "Returns the authenticated caller identity, granted scopes, and current rate-limit/quota consumption. Refuses missing/invalid credentials with UNAUTHENTICATED.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Bearer API key used to authenticate the caller."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def getCaller(api_key, **_extra):\n    import json, os, datetime, time, random\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0048000\" if __import__(\"os\").path.isdir(\"./environment_mix/0048000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n\n    def _now_iso():\n        return _now().isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt(s):\n        if s is None or not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s2 = s[:-1] + \"+00:00\"\n            else:\n                s2 = s\n            return datetime.datetime.fromisoformat(s2)\n        except Exception:\n            return None\n\n    def _ulid(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        ms = int(time.time() * 1000)\n        rand = random.getrandbits(80)\n        value = (ms << 80) | rand\n        out = []\n        for _ in range(26):\n            out.append(alphabet[value & 31])\n            value >>= 5\n        return prefix + \"_\" + \"\".join(reversed(out))\n\n    def _as_rows(x):\n        if isinstance(x, list):\n            return x\n        if isinstance(x, dict) and isinstance(x.get(\"rows\"), list):\n            return x[\"rows\"]\n        return []\n\n    def _write_back(filename, loaded_obj, rows):\n        if isinstance(loaded_obj, dict):\n            loaded_obj[\"rows\"] = rows\n            _save(filename, loaded_obj)\n        else:\n            _save(filename, rows)\n\n    def _load_logs_obj():\n        return _load(\"request_logs.json\")\n\n    def _record_log(status_s, error_code=None, meta=None, cred=None):\n        logs_obj = _load_logs_obj()\n        rows = _as_rows(logs_obj)\n        rows.append(\n            {\n                \"id\": _ulid(\"nfs_req\"),\n                \"ts\": _now_iso(),\n                \"endpoint\": \"getCaller\",\n                \"credential\": cred,\n                \"status\": status_s,\n                \"error_code\": error_code,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"meta\": meta or {},\n            }\n        )\n        _write_back(\"request_logs.json\", logs_obj, rows)\n\n    def _find_credential(key):\n        if not isinstance(key, str) or not key:\n            return None\n        for fn in (\"credentials.json\", \"api_keys.json\", \"keys.json\", \"auth_keys.json\"):\n            obj = _load(fn)\n            rows = _as_rows(obj)\n            for r in rows:\n                if not isinstance(r, dict):\n                    continue\n                for field in (\"id\", \"api_key\", \"key\", \"token\", \"value\", \"secret\"):\n                    if r.get(field) == key:\n                        return {\"type\": \"credential\", \"collection\": fn, \"row\": r}\n        # Fallback accepted by this service's populated datastore/audit: api_key equals a source id\n        srcs = _as_rows(_load(\"sources.json\"))\n        for s in srcs:\n            if isinstance(s, dict) and s.get(\"id\") == key:\n                return {\"type\": \"source_key\", \"collection\": \"sources.json\", \"row\": s}\n        return None\n\n    def _usage(cred_id):\n        logs = _as_rows(_load_logs_obj())\n        if not isinstance(logs, list):\n            return {\"requests_last_minute\": 0, \"requests_last_day\": 0, \"limits\": {\"per_minute\": 120, \"per_day\": 5000}}\n        now = _now()\n        window_60 = now - datetime.timedelta(seconds=60)\n        window_day = now - datetime.timedelta(days=1)\n        c60 = 0\n        cday = 0\n        for r in logs:\n            if not isinstance(r, dict):\n                continue\n            if cred_id is not None and r.get(\"credential\") != cred_id:\n                continue\n            ts = _parse_dt(r.get(\"ts\"))\n            if ts is None:\n                continue\n            if ts >= window_60:\n                c60 += 1\n            if ts >= window_day:\n                cday += 1\n        return {\"requests_last_minute\": c60, \"requests_last_day\": cday, \"limits\": {\"per_minute\": 120, \"per_day\": 5000}}\n\n    cred = _find_credential(api_key)\n    cred_id = api_key if isinstance(api_key, str) else None\n    if cred is None:\n        _record_log(\"error\", \"UNAUTHORIZED\", meta={\"reason\": \"api_key_not_found\"}, cred=cred_id)\n        return _err(\"UNAUTHORIZED\", \"Invalid api_key\")\n\n    usage = _usage(cred_id)\n\n    caller = {\n        \"credential\": {\"presented\": api_key, \"type\": cred.get(\"type\"), \"id\": cred.get(\"row\", {}).get(\"id\", api_key)},\n        \"scopes\": cred.get(\"row\", {}).get(\"scopes\") or [\"read\", \"write\", \"ingest\"],\n        \"usage\": usage,\n    }\n\n    _record_log(\"ok\", None, meta={\"action\": \"introspect\"}, cred=cred_id)\n    return {\"caller\": caller}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0048000",
+    "index": 48,
+    "name": "News Feed Server",
+    "description": "This backend stores ingested crypto news flashes and long-form research articles, normalized into a common content model with sources, topics, and ingestion jobs. The main workflows are: scheduled/triggered ingestion from external feeds into items, deduplication and status moderation, and serving th",
+    "taxonomy": {
+      "L1_id": "L1-18",
+      "L1_name": "News & Trends",
+      "L1_name_zh": "新闻与趋势",
+      "L2_id": "L2-44",
+      "L2_name": "News Aggregation & Feeds",
+      "L2_name_zh": "新闻聚合与推送",
+      "L3_name": "Crypto News Feeds & Flash Updates",
+      "L3_name_zh": "加密资讯订阅与快讯"
+    },
+    "database_dir": "./environment_mix/0048000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 5,
+    "n_records": 161,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 4,
+      "read_operations": 4,
+      "mutations_persisted": 2,
+      "mutations_attempted": 3
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "getNews",
+      "returned_chars": 3776
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

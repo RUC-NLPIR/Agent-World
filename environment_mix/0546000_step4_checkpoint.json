@@ -1,0 +1,335 @@
+{
+  "index": 546,
+  "local_files_dir": "./environment_mix/0546000",
+  "file_list": [
+    "./environment_mix/0546000/README.md",
+    "./environment_mix/0546000/state.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "state.json": "TwitterAPI state. tweets: dict[str(id)] -> {id,username,content,tags[],mentions[]}; comments: dict[str(tweet_id)] -> [{username,content}]; retweets: dict[username] -> [tweet_ids]; following_list: usernames; authenticated user 'john'. Enriched to 25 tweets across 7 users with comments and retweets.",
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "authenticate_twitter",
+          "description": "Authenticates a user by username and password and, on success, starts an authenticated session used by the other TwitterAPI tools. Returns a confirmation that the session is active for the authenticated user. Refuses requests with missing/empty credentials, unknown usernames, or incorrect passwords, and will not authenticate a different user while another session is already active.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "username": {
+                "type": "string",
+                "description": "Username of the user."
+              },
+              "password": {
+                "type": "string",
+                "description": "Password of the user."
+              }
+            },
+            "required": [
+              "username",
+              "password"
+            ]
+          },
+          "implementation": "def authenticate_twitter(username, password, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0546000\" if __import__(\"os\").path.isdir(\"./environment_mix/0546000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started = datetime.datetime.utcnow()\n    status = \"success\"\n\n    # Load state (single-object file; may be missing/empty -> create defaults)\n    S = _load(\"state.json\")\n    if not isinstance(S, dict):\n        # treat as no valid session context\n        S = {}\n\n    # Ensure base structure exists\n    if \"tweets\" not in S or not isinstance(S.get(\"tweets\"), dict):\n        S[\"tweets\"] = {}\n    if \"comments\" not in S or not isinstance(S.get(\"comments\"), dict):\n        S[\"comments\"] = {}\n    if \"retweets\" not in S or not isinstance(S.get(\"retweets\"), dict):\n        S[\"retweets\"] = {}\n    if \"following_list\" not in S or not isinstance(S.get(\"following_list\"), list):\n        S[\"following_list\"] = []\n    if \"tweet_counter\" not in S or not isinstance(S.get(\"tweet_counter\"), int):\n        S[\"tweet_counter\"] = 0\n    if \"random_seed\" not in S or not isinstance(S.get(\"random_seed\"), int):\n        S[\"random_seed\"] = 0\n    if \"authenticated\" not in S or not isinstance(S.get(\"authenticated\"), bool):\n        S[\"authenticated\"] = False\n\n    # Validation\n    if not isinstance(username, str) or not username.strip():\n        status = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"Missing/empty username.\")\n    if not isinstance(password, str) or not password:\n        status = \"error\"\n        return _err(\"VALIDATION_ERROR\", \"Missing/empty password.\")\n    username = username.strip()\n\n    # Session rule: cannot authenticate different user while already authenticated\n    if S.get(\"authenticated\") is True:\n        if S.get(\"username\") != username:\n            status = \"error\"\n            return _err(\"CONFLICT\", \"A different user is already authenticated in this session.\")\n        # Idempotent: re-auth same user requires correct password\n        if S.get(\"password\") != password:\n            status = \"error\"\n            return _err(\"UNAUTHORIZED\", \"Incorrect password.\")\n        # No mutation needed; but real service dynamics require state movement -> update seed/counters anyway\n        S[\"random_seed\"] = int(S.get(\"random_seed\", 0)) + 1\n        _save(\"state.json\", S)\n        latency_ms = int((datetime.datetime.utcnow() - started).total_seconds() * 1000)\n        return {\n            \"authenticated\": True,\n            \"username\": S.get(\"username\"),\n            \"session_active\": True,\n            \"latency_ms\": latency_ms\n        }\n\n    # Known username/password check against stored credentials in state.json\n    stored_user = S.get(\"username\")\n    stored_pass = S.get(\"password\")\n\n    if not isinstance(stored_user, str) or not stored_user:\n        status = \"error\"\n        return _err(\"NOT_FOUND\", \"Unknown username.\")\n    if username != stored_user:\n        status = \"error\"\n        return _err(\"NOT_FOUND\", \"Unknown username.\")\n    if stored_pass != password:\n        status = \"error\"\n        return _err(\"UNAUTHORIZED\", \"Incorrect password.\")\n\n    # Mutate session to authenticated\n    S[\"authenticated\"] = True\n    S[\"username\"] = username\n    # Keep stored password as-is (already matches); advance observable state\n    S[\"random_seed\"] = int(S.get(\"random_seed\", 0)) + 1\n\n    _save(\"state.json\", S)\n\n    latency_ms = int((datetime.datetime.utcnow() - started).total_seconds() * 1000)\n    return {\n        \"authenticated\": True,\n        \"username\": username,\n        \"session_active\": True,\n        \"latency_ms\": latency_ms\n    }\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "comment",
+          "description": "Creates a new comment from the currently authenticated user on the specified tweet and returns the created comment with its identifying details. Refuses requests when no user is authenticated, when the target tweet_id does not exist, or when comment_content is empty or only whitespace. It also refuses to comment on tweets that are not available in the current working set or are otherwise not in a commentable state.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "tweet_id": {
+                "type": "integer",
+                "description": "ID of the tweet to comment on."
+              },
+              "comment_content": {
+                "type": "string",
+                "description": "Content of the comment."
+              }
+            },
+            "required": [
+              "tweet_id",
+              "comment_content"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0546000\" if __import__(\"os\").path.isdir(\"./environment_mix/0546000\") else \"/app/database\")\ndef comment(tweet_id, comment_content):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    if not _S.get(\"authenticated\"):\n        return {\"error\": \"User not authenticated. Please authenticate before commenting.\"}\n    if str(tweet_id) not in _S.get(\"tweets\", {}):\n        return {\"error\": f\"Tweet with ID {tweet_id} not found.\"}\n    return {\"comment_status\": \"Comment added successfully\"}\n",
+          "description_restored": true
+        },
+        {
+          "name": "follow_user",
+          "description": "Adds the specified user to the authenticated user’s following list and returns the updated follow relationship. Refuses requests when no user is authenticated, when username_to_follow is missing/empty or does not correspond to an existing user, or when the authenticated user attempts to follow themselves. It also refuses the request if the authenticated user already follows the target user.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "username_to_follow": {
+                "type": "string",
+                "description": "Username of the user to follow."
+              }
+            },
+            "required": [
+              "username_to_follow"
+            ]
+          },
+          "implementation": "def follow_user(username_to_follow, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0546000\" if __import__(\"os\").path.isdir(\"./environment_mix/0546000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started = datetime.datetime.utcnow()\n\n    S = _load(\"state.json\")\n    if not isinstance(S, dict):\n        return _err(\"UNAUTHORIZED\", \"No valid session context is available.\")\n\n    if S.get(\"following_list\") is None or not isinstance(S.get(\"following_list\"), list):\n        S[\"following_list\"] = []\n\n    if S.get(\"authenticated\") is not True or not isinstance(S.get(\"username\"), str) or not S.get(\"username\"):\n        return _err(\"UNAUTHORIZED\", \"No user is authenticated.\")\n\n    if not isinstance(username_to_follow, str) or not username_to_follow.strip():\n        return _err(\"VALIDATION_ERROR\", \"Missing/empty username_to_follow.\")\n    username_to_follow = username_to_follow.strip()\n\n    # Existence check: in this simplified datastore, only known account is S[\"username\"]\n    known_users = set()\n    if isinstance(S.get(\"username\"), str) and S.get(\"username\"):\n        known_users.add(S[\"username\"])\n    # Also consider authors present in tweets as \"existing users\"\n    if isinstance(S.get(\"tweets\"), dict):\n        for t in S[\"tweets\"].values():\n            if isinstance(t, dict) and isinstance(t.get(\"username\"), str) and t.get(\"username\"):\n                known_users.add(t[\"username\"])\n\n    if username_to_follow not in known_users:\n        return _err(\"NOT_FOUND\", \"Target user does not exist.\", username=username_to_follow)\n\n    current_user = S[\"username\"]\n    if username_to_follow == current_user:\n        return _err(\"CONFLICT\", \"Authenticated user cannot follow themselves.\", username=current_user)\n\n    if username_to_follow in S[\"following_list\"]:\n        return _err(\"CONFLICT\", \"Already following the specified user.\", username=current_user, following=username_to_follow)\n\n    # Mutate\n    S[\"following_list\"].append(username_to_follow)\n    # observable dynamics\n    S[\"random_seed\"] = int(S.get(\"random_seed\", 0)) + 1\n    _save(\"state.json\", S)\n\n    latency_ms = int((datetime.datetime.utcnow() - started).total_seconds() * 1000)\n    return {\n        \"username\": current_user,\n        \"following\": username_to_follow,\n        \"following_list\": list(S[\"following_list\"]),\n        \"latency_ms\": latency_ms\n    }\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "get_tweet",
+          "description": "Retrieves and returns the tweet matching the provided tweet_id, including its stored metadata in the service’s working set. Refuses requests when tweet_id is missing/invalid or when no tweet with that ID exists. It also refuses access if the tweet is not available in the current working set for retrieval.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "tweet_id": {
+                "type": "integer",
+                "description": "ID of the tweet to retrieve."
+              }
+            },
+            "required": [
+              "tweet_id"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0546000\" if __import__(\"os\").path.isdir(\"./environment_mix/0546000\") else \"/app/database\")\ndef get_tweet(tweet_id):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    tweets = _S.get(\"tweets\", {})\n    if str(tweet_id) not in tweets:\n        return {\"error\": f\"Tweet with ID {tweet_id} not found.\"}\n    return tweets[str(tweet_id)]\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_tweet_comments",
+          "description": "Returns the list of comments associated with the specified tweet_id. Refuses requests when tweet_id is missing/invalid or when the tweet does not exist. It also refuses the request if the tweet is not available in the current working set for comment lookup.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "tweet_id": {
+                "type": "integer",
+                "description": "ID of the tweet to retrieve comments for."
+              }
+            },
+            "required": [
+              "tweet_id"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0546000\" if __import__(\"os\").path.isdir(\"./environment_mix/0546000\") else \"/app/database\")\ndef get_tweet_comments(tweet_id):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    if str(tweet_id) not in _S.get(\"tweets\", {}):\n        return {\"error\": f\"Tweet with ID {tweet_id} not found.\"}\n    comments = _S.get(\"comments\", {})\n    return comments.get(str(tweet_id), [])\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_user_stats",
+          "description": "Returns basic statistics for the specified username, such as counts derived from the service’s local working set (for example tweets and follow relationships tracked by the integration). Refuses requests when username is missing/empty or does not correspond to a known user. It also refuses if the user is not available in the current working set for stats computation.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "username": {
+                "type": "string",
+                "description": "Username of the user to get statistics for."
+              }
+            },
+            "required": [
+              "username"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0546000\" if __import__(\"os\").path.isdir(\"./environment_mix/0546000\") else \"/app/database\")\ndef get_user_stats(username):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    tweets = _S.get(\"tweets\", {})\n    tweet_count = len([t for t in tweets.values() if t.get(\"username\") == username])\n    following_count = len(_S.get(\"following_list\", [])) if username == _S.get(\"username\") else 0\n    retweet_count = len(_S.get(\"retweets\", {}).get(username, []))\n    return {\"tweet_count\": tweet_count, \"following_count\": following_count, \"retweet_count\": retweet_count}\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_user_tweets",
+          "description": "Retrieves and returns all tweets authored by the specified username that are present in the service’s working set. Refuses requests when username is missing/empty or does not correspond to a known user. It also refuses if the user’s tweets are not available in the current working set for listing.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "username": {
+                "type": "string",
+                "description": "Username of the user whose tweets to retrieve."
+              }
+            },
+            "required": [
+              "username"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0546000\" if __import__(\"os\").path.isdir(\"./environment_mix/0546000\") else \"/app/database\")\ndef get_user_tweets(username):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    return [t for t in _S.get(\"tweets\", {}).values() if t.get(\"username\") == username]\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_all_following",
+          "description": "Lists and returns all users the currently authenticated user is following. Refuses requests when no user is authenticated. It may also refuse if the authenticated user is not available in the current working set for follow listing.",
+          "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0546000\" if __import__(\"os\").path.isdir(\"./environment_mix/0546000\") else \"/app/database\")\ndef list_all_following():\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    if not _S.get(\"authenticated\"):\n        return {\"error\": \"User not authenticated. Please authenticate before listing following.\"}\n    return {\"following_list\": _S.get(\"following_list\", [])}\n",
+          "description_restored": true
+        },
+        {
+          "name": "mention",
+          "description": "Adds the provided mentioned_usernames as mentions on the specified tweet and returns the updated tweet (or its updated mention list). Refuses requests when no user is authenticated, when the tweet_id does not exist, or when mentioned_usernames is empty or contains empty values. It also refuses mentions for usernames that do not exist, and refuses updates when the tweet is not available in the current working set or cannot be modified.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "tweet_id": {
+                "type": "integer",
+                "description": "ID of the tweet where users are mentioned."
+              },
+              "mentioned_usernames": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of usernames to be mentioned."
+              }
+            },
+            "required": [
+              "tweet_id",
+              "mentioned_usernames"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0546000\" if __import__(\"os\").path.isdir(\"./environment_mix/0546000\") else \"/app/database\")\ndef mention(tweet_id, mentioned_usernames):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    if str(tweet_id) not in _S.get(\"tweets\", {}):\n        return {\"error\": f\"Tweet with ID {tweet_id} not found.\"}\n    return {\"mention_status\": \"Users mentioned successfully\"}\n",
+          "description_restored": true
+        },
+        {
+          "name": "post_tweet",
+          "description": "Creates a new tweet authored by the currently authenticated user and returns the created tweet with its assigned identifier and stored fields. Refuses requests when no user is authenticated or when content is empty or only whitespace. It also refuses tags that are not formatted as hashtags (must start with '#') and mentions that are not formatted as @-mentions (must start with '@'), and may refuse if referenced users are not available in the current working set.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "content": {
+                "type": "string",
+                "description": "Content of the tweet."
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of tags for the tweet. Tag name should start with #. This is only relevant if the user wants to add tags to the tweet.",
+                "default": []
+              },
+              "mentions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of users mentioned in the tweet. Mention name should start with @. This is only relevant if the user wants to add mentions to the tweet.",
+                "default": []
+              }
+            },
+            "required": [
+              "content"
+            ]
+          },
+          "implementation": "def post_tweet(content, tags=None, mentions=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0546000\" if __import__(\"os\").path.isdir(\"./environment_mix/0546000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started = datetime.datetime.utcnow()\n\n    S = _load(\"state.json\")\n    if not isinstance(S, dict):\n        return _err(\"UNAUTHORIZED\", \"No valid session context is available.\")\n\n    if S.get(\"authenticated\") is not True or not isinstance(S.get(\"username\"), str) or not S.get(\"username\"):\n        return _err(\"UNAUTHORIZED\", \"No user is authenticated.\")\n\n    if not isinstance(content, str):\n        return _err(\"VALIDATION_ERROR\", \"content must be a string.\")\n    if not content.strip():\n        return _err(\"VALIDATION_ERROR\", \"content cannot be empty or whitespace.\")\n\n    if tags is None:\n        tags = []\n    if mentions is None:\n        mentions = []\n\n    if not isinstance(tags, list) or any(not isinstance(x, str) for x in tags):\n        return _err(\"VALIDATION_ERROR\", \"tags must be an array of strings.\")\n    if not isinstance(mentions, list) or any(not isinstance(x, str) for x in mentions):\n        return _err(\"VALIDATION_ERROR\", \"mentions must be an array of strings.\")\n\n    bad_tags = [t for t in tags if not t.startswith(\"#\")]\n    if bad_tags:\n        return _err(\"VALIDATION_ERROR\", \"All tags must start with '#'.\", invalid_tags=bad_tags)\n\n    bad_mentions = [m for m in mentions if not m.startswith(\"@\")]\n    if bad_mentions:\n        return _err(\"VALIDATION_ERROR\", \"All mentions must start with '@'.\", invalid_mentions=bad_mentions)\n\n    if \"tweets\" not in S or not isinstance(S.get(\"tweets\"), dict):\n        S[\"tweets\"] = {}\n    if \"tweet_counter\" not in S or not isinstance(S.get(\"tweet_counter\"), int):\n        S[\"tweet_counter\"] = 0\n\n    # Allocate id\n    next_id = int(S[\"tweet_counter\"])\n    # Ensure uniqueness if store was edited\n    while str(next_id) in S[\"tweets\"] or next_id in S[\"tweets\"]:\n        next_id += 1\n\n    tweet = {\n        \"id\": next_id,\n        \"username\": S[\"username\"],\n        \"content\": content,\n        \"tags\": list(tags),\n        \"mentions\": list(mentions)\n    }\n\n    # Persist with string key (JSON object keys are strings)\n    S[\"tweets\"][str(next_id)] = tweet\n    S[\"tweet_counter\"] = next_id + 1\n    # observable dynamics\n    S[\"random_seed\"] = int(S.get(\"random_seed\", 0)) + 1\n\n    _save(\"state.json\", S)\n\n    latency_ms = int((datetime.datetime.utcnow() - started).total_seconds() * 1000)\n    out = dict(tweet)\n    out[\"latency_ms\"] = latency_ms\n    return out\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "posting_get_login_status",
+          "description": "Returns whether there is an authenticated session currently active, and, when logged in, identifies the current user for this session. It refuses requests only when the session state cannot be read or has been invalidated, in which case it reports that no valid login context is available.",
+          "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+          },
+          "implementation": "def posting_get_login_status(**_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0546000\" if __import__(\"os\").path.isdir(\"./environment_mix/0546000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started = datetime.datetime.utcnow()\n\n    S = _load(\"state.json\")\n    if not isinstance(S, dict):\n        return _err(\"UNAUTHORIZED\", \"Session state cannot be read or is invalidated.\")\n\n    # observable dynamics: advance random_seed on every call\n    if not isinstance(S.get(\"random_seed\"), int):\n        S[\"random_seed\"] = 0\n    S[\"random_seed\"] = int(S[\"random_seed\"]) + 1\n    _save(\"state.json\", S)\n\n    logged_in = bool(S.get(\"authenticated\") is True and isinstance(S.get(\"username\"), str) and S.get(\"username\"))\n    latency_ms = int((datetime.datetime.utcnow() - started).total_seconds() * 1000)\n    return {\n        \"login_status\": logged_in,\n        \"username\": S.get(\"username\") if logged_in else None,\n        \"latency_ms\": latency_ms\n    }\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "retweet",
+          "description": "Retweets the specified tweet as the authenticated user and returns the resulting retweet/interaction state for that tweet. It refuses requests when no user is logged in, when the tweet_id is missing or not a valid integer identifier, when the target tweet cannot be found, or when the user is not allowed to retweet it. It also refuses the request if the tweet has already been retweeted by the authenticated user or if the tweet’s state prevents retweeting (for example, deleted).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "tweet_id": {
+                "type": "integer",
+                "description": "ID of the tweet to retweet."
+              }
+            },
+            "required": [
+              "tweet_id"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0546000\" if __import__(\"os\").path.isdir(\"./environment_mix/0546000\") else \"/app/database\")\ndef retweet(tweet_id):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    if not _S.get(\"authenticated\"):\n        return {\"error\": \"User not authenticated. Please authenticate before retweeting.\"}\n    tweets = _S.get(\"tweets\", {})\n    if str(tweet_id) not in tweets:\n        return {\"error\": f\"Tweet with ID {tweet_id} not found.\"}\n    retweets = _S.get(\"retweets\", {}).get(_S.get(\"username\"), [])\n    if tweet_id in retweets:\n        return {\"retweet_status\": \"Already retweeted\"}\n    return {\"retweet_status\": \"Successfully retweeted\"}\n",
+          "description_restored": true
+        },
+        {
+          "name": "search_tweets",
+          "description": "Searches the service’s accessible tweet set for tweets whose content matches the provided keyword and returns the matching tweets. It refuses requests when the keyword is missing, empty, or not a string, or when the keyword is too broad to execute under service limits. It may also refuse searches when there is no authenticated session and the service is configured to require login for searching.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "keyword": {
+                "type": "string",
+                "description": "Keyword to search for in the content of the tweets."
+              }
+            },
+            "required": [
+              "keyword"
+            ]
+          },
+          "implementation": "def search_tweets(keyword, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0546000\" if __import__(\"os\").path.isdir(\"./environment_mix/0546000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started = datetime.datetime.utcnow()\n\n    if not isinstance(keyword, str):\n        return _err(\"VALIDATION_ERROR\", \"keyword must be a string.\")\n    kw = keyword.strip()\n    if not kw:\n        return _err(\"VALIDATION_ERROR\", \"keyword cannot be empty.\")\n    # simple \"too broad\" guard\n    if len(kw) < 2:\n        return _err(\"VALIDATION_ERROR\", \"keyword is too broad to execute under service limits.\")\n\n    S = _load(\"state.json\")\n    if not isinstance(S, dict):\n        return _err(\"UNAUTHORIZED\", \"Session state cannot be read or is invalidated.\")\n\n    tweets_obj = S.get(\"tweets\")\n    if not isinstance(tweets_obj, dict):\n        tweets_obj = {}\n\n    kw_low = kw.lower()\n    matches = []\n    for _, t in tweets_obj.items():\n        if not isinstance(t, dict):\n            continue\n        content = t.get(\"content\", \"\")\n        tags = t.get(\"tags\", [])\n        if not isinstance(content, str):\n            content = str(content)\n        if not isinstance(tags, list):\n            tags = []\n        in_content = kw_low in content.lower()\n        in_tags = any(kw_low in str(tag).lower() for tag in tags)\n        if in_content or in_tags:\n            matches.append(t)\n\n    # observable dynamics\n    if not isinstance(S.get(\"random_seed\"), int):\n        S[\"random_seed\"] = 0\n    S[\"random_seed\"] = int(S[\"random_seed\"]) + 1\n    _save(\"state.json\", S)\n\n    latency_ms = int((datetime.datetime.utcnow() - started).total_seconds() * 1000)\n    return {\n        \"keyword\": kw,\n        \"total\": len(matches),\n        \"tweets\": matches,\n        \"latency_ms\": latency_ms\n    }\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "unfollow_user",
+          "description": "Stops the authenticated user from following the specified username and returns the updated follow relationship status. It refuses requests when no user is logged in, when username_to_unfollow is missing or empty, when the target user does not exist, or when the request attempts to unfollow the current user. It also refuses the request if the authenticated user is not currently following that account or if the relationship cannot be changed due to account state or restrictions.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "username_to_unfollow": {
+                "type": "string",
+                "description": "Username of the user to unfollow."
+              }
+            },
+            "required": [
+              "username_to_unfollow"
+            ]
+          },
+          "implementation": "def unfollow_user(username_to_unfollow, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0546000\" if __import__(\"os\").path.isdir(\"./environment_mix/0546000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started = datetime.datetime.utcnow()\n\n    S = _load(\"state.json\")\n    if not isinstance(S, dict):\n        return _err(\"UNAUTHORIZED\", \"No valid session context is available.\")\n\n    if S.get(\"following_list\") is None or not isinstance(S.get(\"following_list\"), list):\n        S[\"following_list\"] = []\n\n    if S.get(\"authenticated\") is not True or not isinstance(S.get(\"username\"), str) or not S.get(\"username\"):\n        return _err(\"UNAUTHORIZED\", \"No user is authenticated.\")\n\n    if not isinstance(username_to_unfollow, str) or not username_to_unfollow.strip():\n        return _err(\"VALIDATION_ERROR\", \"Missing/empty username_to_unfollow.\")\n    username_to_unfollow = username_to_unfollow.strip()\n\n    # Existence check: known users derived similarly as follow_user\n    known_users = set()\n    if isinstance(S.get(\"username\"), str) and S.get(\"username\"):\n        known_users.add(S[\"username\"])\n    if isinstance(S.get(\"tweets\"), dict):\n        for t in S[\"tweets\"].values():\n            if isinstance(t, dict) and isinstance(t.get(\"username\"), str) and t.get(\"username\"):\n                known_users.add(t[\"username\"])\n\n    if username_to_unfollow not in known_users:\n        return _err(\"NOT_FOUND\", \"Target user does not exist.\", username=username_to_unfollow)\n\n    current_user = S[\"username\"]\n    if username_to_unfollow == current_user:\n        return _err(\"CONFLICT\", \"Authenticated user cannot unfollow themselves.\", username=current_user)\n\n    if username_to_unfollow not in S[\"following_list\"]:\n        return _err(\"CONFLICT\", \"Not currently following the specified user.\", username=current_user, following=username_to_unfollow)\n\n    # Mutate\n    S[\"following_list\"] = [u for u in S[\"following_list\"] if u != username_to_unfollow]\n    # observable dynamics\n    S[\"random_seed\"] = int(S.get(\"random_seed\", 0)) + 1\n    _save(\"state.json\", S)\n\n    latency_ms = int((datetime.datetime.utcnow() - started).total_seconds() * 1000)\n    return {\n        \"username\": current_user,\n        \"unfollowed\": username_to_unfollow,\n        \"following_list\": list(S[\"following_list\"]),\n        \"latency_ms\": latency_ms\n    }\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0546000",
+    "index": 546,
+    "name": "Bluefin Social Console",
+    "description": "Provides authenticated microblogging integration with session state and APIs to post, retrieve, search, and interact with posts, replies, mentions, reposts, and follow relationships.",
+    "taxonomy": {
+      "L1_id": "L1-03",
+      "L1_name": "Social Media & Community",
+      "L1_name_zh": "社交媒体与社区",
+      "L2_id": "L2-06",
+      "L2_name": "Social Network Integration",
+      "L2_name_zh": "社交网络集成",
+      "L3_name": "Microblogging & Social Graph (X/Bluesky)",
+      "L3_name_zh": "微博与社交图谱（X/Bluesky）"
+    },
+    "database_dir": "./environment_mix/0546000",
+    "mount_path": "/app/database",
+    "n_tools": 14,
+    "n_collections": 1,
+    "n_records": 9,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 14,
+      "loaded": 14,
+      "reads_returning_data": 9,
+      "read_operations": 10,
+      "mutations_persisted": 4,
+      "mutations_attempted": 4
+    },
+    "tools_loadable_from_database_dir": 14,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_tweet",
+      "returned_chars": 120
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

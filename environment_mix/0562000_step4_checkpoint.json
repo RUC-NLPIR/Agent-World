@@ -1,0 +1,161 @@
+{
+  "index": 562,
+  "local_files_dir": "./environment_mix/0562000",
+  "file_list": [
+    "./environment_mix/0562000/README.md",
+    "./environment_mix/0562000/files.json",
+    "./environment_mix/0562000/shares.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "files.json": "Array of files (file_id, name, size_kb, owner, folder, modified).",
+        "shares.json": "Array of file shares (share_id, file_id, shared_with, permission).",
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "list_files",
+          "description": "Lists file metadata entries, optionally narrowed to a specific folder path and/or a specific owner email, and returns the matching collection. Refuses requests where provided filters are not valid strings or where the folder value is not a usable path filter for this service. Refuses owner filters that are not a valid email value.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "folder": {
+                "type": "string",
+                "description": "Optional folder path filter."
+              },
+              "owner": {
+                "type": "string",
+                "description": "Optional owner email filter."
+              }
+            }
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0562000\" if __import__(\"os\").path.isdir(\"./environment_mix/0562000\") else \"/app/database\")\ndef list_files(folder=None, owner=None):\n    import json\n    with open(__import__(\"os\").path.join(_DB, 'files.json')) as f:\n        fs = json.load(f)\n    if folder:\n        fs = [x for x in fs if x.get('folder') == folder]\n    if owner:\n        fs = [x for x in fs if x.get('owner') == owner]\n    return fs",
+          "description_restored": true
+        },
+        {
+          "name": "get_file",
+          "description": "Retrieves the metadata for a single file by file_id and returns it; if no such file exists, it returns an explicit “not found” result rather than file data. Refuses requests missing file_id or where file_id is not a non-empty string. Refuses malformed identifiers that cannot be interpreted as a file id in this system.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "file_id": {
+                "type": "string",
+                "description": "File id."
+              }
+            },
+            "required": [
+              "file_id"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0562000\" if __import__(\"os\").path.isdir(\"./environment_mix/0562000\") else \"/app/database\")\ndef get_file(file_id):\n    import json\n    with open(__import__(\"os\").path.join(_DB, 'files.json')) as f:\n        fs = json.load(f)\n    for x in fs:\n        if x.get('file_id') == file_id:\n            return x\n    return {'found': False, 'file_id': file_id}",
+          "description_restored": true
+        },
+        {
+          "name": "search_files",
+          "description": "Searches file metadata by filename, returning files whose name contains the provided query substring case-insensitively. Refuses requests missing query or where query is not a non-empty string. Refuses queries that are only whitespace or otherwise not usable as a search term.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Filename substring."
+              }
+            },
+            "required": [
+              "query"
+            ]
+          },
+          "implementation": "def search_files(query, **_extra):\n    import json, os, datetime, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0562000\" if __import__(\"os\").path.isdir(\"./environment_mix/0562000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    ts = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # Load/create usage log collection (not declared in schema, but required for observable service dynamics)\n    usage_name = \"usage.json\"\n    usage = _load(usage_name)\n    if not isinstance(usage, dict):\n        usage = {}\n    if \"requests\" not in usage or not isinstance(usage.get(\"requests\"), list):\n        usage[\"requests\"] = []\n    if \"counters\" not in usage or not isinstance(usage.get(\"counters\"), dict):\n        usage[\"counters\"] = {}\n    usage[\"counters\"].setdefault(\"total_requests\", 0)\n    usage[\"counters\"].setdefault(\"search_files_requests\", 0)\n\n    def _log(status, error_code=None, **extra):\n        latency_ms = int((time.time() - t0) * 1000)\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"counters\"][\"search_files_requests\"] += 1\n        rec = {\n            \"timestamp\": ts,\n            \"endpoint\": \"search_files\",\n            \"status\": status,\n            \"latency_ms\": latency_ms,\n        }\n        if error_code:\n            rec[\"error_code\"] = error_code\n        rec.update(extra)\n        usage[\"requests\"].append(rec)\n        _save(usage_name, usage)\n\n    # Rate limit enforcement (simple sliding window over usage log)\n    # Limit: 120 requests / 60 seconds (service-global in this local store)\n    try:\n        now = datetime.datetime.utcnow()\n        window_s = 60\n        limit = 120\n        recent = 0\n        for r in reversed(usage[\"requests\"]):\n            rts = r.get(\"timestamp\")\n            if not isinstance(rts, str):\n                continue\n            try:\n                rt = datetime.datetime.fromisoformat(rts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                continue\n            if (now - rt).total_seconds() <= window_s:\n                recent += 1\n                if recent >= limit:\n                    _log(\"error\", \"RATE_LIMIT\", reason=\"Too many requests\", window_seconds=window_s, limit=limit)\n                    return _err(\"RATE_LIMIT\", \"Too many requests, please slow down.\", window_seconds=window_s, limit=limit)\n            else:\n                break\n    except Exception:\n        # If rate limit parsing fails due to malformed historical rows, don't block valid requests.\n        pass\n\n    # Validate input\n    if query is None or not isinstance(query, str):\n        _log(\"error\", \"VALIDATION_ERROR\", reason=\"query must be a non-empty string\")\n        return _err(\"VALIDATION_ERROR\", \"Missing or invalid 'query'. It must be a non-empty string.\")\n    if query.strip() == \"\":\n        _log(\"error\", \"VALIDATION_ERROR\", reason=\"query cannot be only whitespace\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid 'query'. It cannot be empty or only whitespace.\")\n\n    q = query.strip().lower()\n\n    # Load files collection\n    files_doc = _load(\"files.json\")\n    if isinstance(files_doc, dict) and isinstance(files_doc.get(\"rows\"), list):\n        files_rows = files_doc[\"rows\"]\n    elif isinstance(files_doc, list):\n        files_rows = files_doc\n    else:\n        files_rows = []\n\n    # Search\n    matches = []\n    for row in files_rows:\n        if not isinstance(row, dict):\n            continue\n        name = row.get(\"name\", \"\")\n        if isinstance(name, str) and q in name.lower():\n            matches.append(row)\n\n    resp = {\n        \"data\": matches,\n        \"meta\": {\n            \"query\": query,\n            \"total\": len(matches),\n            \"has_more\": False,\n            \"next_cursor\": None,\n        },\n    }\n    _log(\"ok\", returned=len(matches))\n    return resp\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "list_file_shares",
+          "description": "Lists share grants, either for a specific file when file_id is provided or across all files when it is omitted, returning the matching grants. Refuses requests where file_id is provided but is not a non-empty string. Refuses a file_id filter that does not correspond to a recognizable file identifier for this service.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "file_id": {
+                "type": "string",
+                "description": "Optional file id filter."
+              }
+            }
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0562000\" if __import__(\"os\").path.isdir(\"./environment_mix/0562000\") else \"/app/database\")\ndef list_file_shares(file_id=None):\n    import json\n    with open(__import__(\"os\").path.join(_DB, 'shares.json')) as f:\n        ss = json.load(f)\n    if file_id:\n        ss = [s for s in ss if s.get('file_id') == file_id]\n    return ss",
+          "description_restored": true
+        },
+        {
+          "name": "share_file",
+          "description": "Creates a share grant for the given file_id to the recipient email in shared_with, optionally with the specified permission, and returns the newly created grant. Refuses requests missing file_id or shared_with, where either value is empty or not a string, or where shared_with is not a valid email. Refuses requests with an unsupported permission value, attempts to share a file that does not exist, or attempts that conflict with an existing identical grant for the same file and recipient.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "file_id": {
+                "type": "string",
+                "description": "File id."
+              },
+              "shared_with": {
+                "type": "string",
+                "description": "Recipient email."
+              },
+              "permission": {
+                "type": "string",
+                "enum": [
+                  "view",
+                  "edit"
+                ],
+                "description": "Permission level."
+              }
+            },
+            "required": [
+              "file_id",
+              "shared_with"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0562000\" if __import__(\"os\").path.isdir(\"./environment_mix/0562000\") else \"/app/database\")\ndef share_file(file_id, shared_with, permission='view'):\n    import json\n    with open(__import__(\"os\").path.join(_DB, 'files.json')) as f:\n        fs = json.load(f)\n    exists = any(x.get('file_id') == file_id for x in fs)\n    return {'status': 'shared' if exists else 'file_not_found', 'grant': {'file_id': file_id, 'shared_with': shared_with, 'permission': permission}}",
+          "description_restored": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0562000",
+    "index": 562,
+    "name": "LatticeFile ShareHub",
+    "description": "A backend service for listing and searching file metadata and managing user-to-user file sharing permissions.",
+    "taxonomy": {
+      "L1_id": "L1-10",
+      "L1_name": "Data Storage & Databases",
+      "L1_name_zh": "数据存储与数据库",
+      "L2_id": "L2-27",
+      "L2_name": "Memory & Knowledge Management",
+      "L2_name_zh": "记忆与知识管理",
+      "L3_name": "Workspace Docs & Notes",
+      "L3_name_zh": "工作空间文档与笔记"
+    },
+    "database_dir": "./environment_mix/0562000",
+    "mount_path": "/app/database",
+    "n_tools": 5,
+    "n_collections": 2,
+    "n_records": 200,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 5,
+      "loaded": 5,
+      "reads_returning_data": 5,
+      "read_operations": 5,
+      "mutations_persisted": 0,
+      "mutations_attempted": 0
+    },
+    "tools_loadable_from_database_dir": 5,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_files",
+      "returned_chars": 158
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

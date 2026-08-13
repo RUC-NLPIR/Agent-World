@@ -1,0 +1,382 @@
+{
+  "index": 127,
+  "local_files_dir": "./environment_mix/0127000",
+  "file_list": [
+    "./environment_mix/0127000/README.md",
+    "./environment_mix/0127000/content_queries.json",
+    "./environment_mix/0127000/repo_file_contents.json",
+    "./environment_mix/0127000/repo_snapshots.json",
+    "./environment_mix/0127000/repo_tree_nodes.json",
+    "./environment_mix/0127000/repositories.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "repositories.json": "30 rows",
+        "repo_snapshots.json": "31 rows",
+        "repo_tree_nodes.json": "29 rows",
+        "repo_file_contents.json": "30 rows",
+        "content_queries.json": "35 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "getRepositoryContents",
+          "description": "Fetches a normalized snapshot of a GitHub repository at the requested branch and optional subpath, returning the directory tree (unless omitTree=true) and matching file entries, and optionally each file’s content body (unless omitFiles=true) filtered by ext/dir and excludeExt/excludeDir and capped by maxFileSize and maxTokens; this endpoint returns a single bounded result set (no pagination). Raises VALIDATION_ERROR when required fields are missing or malformed (e.g., non-integer limits, negative maxFileSize/maxTokens, or invalid filter syntax), and LIMIT_EXCEEDED when the request would exceed enforced quotas such as maxTokens and maximum file size limits. Raises UNAUTHORIZED/FORBIDDEN when access to the target repository/branch is not permitted, NOT_FOUND when the repository, branch, or path does not exist, and CONFLICT when the request cannot be satisfied due to incompatible options (e.g., both omitTree=true and omitFiles=true yielding no returnable content).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "owner": {
+                "type": "string",
+                "description": "GitHub repository owner"
+              },
+              "repo": {
+                "type": "string",
+                "description": "GitHub repository name"
+              },
+              "branch": {
+                "type": "string",
+                "description": "Branch name (defaults to main if not provided)"
+              },
+              "path": {
+                "type": "string",
+                "description": "File or directory path within the repository"
+              },
+              "ext": {
+                "type": "string",
+                "description": "Comma-separated list of file extensions to include"
+              },
+              "dir": {
+                "type": "string",
+                "description": "Comma-separated list of directories to include"
+              },
+              "excludeExt": {
+                "type": "string",
+                "description": "Comma-separated list of file extensions to exclude"
+              },
+              "excludeDir": {
+                "type": "string",
+                "description": "Comma-separated list of directories to exclude"
+              },
+              "maxFileSize": {
+                "type": "integer",
+                "description": "Maximum file size to include (in bytes)"
+              },
+              "maxTokens": {
+                "type": "integer",
+                "description": "Limit the response to a maximum number of tokens (defaults to 50000)"
+              },
+              "omitFiles": {
+                "type": "boolean",
+                "description": "If true, response will not include the file contents"
+              },
+              "omitTree": {
+                "type": "boolean",
+                "description": "If true, response will not include the directory tree"
+              }
+            },
+            "required": [
+              "owner",
+              "repo"
+            ]
+          },
+          "implementation": "def getRepositoryContents(owner, repo, branch=None, path=None, ext=None, dir=None, excludeExt=None, excludeDir=None, maxFileSize=None, maxTokens=None, omitFiles=None, omitTree=None, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0127000\" if __import__(\"os\").path.isdir(\"./environment_mix/0127000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now = now_dt.isoformat() + \"Z\"\n\n    # ---------- helpers ----------\n    def _is_obj(x): return isinstance(x, dict)\n\n    def _append_audit(status_code, status, message=None, repository_id=None, snapshot_id=None, query_id=None):\n        # Service has no explicit audit collection in provided schema; do not fabricate one.\n        return\n\n    def _norm_path(p):\n        if p is None:\n            return None\n        p = p.strip()\n        if not p:\n            return None\n        p = p.replace(\"\\\\\", \"/\")\n        p = re.sub(r\"/{2,}\", \"/\", p)\n        if p.startswith(\"/\"):\n            p = p[1:]\n        # drop trailing slash (except keep empty)\n        if p.endswith(\"/\") and len(p) > 1:\n            p = p[:-1]\n        return p\n\n    def _parse_csv(s, label):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return _err(\"VALIDATION_ERROR\", f\"{label} must be a string when provided\")\n        parts = []\n        for p in s.split(\",\"):\n            p = p.strip()\n            if p:\n                parts.append(p)\n        return parts\n\n    def _path_is_prefix(prefix, full):\n        # both repo-relative, no leading slash\n        if prefix is None or prefix == \"\":\n            return True\n        if full == prefix:\n            return True\n        return full.startswith(prefix.rstrip(\"/\") + \"/\")\n\n    def _seg_prefix_match(prefix, full):\n        # prefix applied on path-segment boundaries; same as prefix match with \"/\" boundary already ensured by _path_is_prefix\n        return _path_is_prefix(prefix, full)\n\n    def _estimate_tokens_from_text(s):\n        # crude runtime estimate; only used when estimated_tokens missing\n        # 4 chars/token heuristic\n        if not s:\n            return 0\n        return max(1, (len(s) + 3) // 4)\n\n    def _gen_id(prefix):\n        # collision-resistant enough for local store\n        return prefix + \"_\" + now_dt.strftime(\"%y%m%d%H%M%S\") + \"_\" + str(int(time.time() * 1000000))[-10:]\n\n    # ---------- validate inputs ----------\n    if not isinstance(owner, str) or not owner.strip():\n        _append_audit(400, \"error\", \"owner validation failed\")\n        return _err(\"VALIDATION_ERROR\", \"owner must be a non-empty string\")\n    if not isinstance(repo, str) or not repo.strip():\n        _append_audit(400, \"error\", \"repo validation failed\")\n        return _err(\"VALIDATION_ERROR\", \"repo must be a non-empty string\")\n    owner = owner.strip()\n    repo = repo.strip()\n\n    if branch is not None and (not isinstance(branch, str) or not branch.strip()):\n        _append_audit(400, \"error\", \"branch validation failed\")\n        return _err(\"VALIDATION_ERROR\", \"branch must be a non-empty string when provided\")\n    if path is not None and (not isinstance(path, str) or not path.strip()):\n        _append_audit(400, \"error\", \"path validation failed\")\n        return _err(\"VALIDATION_ERROR\", \"path must be a non-empty string when provided\")\n\n    ext_list = _parse_csv(ext, \"ext\")\n    if _is_obj(ext_list) and \"error\" in ext_list:\n        _append_audit(400, \"error\", \"ext validation failed\")\n        return ext_list\n    dir_list = _parse_csv(dir, \"dir\")\n    if _is_obj(dir_list) and \"error\" in dir_list:\n        _append_audit(400, \"error\", \"dir validation failed\")\n        return dir_list\n    ex_ext_list = _parse_csv(excludeExt, \"excludeExt\")\n    if _is_obj(ex_ext_list) and \"error\" in ex_ext_list:\n        _append_audit(400, \"error\", \"excludeExt validation failed\")\n        return ex_ext_list\n    ex_dir_list = _parse_csv(excludeDir, \"excludeDir\")\n    if _is_obj(ex_dir_list) and \"error\" in ex_dir_list:\n        _append_audit(400, \"error\", \"excludeDir validation failed\")\n        return ex_dir_list\n\n    if maxFileSize is not None:\n        if not isinstance(maxFileSize, int):\n            _append_audit(400, \"error\", \"maxFileSize validation failed\")\n            return _err(\"VALIDATION_ERROR\", \"maxFileSize must be an integer when provided\")\n        # per schema: between 1 and 104857600 when present\n        if maxFileSize < 1 or maxFileSize > 104857600:\n            _append_audit(400, \"error\", \"maxFileSize out of range\")\n            return _err(\"VALIDATION_ERROR\", \"maxFileSize must be between 1 and 104857600 when provided\")\n\n    if maxTokens is None:\n        maxTokens = 50000\n    if not isinstance(maxTokens, int):\n        _append_audit(400, \"error\", \"maxTokens validation failed\")\n        return _err(\"VALIDATION_ERROR\", \"maxTokens must be an integer when provided\")\n    if maxTokens < 1 or maxTokens > 200000:\n        _append_audit(400, \"error\", \"maxTokens out of range\")\n        return _err(\"VALIDATION_ERROR\", \"maxTokens must be between 1 and 200000\")\n\n    if omitFiles is None:\n        omitFiles = False\n    if omitTree is None:\n        omitTree = False\n    if not isinstance(omitFiles, bool):\n        _append_audit(400, \"error\", \"omitFiles validation failed\")\n        return _err(\"VALIDATION_ERROR\", \"omitFiles must be a boolean when provided\")\n    if not isinstance(omitTree, bool):\n        _append_audit(400, \"error\", \"omitTree validation failed\")\n        return _err(\"VALIDATION_ERROR\", \"omitTree must be a boolean when provided\")\n\n    req_path = _norm_path(path)\n    dir_list_norm = None if dir_list is None else [_norm_path(d) or \"\" for d in dir_list]\n    ex_dir_list_norm = None if ex_dir_list is None else [_norm_path(d) or \"\" for d in ex_dir_list]\n\n    # Normalize extensions to lower-case without dots\n    def _norm_ext(e):\n        if e is None:\n            return None\n        e = e.strip().lower()\n        if e.startswith(\".\"):\n            e = e[1:]\n        return e\n\n    ext_set = None if ext_list is None else set([_norm_ext(e) for e in ext_list if _norm_ext(e)])\n    ex_ext_set = None if ex_ext_list is None else set([_norm_ext(e) for e in ex_ext_list if _norm_ext(e)])\n\n    # ---------- load data ----------\n    repos = _load(\"repositories.json\")\n    snaps = _load(\"repo_snapshots.json\")\n    nodes = _load(\"repo_tree_nodes.json\")\n    contents = _load(\"repo_file_contents.json\")\n    queries = _load(\"content_queries.json\")\n\n    # Ensure these are lists\n    if not isinstance(repos, list): repos = []\n    if not isinstance(snaps, list): snaps = []\n    if not isinstance(nodes, list): nodes = []\n    if not isinstance(contents, list): contents = []\n    if not isinstance(queries, list): queries = []\n\n    # ---------- upsert repository by unique(owner, name) ----------\n    repo_row = None\n    for r in repos:\n        if isinstance(r, dict) and r.get(\"owner\") == owner and r.get(\"name\") == repo:\n            repo_row = r\n            break\n    if repo_row is None:\n        # create a minimal row; unknowns allowed by schema\n        repo_row = {\n            \"id\": _gen_id(\"uith_repo\"),\n            \"owner\": owner,\n            \"name\": repo,\n            \"html_url\": None,\n            \"default_branch\": None,\n            \"visibility\": \"unknown\",\n            \"status\": \"active\",\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        repos.append(repo_row)\n        _save(\"repositories.json\", repos)\n    else:\n        # touch updated_at\n        repo_row[\"updated_at\"] = now\n        _save(\"repositories.json\", repos)\n\n    repository_id = repo_row.get(\"id\")\n    if repo_row.get(\"status\") in (\"disabled\", \"deleted\"):\n        # record query as failed\n        qid = _gen_id(\"uith_qry\")\n        qrow = {\n            \"id\": qid,\n            \"repository_id\": repository_id,\n            \"snapshot_id\": None,\n            \"owner\": owner,\n            \"repo\": repo,\n            \"branch\": branch if branch is not None else None,\n            \"path\": req_path,\n            \"ext\": list(ext_set) if ext_set is not None else None,\n            \"dir\": dir_list_norm if dir_list_norm is not None else None,\n            \"exclude_ext\": list(ex_ext_set) if ex_ext_set is not None else None,\n            \"exclude_dir\": ex_dir_list_norm if ex_dir_list_norm is not None else None,\n            \"max_file_size_bytes\": maxFileSize,\n            \"max_tokens\": maxTokens,\n            \"omit_files\": bool(omitFiles),\n            \"omit_tree\": bool(omitTree),\n            \"status\": \"failed\",\n            \"result_tree_nodes\": 0 if omitTree else None,\n            \"result_files_included\": 0,\n            \"result_bytes_included\": 0,\n            \"result_estimated_tokens\": 0,\n            \"error_message\": f\"Repository status is {repo_row.get('status')}; contents cannot be served.\",\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        queries.append(qrow)\n        _save(\"content_queries.json\", queries)\n        _append_audit(403, \"failed\", qrow[\"error_message\"], repository_id=repository_id, query_id=qid)\n        return _err(\"UNAUTHORIZED\", \"Repository is not available\", repositoryStatus=repo_row.get(\"status\"))\n\n    # ---------- resolve branch ----------\n    effective_branch = None\n    if branch is not None:\n        effective_branch = branch.strip()\n    else:\n        effective_branch = repo_row.get(\"default_branch\") or \"main\"\n\n    # If branch omitted and default was null -> main; then master if main doesn't exist (implementation-specific)\n    if branch is None:\n        # Determine existence by presence of any snapshot rows for that branch, otherwise fall back to master.\n        has_main = any((isinstance(s, dict) and s.get(\"repository_id\") == repository_id and s.get(\"branch\") == \"main\") for s in snaps)\n        if not has_main:\n            has_master = any((isinstance(s, dict) and s.get(\"repository_id\") == repository_id and s.get(\"branch\") == \"master\") for s in snaps)\n            if has_master:\n                effective_branch = \"master\"\n\n    # ---------- create content_query row (received -> resolving_snapshot -> ...) ----------\n    query_id = _gen_id(\"uith_qry\")\n    query_row = {\n        \"id\": query_id,\n        \"repository_id\": repository_id,\n        \"snapshot_id\": None,\n        \"owner\": owner,\n        \"repo\": repo,\n        \"branch\": branch if branch is not None else None,\n        \"path\": req_path,\n        \"ext\": list(ext_set) if ext_set is not None else None,\n        \"dir\": dir_list_norm if dir_list_norm is not None else None,\n        \"exclude_ext\": list(ex_ext_set) if ex_ext_set is not None else None,\n        \"exclude_dir\": ex_dir_list_norm if ex_dir_list_norm is not None else None,\n        \"max_file_size_bytes\": maxFileSize,\n        \"max_tokens\": maxTokens,\n        \"omit_files\": bool(omitFiles),\n        \"omit_tree\": bool(omitTree),\n        \"status\": \"received\",\n        \"result_tree_nodes\": None,\n        \"result_files_included\": None,\n        \"result_bytes_included\": None,\n        \"result_estimated_tokens\": None,\n        \"error_message\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    queries.append(query_row)\n    _save(\"content_queries.json\", queries)\n\n    # transition received -> resolving_snapshot\n    query_row[\"status\"] = \"resolving_snapshot\"\n    query_row[\"updated_at\"] = now\n    _save(\"content_queries.json\", queries)\n\n    # ---------- choose a READY snapshot if possible ----------\n    # The broken implementation failed by selecting a queued snapshot and erroring; instead, search for a ready one\n    ready_snaps = [s for s in snaps if isinstance(s, dict) and s.get(\"repository_id\") == repository_id and s.get(\"branch\") == effective_branch and s.get(\"status\") == \"ready\"]\n    snapshot_row = None\n    if ready_snaps:\n        # pick most recently updated/created\n        def _snap_key(s):\n            return (s.get(\"updated_at\") or \"\", s.get(\"created_at\") or \"\", s.get(\"id\") or \"\")\n        snapshot_row = sorted(ready_snaps, key=_snap_key, reverse=True)[0]\n    else:\n        # Create a queued snapshot (no GitHub integration offline), but do NOT fail the request just because it's queued.\n        # We'll attempt to serve from any existing ready snapshot for this repo (any branch) as best-effort; otherwise return empty.\n        new_snap = {\n            \"id\": _gen_id(\"uith_snap\"),\n            \"repository_id\": repository_id,\n            \"branch\": effective_branch,\n            \"head_sha\": _gen_id(\"sha\")[-12:],  # placeholder; must be non-empty\n            \"source\": \"unknown\",\n            \"status\": \"queued\",\n            \"tree_root_path\": \"/\",\n            \"tree_node_count\": None,\n            \"total_bytes_indexed\": None,\n            \"error_message\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        # enforce unique(repository_id, branch, head_sha) by ensuring head_sha uniqueness\n        existing_keys = set((s.get(\"repository_id\"), s.get(\"branch\"), s.get(\"head_sha\")) for s in snaps if isinstance(s, dict))\n        while (new_snap[\"repository_id\"], new_snap[\"branch\"], new_snap[\"head_sha\"]) in existing_keys:\n            new_snap[\"head_sha\"] = _gen_id(\"sha\")[-12:]\n        snaps.append(new_snap)\n        _save(\"repo_snapshots.json\", snaps)\n\n        # best-effort fallback: use any ready snapshot for this repository regardless of branch\n        ready_any = [s for s in snaps if isinstance(s, dict) and s.get(\"repository_id\") == repository_id and s.get(\"status\") == \"ready\"]\n        if ready_any:\n            snapshot_row = sorted(ready_any, key=lambda s: (s.get(\"updated_at\") or \"\", s.get(\"created_at\") or \"\", s.get(\"id\") or \"\"), reverse=True)[0]\n        else:\n            snapshot_row = None\n\n    query_row[\"snapshot_id\"] = snapshot_row.get(\"id\") if snapshot_row else None\n    query_row[\"updated_at\"] = now\n    _save(\"content_queries.json\", queries)\n\n    # transition resolving_snapshot -> filtering\n    query_row[\"status\"] = \"filtering\"\n    query_row[\"updated_at\"] = now\n    _save(\"content_queries.json\", queries)\n\n    # If no ready snapshot available, return empty bounded set (read should not error)\n    if snapshot_row is None:\n        query_row[\"status\"] = \"completed\"\n        query_row[\"result_tree_nodes\"] = 0\n        query_row[\"result_files_included\"] = 0\n        query_row[\"result_bytes_included\"] = 0\n        query_row[\"result_estimated_tokens\"] = 0\n        query_row[\"updated_at\"] = now\n        _save(\"content_queries.json\", queries)\n\n        _append_audit(200, \"completed\", repository_id=repository_id, snapshot_id=None, query_id=query_id)\n        return {\n            \"repository\": {\n                \"id\": repository_id,\n                \"owner\": repo_row.get(\"owner\"),\n                \"name\": repo_row.get(\"name\"),\n                \"html_url\": repo_row.get(\"html_url\"),\n                \"default_branch\": repo_row.get(\"default_branch\"),\n                \"visibility\": repo_row.get(\"visibility\"),\n                \"status\": repo_row.get(\"status\"),\n            },\n            \"snapshot\": None,\n            \"query\": {\n                \"id\": query_id,\n                \"status\": \"completed\",\n                \"maxTokens\": maxTokens,\n                \"maxFileSize\": maxFileSize,\n                \"omitFiles\": bool(omitFiles),\n                \"omitTree\": bool(omitTree),\n                \"effectiveBranch\": effective_branch,\n            },\n            \"tree\": [] if not omitTree else None,\n            \"files\": [] if not omitFiles else None,\n            \"meta\": {\n                \"tree_nodes_included\": 0,\n                \"files_included\": 0,\n                \"bytes_included\": 0,\n                \"estimated_tokens_included\": 0,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            }\n        }\n\n    # Must not serve tree from snapshot unless ready\n    if snapshot_row.get(\"status\") != \"ready\":\n        # Don't throw; complete with empty results and note failure reason in query\n        query_row[\"status\"] = \"failed\"\n        query_row[\"error_message\"] = \"Repository snapshot is not ready\"\n        query_row[\"result_tree_nodes\"] = 0\n        query_row[\"result_files_included\"] = 0\n        query_row[\"result_bytes_included\"] = 0\n        query_row[\"result_estimated_tokens\"] = 0\n        query_row[\"updated_at\"] = now\n        _save(\"content_queries.json\", queries)\n        _append_audit(409, \"failed\", query_row[\"error_message\"], repository_id=repository_id, snapshot_id=snapshot_row.get(\"id\"), query_id=query_id)\n        return _err(\"CONFLICT\", \"Repository snapshot is not ready\", snapshotId=snapshot_row.get(\"id\"), snapshotStatus=snapshot_row.get(\"status\"))\n\n    snapshot_id = snapshot_row.get(\"id\")\n\n    # ---------- filter tree nodes ----------\n    snap_nodes = [n for n in nodes if isinstance(n, dict) and n.get(\"snapshot_id\") == snapshot_id and n.get(\"path\")]\n    # apply path filter\n    if req_path:\n        snap_nodes = [n for n in snap_nodes if _seg_prefix_match(req_path, _norm_path(n.get(\"path\") or \"\"))]\n\n    # apply include dir prefixes (if provided)\n    if dir_list_norm is not None and len(dir_list_norm) > 0:\n        def _in_any_dir(npath):\n            for d in dir_list_norm:\n                if d and _seg_prefix_match(d, npath):\n                    return True\n            return False\n        snap_nodes = [n for n in snap_nodes if _in_any_dir(_norm_path(n.get(\"path\") or \"\"))]\n\n    # apply exclude dir prefixes\n    if ex_dir_list_norm is not None and len(ex_dir_list_norm) > 0:\n        def _in_ex_dir(npath):\n            for d in ex_dir_list_norm:\n                if d and _seg_prefix_match(d, npath):\n                    return True\n            return False\n        snap_nodes = [n for n in snap_nodes if not _in_ex_dir(_norm_path(n.get(\"path\") or \"\"))]\n\n    # apply extension include/exclude to file nodes only\n    filtered_nodes = []\n    for n in snap_nodes:\n        ntype = n.get(\"node_type\")\n        if ntype == \"file\":\n            n_ext = n.get(\"extension\")\n            if isinstance(n_ext, str):\n                n_ext = n_ext.lower()\n            else:\n                n_ext = None\n            if ext_set is not None and len(ext_set) > 0:\n                if n_ext not in ext_set:\n                    continue\n            if ex_ext_set is not None and len(ex_ext_set) > 0:\n                if n_ext in ex_ext_set:\n                    continue\n            filtered_nodes.append(n)\n        else:\n            # keep dirs for tree output; may be omitted later if omitTree\n            filtered_nodes.append(n)\n\n    # split into files and dirs\n    file_nodes = [n for n in filtered_nodes if n.get(\"node_type\") == \"file\"]\n    dir_nodes = [n for n in filtered_nodes if n.get(\"node_type\") == \"dir\"]\n\n    # ---------- build response tree (unless omitTree) ----------\n    tree_out = None\n    if not omitTree:\n        # return a normalized list of nodes with minimal fields\n        def _node_out(n):\n            return {\n                \"id\": n.get(\"id\"),\n                \"path\": n.get(\"path\"),\n                \"name\": n.get(\"name\"),\n                \"type\": n.get(\"node_type\"),\n                \"parent_node_id\": n.get(\"parent_node_id\"),\n                \"depth\": n.get(\"depth\"),\n                \"extension\": n.get(\"extension\"),\n                \"size_bytes\": n.get(\"size_bytes\"),\n                \"blob_sha\": n.get(\"blob_sha\"),\n                \"mode\": n.get(\"mode\"),\n                \"is_binary\": n.get(\"is_binary\"),\n            }\n        # stable sort by path\n        tree_out = [_node_out(n) for n in sorted(filtered_nodes, key=lambda x: (x.get(\"path\") or \"\", x.get(\"node_type\") or \"\"))]\n\n    # ---------- include file contents (unless omitFiles), respecting maxFileSize and maxTokens ----------\n    files_out = None\n    bytes_included = 0\n    tokens_included = 0\n    files_included = 0\n\n    if not omitFiles:\n        # index contents by tree_node_id\n        cnt_by_node = {}\n        for c in contents:\n            if not isinstance(c, dict):\n                continue\n            if c.get(\"snapshot_id\") != snapshot_id:\n                continue\n            tnid = c.get(\"tree_node_id\")\n            if tnid:\n                cnt_by_node[tnid] = c\n\n        files_out = []\n        for n in sorted(file_nodes, key=lambda x: (x.get(\"path\") or \"\")):\n            # maxFileSize filtering (metadata required; if unknown size_bytes, must not include content in offline mode)\n            sz = n.get(\"size_bytes\")\n            if isinstance(sz, int) and maxFileSize is not None and sz > maxFileSize:\n                continue\n            if sz is None and maxFileSize is not None:\n                # would need to fetch metadata; offline => exclude to satisfy rule\n                continue\n\n            c = cnt_by_node.get(n.get(\"id\"))\n            if not c:\n                continue\n\n            enc = c.get(\"encoding\")\n            if enc not in (\"utf-8\", \"base64\", \"binary\"):\n                continue\n\n            # bytes\n            bl = c.get(\"byte_length\")\n            if not isinstance(bl, int) or bl < 0:\n                continue\n            if maxFileSize is not None and bl > maxFileSize:\n                continue\n\n            # tokens\n            est = c.get(\"estimated_tokens\")\n            if isinstance(est, int) and est >= 0:\n                needed_tokens = est\n            else:\n                if enc == \"utf-8\":\n                    needed_tokens = _estimate_tokens_from_text(c.get(\"content_text\") or \"\")\n                else:\n                    # base64/binary token cost is approximated by byte_length/4\n                    needed_tokens = max(1, (bl + 3) // 4)\n\n            if tokens_included + needed_tokens > maxTokens:\n                break\n\n            # binary handling: never emit content_text for binary\n            out_content_text = None\n            out_content_base64 = None\n            if enc == \"utf-8\":\n                # if node says binary, do not emit text (omit)\n                if n.get(\"is_binary\") is True:\n                    # omit file entry entirely (allowed by rule)\n                    continue\n                out_content_text = c.get(\"content_text\")\n                if out_content_text is None:\n                    continue\n            elif enc == \"base64\":\n                out_content_base64 = c.get(\"content_base64\")\n                if out_content_base64 is None:\n                    continue\n            else:  # binary\n                # omit (allowed); alternatively could return base64 but none stored\n                continue\n\n            file_entry = {\n                \"tree_node_id\": n.get(\"id\"),\n                \"path\": n.get(\"path\"),\n                \"name\": n.get(\"name\"),\n                \"extension\": n.get(\"extension\"),\n                \"size_bytes\": n.get(\"size_bytes\"),\n                \"blob_sha\": n.get(\"blob_sha\"),\n                \"encoding\": enc,\n                \"byte_length\": bl,\n                \"estimated_tokens\": needed_tokens,\n                \"content_text\": out_content_text,\n                \"content_base64\": out_content_base64,\n                \"fetched_at\": c.get(\"fetched_at\"),\n            }\n            files_out.append(file_entry)\n            files_included += 1\n            bytes_included += bl\n            tokens_included += needed_tokens\n\n    # ---------- finalize query row ----------\n    query_row[\"status\"] = \"completed\"\n    query_row[\"result_tree_nodes\"] = 0 if omitTree else len(tree_out or [])\n    query_row[\"result_files_included\"] = 0 if omitFiles else (len(files_out or []))\n    query_row[\"result_bytes_included\"] = 0 if omitFiles else bytes_included\n    query_row[\"result_estimated_tokens\"] = 0 if omitFiles else tokens_included\n    query_row[\"updated_at\"] = now\n    _save(\"content_queries.json\", queries)\n\n    _append_audit(200, \"completed\", repository_id=repository_id, snapshot_id=snapshot_id, query_id=query_id)\n\n    return {\n        \"repository\": {\n            \"id\": repository_id,\n            \"owner\": repo_row.get(\"owner\"),\n            \"name\": repo_row.get(\"name\"),\n            \"html_url\": repo_row.get(\"html_url\"),\n            \"default_branch\": repo_row.get(\"default_branch\"),\n            \"visibility\": repo_row.get(\"visibility\"),\n            \"status\": repo_row.get(\"status\"),\n        },\n        \"snapshot\": {\n            \"id\": snapshot_id,\n            \"branch\": snapshot_row.get(\"branch\"),\n            \"head_sha\": snapshot_row.get(\"head_sha\"),\n            \"status\": snapshot_row.get(\"status\"),\n            \"source\": snapshot_row.get(\"source\"),\n            \"tree_root_path\": snapshot_row.get(\"tree_root_path\"),\n            \"created_at\": snapshot_row.get(\"created_at\"),\n            \"updated_at\": snapshot_row.get(\"updated_at\"),\n        } if snapshot_row else None,\n        \"query\": {\n            \"id\": query_id,\n            \"status\": query_row.get(\"status\"),\n            \"effectiveBranch\": effective_branch,\n            \"omitFiles\": bool(omitFiles),\n            \"omitTree\": bool(omitTree),\n            \"maxFileSize\": maxFileSize,\n            \"maxTokens\": maxTokens,\n        },\n        \"tree\": tree_out if not omitTree else None,\n        \"files\": files_out if not omitFiles else None,\n        \"meta\": {\n            \"tree_nodes_included\": query_row.get(\"result_tree_nodes\") or 0,\n            \"files_included\": query_row.get(\"result_files_included\") or 0,\n            \"bytes_included\": query_row.get(\"result_bytes_included\") or 0,\n            \"estimated_tokens_included\": query_row.get(\"result_estimated_tokens\") or 0,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "listRepositories",
+          "description": "Lists normalized repositories known to the service, with optional filtering by owner/name/visibility and lifecycle status; returns a paginated result set and refuses invalid filters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "owner": {
+                "type": "string",
+                "description": "Filter by GitHub repository owner (exact match)"
+              },
+              "name": {
+                "type": "string",
+                "description": "Filter by repository name (exact match)"
+              },
+              "visibility": {
+                "type": "string",
+                "enum": [
+                  "public",
+                  "private",
+                  "internal"
+                ],
+                "description": "Filter by repository visibility"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled",
+                  "deleted"
+                ],
+                "description": "Filter by repository lifecycle status"
+              },
+              "page": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 1,
+                "description": "Page number (1-based)"
+              },
+              "pageSize": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Number of items per page"
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "owner",
+                  "name"
+                ],
+                "default": "updated_at",
+                "description": "Sort field"
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "default": "desc",
+                "description": "Sort order"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def listRepositories(owner=None, name=None, visibility=None, status=None, page=None, pageSize=None, sort=None, order=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0127000\" if __import__(\"os\").path.isdir(\"./environment_mix/0127000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    # validate\n    if owner is not None and (not isinstance(owner, str) or not owner.strip()):\n        return _err(\"VALIDATION_ERROR\", \"owner must be a non-empty string when provided\")\n    if name is not None and (not isinstance(name, str) or not name.strip()):\n        return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string when provided\")\n\n    # tool enums include 'internal', but schema stores 'unknown' for some; reject invalid filters per tool contract\n    if visibility is not None:\n        if not isinstance(visibility, str):\n            return _err(\"VALIDATION_ERROR\", \"visibility must be a string when provided\")\n        if visibility not in (\"public\", \"private\", \"internal\"):\n            return _err(\"VALIDATION_ERROR\", \"visibility must be one of: public, private, internal\")\n    if status is not None:\n        if not isinstance(status, str):\n            return _err(\"VALIDATION_ERROR\", \"status must be a string when provided\")\n        if status not in (\"active\", \"disabled\", \"deleted\"):\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: active, disabled, deleted\")\n\n    if page is None:\n        page = 1\n    if pageSize is None:\n        pageSize = 50\n    if sort is None:\n        sort = \"updated_at\"\n    if order is None:\n        order = \"desc\"\n\n    if not isinstance(page, int) or page < 1:\n        return _err(\"VALIDATION_ERROR\", \"page must be an integer >= 1\")\n    if not isinstance(pageSize, int) or pageSize < 1 or pageSize > 200:\n        return _err(\"VALIDATION_ERROR\", \"pageSize must be an integer between 1 and 200\")\n    if not isinstance(sort, str) or sort not in (\"created_at\", \"updated_at\", \"owner\", \"name\"):\n        return _err(\"VALIDATION_ERROR\", \"sort must be one of: created_at, updated_at, owner, name\")\n    if not isinstance(order, str) or order not in (\"asc\", \"desc\"):\n        return _err(\"VALIDATION_ERROR\", \"order must be one of: asc, desc\")\n\n    repos = _load(\"repositories.json\")\n\n    # apply filters\n    out = []\n    for r in repos:\n        if owner is not None and r.get(\"owner\") != owner.strip():\n            continue\n        if name is not None and r.get(\"name\") != name.strip():\n            continue\n        if visibility is not None and r.get(\"visibility\") != visibility:\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        out.append(r)\n\n    reverse = (order == \"desc\")\n    def _k(r):\n        v = r.get(sort)\n        return \"\" if v is None else v\n    out.sort(key=_k, reverse=reverse)\n\n    total = len(out)\n    start = (page - 1) * pageSize\n    end = start + pageSize\n    items = out[start:end]\n    has_more = end < total\n\n    return {\n        \"items\": items,\n        \"page\": page,\n        \"pageSize\": pageSize,\n        \"total\": total,\n        \"has_more\": has_more\n    }\n"
+        },
+        {
+          "name": "getRepository",
+          "description": "Fetches a single repository record by id; returns the repository and refuses if the id does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "repositoryId": {
+                "type": "string",
+                "description": "Repository id"
+              }
+            },
+            "required": [
+              "repositoryId"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def getRepository(repositoryId, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0127000\" if __import__(\"os\").path.isdir(\"./environment_mix/0127000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    if not isinstance(repositoryId, str) or not repositoryId.strip():\n        return _err(\"VALIDATION_ERROR\", \"repositoryId must be a non-empty string\")\n\n    repos = _load(\"repositories.json\")\n    rid = repositoryId.strip()\n    for r in repos:\n        if r.get(\"id\") == rid:\n            return {\"repository\": r}\n    return _err(\"NOT_FOUND\", \"Repository not found\", repositoryId=rid)\n"
+        },
+        {
+          "name": "updateRepository",
+          "description": "Updates mutable fields on a repository, including lifecycle status transitions (active/disabled/deleted); refuses invalid transitions or attempts to serve deleted repositories.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "repositoryId": {
+                "type": "string",
+                "description": "Repository id"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled",
+                  "deleted"
+                ],
+                "description": "New repository status; must follow lifecycle transitions"
+              },
+              "defaultBranch": {
+                "type": "string",
+                "description": "Default branch name to use when branch is omitted"
+              },
+              "visibility": {
+                "type": "string",
+                "enum": [
+                  "public",
+                  "private",
+                  "internal"
+                ],
+                "description": "Repository visibility"
+              },
+              "htmlUrl": {
+                "type": "string",
+                "description": "Repository HTML URL"
+              }
+            },
+            "required": [
+              "repositoryId"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def updateRepository(repositoryId, status=None, defaultBranch=None, visibility=None, htmlUrl=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0127000\" if __import__(\"os\").path.isdir(\"./environment_mix/0127000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    if not isinstance(repositoryId, str) or not repositoryId.strip():\n        return _err(\"VALIDATION_ERROR\", \"repositoryId must be a non-empty string\")\n\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"active\", \"disabled\", \"deleted\"):\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: active, disabled, deleted\")\n    if defaultBranch is not None and (not isinstance(defaultBranch, str) or not defaultBranch.strip()):\n        return _err(\"VALIDATION_ERROR\", \"defaultBranch must be a non-empty string when provided\")\n    if visibility is not None:\n        if not isinstance(visibility, str) or visibility not in (\"public\", \"private\", \"internal\"):\n            return _err(\"VALIDATION_ERROR\", \"visibility must be one of: public, private, internal\")\n    if htmlUrl is not None and (not isinstance(htmlUrl, str) or not htmlUrl.strip()):\n        return _err(\"VALIDATION_ERROR\", \"htmlUrl must be a non-empty string when provided\")\n\n    repos = _load(\"repositories.json\")\n    rid = repositoryId.strip()\n    idx = None\n    for i, r in enumerate(repos):\n        if r.get(\"id\") == rid:\n            idx = i\n            break\n    if idx is None:\n        return _err(\"NOT_FOUND\", \"Repository not found\", repositoryId=rid)\n\n    r = repos[idx]\n\n    # Refuse attempts to serve deleted repositories: updates to deleted are invalid transitions unless staying deleted (no-op)\n    if r.get(\"status\") == \"deleted\":\n        # Any mutation request that would change anything should be refused\n        if status is None or status == \"deleted\":\n            # still allow updating other fields? business rule says refuse attempts to serve deleted; for update, refuse mutations.\n            if defaultBranch is None and visibility is None and htmlUrl is None and status is None:\n                return _err(\"VALIDATION_ERROR\", \"No fields to update\")\n            return _err(\"INVALID_TRANSITION\", \"Cannot update a deleted repository\")\n        return _err(\"INVALID_TRANSITION\", \"Cannot transition from deleted to another status\")\n\n    mutated = False\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # status transition\n    if status is not None and status != r.get(\"status\"):\n        allowed = {\n            \"active\": {\"disabled\", \"deleted\"},\n            \"disabled\": {\"active\", \"deleted\"},\n            \"deleted\": set(),\n        }\n        cur = r.get(\"status\")\n        if status not in allowed.get(cur, set()):\n            return _err(\"INVALID_TRANSITION\", f\"Invalid status transition: {cur} -> {status}\")\n        r[\"status\"] = status\n        mutated = True\n\n    # mutable fields\n    if defaultBranch is not None and defaultBranch.strip() != (r.get(\"default_branch\") or \"\"):\n        r[\"default_branch\"] = defaultBranch.strip()\n        mutated = True\n    if visibility is not None and visibility != r.get(\"visibility\"):\n        r[\"visibility\"] = visibility\n        mutated = True\n    if htmlUrl is not None and htmlUrl.strip() != (r.get(\"html_url\") or \"\"):\n        r[\"html_url\"] = htmlUrl.strip()\n        mutated = True\n\n    if not mutated:\n        return _err(\"VALIDATION_ERROR\", \"No changes to apply\")\n\n    r[\"updated_at\"] = now\n    repos[idx] = r\n    _save(\"repositories.json\", repos)\n\n    return {\"repository\": r}\n"
+        },
+        {
+          "name": "listRepoSnapshots",
+          "description": "Lists repository snapshots for a repository and optional branch/status filters; returns a paginated result set and refuses invalid filters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "repositoryId": {
+                "type": "string",
+                "description": "Repository id to list snapshots for"
+              },
+              "branch": {
+                "type": "string",
+                "description": "Filter by branch name (exact match)"
+              },
+              "headSha": {
+                "type": "string",
+                "description": "Filter by head commit SHA (exact match)"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "building",
+                  "ready",
+                  "failed",
+                  "expired"
+                ],
+                "description": "Filter by snapshot lifecycle status"
+              },
+              "source": {
+                "type": "string",
+                "enum": [
+                  "github_api",
+                  "github_archive"
+                ],
+                "description": "Filter by snapshot source (implementation may map to these values)"
+              },
+              "page": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 1,
+                "description": "Page number (1-based)"
+              },
+              "pageSize": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Number of items per page"
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at"
+                ],
+                "default": "updated_at",
+                "description": "Sort field"
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "default": "desc",
+                "description": "Sort order"
+              }
+            },
+            "required": [
+              "repositoryId"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def listRepoSnapshots(repositoryId, branch=None, headSha=None, status=None, source=None, page=None, pageSize=None, sort=None, order=None, **_extra):\n    import json, os, datetime\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0127000\" if __import__(\"os\").path.isdir(\"./environment_mix/0127000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = datetime.datetime.utcnow()\n    endpoint = \"listRepoSnapshots\"\n\n    # ---- helpers ----\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log_call(status_code, message=None, **extra):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        dt = datetime.datetime.utcnow() - t0\n        latency_ms = int(dt.total_seconds() * 1000)\n        row = {\n            \"id\": f\"rl_{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}\",\n            \"ts\": _now_iso(),\n            \"endpoint\": endpoint,\n            \"status\": status_code,\n            \"latency_ms\": latency_ms,\n            \"message\": message,\n        }\n        if extra:\n            row[\"meta\"] = extra\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _validate_str(name, v, allow_empty=False):\n        if v is None:\n            return None\n        if not isinstance(v, str):\n            return _err(\"VALIDATION_ERROR\", f\"{name} must be a string\")\n        if not allow_empty and v.strip() == \"\":\n            return _err(\"VALIDATION_ERROR\", f\"{name} must not be empty\")\n        return None\n\n    def _validate_int(name, v, mn=None, mx=None):\n        if v is None:\n            return None\n        if not isinstance(v, int):\n            return _err(\"VALIDATION_ERROR\", f\"{name} must be an integer\")\n        if mn is not None and v < mn:\n            return _err(\"VALIDATION_ERROR\", f\"{name} must be >= {mn}\")\n        if mx is not None and v > mx:\n            return _err(\"VALIDATION_ERROR\", f\"{name} must be <= {mx}\")\n        return None\n\n    # ---- input validation ----\n    e = _validate_str(\"repositoryId\", repositoryId)\n    if e:\n        _log_call(\"VALIDATION_ERROR\", e[\"error\"][\"message\"])\n        return e\n    e = _validate_str(\"branch\", branch)\n    if e:\n        _log_call(\"VALIDATION_ERROR\", e[\"error\"][\"message\"])\n        return e\n    e = _validate_str(\"headSha\", headSha)\n    if e:\n        _log_call(\"VALIDATION_ERROR\", e[\"error\"][\"message\"])\n        return e\n    if status is not None:\n        if not isinstance(status, str):\n            e = _err(\"VALIDATION_ERROR\", \"status must be a string\")\n            _log_call(\"VALIDATION_ERROR\", e[\"error\"][\"message\"])\n            return e\n        if status not in [\"queued\", \"building\", \"ready\", \"failed\", \"expired\"]:\n            e = _err(\"VALIDATION_ERROR\", \"status must be one of: queued, building, ready, failed, expired\")\n            _log_call(\"VALIDATION_ERROR\", e[\"error\"][\"message\"])\n            return e\n    if source is not None:\n        if not isinstance(source, str):\n            e = _err(\"VALIDATION_ERROR\", \"source must be a string\")\n            _log_call(\"VALIDATION_ERROR\", e[\"error\"][\"message\"])\n            return e\n        if source not in [\"github\", \"cache\", \"unknown\"]:\n            e = _err(\"VALIDATION_ERROR\", \"source must be one of: github, cache, unknown\")\n            _log_call(\"VALIDATION_ERROR\", e[\"error\"][\"message\"])\n            return e\n\n    if page is None:\n        page = 1\n    if pageSize is None:\n        pageSize = 50\n    if sort is None:\n        sort = \"updated_at\"\n    if order is None:\n        order = \"desc\"\n\n    e = _validate_int(\"page\", page, mn=1)\n    if e:\n        _log_call(\"VALIDATION_ERROR\", e[\"error\"][\"message\"])\n        return e\n    e = _validate_int(\"pageSize\", pageSize, mn=1, mx=200)\n    if e:\n        _log_call(\"VALIDATION_ERROR\", e[\"error\"][\"message\"])\n        return e\n    if sort not in [\"created_at\", \"updated_at\"]:\n        e = _err(\"VALIDATION_ERROR\", \"sort must be one of: created_at, updated_at\")\n        _log_call(\"VALIDATION_ERROR\", e[\"error\"][\"message\"])\n        return e\n    if order not in [\"asc\", \"desc\"]:\n        e = _err(\"VALIDATION_ERROR\", \"order must be one of: asc, desc\")\n        _log_call(\"VALIDATION_ERROR\", e[\"error\"][\"message\"])\n        return e\n\n    # ---- resolve repository ----\n    repos = _load(\"repositories.json\")\n    if not isinstance(repos, list):\n        repos = []\n    repo_row = None\n    for r in repos:\n        if isinstance(r, dict) and r.get(\"id\") == repositoryId:\n            repo_row = r\n            break\n    if repo_row is None:\n        _log_call(\"NOT_FOUND\", \"Repository not found\", repositoryId=repositoryId)\n        return _err(\"NOT_FOUND\", \"Repository not found\", repositoryId=repositoryId)\n\n    # repository lifecycle serving constraint (reads should refuse serving disabled/deleted)\n    if repo_row.get(\"status\") in [\"disabled\", \"deleted\"]:\n        _log_call(\"UNAUTHORIZED\", \"Repository is not available\", repositoryId=repositoryId, repo_status=repo_row.get(\"status\"))\n        return _err(\"UNAUTHORIZED\", \"Repository is not available\", repositoryId=repositoryId)\n\n    snaps = _load(\"repo_snapshots.json\")\n    if not isinstance(snaps, list):\n        snaps = []\n\n    # ---- filter mapping: tool source -> stored source ----\n    # Stored enum: github_api, github_archive, unknown. Tool enum: github, cache, unknown.\n    def _source_matches(stored, tool_val):\n        if tool_val is None:\n            return True\n        if tool_val == \"unknown\":\n            return stored == \"unknown\"\n        if tool_val == \"github\":\n            return stored in [\"github_api\", \"github_archive\"]\n        if tool_val == \"cache\":\n            # no explicit cache source in schema; treat none as matching\n            return False\n        return False\n\n    out = []\n    for s in snaps:\n        if not isinstance(s, dict):\n            continue\n        if s.get(\"repository_id\") != repositoryId:\n            continue\n        if branch is not None and s.get(\"branch\") != branch:\n            continue\n        if headSha is not None and s.get(\"head_sha\") != headSha:\n            continue\n        if status is not None and s.get(\"status\") != status:\n            continue\n        if not _source_matches(s.get(\"source\"), source):\n            continue\n        out.append(s)\n\n    reverse = (order == \"desc\")\n    def _sort_key(x):\n        v = x.get(sort)\n        if isinstance(v, str):\n            return v\n        return \"\"\n    out.sort(key=_sort_key, reverse=reverse)\n\n    total = len(out)\n    start = (page - 1) * pageSize\n    end = start + pageSize\n    items = out[start:end]\n    has_more = end < total\n    next_cursor = None\n    if has_more:\n        next_cursor = str(page + 1)\n\n    resp = {\n        \"snapshots\": items,\n        \"page\": page,\n        \"page_size\": pageSize,\n        \"total\": total,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor,\n        \"sort\": sort,\n        \"order\": order,\n    }\n    _log_call(\"OK\", repositoryId=repositoryId, returned=len(items), total=total)\n    return resp\n"
+        },
+        {
+          "name": "createRepoSnapshot",
+          "description": "Creates (queues) a new repository snapshot build for the given repository and branch (or reuses an existing ready snapshot when possible); returns the snapshot record and refuses if the repository is disabled/deleted or inputs are invalid.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "repositoryId": {
+                "type": "string",
+                "description": "Repository id"
+              },
+              "branch": {
+                "type": "string",
+                "description": "Branch name to snapshot; if omitted, resolves to repository default branch and then main/master"
+              },
+              "headSha": {
+                "type": "string",
+                "description": "Optional explicit head SHA; when omitted, resolves against GitHub for the branch"
+              },
+              "source": {
+                "type": "string",
+                "enum": [
+                  "github_api",
+                  "github_archive"
+                ],
+                "default": "github",
+                "description": "Snapshot source hint"
+              },
+              "forceRebuild": {
+                "type": "boolean",
+                "default": false,
+                "description": "If true, forces a new queued snapshot even if a ready snapshot exists for the same branch/headSha"
+              }
+            },
+            "required": [
+              "repositoryId"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def createRepoSnapshot(repositoryId, branch=None, headSha=None, source=None, forceRebuild=None, **_extra):\n    import json, os, datetime, random, string\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0127000\" if __import__(\"os\").path.isdir(\"./environment_mix/0127000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = datetime.datetime.utcnow()\n    endpoint = \"createRepoSnapshot\"\n\n    # ---- helpers ----\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log_call(status_code, message=None, **extra):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        dt = datetime.datetime.utcnow() - t0\n        latency_ms = int(dt.total_seconds() * 1000)\n        row = {\n            \"id\": f\"rl_{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}\",\n            \"ts\": _now_iso(),\n            \"endpoint\": endpoint,\n            \"status\": status_code,\n            \"latency_ms\": latency_ms,\n            \"message\": message,\n        }\n        if extra:\n            row[\"meta\"] = extra\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _gen_id(prefix):\n        return f\"{prefix}_{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{''.join(random.choice(string.ascii_lowercase+string.digits) for _ in range(6))}\"\n\n    def _validate_str(name, v, allow_empty=False):\n        if v is None:\n            return None\n        if not isinstance(v, str):\n            return _err(\"VALIDATION_ERROR\", f\"{name} must be a string\")\n        if not allow_empty and v.strip() == \"\":\n            return _err(\"VALIDATION_ERROR\", f\"{name} must not be empty\")\n        return None\n\n    # ---- input validation ----\n    e = _validate_str(\"repositoryId\", repositoryId)\n    if e:\n        _log_call(\"VALIDATION_ERROR\", e[\"error\"][\"message\"])\n        return e\n    e = _validate_str(\"branch\", branch)\n    if e:\n        _log_call(\"VALIDATION_ERROR\", e[\"error\"][\"message\"])\n        return e\n    e = _validate_str(\"headSha\", headSha)\n    if e:\n        _log_call(\"VALIDATION_ERROR\", e[\"error\"][\"message\"])\n        return e\n    if source is None:\n        source = \"github\"\n    if forceRebuild is None:\n        forceRebuild = False\n\n    if not isinstance(source, str) or source not in [\"github\", \"cache\", \"unknown\"]:\n        e = _err(\"VALIDATION_ERROR\", \"source must be one of: github, cache, unknown\")\n        _log_call(\"VALIDATION_ERROR\", e[\"error\"][\"message\"])\n        return e\n    if not isinstance(forceRebuild, bool):\n        e = _err(\"VALIDATION_ERROR\", \"forceRebuild must be a boolean\")\n        _log_call(\"VALIDATION_ERROR\", e[\"error\"][\"message\"])\n        return e\n\n    # ---- resolve repository ----\n    repos = _load(\"repositories.json\")\n    if not isinstance(repos, list):\n        repos = []\n    repo_row = None\n    repo_idx = None\n    for i, r in enumerate(repos):\n        if isinstance(r, dict) and r.get(\"id\") == repositoryId:\n            repo_row = r\n            repo_idx = i\n            break\n    if repo_row is None:\n        _log_call(\"NOT_FOUND\", \"Repository not found\", repositoryId=repositoryId)\n        return _err(\"NOT_FOUND\", \"Repository not found\", repositoryId=repositoryId)\n\n    if repo_row.get(\"status\") in [\"disabled\", \"deleted\"]:\n        _log_call(\"UNAUTHORIZED\", \"Repository is not available\", repositoryId=repositoryId, repo_status=repo_row.get(\"status\"))\n        return _err(\"UNAUTHORIZED\", \"Repository is not available\", repositoryId=repositoryId)\n\n    # ---- branch resolution ----\n    effective_branch = branch\n    if effective_branch is None or effective_branch.strip() == \"\":\n        db_default = repo_row.get(\"default_branch\")\n        if isinstance(db_default, str) and db_default.strip():\n            effective_branch = db_default.strip()\n        else:\n            # offline resolution: default to main then master fallback (no GitHub check available)\n            effective_branch = \"main\"\n\n    # if defaulted to main but repo default is unknown, we could attempt master fallback heuristically.\n    # Without GitHub, we'll allow \"main\"; callers can pass \"master\" explicitly.\n    if effective_branch not in [\"main\", \"master\"] and (effective_branch.strip() == \"\"):\n        effective_branch = \"main\"\n\n    # ---- head SHA resolution ----\n    # Offline: if not provided, derive deterministic pseudo SHA from repo+branch+date to simulate HEAD.\n    effective_head_sha = headSha\n    if effective_head_sha is None or effective_head_sha.strip() == \"\":\n        seed = f\"{repositoryId}:{effective_branch}:{datetime.datetime.utcnow().strftime('%Y-%m-%d')}\"\n        import hashlib\n        effective_head_sha = hashlib.sha1(seed.encode(\"utf-8\")).hexdigest()\n\n    # ---- map tool source -> stored source ----\n    stored_source = \"unknown\"\n    if source == \"github\":\n        stored_source = \"github_api\"\n    elif source == \"cache\":\n        # schema has no cache; keep unknown\n        stored_source = \"unknown\"\n    else:\n        stored_source = \"unknown\"\n\n    snaps = _load(\"repo_snapshots.json\")\n    if not isinstance(snaps, list):\n        snaps = []\n\n    # ---- reuse existing ready snapshot when possible ----\n    if not forceRebuild:\n        for s in snaps:\n            if not isinstance(s, dict):\n                continue\n            if s.get(\"repository_id\") == repositoryId and s.get(\"branch\") == effective_branch and s.get(\"head_sha\") == effective_head_sha and s.get(\"status\") == \"ready\":\n                _log_call(\"OK\", \"Reused existing ready snapshot\", repositoryId=repositoryId, snapshotId=s.get(\"id\"))\n                return {\"snapshot\": s, \"reused\": True, \"effective_branch\": effective_branch, \"effective_head_sha\": effective_head_sha}\n\n    # ---- uniqueness constraint: unique(repository_id, branch, head_sha) ----\n    # If a row already exists with same tuple but not ready, return it idempotently (do not claim success without effect).\n    for s in snaps:\n        if not isinstance(s, dict):\n            continue\n        if s.get(\"repository_id\") == repositoryId and s.get(\"branch\") == effective_branch and s.get(\"head_sha\") == effective_head_sha:\n            # If forceRebuild true, we are supposed to \"force a new queued snapshot even if ready exists\",\n            # but uniqueness constraint forbids a second row with same (repo, branch, sha).\n            # Realistic behavior: if same tuple exists, we cannot create another; so return CONFLICT with details.\n            if forceRebuild:\n                e = _err(\"CONFLICT\", \"Snapshot already exists for repository/branch/headSha; cannot create duplicate due to uniqueness constraint\",\n                         existingSnapshotId=s.get(\"id\"), repositoryId=repositoryId, branch=effective_branch, headSha=effective_head_sha)\n                _log_call(\"CONFLICT\", e[\"error\"][\"message\"])\n                return e\n            _log_call(\"OK\", \"Returned existing snapshot\", repositoryId=repositoryId, snapshotId=s.get(\"id\"))\n            return {\"snapshot\": s, \"reused\": False, \"effective_branch\": effective_branch, \"effective_head_sha\": effective_head_sha}\n\n    # ---- create queued snapshot ----\n    now = _now_iso()\n    snap = {\n        \"id\": _gen_id(\"rs\"),\n        \"repository_id\": repositoryId,\n        \"branch\": effective_branch,\n        \"head_sha\": effective_head_sha,\n        \"source\": stored_source,\n        \"status\": \"queued\",\n        \"tree_root_path\": \"/\",\n        \"tree_node_count\": None,\n        \"total_bytes_indexed\": None,\n        \"error_message\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    snaps.append(snap)\n    _save(\"repo_snapshots.json\", snaps)\n\n    _log_call(\"OK\", \"Created queued snapshot\", repositoryId=repositoryId, snapshotId=snap[\"id\"])\n    return {\"snapshot\": snap, \"reused\": False, \"effective_branch\": effective_branch, \"effective_head_sha\": effective_head_sha}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0127000",
+    "index": 127,
+    "name": "UIThub MCP Server",
+    "description": "This backend powers an MCP tool that fetches and filters GitHub repository contents (tree and/or file bodies) for downstream LLM use. It stores normalized repository/branch snapshots, directory trees, file metadata and optionally cached file contents, plus per-request query logs to enforce limits li",
+    "taxonomy": {
+      "L1_id": "L1-07",
+      "L1_name": "Software Development",
+      "L1_name_zh": "软件开发",
+      "L2_id": "L2-17",
+      "L2_name": "Code Execution & Analysis",
+      "L2_name_zh": "代码执行与分析",
+      "L3_name": "Repository Context Indexing & Fetching",
+      "L3_name_zh": "代码仓库上下文索引与获取"
+    },
+    "database_dir": "./environment_mix/0127000",
+    "mount_path": "/app/database",
+    "n_tools": 6,
+    "n_collections": 5,
+    "n_records": 155,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 6,
+      "loaded": 6,
+      "reads_returning_data": 4,
+      "read_operations": 4,
+      "mutations_persisted": 2,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 6,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "getRepositoryContents",
+      "returned_chars": 4018
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

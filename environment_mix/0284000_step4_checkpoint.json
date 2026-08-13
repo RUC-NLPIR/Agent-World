@@ -1,0 +1,212 @@
+{
+  "index": 284,
+  "local_files_dir": "./environment_mix/0284000",
+  "file_list": [
+    "./environment_mix/0284000/README.md",
+    "./environment_mix/0284000/notion_databases.json",
+    "./environment_mix/0284000/notion_pages.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "notion_pages.json": "page_id -> {id,title,blocks[*],parent}. 11 pages (page_home, page_weekly, page_weekly_w13, 8D report, audit plan, calibration, production, procurement, CAPA index, inventory) with heading/paragraph/bulleted_list/to_do blocks; parent refs (workspace/page_id/database_id) consistent with notion_databases ids.",
+        "notion_databases.json": "db_title -> {id,schema,rows[{id,...}]}. 4 databases: Defects (20 lot rows), Suppliers (5), CAPA (7), Inventory (10). IDs deterministic (db_defects + uuid5). Schema property->type consistent with row fields.",
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "read_page",
+          "description": "Retrieves a Notion page by its page_id and returns the page’s title and the blocks currently on that page. It refuses requests with a missing or malformed page_id, or when the page cannot be found. It also refuses access when the page isn’t shared with or accessible to the ForgeSight Quality Hub workspace integration.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "page_id": {
+                "type": "string",
+                "description": "Page id."
+              }
+            },
+            "required": [
+              "page_id"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0284000\" if __import__(\"os\").path.isdir(\"./environment_mix/0284000\") else \"/app/database\")\ndef read_page(page_id):\n    import json, os\n    pages = json.load(open(os.path.join(_DB, \"notion_pages.json\"), encoding=\"utf-8\"))\n    p = pages.get(page_id)\n    if not p:\n        return {\"error\": f\"page not found: {page_id}\"}\n    return p\n",
+          "description_restored": true
+        },
+        {
+          "name": "query_db",
+          "description": "Finds the Notion database with the given db_title and returns all rows currently in that database. It refuses requests with a missing/blank db_title, when no database with that title can be found, or when multiple databases match and the title is not unique. It also refuses access if the matched database isn’t shared with or accessible to the ForgeSight Quality Hub workspace integration.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "db_title": {
+                "type": "string",
+                "description": "Database title."
+              }
+            },
+            "required": [
+              "db_title"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0284000\" if __import__(\"os\").path.isdir(\"./environment_mix/0284000\") else \"/app/database\")\ndef query_db(db_title):\n    import json, os\n    dbs = json.load(open(os.path.join(_DB, \"notion_databases.json\"), encoding=\"utf-8\"))\n    db = dbs.get(db_title)\n    if not db:\n        return {\"error\": f\"database not found: {db_title}\"}\n    return db.get(\"rows\", [])\n",
+          "description_restored": true
+        },
+        {
+          "name": "add_database_row",
+          "description": "Creates a new row (page) in the Notion database identified by db_title and returns the created row with its properties. It refuses requests when db_title is missing/blank, when the database can’t be found (or the title is ambiguous), or when the database isn’t accessible to the ForgeSight Quality Hub integration. It also refuses rows whose provided properties don’t match the database schema (unknown property names, invalid value types, or missing values required by Notion for the target schema).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "db_title": {
+                "type": "string",
+                "description": "Database title."
+              },
+              "properties": {
+                "type": "object",
+                "description": "Row property values."
+              }
+            },
+            "required": [
+              "db_title",
+              "properties"
+            ]
+          },
+          "implementation": "def add_database_row(db_title, properties, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0284000\" if __import__(\"os\").path.isdir(\"./environment_mix/0284000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ensure_usage_store():\n        usage = _load(\"usage_log.json\")\n        if not isinstance(usage, dict):\n            usage = {}\n        if \"requests\" not in usage or not isinstance(usage.get(\"requests\"), list):\n            usage[\"requests\"] = []\n        if \"counters\" not in usage or not isinstance(usage.get(\"counters\"), dict):\n            usage[\"counters\"] = {}\n        if \"total_requests\" not in usage[\"counters\"]:\n            usage[\"counters\"][\"total_requests\"] = 0\n        return usage\n\n    def _log_and_maybe_limit(status, started, endpoint, meta=None):\n        usage = _ensure_usage_store()\n        now_ts = time.time()\n        # simple per-endpoint rate limit: 120 req/min\n        window_s = 60\n        limit = 120\n        recent = 0\n        for r in reversed(usage[\"requests\"][-1000:]):\n            try:\n                if r.get(\"endpoint\") == endpoint and (now_ts - float(r.get(\"ts_unix\", 0))) <= window_s:\n                    recent += 1\n                    if recent >= limit:\n                        break\n            except Exception:\n                continue\n        if recent >= limit and status == \"blocked_rate_limit\":\n            usage[\"counters\"][\"total_requests\"] += 1\n            usage[\"requests\"].append(\n                {\n                    \"id\": \"req_\" + uuid.uuid4().hex,\n                    \"endpoint\": endpoint,\n                    \"status\": \"RATE_LIMIT\",\n                    \"ts\": _now(),\n                    \"ts_unix\": now_ts,\n                    \"latency_ms\": int((time.time() - started) * 1000),\n                    \"meta\": meta or {},\n                }\n            )\n            _save(\"usage_log.json\", usage)\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n        return None\n\n    started = time.time()\n    endpoint = \"add_database_row\"\n\n    # Validate inputs\n    if not isinstance(db_title, str) or not db_title.strip():\n        usage = _ensure_usage_store()\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"requests\"].append(\n            {\n                \"id\": \"req_\" + uuid.uuid4().hex,\n                \"endpoint\": endpoint,\n                \"status\": \"VALIDATION_ERROR\",\n                \"ts\": _now(),\n                \"ts_unix\": time.time(),\n                \"latency_ms\": int((time.time() - started) * 1000),\n            }\n        )\n        _save(\"usage_log.json\", usage)\n        return _err(\"VALIDATION_ERROR\", \"db_title is required and must be a non-empty string.\")\n    if not isinstance(properties, dict):\n        usage = _ensure_usage_store()\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"requests\"].append(\n            {\n                \"id\": \"req_\" + uuid.uuid4().hex,\n                \"endpoint\": endpoint,\n                \"status\": \"VALIDATION_ERROR\",\n                \"ts\": _now(),\n                \"ts_unix\": time.time(),\n                \"latency_ms\": int((time.time() - started) * 1000),\n            }\n        )\n        _save(\"usage_log.json\", usage)\n        return _err(\"VALIDATION_ERROR\", \"properties must be an object (dict).\")\n\n    # Load databases\n    dbs = _load(\"notion_databases.json\")\n    if not isinstance(dbs, list):\n        dbs = []\n\n    title = db_title.strip()\n\n    matches = [d for d in dbs if isinstance(d, dict) and d.get(\"title\") == title]\n    if len(matches) == 0:\n        usage = _ensure_usage_store()\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"requests\"].append(\n            {\n                \"id\": \"req_\" + uuid.uuid4().hex,\n                \"endpoint\": endpoint,\n                \"status\": \"NOT_FOUND\",\n                \"ts\": _now(),\n                \"ts_unix\": time.time(),\n                \"latency_ms\": int((time.time() - started) * 1000),\n                \"meta\": {\"db_title\": title},\n            }\n        )\n        _save(\"usage_log.json\", usage)\n        return _err(\"NOT_FOUND\", \"Database not found.\", db_title=title)\n    if len(matches) > 1:\n        usage = _ensure_usage_store()\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"requests\"].append(\n            {\n                \"id\": \"req_\" + uuid.uuid4().hex,\n                \"endpoint\": endpoint,\n                \"status\": \"CONFLICT\",\n                \"ts\": _now(),\n                \"ts_unix\": time.time(),\n                \"latency_ms\": int((time.time() - started) * 1000),\n                \"meta\": {\"db_title\": title, \"matches\": len(matches)},\n            }\n        )\n        _save(\"usage_log.json\", usage)\n        return _err(\"CONFLICT\", \"Database title is ambiguous.\", db_title=title, matches=len(matches))\n\n    db = matches[0]\n    schema = db.get(\"schema\")\n    if not isinstance(schema, dict):\n        schema = {}\n        db[\"schema\"] = schema\n    if \"rows\" not in db or not isinstance(db.get(\"rows\"), list):\n        db[\"rows\"] = []\n\n    # Validate properties against schema: unknown keys rejected, basic type checks where possible\n    allowed = set(schema.keys())\n    unknown = [k for k in properties.keys() if k not in allowed]\n    if unknown:\n        usage = _ensure_usage_store()\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"requests\"].append(\n            {\n                \"id\": \"req_\" + uuid.uuid4().hex,\n                \"endpoint\": endpoint,\n                \"status\": \"VALIDATION_ERROR\",\n                \"ts\": _now(),\n                \"ts_unix\": time.time(),\n                \"latency_ms\": int((time.time() - started) * 1000),\n                \"meta\": {\"unknown_properties\": unknown},\n            }\n        )\n        _save(\"usage_log.json\", usage)\n        return _err(\"VALIDATION_ERROR\", \"Unknown properties provided.\", unknown_properties=unknown)\n\n    def _type_ok(expected, value):\n        if expected is None:\n            return True\n        if not isinstance(expected, str):\n            return True\n        t = expected.lower()\n        if t in (\"text\", \"string\", \"title\", \"rich_text\", \"email\", \"url\", \"date\"):\n            return value is None or isinstance(value, str)\n        if t in (\"number\", \"float\", \"double\"):\n            return value is None or isinstance(value, (int, float)) and not isinstance(value, bool)\n        if t in (\"integer\", \"int\"):\n            return value is None or (isinstance(value, int) and not isinstance(value, bool))\n        if t in (\"checkbox\", \"boolean\", \"bool\"):\n            return value is None or isinstance(value, bool)\n        return True\n\n    bad = {}\n    for k, v in properties.items():\n        expected = schema.get(k)\n        if not _type_ok(expected, v):\n            bad[k] = {\"expected\": expected, \"got\": type(v).__name__}\n    if bad:\n        usage = _ensure_usage_store()\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"requests\"].append(\n            {\n                \"id\": \"req_\" + uuid.uuid4().hex,\n                \"endpoint\": endpoint,\n                \"status\": \"VALIDATION_ERROR\",\n                \"ts\": _now(),\n                \"ts_unix\": time.time(),\n                \"latency_ms\": int((time.time() - started) * 1000),\n                \"meta\": {\"invalid_types\": bad},\n            }\n        )\n        _save(\"usage_log.json\", usage)\n        return _err(\"VALIDATION_ERROR\", \"Invalid property types.\", invalid_types=bad)\n\n    # Rate limit check (record as blocked if exceeded)\n    rl = _log_and_maybe_limit(\"blocked_rate_limit\", started, endpoint, meta={\"db_title\": title})\n    if rl:\n        return rl\n\n    # Create row with unique id\n    existing_ids = {r.get(\"id\") for r in db[\"rows\"] if isinstance(r, dict)}\n    while True:\n        row_id = \"row_\" + uuid.uuid4().hex\n        if row_id not in existing_ids:\n            break\n    row = {\"id\": row_id}\n    for k, v in properties.items():\n        row[k] = v\n    # audit fields (not in schema, but harmless for storage)\n    row[\"_created_at\"] = _now()\n    row[\"_updated_at\"] = row[\"_created_at\"]\n\n    db[\"rows\"].append(row)\n\n    # Persist change\n    _save(\"notion_databases.json\", dbs)\n\n    # Log usage\n    usage = _ensure_usage_store()\n    usage[\"counters\"][\"total_requests\"] += 1\n    usage[\"requests\"].append(\n        {\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"status\": \"OK\",\n            \"ts\": _now(),\n            \"ts_unix\": time.time(),\n            \"latency_ms\": int((time.time() - started) * 1000),\n            \"meta\": {\"db_title\": title, \"database_id\": db.get(\"id\"), \"row_id\": row_id},\n        }\n    )\n    _save(\"usage_log.json\", usage)\n\n    return {\"object\": \"database_row\", \"database_id\": db.get(\"id\"), \"row\": row}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "update_db_row",
+          "description": "Updates the specified database row/page by page_id with the provided property values and returns the updated row properties. It refuses requests with a missing or malformed page_id, when the row can’t be found, or when the row isn’t accessible to the ForgeSight Quality Hub integration. It also refuses updates that don’t conform to the row’s database schema (unknown properties, invalid types, or attempts to set values that conflict with the property configuration).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "page_id": {
+                "type": "string",
+                "description": "Row/page id."
+              },
+              "properties": {
+                "type": "object",
+                "description": "Property values to set."
+              }
+            },
+            "required": [
+              "page_id",
+              "properties"
+            ]
+          },
+          "implementation": "def update_db_row(page_id, properties, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0284000\" if __import__(\"os\").path.isdir(\"./environment_mix/0284000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ensure_usage_store():\n        usage = _load(\"usage_log.json\")\n        if not isinstance(usage, dict):\n            usage = {}\n        if \"requests\" not in usage or not isinstance(usage.get(\"requests\"), list):\n            usage[\"requests\"] = []\n        if \"counters\" not in usage or not isinstance(usage.get(\"counters\"), dict):\n            usage[\"counters\"] = {}\n        if \"total_requests\" not in usage[\"counters\"]:\n            usage[\"counters\"][\"total_requests\"] = 0\n        return usage\n\n    started = time.time()\n    endpoint = \"update_db_row\"\n\n    # Validate inputs\n    if not isinstance(page_id, str) or not page_id.strip():\n        usage = _ensure_usage_store()\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"requests\"].append(\n            {\"id\": \"req_\" + uuid.uuid4().hex, \"endpoint\": endpoint, \"status\": \"VALIDATION_ERROR\", \"ts\": _now(), \"ts_unix\": time.time(), \"latency_ms\": int((time.time() - started) * 1000)}\n        )\n        _save(\"usage_log.json\", usage)\n        return _err(\"VALIDATION_ERROR\", \"page_id is required and must be a non-empty string.\")\n    if not isinstance(properties, dict):\n        usage = _ensure_usage_store()\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"requests\"].append(\n            {\"id\": \"req_\" + uuid.uuid4().hex, \"endpoint\": endpoint, \"status\": \"VALIDATION_ERROR\", \"ts\": _now(), \"ts_unix\": time.time(), \"latency_ms\": int((time.time() - started) * 1000)}\n        )\n        _save(\"usage_log.json\", usage)\n        return _err(\"VALIDATION_ERROR\", \"properties must be an object (dict).\")\n\n    pid = page_id.strip()\n\n    dbs = _load(\"notion_databases.json\")\n    if not isinstance(dbs, list):\n        dbs = []\n\n    found_db = None\n    found_row = None\n\n    for db in dbs:\n        if not isinstance(db, dict):\n            continue\n        rows = db.get(\"rows\")\n        if not isinstance(rows, list):\n            continue\n        for r in rows:\n            if isinstance(r, dict) and r.get(\"id\") == pid:\n                found_db = db\n                found_row = r\n                break\n        if found_row is not None:\n            break\n\n    if found_row is None:\n        usage = _ensure_usage_store()\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"requests\"].append(\n            {\"id\": \"req_\" + uuid.uuid4().hex, \"endpoint\": endpoint, \"status\": \"NOT_FOUND\", \"ts\": _now(), \"ts_unix\": time.time(), \"latency_ms\": int((time.time() - started) * 1000), \"meta\": {\"page_id\": pid}}\n        )\n        _save(\"usage_log.json\", usage)\n        return _err(\"NOT_FOUND\", \"Row not found.\", page_id=pid)\n\n    schema = found_db.get(\"schema\")\n    if not isinstance(schema, dict):\n        schema = {}\n        found_db[\"schema\"] = schema\n\n    allowed = set(schema.keys())\n    unknown = [k for k in properties.keys() if k not in allowed]\n    if unknown:\n        usage = _ensure_usage_store()\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"requests\"].append(\n            {\"id\": \"req_\" + uuid.uuid4().hex, \"endpoint\": endpoint, \"status\": \"VALIDATION_ERROR\", \"ts\": _now(), \"ts_unix\": time.time(), \"latency_ms\": int((time.time() - started) * 1000), \"meta\": {\"unknown_properties\": unknown, \"page_id\": pid}}\n        )\n        _save(\"usage_log.json\", usage)\n        return _err(\"VALIDATION_ERROR\", \"Unknown properties provided.\", unknown_properties=unknown)\n\n    def _type_ok(expected, value):\n        if expected is None:\n            return True\n        if not isinstance(expected, str):\n            return True\n        t = expected.lower()\n        if t in (\"text\", \"string\", \"title\", \"rich_text\", \"email\", \"url\", \"date\"):\n            return value is None or isinstance(value, str)\n        if t in (\"number\", \"float\", \"double\"):\n            return value is None or isinstance(value, (int, float)) and not isinstance(value, bool)\n        if t in (\"integer\", \"int\"):\n            return value is None or (isinstance(value, int) and not isinstance(value, bool))\n        if t in (\"checkbox\", \"boolean\", \"bool\"):\n            return value is None or isinstance(value, bool)\n        return True\n\n    bad = {}\n    for k, v in properties.items():\n        expected = schema.get(k)\n        if not _type_ok(expected, v):\n            bad[k] = {\"expected\": expected, \"got\": type(v).__name__}\n    if bad:\n        usage = _ensure_usage_store()\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"requests\"].append(\n            {\"id\": \"req_\" + uuid.uuid4().hex, \"endpoint\": endpoint, \"status\": \"VALIDATION_ERROR\", \"ts\": _now(), \"ts_unix\": time.time(), \"latency_ms\": int((time.time() - started) * 1000), \"meta\": {\"invalid_types\": bad, \"page_id\": pid}}\n        )\n        _save(\"usage_log.json\", usage)\n        return _err(\"VALIDATION_ERROR\", \"Invalid property types.\", invalid_types=bad)\n\n    # Apply updates\n    changed = False\n    for k, v in properties.items():\n        if found_row.get(k) != v:\n            found_row[k] = v\n            changed = True\n\n    if not changed:\n        # idempotent: still a successful update with no material change, but it DID match a row.\n        pass\n\n    found_row[\"_updated_at\"] = _now()\n\n    _save(\"notion_databases.json\", dbs)\n\n    usage = _ensure_usage_store()\n    usage[\"counters\"][\"total_requests\"] += 1\n    usage[\"requests\"].append(\n        {\"id\": \"req_\" + uuid.uuid4().hex, \"endpoint\": endpoint, \"status\": \"OK\", \"ts\": _now(), \"ts_unix\": time.time(), \"latency_ms\": int((time.time() - started) * 1000), \"meta\": {\"page_id\": pid, \"database_id\": found_db.get(\"id\")}}\n    )\n    _save(\"usage_log.json\", usage)\n\n    return {\"object\": \"database_row\", \"database_id\": found_db.get(\"id\"), \"row\": found_row}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "append_blocks",
+          "description": "Appends the provided blocks to the end of the Notion page identified by page_id and returns the page blocks after the append. It refuses requests with a missing/malformed page_id or a missing/non-array blocks value, or when the page can’t be found. It also refuses access when the page isn’t accessible to the ForgeSight Quality Hub integration, and refuses blocks that are not valid Notion block objects for the target page.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "page_id": {
+                "type": "string",
+                "description": "Page id."
+              },
+              "blocks": {
+                "type": "array",
+                "description": "Blocks to append.",
+                "items": {
+                  "type": "object"
+                }
+              }
+            },
+            "required": [
+              "page_id",
+              "blocks"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0284000\" if __import__(\"os\").path.isdir(\"./environment_mix/0284000\") else \"/app/database\")\ndef append_blocks(page_id, blocks):\n    import json, os\n    pages = json.load(open(os.path.join(_DB, \"notion_pages.json\"), encoding=\"utf-8\"))\n    p = pages.get(page_id)\n    if not p:\n        return {\"error\": f\"page not found: {page_id}\"}\n    if isinstance(blocks, dict):\n        blocks = [blocks]\n    p[\"blocks\"].extend(blocks or [])\n    return {\"page_id\": page_id, \"block_count\": len(p[\"blocks\"])}\n",
+          "description_restored": true
+        },
+        {
+          "name": "create_page",
+          "description": "Creates a new Notion page with the given title and returns the created page, including its id and title. It refuses requests with a missing/blank title or a title that cannot be accepted by Notion. It also refuses creation when the ForgeSight Quality Hub integration does not have permission to create pages in the configured workspace location.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string",
+                "description": "Page title."
+              }
+            },
+            "required": [
+              "title"
+            ]
+          },
+          "implementation": "def create_page(title, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0284000\" if __import__(\"os\").path.isdir(\"./environment_mix/0284000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ensure_usage_store():\n        usage = _load(\"usage_log.json\")\n        if not isinstance(usage, dict):\n            usage = {}\n        if \"requests\" not in usage or not isinstance(usage.get(\"requests\"), list):\n            usage[\"requests\"] = []\n        if \"counters\" not in usage or not isinstance(usage.get(\"counters\"), dict):\n            usage[\"counters\"] = {}\n        if \"total_requests\" not in usage[\"counters\"]:\n            usage[\"counters\"][\"total_requests\"] = 0\n        return usage\n\n    started = time.time()\n    endpoint = \"create_page\"\n\n    if not isinstance(title, str) or not title.strip():\n        usage = _ensure_usage_store()\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"requests\"].append(\n            {\"id\": \"req_\" + uuid.uuid4().hex, \"endpoint\": endpoint, \"status\": \"VALIDATION_ERROR\", \"ts\": _now(), \"ts_unix\": time.time(), \"latency_ms\": int((time.time() - started) * 1000)}\n        )\n        _save(\"usage_log.json\", usage)\n        return _err(\"VALIDATION_ERROR\", \"title is required and must be a non-empty string.\")\n\n    t = title.strip()\n    if len(t) > 2000:\n        usage = _ensure_usage_store()\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"requests\"].append(\n            {\"id\": \"req_\" + uuid.uuid4().hex, \"endpoint\": endpoint, \"status\": \"VALIDATION_ERROR\", \"ts\": _now(), \"ts_unix\": time.time(), \"latency_ms\": int((time.time() - started) * 1000)}\n        )\n        _save(\"usage_log.json\", usage)\n        return _err(\"VALIDATION_ERROR\", \"title is too long to be accepted.\")\n\n    pages = _load(\"notion_pages.json\")\n    if not isinstance(pages, list):\n        pages = []\n\n    # Create page\n    while True:\n        pid = \"page_\" + uuid.uuid4().hex\n        if not any(isinstance(p, dict) and p.get(\"id\") == pid for p in pages):\n            break\n\n    page = {\n        \"id\": pid,\n        \"title\": t,\n        \"blocks\": [],\n        \"parent\": {\"type\": \"workspace\"},\n        \"_created_at\": _now(),\n        \"_updated_at\": _now(),\n    }\n    pages.append(page)\n    _save(\"notion_pages.json\", pages)\n\n    usage = _ensure_usage_store()\n    usage[\"counters\"][\"total_requests\"] += 1\n    usage[\"requests\"].append(\n        {\"id\": \"req_\" + uuid.uuid4().hex, \"endpoint\": endpoint, \"status\": \"OK\", \"ts\": _now(), \"ts_unix\": time.time(), \"latency_ms\": int((time.time() - started) * 1000), \"meta\": {\"page_id\": pid}}\n    )\n    _save(\"usage_log.json\", usage)\n\n    return {\"object\": \"page\", \"page\": {\"id\": page[\"id\"], \"title\": page[\"title\"]}}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "create_database",
+          "description": "Creates a new Notion database with the provided title and properties_schema and returns the created database, including its id and schema. It refuses requests with a missing/blank title, a missing/empty properties_schema, or a schema that contains unsupported property definitions or invalid type mappings. It also refuses creation when the ForgeSight Quality Hub integration does not have permission to create databases in the configured workspace location, or when the requested title conflicts in a way Notion won’t accept.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string",
+                "description": "Database title."
+              },
+              "properties_schema": {
+                "type": "object",
+                "description": "Property name -> type."
+              }
+            },
+            "required": [
+              "title",
+              "properties_schema"
+            ]
+          },
+          "implementation": "def create_database(title, properties_schema, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0284000\" if __import__(\"os\").path.isdir(\"./environment_mix/0284000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ensure_usage_store():\n        usage = _load(\"usage_log.json\")\n        if not isinstance(usage, dict):\n            usage = {}\n        if \"requests\" not in usage or not isinstance(usage.get(\"requests\"), list):\n            usage[\"requests\"] = []\n        if \"counters\" not in usage or not isinstance(usage.get(\"counters\"), dict):\n            usage[\"counters\"] = {}\n        if \"total_requests\" not in usage[\"counters\"]:\n            usage[\"counters\"][\"total_requests\"] = 0\n        return usage\n\n    started = time.time()\n    endpoint = \"create_database\"\n\n    if not isinstance(title, str) or not title.strip():\n        usage = _ensure_usage_store()\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"requests\"].append(\n            {\"id\": \"req_\" + uuid.uuid4().hex, \"endpoint\": endpoint, \"status\": \"VALIDATION_ERROR\", \"ts\": _now(), \"ts_unix\": time.time(), \"latency_ms\": int((time.time() - started) * 1000)}\n        )\n        _save(\"usage_log.json\", usage)\n        return _err(\"VALIDATION_ERROR\", \"title is required and must be a non-empty string.\")\n    if not isinstance(properties_schema, dict) or len(properties_schema) == 0:\n        usage = _ensure_usage_store()\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"requests\"].append(\n            {\"id\": \"req_\" + uuid.uuid4().hex, \"endpoint\": endpoint, \"status\": \"VALIDATION_ERROR\", \"ts\": _now(), \"ts_unix\": time.time(), \"latency_ms\": int((time.time() - started) * 1000)}\n        )\n        _save(\"usage_log.json\", usage)\n        return _err(\"VALIDATION_ERROR\", \"properties_schema is required and must be a non-empty object (dict).\")\n\n    # Validate schema mapping values as supported types\n    supported = {\n        \"text\",\n        \"string\",\n        \"title\",\n        \"rich_text\",\n        \"number\",\n        \"integer\",\n        \"checkbox\",\n        \"boolean\",\n        \"email\",\n        \"url\",\n        \"date\",\n    }\n    bad = {}\n    for k, v in properties_schema.items():\n        if not isinstance(k, str) or not k.strip():\n            bad[str(k)] = \"Property name must be a non-empty string.\"\n            continue\n        if not isinstance(v, str) or not v.strip():\n            bad[k] = \"Property type must be a non-empty string.\"\n            continue\n        if v.strip().lower() not in supported:\n            bad[k] = f\"Unsupported property type: {v}\"\n    if bad:\n        usage = _ensure_usage_store()\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"requests\"].append(\n            {\"id\": \"req_\" + uuid.uuid4().hex, \"endpoint\": endpoint, \"status\": \"VALIDATION_ERROR\", \"ts\": _now(), \"ts_unix\": time.time(), \"latency_ms\": int((time.time() - started) * 1000), \"meta\": {\"schema_errors\": bad}}\n        )\n        _save(\"usage_log.json\", usage)\n        return _err(\"VALIDATION_ERROR\", \"Invalid properties_schema.\", schema_errors=bad)\n\n    dbs = _load(\"notion_databases.json\")\n    if not isinstance(dbs, list):\n        dbs = []\n\n    t = title.strip()\n\n    # Refuse ambiguous title conflicts (existing same title)\n    if any(isinstance(d, dict) and d.get(\"title\") == t for d in dbs):\n        usage = _ensure_usage_store()\n        usage[\"counters\"][\"total_requests\"] += 1\n        usage[\"requests\"].append(\n            {\"id\": \"req_\" + uuid.uuid4().hex, \"endpoint\": endpoint, \"status\": \"CONFLICT\", \"ts\": _now(), \"ts_unix\": time.time(), \"latency_ms\": int((time.time() - started) * 1000), \"meta\": {\"title\": t}}\n        )\n        _save(\"usage_log.json\", usage)\n        return _err(\"CONFLICT\", \"A database with this title already exists.\", title=t)\n\n    # Generate unique database id\n    existing_ids = {d.get(\"id\") for d in dbs if isinstance(d, dict)}\n    while True:\n        did = \"db_\" + uuid.uuid4().hex\n        if did not in existing_ids:\n            break\n\n    schema_out = {str(k).strip(): str(v).strip() for k, v in properties_schema.items()}\n\n    db = {\"id\": did, \"title\": t, \"schema\": schema_out, \"rows\": [], \"_created_at\": _now(), \"_updated_at\": _now()}\n    dbs.append(db)\n    _save(\"notion_databases.json\", dbs)\n\n    usage = _ensure_usage_store()\n    usage[\"counters\"][\"total_requests\"] += 1\n    usage[\"requests\"].append(\n        {\"id\": \"req_\" + uuid.uuid4().hex, \"endpoint\": endpoint, \"status\": \"OK\", \"ts\": _now(), \"ts_unix\": time.time(), \"latency_ms\": int((time.time() - started) * 1000), \"meta\": {\"database_id\": did, \"title\": t}}\n    )\n    _save(\"usage_log.json\", usage)\n\n    return {\"object\": \"database\", \"database\": {\"id\": db[\"id\"], \"title\": db[\"title\"], \"schema\": db[\"schema\"]}}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0284000",
+    "index": 284,
+    "name": "ForgeSight Quality Hub",
+    "description": "A Notion-backed quality control workspace for managing inspections, supplier oversight, and corrective actions with structured databases and page-based documentation.",
+    "taxonomy": {
+      "L1_id": "L1-10",
+      "L1_name": "Data Storage & Databases",
+      "L1_name_zh": "数据存储与数据库",
+      "L2_id": "L2-27",
+      "L2_name": "Memory & Knowledge Management",
+      "L2_name_zh": "记忆与知识管理",
+      "L3_name": "Workspace Docs & Notes",
+      "L3_name_zh": "工作空间文档与笔记"
+    },
+    "database_dir": "./environment_mix/0284000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 2,
+    "n_records": 14,
+    "n_questions": 0,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 3,
+      "read_operations": 3,
+      "mutations_persisted": 1,
+      "mutations_attempted": 4
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "read_page",
+      "returned_chars": 1002
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

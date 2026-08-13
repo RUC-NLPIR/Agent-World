@@ -1,0 +1,359 @@
+{
+  "index": 83,
+  "local_files_dir": "./environment_mix/0083000",
+  "file_list": [
+    "./environment_mix/0083000/README.md",
+    "./environment_mix/0083000/announcements.json",
+    "./environment_mix/0083000/api_request_logs.json",
+    "./environment_mix/0083000/token_chain_support.json",
+    "./environment_mix/0083000/token_price_snapshots.json",
+    "./environment_mix/0083000/tokens.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "tokens.json": "18 rows",
+        "token_chain_support.json": "18 rows",
+        "token_price_snapshots.json": "18 rows",
+        "announcements.json": "18 rows",
+        "api_request_logs.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "getTokenPrice",
+          "description": "Returns the latest stored price snapshot for the requested token symbol and includes the token identifier you requested along with its current price data. Raises VALIDATION_ERROR if `token` is missing/empty or not a supported symbol format, and NOT_FOUND if the token is not present in the catalog or has no price snapshot available. Raises UNAUTHORIZED if access is not permitted and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "token": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "token"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def getTokenPrice(token, **_extra):\n    import json, os, datetime, time, re, base64, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0083000\" if __import__(\"os\").path.isdir(\"./environment_mix/0083000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0)\n\n    def _parse_dt(v):\n        if isinstance(v, datetime.datetime):\n            return v\n        if not isinstance(v, str) or not v:\n            return None\n        s = v\n        if s.endswith(\"Z\"):\n            s = s[:-1] + \"+00:00\"\n        try:\n            return datetime.datetime.fromisoformat(s).replace(tzinfo=None)\n        except Exception:\n            return None\n\n    def _iso(dt):\n        return dt.replace(microsecond=0).isoformat() + \"Z\"\n\n    def _new_id(prefix):\n        return f\"{prefix}_{hashlib.sha256((str(time.time_ns()) + os.urandom(8).hex()).encode()).hexdigest()[:24]}\"\n\n    def _log(tool_name, request_params, status_code, latency_ms, resolved_token_id=None, error_code=None):\n        logs = _load(\"api_request_logs.json\")\n        row = {\n            \"id\": _new_id(\"req\"),\n            \"tool_name\": tool_name,\n            \"request_params\": request_params if isinstance(request_params, dict) else {},\n            \"resolved_token_id\": resolved_token_id,\n            \"response_status_code\": int(status_code),\n            \"latency_ms\": int(max(0, min(300000, latency_ms))),\n            \"error_code\": error_code,\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(now),\n        }\n        logs.append(row)\n        _save(\"api_request_logs.json\", logs)\n\n    # Simple service-wide rate limit: 120 requests/min across all tools (observed via logs)\n    def _enforce_rate_limit():\n        logs = _load(\"api_request_logs.json\")\n        window_start = now - datetime.timedelta(seconds=60)\n        cnt = 0\n        for r in logs:\n            dt = _parse_dt(r.get(\"created_at\"))\n            if dt and dt >= window_start:\n                cnt += 1\n        if cnt >= 120:\n            return False, cnt\n        return True, cnt\n\n    ok_rl, rl_cnt = _enforce_rate_limit()\n    if not ok_rl:\n        latency = int((time.time() - t0) * 1000)\n        _log(\"getTokenPrice\", {\"token\": token}, 429, latency, resolved_token_id=None, error_code=\"RATE_LIMIT\")\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded. Please retry later.\", limit_per_minute=120, recent_requests=rl_cnt)\n\n    # Validation\n    if not isinstance(token, str):\n        latency = int((time.time() - t0) * 1000)\n        _log(\"getTokenPrice\", {\"token\": token}, 400, latency, resolved_token_id=None, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"`token` must be a string.\")\n    norm = token.strip().upper()\n    if not norm:\n        latency = int((time.time() - t0) * 1000)\n        _log(\"getTokenPrice\", {\"token\": token}, 400, latency, resolved_token_id=None, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"`token` is required and cannot be empty.\")\n    if not re.fullmatch(r\"[A-Z0-9][A-Z0-9\\-\\.]{0,19}\", norm):\n        latency = int((time.time() - t0) * 1000)\n        _log(\"getTokenPrice\", {\"token\": token}, 400, latency, resolved_token_id=None, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Unsupported token symbol format.\")\n\n    tokens = _load(\"tokens.json\")\n\n    def _match_token(sym):\n        needle = sym.strip().upper()\n        needle_l = needle.lower()\n        for r in tokens:\n            rs = r.get(\"symbol\")\n            if isinstance(rs, str) and rs.strip().upper() == needle:\n                return r\n        for r in tokens:\n            aliases = r.get(\"aliases\")\n            if isinstance(aliases, list):\n                for a in aliases:\n                    if isinstance(a, str) and a.strip().lower() == needle_l:\n                        return r\n        return None\n\n    tok = _match_token(norm)\n    if not tok:\n        latency = int((time.time() - t0) * 1000)\n        _log(\"getTokenPrice\", {\"token\": token}, 404, latency, resolved_token_id=None, error_code=\"TOKEN_NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Token not found.\", error_code=\"TOKEN_NOT_FOUND\")\n\n    token_id = tok.get(\"id\")\n\n    snaps = _load(\"token_price_snapshots.json\")\n    candidates = []\n    for s in snaps:\n        if s.get(\"token_id\") != token_id:\n            continue\n        if s.get(\"status\") != \"valid\":\n            continue\n        qc = s.get(\"quote_currency\")\n        if qc not in (\"USDT\", \"USD\"):\n            continue\n        as_of = _parse_dt(s.get(\"as_of\"))\n        if not as_of:\n            continue\n        candidates.append((as_of, s))\n    if not candidates:\n        latency = int((time.time() - t0) * 1000)\n        _log(\"getTokenPrice\", {\"token\": token}, 404, latency, resolved_token_id=token_id, error_code=\"NO_PRICE_SNAPSHOT\")\n        return _err(\"NOT_FOUND\", \"No price snapshot available for this token.\", error_code=\"NO_PRICE_SNAPSHOT\")\n\n    candidates.sort(key=lambda x: x[0], reverse=True)\n    as_of, snap = candidates[0]\n\n    # Application-layer staleness marking (do not mutate snapshot here)\n    staleness_threshold = datetime.timedelta(minutes=5)\n    is_stale = (now - as_of) > staleness_threshold\n\n    resp = {\n        \"token\": norm,\n        \"token_id\": token_id,\n        \"quote_currency\": snap.get(\"quote_currency\"),\n        \"price\": snap.get(\"price\"),\n        \"source\": snap.get(\"source\"),\n        \"as_of\": snap.get(\"as_of\"),\n        \"snapshot_status\": snap.get(\"status\"),\n        \"stale\": bool(is_stale),\n    }\n\n    latency = int((time.time() - t0) * 1000)\n    _log(\"getTokenPrice\", {\"token\": token}, 200, latency, resolved_token_id=token_id, error_code=None)\n    return {\"data\": resp}\n",
+          "description_restored": true
+        },
+        {
+          "name": "getAnnoucements",
+          "description": "Searches exchange-style announcements published within the last month, filtered by `anType`, and returns the matching announcement entries (no pagination is supported for this query). Raises VALIDATION_ERROR if `anType` is missing or not one of the allowed values, and NOT_FOUND if there are no announcements in the last month for the requested type. Raises UNAUTHORIZED if access is not permitted and RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "anType": {
+                "type": "string",
+                "enum": [
+                  "latest_news",
+                  "coin_listings",
+                  "trading_competitions_promotions",
+                  "maintenance_system_updates",
+                  "symbol_delisting",
+                  ""
+                ]
+              }
+            },
+            "required": [
+              "anType"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def getAnnoucements(anType, **_extra):\n    import json, os, datetime, time, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0083000\" if __import__(\"os\").path.isdir(\"./environment_mix/0083000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0)\n\n    def _parse_dt(v):\n        if isinstance(v, datetime.datetime):\n            return v\n        if not isinstance(v, str) or not v:\n            return None\n        s = v\n        if s.endswith(\"Z\"):\n            s = s[:-1] + \"+00:00\"\n        try:\n            return datetime.datetime.fromisoformat(s).replace(tzinfo=None)\n        except Exception:\n            return None\n\n    def _iso(dt):\n        return dt.replace(microsecond=0).isoformat() + \"Z\"\n\n    def _new_id(prefix):\n        return f\"{prefix}_{hashlib.sha256((str(time.time_ns()) + os.urandom(8).hex()).encode()).hexdigest()[:24]}\"\n\n    def _log(tool_name, request_params, status_code, latency_ms, resolved_token_id=None, error_code=None):\n        logs = _load(\"api_request_logs.json\")\n        row = {\n            \"id\": _new_id(\"req\"),\n            \"tool_name\": tool_name,\n            \"request_params\": request_params if isinstance(request_params, dict) else {},\n            \"resolved_token_id\": resolved_token_id,\n            \"response_status_code\": int(status_code),\n            \"latency_ms\": int(max(0, min(300000, latency_ms))),\n            \"error_code\": error_code,\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(now),\n        }\n        logs.append(row)\n        _save(\"api_request_logs.json\", logs)\n\n    def _enforce_rate_limit():\n        logs = _load(\"api_request_logs.json\")\n        window_start = now - datetime.timedelta(seconds=60)\n        cnt = 0\n        for r in logs:\n            dt = _parse_dt(r.get(\"created_at\"))\n            if dt and dt >= window_start:\n                cnt += 1\n        if cnt >= 120:\n            return False, cnt\n        return True, cnt\n\n    ok_rl, rl_cnt = _enforce_rate_limit()\n    if not ok_rl:\n        latency = int((time.time() - t0) * 1000)\n        _log(\"getAnnoucements\", {\"anType\": anType}, 429, latency, None, \"RATE_LIMIT\")\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded. Please retry later.\", limit_per_minute=120, recent_requests=rl_cnt)\n\n    allowed = {\n        \"latest_news\",\n        \"coin_listings\",\n        \"trading_competitions_promotions\",\n        \"maintenance_system_updates\",\n        \"symbol_delisting\",\n        \"\",\n    }\n\n    if not isinstance(anType, str):\n        latency = int((time.time() - t0) * 1000)\n        _log(\"getAnnoucements\", {\"anType\": anType}, 400, latency, None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"`anType` must be a string.\")\n    if anType not in allowed:\n        latency = int((time.time() - t0) * 1000)\n        _log(\"getAnnoucements\", {\"anType\": anType}, 400, latency, None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"`anType` must be one of the allowed values (or empty string).\")\n\n    anns = _load(\"announcements.json\")\n    cutoff = now - datetime.timedelta(days=30)\n\n    out = []\n    for a in anns:\n        if a.get(\"status\") != \"published\":\n            continue\n        pub = _parse_dt(a.get(\"published_at\"))\n        if not pub:\n            continue\n        if pub < cutoff:\n            continue\n        if anType != \"\" and a.get(\"anType\") != anType:\n            continue\n        out.append(a)\n\n    out.sort(key=lambda r: (_parse_dt(r.get(\"published_at\")) or datetime.datetime(1970, 1, 1)), reverse=True)\n\n    if not out:\n        latency = int((time.time() - t0) * 1000)\n        _log(\"getAnnoucements\", {\"anType\": anType}, 404, latency, None, \"NO_ANNOUNCEMENTS\")\n        return _err(\"NOT_FOUND\", \"No announcements found in the last month for the requested type.\", error_code=\"NO_ANNOUNCEMENTS\")\n\n    latency = int((time.time() - t0) * 1000)\n    _log(\"getAnnoucements\", {\"anType\": anType}, 200, latency, None, None)\n    return {\"data\": {\"announcements\": out, \"count\": len(out)}}\n",
+          "description_restored": true
+        },
+        {
+          "name": "getCoinInfo",
+          "description": "Get spot coin information。Parameter：coin - Coin name\nResponse Parameters \n- coin: Token name  \n- transfer: Transferability  \n- chains: Support chain list  \n  - chain: Chain name  \n  - needTag: Need tag  \n  - withdrawable: Withdrawal supported  \n  - rechargeable: Deposit supported  \n  - withdrawFee: Withdrawal transaction fee  \n  - extraWithdrawFee: Extra charge (e.g., 0.1 means 10% on-chain destruction)  \n  - browserUrl: Blockchain explorer address  \n  - contractAddress: Coin contract address  \n  - withdrawStep: Withdrawal count step (if not 0, withdrawal size must be a multiple of this value; if 0, no such limit)  \n  - withdrawMinScale: Decimal places of withdrawal amount  \n  - congestion: Chain network status (normal: normal, congested: congestion)",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "coin": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "coin"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def getCoinInfo(coin, **_extra):\n    import json, os, datetime, time, re, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0083000\" if __import__(\"os\").path.isdir(\"./environment_mix/0083000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0)\n\n    def _parse_dt(v):\n        if isinstance(v, datetime.datetime):\n            return v\n        if not isinstance(v, str) or not v:\n            return None\n        s = v\n        if s.endswith(\"Z\"):\n            s = s[:-1] + \"+00:00\"\n        try:\n            return datetime.datetime.fromisoformat(s).replace(tzinfo=None)\n        except Exception:\n            return None\n\n    def _iso(dt):\n        return dt.replace(microsecond=0).isoformat() + \"Z\"\n\n    def _new_id(prefix):\n        return f\"{prefix}_{hashlib.sha256((str(time.time_ns()) + os.urandom(8).hex()).encode()).hexdigest()[:24]}\"\n\n    def _log(tool_name, request_params, status_code, latency_ms, resolved_token_id=None, error_code=None):\n        logs = _load(\"api_request_logs.json\")\n        row = {\n            \"id\": _new_id(\"req\"),\n            \"tool_name\": tool_name,\n            \"request_params\": request_params if isinstance(request_params, dict) else {},\n            \"resolved_token_id\": resolved_token_id,\n            \"response_status_code\": int(status_code),\n            \"latency_ms\": int(max(0, min(300000, latency_ms))),\n            \"error_code\": error_code,\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(now),\n        }\n        logs.append(row)\n        _save(\"api_request_logs.json\", logs)\n\n    def _enforce_rate_limit():\n        logs = _load(\"api_request_logs.json\")\n        window_start = now - datetime.timedelta(seconds=60)\n        cnt = 0\n        for r in logs:\n            dt = _parse_dt(r.get(\"created_at\"))\n            if dt and dt >= window_start:\n                cnt += 1\n        if cnt >= 120:\n            return False, cnt\n        return True, cnt\n\n    ok_rl, rl_cnt = _enforce_rate_limit()\n    if not ok_rl:\n        latency = int((time.time() - t0) * 1000)\n        _log(\"getCoinInfo\", {\"coin\": coin}, 429, latency, None, \"RATE_LIMIT\")\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded. Please retry later.\", limit_per_minute=120, recent_requests=rl_cnt)\n\n    if not isinstance(coin, str):\n        latency = int((time.time() - t0) * 1000)\n        _log(\"getCoinInfo\", {\"coin\": coin}, 400, latency, None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"`coin` must be a string.\")\n    norm = coin.strip().upper()\n    if not norm:\n        latency = int((time.time() - t0) * 1000)\n        _log(\"getCoinInfo\", {\"coin\": coin}, 400, latency, None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"`coin` is required and cannot be empty.\")\n    if not re.fullmatch(r\"[A-Z0-9][A-Z0-9\\-\\.]{0,19}\", norm):\n        latency = int((time.time() - t0) * 1000)\n        _log(\"getCoinInfo\", {\"coin\": coin}, 400, latency, None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Unsupported coin symbol format.\")\n\n    tokens = _load(\"tokens.json\")\n\n    def _match_token(sym):\n        needle = sym.strip().upper()\n        needle_l = needle.lower()\n        for r in tokens:\n            rs = r.get(\"symbol\")\n            if isinstance(rs, str) and rs.strip().upper() == needle:\n                return r\n        for r in tokens:\n            aliases = r.get(\"aliases\")\n            if isinstance(aliases, list):\n                for a in aliases:\n                    if isinstance(a, str) and a.strip().lower() == needle_l:\n                        return r\n        return None\n\n    tok = _match_token(norm)\n    if not tok:\n        latency = int((time.time() - t0) * 1000)\n        _log(\"getCoinInfo\", {\"coin\": coin}, 404, latency, None, \"TOKEN_NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Token not found.\", error_code=\"TOKEN_NOT_FOUND\")\n\n    token_id = tok.get(\"id\")\n\n    tcs = _load(\"token_chain_support.json\")\n    chains = []\n    for r in tcs:\n        if r.get(\"token_id\") != token_id:\n            continue\n        if r.get(\"status\") != \"enabled\":\n            continue\n        chains.append({\n            \"chain\": r.get(\"chain\"),\n            \"needTag\": r.get(\"needTag\"),\n            \"withdrawable\": r.get(\"withdrawable\"),\n            \"rechargeable\": r.get(\"rechargeable\"),\n            \"withdrawFee\": r.get(\"withdrawFee\"),\n            \"extraWithdrawFee\": r.get(\"extraWithdrawFee\"),\n        })\n    chains.sort(key=lambda c: (c.get(\"chain\") or \"\"))\n\n    resp = {\n        \"coin\": tok.get(\"symbol\"),\n        \"transfer\": tok.get(\"transfer\"),\n        \"chains\": chains,\n    }\n\n    latency = int((time.time() - t0) * 1000)\n    _log(\"getCoinInfo\", {\"coin\": coin}, 200, latency, resolved_token_id=token_id, error_code=None)\n    return {\"data\": resp}\n"
+        },
+        {
+          "name": "listTokens",
+          "description": "Lists tokens in the catalog with optional filtering by symbol/name, status, and spot support. Returns a paginated result ordered by symbol, and refuses invalid filters with VALIDATION_ERROR; requires authorization and may return RATE_LIMITED when quota is exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Optional free-text filter matched against token symbol, name, or aliases (case-insensitive)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "inactive",
+                  "delisted"
+                ],
+                "description": "Filter by token lifecycle status."
+              },
+              "is_spot_supported": {
+                "type": "boolean",
+                "description": "Filter tokens by spot support flag."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of tokens to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def listTokens(query=None, status=None, is_spot_supported=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, base64, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0083000\" if __import__(\"os\").path.isdir(\"./environment_mix/0083000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0)\n\n    def _parse_dt(v):\n        if isinstance(v, datetime.datetime):\n            return v\n        if not isinstance(v, str) or not v:\n            return None\n        s = v\n        if s.endswith(\"Z\"):\n            s = s[:-1] + \"+00:00\"\n        try:\n            return datetime.datetime.fromisoformat(s).replace(tzinfo=None)\n        except Exception:\n            return None\n\n    def _iso(dt):\n        return dt.replace(microsecond=0).isoformat() + \"Z\"\n\n    def _new_id(prefix):\n        return f\"{prefix}_{hashlib.sha256((str(time.time_ns()) + os.urandom(8).hex()).encode()).hexdigest()[:24]}\"\n\n    def _log(tool_name, request_params, status_code, latency_ms, resolved_token_id=None, error_code=None):\n        logs = _load(\"api_request_logs.json\")\n        row = {\n            \"id\": _new_id(\"req\"),\n            \"tool_name\": tool_name,  # not in api_request_logs enum; keep logging best-effort by storing anyway\n            \"request_params\": request_params if isinstance(request_params, dict) else {},\n            \"resolved_token_id\": resolved_token_id,\n            \"response_status_code\": int(status_code),\n            \"latency_ms\": int(max(0, min(300000, latency_ms))),\n            \"error_code\": error_code,\n            \"created_at\": _iso(now),\n            \"updated_at\": _iso(now),\n        }\n        logs.append(row)\n        _save(\"api_request_logs.json\", logs)\n\n    # Rate limit: 120 req/min\n    def _enforce_rate_limit():\n        logs = _load(\"api_request_logs.json\")\n        window_start = now - datetime.timedelta(seconds=60)\n        cnt = 0\n        for r in logs:\n            dt = _parse_dt(r.get(\"created_at\"))\n            if dt and dt >= window_start:\n                cnt += 1\n        if cnt >= 120:\n            return False, cnt\n        return True, cnt\n\n    ok_rl, rl_cnt = _enforce_rate_limit()\n    if not ok_rl:\n        latency = int((time.time() - t0) * 1000)\n        _log(\"listTokens\", {\"query\": query, \"status\": status, \"is_spot_supported\": is_spot_supported, \"limit\": limit, \"cursor\": cursor}, 429, latency, None, \"RATE_LIMIT\")\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded. Please retry later.\", limit_per_minute=120, recent_requests=rl_cnt)\n\n    # Validation\n    if query is not None and not isinstance(query, str):\n        latency = int((time.time() - t0) * 1000)\n        _log(\"listTokens\", {\"query\": query, \"status\": status, \"is_spot_supported\": is_spot_supported, \"limit\": limit, \"cursor\": cursor}, 400, latency, None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"`query` must be a string when provided.\")\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"active\", \"inactive\", \"delisted\"):\n            latency = int((time.time() - t0) * 1000)\n            _log(\"listTokens\", {\"query\": query, \"status\": status, \"is_spot_supported\": is_spot_supported, \"limit\": limit, \"cursor\": cursor}, 400, latency, None, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"`status` must be one of: active, inactive, delisted.\")\n    if is_spot_supported is not None and not isinstance(is_spot_supported, bool):\n        latency = int((time.time() - t0) * 1000)\n        _log(\"listTokens\", {\"query\": query, \"status\": status, \"is_spot_supported\": is_spot_supported, \"limit\": limit, \"cursor\": cursor}, 400, latency, None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"`is_spot_supported` must be a boolean when provided.\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        latency = int((time.time() - t0) * 1000)\n        _log(\"listTokens\", {\"query\": query, \"status\": status, \"is_spot_supported\": is_spot_supported, \"limit\": limit, \"cursor\": cursor}, 400, latency, None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"`limit` must be an integer.\")\n    if limit < 1 or limit > 200:\n        latency = int((time.time() - t0) * 1000)\n        _log(\"listTokens\", {\"query\": query, \"status\": status, \"is_spot_supported\": is_spot_supported, \"limit\": limit, \"cursor\": cursor}, 400, latency, None, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"`limit` must be between 1 and 200.\")\n\n    start_after = None\n    if cursor is not None:\n        if not isinstance(cursor, str) or not cursor:\n            latency = int((time.time() - t0) * 1000)\n            _log(\"listTokens\", {\"query\": query, \"status\": status, \"is_spot_supported\": is_spot_supported, \"limit\": limit, \"cursor\": cursor}, 400, latency, None, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"`cursor` must be a non-empty string when provided.\")\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"==\").decode(\"utf-8\")\n            if not raw.startswith(\"sym:\"):\n                raise ValueError(\"bad cursor\")\n            start_after = raw[4:]\n        except Exception:\n            latency = int((time.time() - t0) * 1000)\n            _log(\"listTokens\", {\"query\": query, \"status\": status, \"is_spot_supported\": is_spot_supported, \"limit\": limit, \"cursor\": cursor}, 400, latency, None, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n    tokens = _load(\"tokens.json\")\n\n    q = (query or \"\").strip().lower()\n    def _matches(t):\n        if status is not None and t.get(\"status\") != status:\n            return False\n        if is_spot_supported is not None and t.get(\"is_spot_supported\") is not is_spot_supported:\n            return False\n        if q:\n            sym = (t.get(\"symbol\") or \"\")\n            name = (t.get(\"name\") or \"\")\n            aliases = t.get(\"aliases\") if isinstance(t.get(\"aliases\"), list) else []\n            hay = [sym, name] + [a for a in aliases if isinstance(a, str)]\n            if not any(q in (h or \"\").lower() for h in hay):\n                return False\n        return True\n\n    filtered = [t for t in tokens if isinstance(t, dict) and _matches(t)]\n    filtered.sort(key=lambda r: ((r.get(\"symbol\") or \"\").upper(), (r.get(\"id\") or \"\")))\n\n    if start_after is not None:\n        sa = start_after.upper()\n        filtered = [r for r in filtered if ((r.get(\"symbol\") or \"\").upper() > sa)]\n\n    page = filtered[:limit]\n    has_more = len(filtered) > len(page)\n    next_cursor = None\n    if has_more and page:\n        last_sym = (page[-1].get(\"symbol\") or \"\").upper()\n        next_cursor = base64.urlsafe_b64encode(f\"sym:{last_sym}\".encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    latency = int((time.time() - t0) * 1000)\n    _log(\"listTokens\", {\"query\": query, \"status\": status, \"is_spot_supported\": is_spot_supported, \"limit\": limit, \"cursor\": cursor}, 200, latency, None, None)\n\n    return {\n        \"data\": {\n            \"tokens\": page,\n            \"total\": len(filtered),\n            \"has_more\": bool(has_more),\n            \"next_cursor\": next_cursor,\n            \"limit\": limit,\n        }\n    }\n"
+        },
+        {
+          "name": "getToken",
+          "description": "Fetches a single token by its id. Returns the token record if found; raises NOT_FOUND if the token id does not exist, and UNAUTHORIZED if access is not permitted.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Token primary key."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def getToken(id, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0083000\" if __import__(\"os\").path.isdir(\"./environment_mix/0083000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.perf_counter()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    # Validation\n    if not isinstance(id, str) or not id.strip():\n        # No api_request_logs entry for non-enum tool per schema; return error\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'id' must be a non-empty string.\")\n\n    tokens = _load(\"tokens.json\")\n    tok = None\n    for r in tokens:\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            tok = r\n            break\n\n    if tok is None:\n        return _err(\"NOT_FOUND\", \"Token not found.\", id=id)\n\n    return {\"token\": tok}\n"
+        },
+        {
+          "name": "upsertToken",
+          "description": "Creates a new token or updates an existing token by `id`. Validates lifecycle transitions for `status` and refuses invalid transitions with VALIDATION_ERROR; refuses attempts to modify immutable identifiers with VALIDATION_ERROR. Returns the stored token record on success; requires authorization and may return RATE_LIMITED.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Token primary key. If provided and exists, the token is updated; if not found, a new token is created."
+              },
+              "symbol": {
+                "type": "string",
+                "description": "Canonical trading symbol (stored uppercase)."
+              },
+              "name": {
+                "type": "string",
+                "description": "Human-readable token name."
+              },
+              "aliases": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Alternate symbols/names used for resolution."
+              },
+              "is_spot_supported": {
+                "type": "boolean",
+                "description": "Whether spot trading is supported for this token."
+              },
+              "transfer": {
+                "type": "boolean",
+                "description": "Transferability metadata blob as provided by upstream exchange sources."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "inactive",
+                  "delisted"
+                ],
+                "description": "Lifecycle status. Allowed transitions: active↔inactive, active/inactive→delisted; delisted is terminal."
+              }
+            },
+            "required": [
+              "symbol",
+              "name"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def upsertToken(symbol, name, id=None, aliases=None, is_spot_supported=None, transfer=None, status=None, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0083000\" if __import__(\"os\").path.isdir(\"./environment_mix/0083000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.perf_counter()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    # Basic validation\n    if not isinstance(symbol, str) or not symbol.strip():\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'symbol' must be a non-empty string.\")\n    if not isinstance(name, str) or not name.strip():\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'name' must be a non-empty string.\")\n    if id is not None and (not isinstance(id, str) or not id.strip()):\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'id' must be a non-empty string when provided.\")\n\n    sym_up = symbol.strip().upper()\n    if status is not None:\n        if not isinstance(status, str):\n            return _err(\"VALIDATION_ERROR\", \"Parameter 'status' must be a string.\")\n        if status not in (\"active\", \"inactive\", \"delisted\"):\n            return _err(\"VALIDATION_ERROR\", \"Invalid 'status'.\", allowed=[\"active\", \"inactive\", \"delisted\"])\n    if aliases is not None:\n        if not isinstance(aliases, list):\n            return _err(\"VALIDATION_ERROR\", \"Parameter 'aliases' must be an array of strings.\")\n        norm_aliases = []\n        seen = set()\n        for a in aliases:\n            if not isinstance(a, str) or not a.strip():\n                return _err(\"VALIDATION_ERROR\", \"All aliases must be non-empty strings.\")\n            al = a.strip().lower()\n            if al in seen:\n                return _err(\"VALIDATION_ERROR\", \"Aliases must be unique (case-insensitive).\", duplicate=al)\n            seen.add(al)\n            norm_aliases.append(al)\n        aliases = norm_aliases\n    if is_spot_supported is not None and not isinstance(is_spot_supported, bool):\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'is_spot_supported' must be a boolean.\")\n    if transfer is not None and not isinstance(transfer, (dict, bool)):\n        # schema says boolean, but tool param says object; accept dict, and also accept bool for compatibility\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'transfer' must be an object.\")\n    # Load stores\n    tokens = _load(\"tokens.json\")\n    chain_support = _load(\"token_chain_support.json\")\n\n    # Find existing by id if provided\n    existing = None\n    existing_idx = None\n    if id is not None:\n        for i, r in enumerate(tokens):\n            if isinstance(r, dict) and r.get(\"id\") == id:\n                existing = r\n                existing_idx = i\n                break\n\n    # Enforce unique(lower(symbol))\n    for r in tokens:\n        if not isinstance(r, dict):\n            continue\n        if existing is not None and r.get(\"id\") == existing.get(\"id\"):\n            continue\n        rs = r.get(\"symbol\")\n        if isinstance(rs, str) and rs.strip().lower() == sym_up.lower():\n            return _err(\"CONFLICT\", \"A token with this symbol already exists.\", symbol=sym_up)\n\n    # Determine create vs update and apply lifecycle transition validation\n    transitions = {\n        \"active\": {\"inactive\", \"delisted\"},\n        \"inactive\": {\"active\", \"delisted\"},\n        \"delisted\": set()\n    }\n\n    if existing is None:\n        # Create\n        new_id = id.strip() if id is not None else f\"tok_{uuid.uuid4().hex}\"\n        # ensure id uniqueness\n        for r in tokens:\n            if isinstance(r, dict) and r.get(\"id\") == new_id:\n                return _err(\"CONFLICT\", \"Token id already exists.\", id=new_id)\n\n        st = status if status is not None else \"active\"\n        if st not in (\"active\", \"inactive\", \"delisted\"):\n            return _err(\"VALIDATION_ERROR\", \"Invalid 'status'.\", allowed=[\"active\", \"inactive\", \"delisted\"])\n\n        # Constraint: delisted coins should not be is_spot_supported=true\n        if st == \"delisted\" and is_spot_supported is True:\n            return _err(\"VALIDATION_ERROR\", \"Delisted tokens cannot be spot supported.\", status=st, is_spot_supported=True)\n\n        created = now.isoformat()\n        rec = {\n            \"id\": new_id,\n            \"symbol\": sym_up,\n            \"name\": name,\n            \"aliases\": aliases if aliases is not None else [],\n            \"is_spot_supported\": bool(is_spot_supported) if is_spot_supported is not None else False,\n            \"transfer\": bool(transfer) if isinstance(transfer, bool) else (transfer if transfer is not None else False),\n            \"status\": st,\n            \"created_at\": created,\n            \"updated_at\": created\n        }\n        tokens.append(rec)\n        _save(\"tokens.json\", tokens)\n        return {\"token\": rec, \"created\": True}\n    else:\n        # Update\n        # Refuse attempts to modify immutable identifiers (id itself). Since id locates record, no change allowed.\n        # (symbol is mutable but unique; enforce canonical casing)\n        prev_status = existing.get(\"status\")\n        next_status = status if status is not None else prev_status\n\n        if prev_status is None or prev_status not in transitions:\n            return _err(\"VALIDATION_ERROR\", \"Existing token has invalid stored status.\", status=prev_status)\n\n        if next_status != prev_status:\n            if next_status not in transitions.get(prev_status, set()):\n                return _err(\"VALIDATION_ERROR\", \"Invalid status transition.\", from_status=prev_status, to_status=next_status)\n\n        # Constraint: delisted coins should not be is_spot_supported=true\n        effective_is_spot = existing.get(\"is_spot_supported\") if is_spot_supported is None else is_spot_supported\n        if next_status == \"delisted\" and effective_is_spot is True:\n            return _err(\"VALIDATION_ERROR\", \"Delisted tokens cannot be spot supported.\", status=next_status, is_spot_supported=True)\n\n        # Apply updates\n        updated = dict(existing)\n        updated[\"symbol\"] = sym_up\n        updated[\"name\"] = name\n        if aliases is not None:\n            updated[\"aliases\"] = aliases\n        if is_spot_supported is not None:\n            updated[\"is_spot_supported\"] = is_spot_supported\n        if transfer is not None:\n            updated[\"transfer\"] = bool(transfer) if isinstance(transfer, bool) else transfer\n        if status is not None:\n            updated[\"status\"] = next_status\n\n        # Enforce created_at <= updated_at (and keep created_at stable)\n        created_at = updated.get(\"created_at\")\n        try:\n            # If stored created_at is invalid, normalize to now to avoid breaking constraint\n            _ = datetime.datetime.fromisoformat(created_at.replace(\"Z\", \"+00:00\")) if isinstance(created_at, str) else None\n        except Exception:\n            created_at = now.isoformat()\n            updated[\"created_at\"] = created_at\n\n        updated[\"updated_at\"] = now.isoformat()\n\n        # Additional business rule on write (token_chain_support must not exist for delisted unless disabled)\n        if updated.get(\"status\") == \"delisted\":\n            tid = updated.get(\"id\")\n            for csr in chain_support:\n                if not isinstance(csr, dict):\n                    continue\n                if csr.get(\"token_id\") == tid and csr.get(\"status\") != \"disabled\":\n                    return _err(\n                        \"VALIDATION_ERROR\",\n                        \"Cannot delist token while chain support rows are enabled; disable them first.\",\n                        token_id=tid\n                    )\n\n        tokens[existing_idx] = updated\n        _save(\"tokens.json\", tokens)\n        return {\"token\": updated, \"created\": False}\n"
+        },
+        {
+          "name": "listAnnouncements",
+          "description": "Lists announcements with pagination and optional filtering by type and status. Returns results ordered by published_at descending. Refuses invalid filters with VALIDATION_ERROR; requires authorization and may return RATE_LIMITED.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "anType": {
+                "type": "string",
+                "enum": [
+                  "latest_news",
+                  "coin_listings",
+                  "trading_competitions_promotions",
+                  "maintenance_system_updates",
+                  "symbol_delisting"
+                ],
+                "description": "Filter by announcement type."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "published",
+                  "retracted",
+                  "archived"
+                ],
+                "description": "Filter by announcement lifecycle status."
+              },
+              "published_from": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return announcements with published_at >= this timestamp."
+              },
+              "published_to": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Only return announcements with published_at <= this timestamp."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of announcements to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def listAnnouncements(anType=None, status=None, published_from=None, published_to=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, uuid, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0083000\" if __import__(\"os\").path.isdir(\"./environment_mix/0083000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    # Validation\n    allowed_types = {\n        \"latest_news\",\n        \"coin_listings\",\n        \"trading_competitions_promotions\",\n        \"maintenance_system_updates\",\n        \"symbol_delisting\",\n    }\n    allowed_status = {\"published\", \"retracted\", \"archived\"}\n\n    if anType is not None:\n        if not isinstance(anType, str):\n            return _err(\"VALIDATION_ERROR\", \"Parameter 'anType' must be a string.\")\n        if anType not in allowed_types:\n            return _err(\"VALIDATION_ERROR\", \"Invalid 'anType'.\", allowed=sorted(list(allowed_types)))\n\n    if status is not None:\n        if not isinstance(status, str):\n            return _err(\"VALIDATION_ERROR\", \"Parameter 'status' must be a string.\")\n        if status not in allowed_status:\n            return _err(\"VALIDATION_ERROR\", \"Invalid 'status'.\", allowed=sorted(list(allowed_status)))\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s.strip():\n            return _err(\"VALIDATION_ERROR\", f\"Parameter '{field}' must be an ISO date-time string.\")\n        try:\n            return datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", f\"Parameter '{field}' must be a valid ISO date-time.\", value=s)\n\n    pf = _parse_dt(published_from, \"published_from\")\n    if isinstance(pf, dict) and \"error\" in pf:\n        return pf\n    pt = _parse_dt(published_to, \"published_to\")\n    if isinstance(pt, dict) and \"error\" in pt:\n        return pt\n    if pf and pt and pf > pt:\n        return _err(\"VALIDATION_ERROR\", \"'published_from' must be <= 'published_to'.\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'limit' must be an integer.\")\n    if limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'limit' must be between 1 and 200.\")\n\n    # Cursor decode: base64 JSON {\"published_at\": \"...\", \"id\":\"...\"}\n    cursor_obj = None\n    if cursor is not None:\n        if not isinstance(cursor, str) or not cursor.strip():\n            return _err(\"VALIDATION_ERROR\", \"Parameter 'cursor' must be a non-empty string when provided.\")\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            cursor_obj = json.loads(raw.decode(\"utf-8\"))\n            if not isinstance(cursor_obj, dict):\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n            if \"published_at\" not in cursor_obj or \"id\" not in cursor_obj:\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n    anns = _load(\"announcements.json\")\n\n    # Filter\n    def _to_dt(v):\n        try:\n            if isinstance(v, str):\n                return datetime.datetime.fromisoformat(v.replace(\"Z\", \"+00:00\"))\n        except Exception:\n            return None\n        return None\n\n    rows = []\n    for a in anns:\n        if not isinstance(a, dict):\n            continue\n        if anType is not None and a.get(\"anType\") != anType:\n            continue\n        if status is not None and a.get(\"status\") != status:\n            continue\n        pdt = _to_dt(a.get(\"published_at\"))\n        if pdt is None:\n            continue\n        if pf is not None and pdt < pf:\n            continue\n        if pt is not None and pdt > pt:\n            continue\n        rows.append(a)\n\n    # Sort published_at desc, tie-breaker id desc (stable)\n    rows.sort(key=lambda r: (_to_dt(r.get(\"published_at\")) or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), str(r.get(\"id\") or \"\")), reverse=True)\n\n    # Apply cursor (exclusive)\n    if cursor_obj is not None:\n        c_dt = _to_dt(cursor_obj.get(\"published_at\"))\n        c_id = str(cursor_obj.get(\"id\"))\n        if c_dt is None:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n        filtered = []\n        for r in rows:\n            rdt = _to_dt(r.get(\"published_at\"))\n            rid = str(r.get(\"id\") or \"\")\n            if rdt is None:\n                continue\n            # since sorted desc, include items strictly \"after\" cursor in list (i.e., older than cursor)\n            if rdt < c_dt or (rdt == c_dt and rid < c_id):\n                filtered.append(r)\n        rows = filtered\n\n    total = len(rows)\n    page = rows[:limit]\n    has_more = total > limit\n\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        payload = {\"published_at\": last.get(\"published_at\"), \"id\": last.get(\"id\")}\n        next_cursor = base64.urlsafe_b64encode(json.dumps(payload, ensure_ascii=False).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    return {\n        \"announcements\": page,\n        \"meta\": {\n            \"limit\": limit,\n            \"total\": total,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor\n        }\n    }\n"
+        },
+        {
+          "name": "upsertAnnouncement",
+          "description": "Creates a new announcement or updates an existing one by `id`. Enforces announcement lifecycle transitions (published→archived/retracted, archived→retracted) and refuses invalid transitions with VALIDATION_ERROR. Rejects announcements with published_at unreasonably far in the future (more than 24 hours) with VALIDATION_ERROR. Returns the stored announcement record; requires authorization and may return RATE_LIMITED.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Announcement primary key. If provided and exists, the announcement is updated; if not found, a new announcement is created."
+              },
+              "anType": {
+                "type": "string",
+                "enum": [
+                  "latest_news",
+                  "coin_listings",
+                  "trading_competitions_promotions",
+                  "maintenance_system_updates",
+                  "symbol_delisting"
+                ],
+                "description": "Announcement type."
+              },
+              "title": {
+                "type": "string",
+                "description": "Announcement title."
+              },
+              "body": {
+                "type": "string",
+                "description": "Announcement body content."
+              },
+              "url": {
+                "type": "string",
+                "description": "Canonical source URL for the announcement."
+              },
+              "published_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Publish timestamp (must not be >24h in the future)."
+              },
+              "source": {
+                "type": "string",
+                "description": "Origin/source system identifier."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "published",
+                  "retracted",
+                  "archived"
+                ],
+                "description": "Lifecycle status with enforced transitions."
+              }
+            },
+            "required": [
+              "anType",
+              "title",
+              "published_at",
+              "source",
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def upsertAnnouncement(anType, title, published_at, source, status, id=None, body=None, url=None, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0083000\" if __import__(\"os\").path.isdir(\"./environment_mix/0083000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    # Validate required\n    allowed_types = {\n        \"latest_news\",\n        \"coin_listings\",\n        \"trading_competitions_promotions\",\n        \"maintenance_system_updates\",\n        \"symbol_delisting\",\n    }\n    allowed_status = {\"published\", \"retracted\", \"archived\"}\n\n    if not isinstance(anType, str) or anType not in allowed_types:\n        return _err(\"VALIDATION_ERROR\", \"Invalid 'anType'.\", allowed=sorted(list(allowed_types)))\n    if not isinstance(title, str) or not title.strip():\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'title' must be a non-empty string.\")\n    if not isinstance(source, str) or not source.strip():\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'source' must be a non-empty string.\")\n    if not isinstance(status, str) or status not in allowed_status:\n        return _err(\"VALIDATION_ERROR\", \"Invalid 'status'.\", allowed=sorted(list(allowed_status)))\n\n    if id is not None and (not isinstance(id, str) or not id.strip()):\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'id' must be a non-empty string when provided.\")\n    if body is not None and not isinstance(body, str):\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'body' must be a string.\")\n    if url is not None and not isinstance(url, str):\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'url' must be a string.\")\n\n    if not isinstance(published_at, str) or not published_at.strip():\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'published_at' must be an ISO date-time string.\")\n    try:\n        pdt = datetime.datetime.fromisoformat(published_at.replace(\"Z\", \"+00:00\"))\n    except Exception:\n        return _err(\"VALIDATION_ERROR\", \"Parameter 'published_at' must be a valid ISO date-time.\", value=published_at)\n\n    # Business rule: published_at not more than 24h in the future relative to ingestion\n    # (allow naive dt treated as UTC)\n    if pdt.tzinfo is None:\n        pdt = pdt.replace(tzinfo=datetime.timezone.utc)\n    if pdt > (now + datetime.timedelta(hours=24)):\n        return _err(\"VALIDATION_ERROR\", \"published_at is unreasonably far in the future (>24h).\", published_at=published_at)\n\n    anns = _load(\"announcements.json\")\n\n    # Find existing by id if provided\n    existing = None\n    existing_idx = None\n    if id is not None:\n        for i, r in enumerate(anns):\n            if isinstance(r, dict) and r.get(\"id\") == id:\n                existing = r\n                existing_idx = i\n                break\n\n    # Dedupe constraint: unique(source, url) where url not null\n    if url is not None and url.strip():\n        for r in anns:\n            if not isinstance(r, dict):\n                continue\n            if existing is not None and r.get(\"id\") == existing.get(\"id\"):\n                continue\n            if r.get(\"source\") == source and r.get(\"url\") == url:\n                return _err(\"CONFLICT\", \"Announcement with same (source, url) already exists.\", source=source, url=url)\n\n    transitions = {\n        \"published\": {\"archived\", \"retracted\"},\n        \"archived\": {\"retracted\"},\n        \"retracted\": set()\n    }\n\n    if existing is None:\n        new_id = id.strip() if id is not None else f\"ann_{uuid.uuid4().hex}\"\n        for r in anns:\n            if isinstance(r, dict) and r.get(\"id\") == new_id:\n                return _err(\"CONFLICT\", \"Announcement id already exists.\", id=new_id)\n\n        created = now.isoformat()\n        rec = {\n            \"id\": new_id,\n            \"anType\": anType,\n            \"title\": title,\n            \"body\": body if body is not None else None,\n            \"url\": url if url is not None else None,\n            \"published_at\": pdt.isoformat(),\n            \"source\": source,\n            \"status\": status,\n            \"created_at\": created,\n            \"updated_at\": created\n        }\n        anns.append(rec)\n        _save(\"announcements.json\", anns)\n        return {\"announcement\": rec, \"created\": True}\n    else:\n        prev_status = existing.get(\"status\")\n        if prev_status not in transitions:\n            return _err(\"VALIDATION_ERROR\", \"Existing announcement has invalid stored status.\", status=prev_status)\n        if status != prev_status:\n            if status not in transitions.get(prev_status, set()):\n                return _err(\"VALIDATION_ERROR\", \"Invalid status transition.\", from_status=prev_status, to_status=status)\n\n        updated = dict(existing)\n        updated[\"anType\"] = anType\n        updated[\"title\"] = title\n        updated[\"published_at\"] = pdt.isoformat()\n        updated[\"source\"] = source\n        updated[\"status\"] = status\n        if body is not None:\n            updated[\"body\"] = body\n        if url is not None:\n            updated[\"url\"] = url\n\n        # Keep created_at stable; update updated_at\n        created_at = updated.get(\"created_at\")\n        try:\n            _ = datetime.datetime.fromisoformat(created_at.replace(\"Z\", \"+00:00\")) if isinstance(created_at, str) else None\n        except Exception:\n            updated[\"created_at\"] = now.isoformat()\n        updated[\"updated_at\"] = now.isoformat()\n\n        anns[existing_idx] = updated\n        _save(\"announcements.json\", anns)\n        return {\"announcement\": updated, \"created\": False}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0083000",
+    "index": 83,
+    "name": "Coin MCP Server",
+    "description": "This backend powers a cryptocurrency info/search MCP service by storing a catalog of tokens, their current price snapshots, and exchange-style announcements. It supports read-only tools to fetch latest token price, query announcements within the last month by type, and fetch coin transfer/chain (dep",
+    "taxonomy": {
+      "L1_id": "L1-05",
+      "L1_name": "Cryptocurrency & Web3",
+      "L1_name_zh": "加密货币与 Web3",
+      "L2_id": "L2-11",
+      "L2_name": "Crypto Market Data",
+      "L2_name_zh": "加密市场数据",
+      "L3_name": "Price Quotes & Market Snapshots",
+      "L3_name_zh": "价格报价与市场快照"
+    },
+    "database_dir": "./environment_mix/0083000",
+    "mount_path": "/app/database",
+    "n_tools": 8,
+    "n_collections": 5,
+    "n_records": 90,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 8,
+      "loaded": 8,
+      "reads_returning_data": 6,
+      "read_operations": 6,
+      "mutations_persisted": 2,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 8,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "getTokenPrice",
+      "returned_chars": 224
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

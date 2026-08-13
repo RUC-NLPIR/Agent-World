@@ -1,0 +1,368 @@
+{
+  "index": 222,
+  "local_files_dir": "./environment_mix/0222000",
+  "file_list": [
+    "./environment_mix/0222000/README.md",
+    "./environment_mix/0222000/api_keys.json",
+    "./environment_mix/0222000/diagram_artifacts.json",
+    "./environment_mix/0222000/diagram_generations.json",
+    "./environment_mix/0222000/projects.json",
+    "./environment_mix/0222000/usage_events.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "projects.json": "12 rows",
+        "diagram_generations.json": "18 rows",
+        "diagram_artifacts.json": "18 rows",
+        "api_keys.json": "12 rows",
+        "usage_events.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "generateDiagram",
+          "description": "Creates and stores a new diagram generation request for the specified project, recording the provided input_spec (verbatim) and returning the created request record (and any generator metadata) for downstream job processing; if idempotency_key is provided, repeated calls with the same key for the same project return the originally created request instead of creating a duplicate. Raises VALIDATION_ERROR if project_id does not match the expected format, if input_spec is missing/invalid, if generator_version/idempotency_key violate length constraints, or if unknown fields are supplied. Raises UNAUTHORIZED if the caller is not permitted to create requests for the project, NOT_FOUND if the referenced project_id does not exist, and CONFLICT if the same idempotency_key is reused with a different request payload (project_id, input_spec, or generator_version).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "project_id": {
+                "type": "string",
+                "pattern": "^ers_proj_[0-9A-Z]{18,}$",
+                "description": "ID of the project to associate this diagram generation with."
+              },
+              "input_spec": {
+                "type": "object",
+                "description": "Generator input specification used to produce the diagram (stored verbatim for audit/debug)."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Client-provided idempotency key to deduplicate repeated generation requests."
+              },
+              "generator_version": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "Optional generator version identifier to run (if omitted, server uses default)."
+              }
+            },
+            "required": [
+              "project_id",
+              "input_spec"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def generateDiagram(project_id, input_spec, idempotency_key=None, generator_version=None, **_extra):\n    import json, os, datetime, time, re, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0222000\" if __import__(\"os\").path.isdir(\"./environment_mix/0222000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n    now_iso = now.isoformat().replace(\"+00:00\", \"Z\")\n\n    def _new_id(prefix):\n        # 20 chars base32-ish, uppercase\n        alphabet = \"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567\"\n        raw = uuid.uuid4().bytes + uuid.uuid4().bytes\n        out = []\n        for b in raw:\n            out.append(alphabet[b & 31])\n            if len(out) >= 20:\n                break\n        return f\"{prefix}_{''.join(out)}\"\n\n    def _parse_ts(s):\n        if not isinstance(s, str) or not s:\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1] + \"+00:00\")\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    # Validate inputs\n    if not isinstance(project_id, str) or not re.match(r\"^ers_proj_[0-9A-Z]{18,}$\", project_id):\n        return _err(\"VALIDATION_ERROR\", \"Invalid project_id.\")\n    if not isinstance(input_spec, dict):\n        return _err(\"VALIDATION_ERROR\", \"input_spec must be an object.\")\n    if idempotency_key is not None:\n        if not isinstance(idempotency_key, str) or not (1 <= len(idempotency_key) <= 256):\n            return _err(\"VALIDATION_ERROR\", \"Invalid idempotency_key.\")\n    if generator_version is not None:\n        if not isinstance(generator_version, str) or not (1 <= len(generator_version) <= 128):\n            return _err(\"VALIDATION_ERROR\", \"Invalid generator_version.\")\n\n    # Business rule: tool surface defines no parameters; normalize to {}\n    normalized_input_spec = {}\n\n    projects = _load(\"projects.json\")\n    gens = _load(\"diagram_generations.json\")\n    keys = _load(\"api_keys.json\")\n    usage = _load(\"usage_events.json\")\n\n    # Validate project exists and is not deleted (on delete restrict semantics for generations)\n    proj = next((p for p in projects if p.get(\"id\") == project_id), None)\n    if not proj:\n        # no generation_id to attach usage; return error\n        return _err(\"NOT_FOUND\", \"Project not found.\", project_id=project_id)\n    if proj.get(\"status\") == \"deleted\":\n        return _err(\"INVALID_TRANSITION\", \"Cannot generate diagrams for a deleted project.\", project_id=project_id)\n\n    # Resolve an API key context if possible (ambient auth). Since this tool has no credential param,\n    # choose a working active key if one exists; otherwise proceed as internal (api_key_id=None)\n    active_keys = [k for k in keys if k.get(\"status\") == \"active\"]\n    api_key_row = active_keys[0] if active_keys else None\n    api_key_id = api_key_row.get(\"id\") if api_key_row else None\n\n    # Idempotency: if idempotency_key supplied, return existing generation in same project\n    if idempotency_key is not None:\n        existing = next((g for g in gens if g.get(\"project_id\") == project_id and g.get(\"idempotency_key\") == idempotency_key), None)\n        if existing:\n            # Record usage event as accepted (idempotent attach)\n            ue = {\n                \"id\": _new_id(\"ers_usage\"),\n                \"api_key_id\": api_key_id,\n                \"generation_id\": existing.get(\"id\"),\n                \"tool_name\": \"generateDiagram\",\n                \"request_ts\": now_iso,\n                \"response_status\": \"accepted\",\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"created_at\": now_iso,\n                \"updated_at\": now_iso,\n            }\n            usage.append(ue)\n            _save(\"usage_events.json\", usage)\n            return {\n                \"generation\": existing,\n                \"idempotent_replay\": True,\n            }\n\n    # Apply rate limit and quota if we have an API key\n    if api_key_row:\n        # If key isn't active (shouldn't happen due to selection), reject\n        if api_key_row.get(\"status\") != \"active\":\n            # can't enqueue; record usage error without generation_id: we must create a generation_id? Schema says generation_id non-null.\n            # Therefore, create no usage event (cannot satisfy schema) and return UNAUTHORIZED-like error per business rule.\n            return _err(\"UNAUTHORIZED\", \"API key is not active.\")\n        rate_limit = api_key_row.get(\"rate_limit_per_minute\")\n        quota = api_key_row.get(\"daily_generation_quota\")\n        if not isinstance(rate_limit, int) or rate_limit < 1 or rate_limit > 6000:\n            return _err(\"UNAUTHORIZED\", \"API key misconfigured (rate limit).\")\n        if not isinstance(quota, int) or quota < 0 or quota > 100000:\n            return _err(\"UNAUTHORIZED\", \"API key misconfigured (quota).\")\n\n        # Count accepted events in last 60 seconds\n        cutoff = now - datetime.timedelta(seconds=60)\n        accepted_recent = 0\n        for e in usage:\n            if e.get(\"api_key_id\") != api_key_id: \n                continue\n            if e.get(\"tool_name\") != \"generateDiagram\" or e.get(\"response_status\") != \"accepted\":\n                continue\n            ts = _parse_ts(e.get(\"request_ts\"))\n            if ts and ts >= cutoff:\n                accepted_recent += 1\n        if accepted_recent >= rate_limit:\n            # Need a generation_id for usage event; but request rejected before enqueue, schema requires generation_id.\n            # Real service would still log request; enforce schema by creating a placeholder generation with status=failed?\n            # That would \"enqueue\" effect. Instead, refuse with RATE_LIMIT and do not write usage_event (cannot).\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\")\n\n        # Count accepted events today UTC\n        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)\n        accepted_today = 0\n        for e in usage:\n            if e.get(\"api_key_id\") != api_key_id:\n                continue\n            if e.get(\"tool_name\") != \"generateDiagram\" or e.get(\"response_status\") != \"accepted\":\n                continue\n            ts = _parse_ts(e.get(\"request_ts\"))\n            if ts and ts >= day_start and ts <= now:\n                accepted_today += 1\n        if accepted_today >= quota:\n            return _err(\"QUOTA_EXCEEDED\", \"Daily generation quota exceeded.\")\n\n    # Create generation\n    gen_id = _new_id(\"ers_gen\")\n    gv = generator_version if generator_version is not None else \"default\"\n    gen = {\n        \"id\": gen_id,\n        \"project_id\": project_id,\n        \"status\": \"queued\",\n        \"requested_by_api_key_id\": api_key_id,\n        \"generator_version\": gv,\n        \"input_spec\": normalized_input_spec,\n        \"idempotency_key\": idempotency_key,\n        \"queued_at\": now_iso,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"compute_ms\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n    }\n\n    # Enforce unique(project_id, idempotency_key) where not null (race-safe best effort)\n    if idempotency_key is not None:\n        for g in gens:\n            if g.get(\"project_id\") == project_id and g.get(\"idempotency_key\") == idempotency_key:\n                # Another entry exists; attach to it (idempotent)\n                ue = {\n                    \"id\": _new_id(\"ers_usage\"),\n                    \"api_key_id\": api_key_id,\n                    \"generation_id\": g.get(\"id\"),\n                    \"tool_name\": \"generateDiagram\",\n                    \"request_ts\": now_iso,\n                    \"response_status\": \"accepted\",\n                    \"latency_ms\": int((time.time() - t0) * 1000),\n                    \"created_at\": now_iso,\n                    \"updated_at\": now_iso,\n                }\n                usage.append(ue)\n                _save(\"usage_events.json\", usage)\n                return {\"generation\": g, \"idempotent_replay\": True}\n\n    gens.append(gen)\n    _save(\"diagram_generations.json\", gens)\n\n    # Record usage event accepted (now generation_id exists)\n    ue = {\n        \"id\": _new_id(\"ers_usage\"),\n        \"api_key_id\": api_key_id,\n        \"generation_id\": gen_id,\n        \"tool_name\": \"generateDiagram\",\n        \"request_ts\": now_iso,\n        \"response_status\": \"accepted\",\n        \"latency_ms\": int((time.time() - t0) * 1000),\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n    }\n    usage.append(ue)\n    _save(\"usage_events.json\", usage)\n\n    return {\n        \"generation\": gen,\n        \"idempotent_replay\": False,\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "listProjects",
+          "description": "Lists projects visible to the calling API key, optionally filtered by status and free-text query, returning a paginated result set ordered by created_at descending. Refuses invalid pagination parameters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "description": "API key used to authenticate the request."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "Filter projects by lifecycle status."
+              },
+              "query": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "Case-insensitive substring match against project name/description."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of projects to return."
+              },
+              "cursor": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "description": "Opaque pagination cursor from a previous response."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def listProjects(api_key, status=None, query=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0222000\" if __import__(\"os\").path.isdir(\"./environment_mix/0222000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n    now_iso = now.isoformat().replace(\"+00:00\", \"Z\")\n\n    # Validate inputs\n    if not isinstance(api_key, str) or not (1 <= len(api_key) <= 512):\n        return _err(\"VALIDATION_ERROR\", \"Invalid api_key.\")\n    if status is not None and status not in (\"active\", \"archived\", \"deleted\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid status.\")\n    if query is not None:\n        if not isinstance(query, str) or not (1 <= len(query) <= 200):\n            return _err(\"VALIDATION_ERROR\", \"Invalid query.\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or not (1 <= limit <= 200):\n        return _err(\"VALIDATION_ERROR\", \"Invalid limit.\")\n    if cursor is not None:\n        if not isinstance(cursor, str) or not (1 <= len(cursor) <= 512):\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n    keys = _load(\"api_keys.json\")\n    projects = _load(\"projects.json\")\n\n    # Authenticate: match by id or by stored client-visible value (no plaintext exists for key_hash, so match id only)\n    key_row = next((k for k in keys if k.get(\"id\") == api_key), None)\n    if not key_row:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key.\")\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"API key is revoked.\")\n\n    # Sort by created_at desc (best-effort parse)\n    def _ts(p):\n        s = p.get(\"created_at\")\n        if isinstance(s, str):\n            try:\n                if s.endswith(\"Z\"):\n                    return datetime.datetime.fromisoformat(s[:-1] + \"+00:00\")\n                return datetime.datetime.fromisoformat(s)\n            except Exception:\n                return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n\n    rows = list(projects)\n\n    if status is not None:\n        rows = [p for p in rows if p.get(\"status\") == status]\n\n    if query is not None:\n        q = query.lower()\n        def _s(x): return x if isinstance(x, str) else \"\"\n        rows = [p for p in rows if (q in _s(p.get(\"name\")).lower()) or (q in _s(p.get(\"description\")).lower())]\n\n    rows.sort(key=_ts, reverse=True)\n\n    # Cursor is opaque; encode/decode as base64 JSON {\"offset\": int}\n    offset = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            obj = json.loads(raw.decode(\"utf-8\"))\n            if not isinstance(obj, dict) or not isinstance(obj.get(\"offset\"), int) or obj[\"offset\"] < 0:\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n            offset = obj[\"offset\"]\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n    total = len(rows)\n    page = rows[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        payload = json.dumps({\"offset\": next_offset}, separators=(\",\", \":\")).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(payload).decode(\"utf-8\").rstrip(\"=\")\n\n    return {\n        \"projects\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"server_time\": now_iso,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n    }\n"
+        },
+        {
+          "name": "createProject",
+          "description": "Creates a new project owned/accessible to the calling API key and returns the created project record. Refuses requests with missing/invalid fields.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "description": "API key used to authenticate the request."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120,
+                "description": "Human-readable project name."
+              },
+              "description": {
+                "type": "string",
+                "maxLength": 2000,
+                "description": "Optional project description."
+              }
+            },
+            "required": [
+              "api_key",
+              "name"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def createProject(api_key, name, description=None, **_extra):\n    import json, os, datetime, time, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0222000\" if __import__(\"os\").path.isdir(\"./environment_mix/0222000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now.replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _lat_ms():\n        return int((time.time() - t0) * 1000)\n\n    def _new_id(prefix):\n        alphabet = \"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\"\n        raw = (uuid.uuid4().hex + uuid.uuid4().hex).upper()\n        token = \"\".join(alphabet[ord(c) % len(alphabet)] for c in raw)[:20]\n        return f\"{prefix}_{token}\"\n\n    def _resolve_api_key_id(api_key_value):\n        # Explicit credential parameter: authenticate by id OR by client-visible secret value if present.\n        # Store only has key_hash; do NOT compare against it.\n        keys = _load(\"api_keys.json\")\n        for r in keys:\n            if r.get(\"id\") == api_key_value:\n                return r.get(\"id\"), r\n        # If the store had a plaintext column we'd check it; it doesn't, so id-match is the only viable auth here.\n        return None, None\n\n    def _append_usage(api_key_id, response_status):\n        usage = _load(\"usage_events.json\")\n        ev = {\n            \"id\": _new_id(\"ers_use\"),\n            \"api_key_id\": api_key_id,\n            \"generation_id\": f\"ers_gen_internal_{uuid.uuid4().hex.upper()}\",\n            \"tool_name\": \"generateDiagram\",\n            \"request_ts\": now_iso,\n            \"response_status\": response_status,\n            \"latency_ms\": _lat_ms(),\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n        }\n        usage.append(ev)\n        _save(\"usage_events.json\", usage)\n\n    # Validate tool schema\n    if not isinstance(api_key, str) or not (1 <= len(api_key) <= 512):\n        _append_usage(None, \"error\")\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string up to 512 characters.\", field=\"api_key\")\n    if not isinstance(name, str) or not (1 <= len(name) <= 120):\n        ak_id, _ = _resolve_api_key_id(api_key)\n        _append_usage(ak_id, \"error\")\n        return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string up to 120 characters.\", field=\"name\")\n    if description is not None:\n        if not isinstance(description, str):\n            ak_id, _ = _resolve_api_key_id(api_key)\n            _append_usage(ak_id, \"error\")\n            return _err(\"VALIDATION_ERROR\", \"description must be a string when provided.\", field=\"description\")\n        if len(description) > 2000:\n            ak_id, _ = _resolve_api_key_id(api_key)\n            _append_usage(ak_id, \"error\")\n            return _err(\"VALIDATION_ERROR\", \"description must be at most 2000 characters.\", field=\"description\")\n\n    # Authenticate\n    api_key_id, ak_row = _resolve_api_key_id(api_key)\n    if not api_key_id:\n        _append_usage(None, \"error\")\n        return _err(\"UNAUTHORIZED\", \"Invalid API key.\")\n\n    # Enforce API key lifecycle\n    if ak_row.get(\"status\") != \"active\":\n        _append_usage(api_key_id, \"error\")\n        return _err(\"UNAUTHORIZED\", \"API key is not active.\", field=\"api_key\")\n\n    # Enforce project constraints\n    # - schema constraints: name length 1..200 (tool already restricts 1..120, ok)\n    # - unique(name) where status != 'deleted'\n    projects = _load(\"projects.json\")\n    for p in projects:\n        if p.get(\"status\") != \"deleted\" and isinstance(p.get(\"name\"), str) and p.get(\"name\") == name:\n            _append_usage(api_key_id, \"error\")\n            return _err(\n                \"CONFLICT\",\n                \"Project constraint violated: unique(name) where status != 'deleted' (a non-deleted project with this name already exists).\",\n                field=\"name\",\n            )\n\n    # Create\n    proj = {\n        \"id\": _new_id(\"ers_proj\"),\n        \"name\": name,\n        \"description\": description,\n        \"status\": \"active\",\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n    }\n    projects.append(proj)\n    _save(\"projects.json\", projects)\n\n    _append_usage(api_key_id, \"accepted\")\n    return {\"project\": proj}\n"
+        },
+        {
+          "name": "updateProject",
+          "description": "Updates mutable fields on an existing project and/or transitions its status according to the project lifecycle. Returns the updated project record. Refuses invalid transitions (e.g., deleted -> active) or attempts to modify a deleted project.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "description": "API key used to authenticate the request."
+              },
+              "project_id": {
+                "type": "string",
+                "pattern": "^ers_proj_[0-9A-Z]{18,}$",
+                "description": "ID of the project to update."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120,
+                "description": "New project name."
+              },
+              "description": {
+                "type": "string",
+                "maxLength": 2000,
+                "description": "New project description."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "New lifecycle status. Allowed transitions: active->archived/deleted; archived->active/deleted."
+              }
+            },
+            "required": [
+              "api_key",
+              "project_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def updateProject(api_key, project_id, name=None, description=None, status=None, **_extra):\n    import json, os, datetime, time, re, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0222000\" if __import__(\"os\").path.isdir(\"./environment_mix/0222000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n    now_iso = now.replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _lat_ms():\n        return int((time.time() - t0) * 1000)\n\n    def _new_id(prefix):\n        alphabet = \"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\"\n        raw = (uuid.uuid4().hex + uuid.uuid4().hex).upper()\n        token = \"\".join(alphabet[ord(c) % len(alphabet)] for c in raw)[:20]\n        return f\"{prefix}_{token}\"\n\n    def _resolve_api_key_id(api_key_value):\n        keys = _load(\"api_keys.json\")\n        for r in keys:\n            if r.get(\"id\") == api_key_value:\n                return r.get(\"id\"), r\n        return None, None\n\n    def _append_usage(api_key_id, response_status):\n        usage = _load(\"usage_events.json\")\n        ev = {\n            \"id\": _new_id(\"ers_use\"),\n            \"api_key_id\": api_key_id,\n            \"generation_id\": f\"ers_gen_internal_{uuid.uuid4().hex.upper()}\",\n            \"tool_name\": \"generateDiagram\",\n            \"request_ts\": now_iso,\n            \"response_status\": response_status,\n            \"latency_ms\": _lat_ms(),\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso,\n        }\n        usage.append(ev)\n        _save(\"usage_events.json\", usage)\n\n    # Validate inputs (tool schema)\n    if not isinstance(api_key, str) or not (1 <= len(api_key) <= 512):\n        _append_usage(None, \"error\")\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string up to 512 characters.\", field=\"api_key\")\n    if not isinstance(project_id, str) or not re.match(r\"^ers_proj_[0-9A-Z]{18,}$\", project_id):\n        ak_id, _ = _resolve_api_key_id(api_key)\n        _append_usage(ak_id, \"error\")\n        return _err(\"VALIDATION_ERROR\", \"project_id must match ^ers_proj_[0-9A-Z]{18,}$.\", field=\"project_id\")\n\n    if name is not None:\n        if not isinstance(name, str) or not (1 <= len(name) <= 120):\n            ak_id, _ = _resolve_api_key_id(api_key)\n            _append_usage(ak_id, \"error\")\n            return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string up to 120 characters.\", field=\"name\")\n    if description is not None:\n        if not isinstance(description, str):\n            ak_id, _ = _resolve_api_key_id(api_key)\n            _append_usage(ak_id, \"error\")\n            return _err(\"VALIDATION_ERROR\", \"description must be a string when provided.\", field=\"description\")\n        if len(description) > 2000:\n            ak_id, _ = _resolve_api_key_id(api_key)\n            _append_usage(ak_id, \"error\")\n            return _err(\"VALIDATION_ERROR\", \"description must be at most 2000 characters.\", field=\"description\")\n    if status is not None:\n        if status not in (\"active\", \"archived\", \"deleted\"):\n            ak_id, _ = _resolve_api_key_id(api_key)\n            _append_usage(ak_id, \"error\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: active, archived, deleted.\", field=\"status\")\n\n    # Must attempt a real mutation; require at least one change\n    if name is None and description is None and status is None:\n        ak_id, _ = _resolve_api_key_id(api_key)\n        _append_usage(ak_id, \"error\")\n        return _err(\"VALIDATION_ERROR\", \"At least one of name, description, or status must be provided.\")\n\n    # Authenticate\n    api_key_id, ak_row = _resolve_api_key_id(api_key)\n    if not api_key_id:\n        _append_usage(None, \"error\")\n        return _err(\"UNAUTHORIZED\", \"Invalid API key.\")\n    if ak_row.get(\"status\") != \"active\":\n        _append_usage(api_key_id, \"error\")\n        return _err(\"UNAUTHORIZED\", \"API key is not active.\", field=\"api_key\")\n\n    projects = _load(\"projects.json\")\n    idx = None\n    for i, p in enumerate(projects):\n        if p.get(\"id\") == project_id:\n            idx = i\n            break\n    if idx is None:\n        _append_usage(api_key_id, \"error\")\n        return _err(\"NOT_FOUND\", \"Project not found.\", field=\"project_id\")\n\n    proj = projects[idx]\n\n    # Cannot modify a deleted project (per tool description)\n    if proj.get(\"status\") == \"deleted\":\n        _append_usage(api_key_id, \"error\")\n        return _err(\"INVALID_TRANSITION\", \"Cannot modify a deleted project.\", field=\"status\")\n\n    # Enforce lifecycle transitions when status changes\n    transitions = {\n        \"active\": {\"archived\", \"deleted\"},\n        \"archived\": {\"active\", \"deleted\"},\n        \"deleted\": set(),\n    }\n    if status is not None and status != proj.get(\"status\"):\n        cur = proj.get(\"status\")\n        if cur not in transitions or status not in transitions.get(cur, set()):\n            _append_usage(api_key_id, \"error\")\n            return _err(\n                \"INVALID_TRANSITION\",\n                f\"Invalid status transition: {cur} -> {status}.\",\n                field=\"status\",\n            )\n\n    # Enforce unique(name) where status != 'deleted' (for new name)\n    if name is not None and name != proj.get(\"name\"):\n        for p in projects:\n            if p.get(\"id\") == project_id:\n                continue\n            if p.get(\"status\") != \"deleted\" and p.get(\"name\") == name:\n                _append_usage(api_key_id, \"error\")\n                return _err(\n                    \"CONFLICT\",\n                    \"Project constraint violated: unique(name) where status != 'deleted' (a non-deleted project with this name already exists).\",\n                    field=\"name\",\n                )\n\n    # Apply changes\n    changed = False\n    if name is not None and name != proj.get(\"name\"):\n        proj[\"name\"] = name\n        changed = True\n    if description is not None and description != proj.get(\"description\"):\n        proj[\"description\"] = description\n        changed = True\n    if status is not None and status != proj.get(\"status\"):\n        proj[\"status\"] = status\n        changed = True\n\n    if not changed:\n        # No success without effect\n        _append_usage(api_key_id, \"error\")\n        return _err(\"CONFLICT\", \"No changes to apply (fields match existing values).\")\n\n    proj[\"updated_at\"] = now_iso\n    projects[idx] = proj\n    _save(\"projects.json\", projects)\n\n    _append_usage(api_key_id, \"accepted\")\n    return {\"project\": proj}\n"
+        },
+        {
+          "name": "listDiagramGenerations",
+          "description": "Lists diagram generation requests for a project, optionally filtered by status and idempotency_key, returning a paginated result set ordered by created_at descending. Refuses invalid filters or pagination parameters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "description": "API key used to authenticate the request."
+              },
+              "project_id": {
+                "type": "string",
+                "pattern": "^ers_proj_[0-9A-Z]{18,}$",
+                "description": "Project whose generation requests to list."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "Filter generations by lifecycle status."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "description": "Filter generations by client idempotency key."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of generations to return."
+              },
+              "cursor": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "description": "Opaque pagination cursor from a previous response."
+              }
+            },
+            "required": [
+              "api_key",
+              "project_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def listDiagramGenerations(api_key, project_id, status=None, idempotency_key=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0222000\" if __import__(\"os\").path.isdir(\"./environment_mix/0222000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n    now_iso = now.isoformat()\n\n    def _usage_log(api_key_id, generation_id, response_status, latency_ms):\n        usage = _load(\"usage_events.json\")\n        new_id = \"ers_use_\" + os.urandom(12).hex().upper()\n        row = {\n            \"id\": new_id,\n            \"api_key_id\": api_key_id,\n            \"generation_id\": generation_id,\n            \"tool_name\": \"generateDiagram\",\n            \"request_ts\": now_iso,\n            \"response_status\": response_status,\n            \"latency_ms\": latency_ms,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso\n        }\n        usage.append(row)\n        _save(\"usage_events.json\", usage)\n\n    # Validate inputs\n    if not isinstance(api_key, str) or not (1 <= len(api_key) <= 512):\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string up to 512 chars\")\n    if not isinstance(project_id, str) or re.match(r\"^ers_proj_[0-9A-Z]{18,}$\", project_id) is None:\n        return _err(\"VALIDATION_ERROR\", \"project_id is invalid\")\n    if status is not None:\n        if not isinstance(status, str) or status not in [\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"]:\n            return _err(\"VALIDATION_ERROR\", \"status is invalid\")\n    if idempotency_key is not None:\n        if not isinstance(idempotency_key, str) or not (1 <= len(idempotency_key) <= 256):\n            return _err(\"VALIDATION_ERROR\", \"idempotency_key is invalid\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or not (1 <= limit <= 200):\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200\")\n    if cursor is not None:\n        if not isinstance(cursor, str) or not (1 <= len(cursor) <= 512):\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n\n    # Authenticate (explicit credential)\n    keys = _load(\"api_keys.json\")\n    key_row = None\n    for k in keys:\n        if k.get(\"id\") == api_key or k.get(\"key_hash\") == api_key:\n            key_row = k\n            break\n    if not key_row:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"API key is not active\")\n\n    projects = _load(\"projects.json\")\n    proj = next((p for p in projects if p.get(\"id\") == project_id), None)\n    if not proj:\n        return _err(\"NOT_FOUND\", \"Project not found\")\n    if proj.get(\"status\") == \"deleted\":\n        return _err(\"NOT_FOUND\", \"Project not found\")\n\n    # Cursor decode\n    offset = 0\n    if cursor is not None:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\")).decode(\"utf-8\")\n            payload = json.loads(raw)\n            if not isinstance(payload, dict) or payload.get(\"v\") != 1 or payload.get(\"tool\") != \"listDiagramGenerations\":\n                return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n            if payload.get(\"project_id\") != project_id:\n                return _err(\"VALIDATION_ERROR\", \"cursor does not match project_id\")\n            if payload.get(\"status\") != status:\n                return _err(\"VALIDATION_ERROR\", \"cursor does not match status filter\")\n            if payload.get(\"idempotency_key\") != idempotency_key:\n                return _err(\"VALIDATION_ERROR\", \"cursor does not match idempotency_key filter\")\n            offset = payload.get(\"offset\")\n            if not isinstance(offset, int) or offset < 0:\n                return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n\n    gens = _load(\"diagram_generations.json\")\n    rows = [g for g in gens if g.get(\"project_id\") == project_id]\n    if status is not None:\n        rows = [g for g in rows if g.get(\"status\") == status]\n    if idempotency_key is not None:\n        rows = [g for g in rows if g.get(\"idempotency_key\") == idempotency_key]\n\n    def _parse_dt(s):\n        if not isinstance(s, str):\n            return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n        try:\n            # Accept ISO with Z or offset\n            if s.endswith(\"Z\"):\n                s2 = s[:-1] + \"+00:00\"\n            else:\n                s2 = s\n            dt = datetime.datetime.fromisoformat(s2)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except Exception:\n            return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n\n    rows.sort(key=lambda r: (_parse_dt(r.get(\"created_at\")), str(r.get(\"id\") or \"\")), reverse=True)\n\n    total = len(rows)\n    page = rows[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        payload = {\n            \"v\": 1,\n            \"tool\": \"listDiagramGenerations\",\n            \"project_id\": project_id,\n            \"status\": status,\n            \"idempotency_key\": idempotency_key,\n            \"offset\": next_offset\n        }\n        next_cursor = base64.urlsafe_b64encode(json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")).decode(\"utf-8\")\n\n    # Observable service dynamics: record usage event (reads are logged as generateDiagram/error)\n    latency_ms = int((time.time() - t0) * 1000)\n    try:\n        _usage_log(key_row.get(\"id\"), \"ers_gen_000000000000000000\", \"error\", latency_ms)\n    except Exception:\n        return _err(\"error\", \"Failed to record usage event\")\n\n    return {\n        \"object\": \"list\",\n        \"data\": page,\n        \"total\": total,\n        \"limit\": limit,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor\n    }\n"
+        },
+        {
+          "name": "getDiagramGeneration",
+          "description": "Fetches a single diagram generation request by id and returns the full record including status and timing fields. Refuses access if the generation is not visible to the calling API key.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "description": "API key used to authenticate the request."
+              },
+              "generation_id": {
+                "type": "string",
+                "pattern": "^ers_gen_[0-9A-Z]{18,}$",
+                "description": "ID of the diagram generation request to fetch."
+              }
+            },
+            "required": [
+              "api_key",
+              "generation_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def getDiagramGeneration(api_key, generation_id, **_extra):\n    import json, os, datetime, time, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0222000\" if __import__(\"os\").path.isdir(\"./environment_mix/0222000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n    now_iso = now.isoformat()\n\n    def _usage_log(api_key_id, generation_id_val, response_status, latency_ms):\n        usage = _load(\"usage_events.json\")\n        new_id = \"ers_use_\" + os.urandom(12).hex().upper()\n        row = {\n            \"id\": new_id,\n            \"api_key_id\": api_key_id,\n            \"generation_id\": generation_id_val,\n            \"tool_name\": \"generateDiagram\",\n            \"request_ts\": now_iso,\n            \"response_status\": response_status,\n            \"latency_ms\": latency_ms,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso\n        }\n        usage.append(row)\n        _save(\"usage_events.json\", usage)\n\n    if not isinstance(api_key, str) or not (1 <= len(api_key) <= 512):\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string up to 512 chars\")\n    if not isinstance(generation_id, str) or re.match(r\"^ers_gen_[0-9A-Z]{18,}$\", generation_id) is None:\n        return _err(\"VALIDATION_ERROR\", \"generation_id is invalid\")\n\n    keys = _load(\"api_keys.json\")\n    key_row = None\n    for k in keys:\n        if k.get(\"id\") == api_key or k.get(\"key_hash\") == api_key:\n            key_row = k\n            break\n    if not key_row:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"API key is not active\")\n\n    gens = _load(\"diagram_generations.json\")\n    gen = next((g for g in gens if g.get(\"id\") == generation_id), None)\n    if not gen:\n        # still log read attempt\n        latency_ms = int((time.time() - t0) * 1000)\n        try:\n            _usage_log(key_row.get(\"id\"), generation_id, \"error\", latency_ms)\n        except Exception:\n            return _err(\"error\", \"Failed to record usage event\")\n        return _err(\"NOT_FOUND\", \"Generation not found\")\n\n    # Visibility rule: only visible if it was requested by this API key (when set)\n    req_key = gen.get(\"requested_by_api_key_id\")\n    if req_key is not None and req_key != key_row.get(\"id\"):\n        latency_ms = int((time.time() - t0) * 1000)\n        try:\n            _usage_log(key_row.get(\"id\"), generation_id, \"error\", latency_ms)\n        except Exception:\n            return _err(\"error\", \"Failed to record usage event\")\n        return _err(\"UNAUTHORIZED\", \"Not authorized to access this generation\")\n\n    latency_ms = int((time.time() - t0) * 1000)\n    try:\n        _usage_log(key_row.get(\"id\"), generation_id, \"error\", latency_ms)\n    except Exception:\n        return _err(\"error\", \"Failed to record usage event\")\n\n    return {\"object\": \"diagram_generation\", \"data\": gen}\n"
+        },
+        {
+          "name": "listDiagramArtifacts",
+          "description": "Lists artifacts produced for a diagram generation, optionally filtered by artifact_type, returning a paginated result set ordered by created_at ascending. Refuses invalid filters or pagination parameters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "description": "API key used to authenticate the request."
+              },
+              "generation_id": {
+                "type": "string",
+                "pattern": "^ers_gen_[0-9A-Z]{18,}$",
+                "description": "ID of the generation whose artifacts to list."
+              },
+              "artifact_type": {
+                "type": "string",
+                "enum": [
+                  "eraser_diagram_dsl",
+                  "eraser_json",
+                  "png_preview",
+                  "svg_preview",
+                  "log"
+                ],
+                "description": "Filter artifacts by type."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 100,
+                "description": "Maximum number of artifacts to return."
+              },
+              "cursor": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "description": "Opaque pagination cursor from a previous response."
+              }
+            },
+            "required": [
+              "api_key",
+              "generation_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def listDiagramArtifacts(api_key, generation_id, artifact_type=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0222000\" if __import__(\"os\").path.isdir(\"./environment_mix/0222000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n    now_iso = now.isoformat()\n\n    def _usage_log(api_key_id, generation_id_val, response_status, latency_ms):\n        usage = _load(\"usage_events.json\")\n        new_id = \"ers_use_\" + os.urandom(12).hex().upper()\n        row = {\n            \"id\": new_id,\n            \"api_key_id\": api_key_id,\n            \"generation_id\": generation_id_val,\n            \"tool_name\": \"generateDiagram\",\n            \"request_ts\": now_iso,\n            \"response_status\": response_status,\n            \"latency_ms\": latency_ms,\n            \"created_at\": now_iso,\n            \"updated_at\": now_iso\n        }\n        usage.append(row)\n        _save(\"usage_events.json\", usage)\n\n    # Validate\n    if not isinstance(api_key, str) or not (1 <= len(api_key) <= 512):\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string up to 512 chars\")\n    if not isinstance(generation_id, str) or re.match(r\"^ers_gen_[0-9A-Z]{18,}$\", generation_id) is None:\n        return _err(\"VALIDATION_ERROR\", \"generation_id is invalid\")\n    if artifact_type is not None:\n        if not isinstance(artifact_type, str) or artifact_type not in [\"eraser_diagram_dsl\", \"eraser_json\", \"png_preview\", \"svg_preview\", \"log\"]:\n            return _err(\"VALIDATION_ERROR\", \"artifact_type is invalid\")\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int) or not (1 <= limit <= 200):\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200\")\n    if cursor is not None:\n        if not isinstance(cursor, str) or not (1 <= len(cursor) <= 512):\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n\n    # Auth\n    keys = _load(\"api_keys.json\")\n    key_row = None\n    for k in keys:\n        if k.get(\"id\") == api_key or k.get(\"key_hash\") == api_key:\n            key_row = k\n            break\n    if not key_row:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"API key is not active\")\n\n    gens = _load(\"diagram_generations.json\")\n    gen = next((g for g in gens if g.get(\"id\") == generation_id), None)\n    if not gen:\n        latency_ms = int((time.time() - t0) * 1000)\n        try:\n            _usage_log(key_row.get(\"id\"), generation_id, \"error\", latency_ms)\n        except Exception:\n            return _err(\"error\", \"Failed to record usage event\")\n        return _err(\"NOT_FOUND\", \"Generation not found\")\n\n    req_key = gen.get(\"requested_by_api_key_id\")\n    if req_key is not None and req_key != key_row.get(\"id\"):\n        latency_ms = int((time.time() - t0) * 1000)\n        try:\n            _usage_log(key_row.get(\"id\"), generation_id, \"error\", latency_ms)\n        except Exception:\n            return _err(\"error\", \"Failed to record usage event\")\n        return _err(\"UNAUTHORIZED\", \"Not authorized to access artifacts for this generation\")\n\n    # Cursor decode\n    offset = 0\n    if cursor is not None:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\")).decode(\"utf-8\")\n            payload = json.loads(raw)\n            if not isinstance(payload, dict) or payload.get(\"v\") != 1 or payload.get(\"tool\") != \"listDiagramArtifacts\":\n                return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n            if payload.get(\"generation_id\") != generation_id:\n                return _err(\"VALIDATION_ERROR\", \"cursor does not match generation_id\")\n            if payload.get(\"artifact_type\") != artifact_type:\n                return _err(\"VALIDATION_ERROR\", \"cursor does not match artifact_type filter\")\n            offset = payload.get(\"offset\")\n            if not isinstance(offset, int) or offset < 0:\n                return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n\n    arts = _load(\"diagram_artifacts.json\")\n    rows = [a for a in arts if a.get(\"generation_id\") == generation_id]\n    if artifact_type is not None:\n        rows = [a for a in rows if a.get(\"artifact_type\") == artifact_type]\n\n    def _parse_dt(s):\n        if not isinstance(s, str):\n            return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n        try:\n            if s.endswith(\"Z\"):\n                s2 = s[:-1] + \"+00:00\"\n            else:\n                s2 = s\n            dt = datetime.datetime.fromisoformat(s2)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except Exception:\n            return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)\n\n    rows.sort(key=lambda r: (_parse_dt(r.get(\"created_at\")), str(r.get(\"id\") or \"\")), reverse=False)\n\n    total = len(rows)\n    page = rows[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        payload = {\n            \"v\": 1,\n            \"tool\": \"listDiagramArtifacts\",\n            \"generation_id\": generation_id,\n            \"artifact_type\": artifact_type,\n            \"offset\": next_offset\n        }\n        next_cursor = base64.urlsafe_b64encode(json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")).decode(\"utf-8\")\n\n    latency_ms = int((time.time() - t0) * 1000)\n    try:\n        _usage_log(key_row.get(\"id\"), generation_id, \"error\", latency_ms)\n    except Exception:\n        return _err(\"error\", \"Failed to record usage event\")\n\n    return {\n        \"object\": \"list\",\n        \"data\": page,\n        \"total\": total,\n        \"limit\": limit,\n        \"has_more\": has_more,\n        \"next_cursor\": next_cursor\n    }\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0222000",
+    "index": 222,
+    "name": "Eraser Diagram Generator",
+    "description": "This backend stores requests to generate Eraser diagrams and the resulting diagram artifacts produced by a generator service. The main workflow is: a client submits a generation request, the system runs a job to produce an Eraser-compatible output, stores the artifact(s), and records usage for audit",
+    "taxonomy": {
+      "L1_id": "L1-17",
+      "L1_name": "Document & Design",
+      "L1_name_zh": "文档与设计",
+      "L2_id": "L2-43",
+      "L2_name": "Design, UI & Visualization",
+      "L2_name_zh": "设计、UI 与可视化",
+      "L3_name": "Diagram Generation & Rendering",
+      "L3_name_zh": "图表/流程图生成与渲染"
+    },
+    "database_dir": "./environment_mix/0222000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 5,
+    "n_records": 78,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 4,
+      "read_operations": 4,
+      "mutations_persisted": 1,
+      "mutations_attempted": 3
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "listProjects",
+      "returned_chars": 3211
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

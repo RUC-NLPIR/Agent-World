@@ -1,0 +1,268 @@
+{
+  "index": 543,
+  "local_files_dir": "./environment_mix/0543000",
+  "file_list": [
+    "./environment_mix/0543000/README.md",
+    "./environment_mix/0543000/request_logs.json",
+    "./environment_mix/0543000/transcript_cues.json",
+    "./environment_mix/0543000/transcript_requests.json",
+    "./environment_mix/0543000/transcripts.json",
+    "./environment_mix/0543000/videos.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "videos.json": "31 rows",
+        "transcript_requests.json": "33 rows",
+        "transcripts.json": "33 rows",
+        "transcript_cues.json": "30 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "get_transcript",
+          "description": "Fetches the latest stored successful transcript for the YouTube video identified by the provided URL and preferred language (default: \"en\"), returning the transcript payload segmented into timed cues for that video/language when available. Raises VALIDATION_ERROR if the URL is missing/invalid or the language code is not a supported format, and UNAUTHORIZED/FORBIDDEN if the caller is not permitted to request transcripts. Raises NOT_FOUND when no successful transcript exists for the resolved video id in the requested language, and TOO_MANY_REQUESTS when request rate or quota limits are exceeded.",
+          "parameters": {
+            "properties": {
+              "url": {
+                "description": "The URL of the YouTube video",
+                "title": "Url",
+                "type": "string"
+              },
+              "lang": {
+                "default": "en",
+                "description": "The preferred language for the transcript",
+                "title": "Lang",
+                "type": "string"
+              }
+            },
+            "required": [
+              "url"
+            ],
+            "title": "get_transcriptArguments",
+            "type": "object"
+          },
+          "implementation": "def get_transcript(url, lang=None, **_extra):\n    import json, os, datetime, time, re, hashlib, base64, urllib.parse\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0543000\" if __import__(\"os\").path.isdir(\"./environment_mix/0543000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started = time.time()\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, http_status, ok, detail=None):\n        # Optional observable dynamics: if request_logs collection exists in this store, append logs.\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            return\n        ts = _now_iso()\n        latency_ms = int(max(0, (time.time() - started) * 1000))\n        rid = \"rl_\" + hashlib.sha256((ts + \"|\" + endpoint + \"|\" + str(time.time())).encode(\"utf-8\")).hexdigest()[:24]\n        logs.append({\n            \"id\": rid,\n            \"timestamp\": ts,\n            \"endpoint\": endpoint,\n            \"credential_id\": None,\n            \"http_status\": int(http_status) if isinstance(http_status, int) else None,\n            \"ok\": bool(ok),\n            \"latency_ms\": latency_ms,\n            \"detail\": detail,\n        })\n        _save(\"request_logs.json\", logs)\n\n    def _parse_video_id(u):\n        u = u.strip()\n        try:\n            p = urllib.parse.urlparse(u)\n        except Exception:\n            return None, None\n        host = (p.netloc or \"\").lower()\n        path = p.path or \"\"\n        qs = urllib.parse.parse_qs(p.query or \"\")\n        vid = None\n        if \"v\" in qs and qs[\"v\"]:\n            vid = qs[\"v\"][0]\n        if vid is None and host.endswith(\"youtu.be\"):\n            cand = path.lstrip(\"/\").split(\"/\")[0]\n            if cand:\n                vid = cand\n        # Very permissive acceptance but bounded by schema constraint.\n        if not isinstance(vid, str):\n            return None, None\n        vid = vid.strip()\n        if not vid or not (6 <= len(vid) <= 32):\n            return None, None\n        canon = \"https://www.youtube.com/watch?v=\" + vid\n        return vid, canon\n\n    # --- validation (input schema) ---\n    if not isinstance(url, str) or not url.strip():\n        _log(\"get_transcript\", 400, False, \"VALIDATION_ERROR url\")\n        return _err(\"VALIDATION_ERROR\", \"url is required and must be a non-empty string\", field=\"url\")\n    if lang is None:\n        lang = \"en\"\n    if not isinstance(lang, str) or not lang.strip():\n        _log(\"get_transcript\", 400, False, \"VALIDATION_ERROR lang\")\n        return _err(\"VALIDATION_ERROR\", \"lang must be a non-empty string\", field=\"lang\")\n    if len(lang.strip()) > 16:\n        _log(\"get_transcript\", 400, False, \"VALIDATION_ERROR lang length\")\n        return _err(\"VALIDATION_ERROR\", \"lang must be at most 16 characters\", field=\"lang\")\n    if not re.fullmatch(r\"[A-Za-z]{1,8}([_-][A-Za-z0-9]{1,8}){0,3}\", lang.strip()):\n        _log(\"get_transcript\", 400, False, \"VALIDATION_ERROR lang format\")\n        return _err(\"VALIDATION_ERROR\", \"lang must be a supported format like 'en' or 'en-US'\", field=\"lang\")\n\n    requested_lang = lang\n    normalized_lang = requested_lang.strip().lower().replace(\"_\", \"-\")\n\n    # --- MUST create transcript_requests row first ---\n    reqs = _load(\"transcript_requests.json\")\n    if not isinstance(reqs, list):\n        reqs = []\n    now = _now_iso()\n    req_id = \"ytrq_\" + base64.urlsafe_b64encode(os.urandom(12)).decode(\"ascii\").rstrip(\"=\")\n    req_row = {\n        \"id\": req_id,\n        \"raw_url\": url,\n        \"requested_lang\": requested_lang,\n        \"normalized_lang\": normalized_lang,\n        \"video_id\": None,\n        \"status\": \"queued\",\n        \"transcript_id\": None,\n        \"served_from_cache\": False,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"http_status\": None,\n        \"duration_ms\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    reqs.append(req_row)\n    _save(\"transcript_requests.json\", reqs)\n\n    def _set_req_status(from_status, to_status, **fields):\n        transitions = {\n            \"queued\": [\"running\", \"failed\", \"rate_limited\"],\n            \"running\": [\"succeeded\", \"not_found\", \"no_transcript\", \"invalid_url\", \"failed\", \"rate_limited\"],\n            \"succeeded\": [],\n            \"not_found\": [],\n            \"no_transcript\": [],\n            \"invalid_url\": [],\n            \"rate_limited\": [],\n            \"failed\": [],\n        }\n        all_reqs = _load(\"transcript_requests.json\")\n        if not isinstance(all_reqs, list):\n            return _err(\"FAILED\", \"transcript_requests store is not a list\")\n        idx = next((i for i, r in enumerate(all_reqs) if isinstance(r, dict) and r.get(\"id\") == req_id), None)\n        if idx is None:\n            return _err(\"NOT_FOUND\", \"transcript_request not found\", id=req_id)\n        cur = all_reqs[idx].get(\"status\")\n        if cur != from_status:\n            # allow idempotent set if already in desired status\n            if cur == to_status:\n                return all_reqs[idx]\n            return _err(\"INVALID_TRANSITION\", \"Cannot transition transcript_requests.status\", from_status=cur, to_status=to_status)\n        if to_status not in transitions.get(from_status, []):\n            return _err(\"INVALID_TRANSITION\", \"Cannot transition transcript_requests.status\", from_status=from_status, to_status=to_status)\n        all_reqs[idx][\"status\"] = to_status\n        all_reqs[idx][\"updated_at\"] = _now_iso()\n        for k, v in fields.items():\n            all_reqs[idx][k] = v\n        _save(\"transcript_requests.json\", all_reqs)\n        return all_reqs[idx]\n\n    def _patch_req(**fields):\n        all_reqs = _load(\"transcript_requests.json\")\n        if not isinstance(all_reqs, list):\n            return _err(\"FAILED\", \"transcript_requests store is not a list\")\n        idx = next((i for i, r in enumerate(all_reqs) if isinstance(r, dict) and r.get(\"id\") == req_id), None)\n        if idx is None:\n            return _err(\"NOT_FOUND\", \"transcript_request not found\", id=req_id)\n        all_reqs[idx][\"updated_at\"] = _now_iso()\n        for k, v in fields.items():\n            all_reqs[idx][k] = v\n        _save(\"transcript_requests.json\", all_reqs)\n        return all_reqs[idx]\n\n    def _finalize_terminal(status, http_status=None, error_code=None, error_message=None, transcript_id=None, video_id=None, served_from_cache=False):\n        dur = int(max(0, (time.time() - started) * 1000))\n        # terminal statuses must come from running (or queued->rate_limited/failed already handled)\n        cur_reqs = _load(\"transcript_requests.json\")\n        if not isinstance(cur_reqs, list):\n            return _err(\"FAILED\", \"transcript_requests store is not a list\")\n        row = next((r for r in cur_reqs if isinstance(r, dict) and r.get(\"id\") == req_id), None)\n        if row is None:\n            return _err(\"NOT_FOUND\", \"transcript_request not found\", id=req_id)\n        cur_status = row.get(\"status\")\n        terminal = status\n        if cur_status == \"queued\":\n            # must transition to running before any upstream attempt; but cached serves can go queued->running->succeeded\n            res = _set_req_status(\"queued\", \"running\")\n            if isinstance(res, dict) and \"error\" in res:\n                return res\n            cur_status = \"running\"\n        if cur_status == \"running\":\n            res = _set_req_status(\"running\", terminal,\n                                  http_status=http_status,\n                                  error_code=error_code,\n                                  error_message=error_message,\n                                  transcript_id=transcript_id,\n                                  video_id=video_id,\n                                  served_from_cache=bool(served_from_cache),\n                                  duration_ms=dur)\n            return res\n        # already terminal; idempotently patch duration_ms if missing\n        if row.get(\"duration_ms\") is None:\n            return _patch_req(duration_ms=dur)\n        return row\n\n    # --- URL parse / validate ---\n    yt_vid, canonical_url = _parse_video_id(url)\n    if yt_vid is None:\n        # queued -> running -> invalid_url (per lifecycle)\n        _set_req_status(\"queued\", \"running\")\n        _finalize_terminal(\"invalid_url\", http_status=400, error_code=\"PARSE_URL_ERROR\", error_message=\"Could not extract YouTube video id from url\", video_id=None)\n        _log(\"get_transcript\", 400, False, \"invalid_url\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid YouTube URL: could not extract video id\", error_code=\"PARSE_URL_ERROR\")\n\n    # --- upsert video and attach to request ---\n    videos = _load(\"videos.json\")\n    if not isinstance(videos, list):\n        videos = []\n    vid_row = next((v for v in videos if isinstance(v, dict) and v.get(\"youtube_video_id\") == yt_vid), None)\n    if vid_row is None:\n        v_id = \"ytv_\" + base64.urlsafe_b64encode(os.urandom(12)).decode(\"ascii\").rstrip(\"=\")\n        nowv = _now_iso()\n        vid_row = {\n            \"id\": v_id,\n            \"youtube_video_id\": yt_vid,\n            \"canonical_url\": canonical_url,\n            \"title\": None,\n            \"channel_id\": None,\n            \"created_at\": nowv,\n            \"updated_at\": nowv,\n        }\n        videos.append(vid_row)\n        _save(\"videos.json\", videos)\n    else:\n        # refresh canonical_url if missing/mismatched, update timestamp\n        changed = False\n        if isinstance(canonical_url, str) and canonical_url and vid_row.get(\"canonical_url\") != canonical_url:\n            vid_row[\"canonical_url\"] = canonical_url\n            changed = True\n        if changed:\n            vid_row[\"updated_at\"] = _now_iso()\n            _save(\"videos.json\", videos)\n\n    _patch_req(video_id=vid_row[\"id\"])\n\n    # --- cache lookup: active transcript exists for (video_id, normalized_lang) ---\n    transcripts = _load(\"transcripts.json\")\n    if not isinstance(transcripts, list):\n        transcripts = []\n    active = next((t for t in transcripts\n                   if isinstance(t, dict)\n                   and t.get(\"video_id\") == vid_row[\"id\"]\n                   and t.get(\"lang\") == normalized_lang\n                   and t.get(\"status\") == \"active\"), None)\n    if active is not None:\n        # Must still obey request lifecycle: queued->running->succeeded\n        _set_req_status(\"queued\", \"running\")\n        _finalize_terminal(\"succeeded\", http_status=200, transcript_id=active[\"id\"], video_id=vid_row[\"id\"], served_from_cache=True)\n        cues = _load(\"transcript_cues.json\")\n        if not isinstance(cues, list):\n            cues = []\n        cue_rows = [c for c in cues if isinstance(c, dict) and c.get(\"transcript_id\") == active[\"id\"]]\n        cue_rows.sort(key=lambda r: (r.get(\"seq\") if isinstance(r.get(\"seq\"), int) else 10**9))\n        _log(\"get_transcript\", 200, True, \"served_from_cache\")\n        return {\n            \"transcript_request_id\": req_id,\n            \"served_from_cache\": True,\n            \"video\": vid_row,\n            \"transcript\": active,\n            \"cues\": cue_rows,\n        }\n\n    # --- No cached transcript: simulate upstream fetch (offline). Mark terminal not_found/no_transcript/failed. ---\n    # We must transition queued -> running before \"upstream access\".\n    r = _set_req_status(\"queued\", \"running\")\n    if isinstance(r, dict) and \"error\" in r:\n        _log(\"get_transcript\", 409, False, \"transition error\")\n        return r\n\n    # Offline backend: cannot fetch upstream. Choose a deterministic terminal state:\n    # If video exists in YouTube id format but no transcript stored, return no_transcript (more specific than not_found).\n    term = _finalize_terminal(\"no_transcript\", http_status=404, error_code=\"YT_NO_CAPTIONS\", error_message=\"No cached transcript available and upstream fetch is unavailable in offline mode.\", video_id=vid_row[\"id\"])\n    if isinstance(term, dict) and \"error\" in term:\n        _log(\"get_transcript\", 500, False, \"finalize error\")\n        return term\n    _log(\"get_transcript\", 404, False, \"no_transcript_offline\")\n\n    # Read tools should return data not errors when possible; here transcript is absent, so return an empty transcript payload plus request record.\n    return {\n        \"transcript_request_id\": req_id,\n        \"served_from_cache\": False,\n        \"video\": vid_row,\n        \"transcript\": None,\n        \"cues\": [],\n        \"status\": \"no_transcript\",\n        \"error_code\": \"YT_NO_CAPTIONS\",\n        \"error_message\": \"No cached transcript available and upstream fetch is unavailable in offline mode.\",\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "list_transcript_requests",
+          "description": "Lists transcript request attempts, optionally filtered by status, video, or language. Returns a paginated set of transcript_requests ordered by most recent first. Refuses UNAUTHORIZED/FORBIDDEN if the caller lacks access.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "description": "Filter by request status.",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "not_found",
+                  "no_transcript",
+                  "invalid_url",
+                  "rate_limited",
+                  "failed"
+                ]
+              },
+              "video_id": {
+                "type": "string",
+                "description": "Filter by internal video id."
+              },
+              "youtube_video_id": {
+                "type": "string",
+                "description": "Filter by YouTube video id (11-char)."
+              },
+              "normalized_lang": {
+                "type": "string",
+                "description": "Filter by normalized language code (e.g., \"en\", \"en-US\")."
+              },
+              "served_from_cache": {
+                "type": "boolean",
+                "description": "Filter by whether the request was served from cache."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of items to return.",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_transcript_requests(status=None, video_id=None, youtube_video_id=None, normalized_lang=None, served_from_cache=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0543000\" if __import__(\"os\").path.isdir(\"./environment_mix/0543000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    valid_status = {\"queued\",\"running\",\"succeeded\",\"not_found\",\"no_transcript\",\"invalid_url\",\"rate_limited\",\"failed\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in valid_status:\n            return _err(\"VALIDATION_ERROR\", \"Invalid status\", field=\"status\", allowed=sorted(valid_status))\n    if video_id is not None and (not isinstance(video_id, str) or not video_id.strip()):\n        return _err(\"VALIDATION_ERROR\", \"video_id must be a non-empty string\", field=\"video_id\")\n    if youtube_video_id is not None and (not isinstance(youtube_video_id, str) or not youtube_video_id.strip()):\n        return _err(\"VALIDATION_ERROR\", \"youtube_video_id must be a non-empty string\", field=\"youtube_video_id\")\n    if normalized_lang is not None and (not isinstance(normalized_lang, str) or not normalized_lang.strip()):\n        return _err(\"VALIDATION_ERROR\", \"normalized_lang must be a non-empty string\", field=\"normalized_lang\")\n    if served_from_cache is not None and not isinstance(served_from_cache, bool):\n        return _err(\"VALIDATION_ERROR\", \"served_from_cache must be a boolean\", field=\"served_from_cache\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200\", field=\"limit\")\n    if cursor is not None and (not isinstance(cursor, str) or not cursor.strip()):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string when provided\", field=\"cursor\")\n\n    # resolve youtube_video_id -> video_id if requested\n    if youtube_video_id is not None:\n        vids = _load(\"videos.json\")\n        vrow = next((v for v in vids if v.get(\"youtube_video_id\") == youtube_video_id), None)\n        if vrow is None:\n            # valid filter, matches nothing\n            return {\n                \"data\": [],\n                \"meta\": {\"total\": 0, \"limit\": limit, \"has_more\": False, \"next_cursor\": None}\n            }\n        video_id = vrow.get(\"id\")\n\n    reqs = _load(\"transcript_requests.json\")\n\n    # order by created_at desc (ISO Z sorts lexicographically)\n    reqs_sorted = sorted(reqs, key=lambda r: (r.get(\"created_at\") or \"\"), reverse=True)\n\n    # cursor is base64 encoded created_at + id\n    start = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"ascii\") + b\"===\").decode(\"utf-8\")\n            c_created, c_id = raw.split(\"|\", 1)\n            # find position after this item in current ordering\n            for i, r in enumerate(reqs_sorted):\n                if (r.get(\"created_at\") or \"\") == c_created and (r.get(\"id\") or \"\") == c_id:\n                    start = i + 1\n                    break\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\", field=\"cursor\")\n\n    def _match(r):\n        if status is not None and r.get(\"status\") != status: return False\n        if video_id is not None and r.get(\"video_id\") != video_id: return False\n        if normalized_lang is not None and r.get(\"normalized_lang\") != normalized_lang: return False\n        if served_from_cache is not None and r.get(\"served_from_cache\") != served_from_cache: return False\n        return True\n\n    filtered = [r for r in reqs_sorted if _match(r)]\n    total = len(filtered)\n    page = filtered[start:start+limit]\n    has_more = start + limit < total\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        token = f\"{last.get('created_at') or ''}|{last.get('id') or ''}\".encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(token).decode(\"ascii\").rstrip(\"=\")\n\n    return {\n        \"data\": page,\n        \"meta\": {\"total\": total, \"limit\": limit, \"has_more\": has_more, \"next_cursor\": next_cursor}\n    }\n"
+        },
+        {
+          "name": "get_transcript_request",
+          "description": "Fetches a single transcript_requests record by id, including its terminal status and any associated transcript_id. Refuses NOT_FOUND if the id does not exist and UNAUTHORIZED/FORBIDDEN if the caller lacks access.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "The transcript request id."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_transcript_request(id, **_extra):\n    import json, os, datetime, time, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0543000\" if __import__(\"os\").path.isdir(\"./environment_mix/0543000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started = time.time()\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, http_status, ok, detail=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            return\n        ts = _now_iso()\n        latency_ms = int(max(0, (time.time() - started) * 1000))\n        rid = \"rl_\" + hashlib.sha256((ts + \"|\" + endpoint + \"|\" + str(time.time())).encode(\"utf-8\")).hexdigest()[:24]\n        logs.append({\n            \"id\": rid,\n            \"timestamp\": ts,\n            \"endpoint\": endpoint,\n            \"credential_id\": None,\n            \"http_status\": int(http_status) if isinstance(http_status, int) else None,\n            \"ok\": bool(ok),\n            \"latency_ms\": latency_ms,\n            \"detail\": detail,\n        })\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(id, str) or not id.strip():\n        _log(\"get_transcript_request\", 400, False, \"VALIDATION_ERROR id\")\n        return _err(\"VALIDATION_ERROR\", \"id is required and must be a non-empty string\", field=\"id\")\n\n    # IMPORTANT: callers may mistakenly pass a videos.id or transcripts.id; try to resolve to the latest request for that entity.\n    reqs = _load(\"transcript_requests.json\")\n    if not isinstance(reqs, list):\n        reqs = []\n    row = next((r for r in reqs if isinstance(r, dict) and r.get(\"id\") == id), None)\n\n    if row is None:\n        # Fallback mapping: if id is a videos.id, return most recent request for that video_id\n        if id.startswith(\"ytv_\"):\n            candidates = [r for r in reqs if isinstance(r, dict) and r.get(\"video_id\") == id]\n            candidates.sort(key=lambda r: r.get(\"created_at\") or \"\", reverse=True)\n            row = candidates[0] if candidates else None\n        elif id.startswith(\"ytt_\"):\n            candidates = [r for r in reqs if isinstance(r, dict) and r.get(\"transcript_id\") == id]\n            candidates.sort(key=lambda r: r.get(\"created_at\") or \"\", reverse=True)\n            row = candidates[0] if candidates else None\n\n    if row is None:\n        _log(\"get_transcript_request\", 404, False, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"transcript_request not found\", id=id)\n\n    _log(\"get_transcript_request\", 200, True, None)\n    return {\"transcript_request\": row}\n"
+        },
+        {
+          "name": "create_transcript_request",
+          "description": "Creates a new transcript request attempt for the given YouTube URL and preferred language (default: \"en\"). Returns the created transcript_requests row in status \"queued\"; processing may occur asynchronously. Refuses VALIDATION_ERROR for invalid inputs and UNAUTHORIZED/FORBIDDEN if the caller is not permitted.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "url": {
+                "type": "string",
+                "description": "The URL of the YouTube video to fetch a transcript for."
+              },
+              "lang": {
+                "type": "string",
+                "description": "Preferred language code for the transcript request (defaults to \"en\").",
+                "default": "en"
+              }
+            },
+            "required": [
+              "url"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_transcript_request(url, lang=None, **_extra):\n    import json, os, datetime, base64, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0543000\" if __import__(\"os\").path.isdir(\"./environment_mix/0543000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    if not isinstance(url, str) or not url.strip():\n        return _err(\"VALIDATION_ERROR\", \"url is required and must be a non-empty string\", field=\"url\")\n    if lang is None:\n        lang = \"en\"\n    if not isinstance(lang, str) or not lang.strip():\n        return _err(\"VALIDATION_ERROR\", \"lang must be a non-empty string\", field=\"lang\")\n    if len(lang.strip()) > 16:\n        return _err(\"VALIDATION_ERROR\", \"lang must be at most 16 characters\", field=\"lang\")\n    if not re.fullmatch(r\"[A-Za-z]{2,8}([_-][A-Za-z0-9]{2,8}){0,3}\", lang.strip()):\n        return _err(\"VALIDATION_ERROR\", \"lang must be a supported format like 'en' or 'en-US'\", field=\"lang\")\n\n    requested_lang = lang\n    normalized_lang = requested_lang.strip().lower().replace(\"_\", \"-\")\n\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    reqs = _load(\"transcript_requests.json\")\n    req_id = \"trq_\" + base64.urlsafe_b64encode(os.urandom(12)).decode(\"ascii\").rstrip(\"=\")\n    row = {\n        \"id\": req_id,\n        \"raw_url\": url,\n        \"requested_lang\": requested_lang,\n        \"normalized_lang\": normalized_lang,\n        \"video_id\": None,\n        \"status\": \"queued\",\n        \"transcript_id\": None,\n        \"served_from_cache\": False,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"http_status\": None,\n        \"duration_ms\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    reqs.append(row)\n    _save(\"transcript_requests.json\", reqs)\n\n    return {\"transcript_request\": row}\n"
+        },
+        {
+          "name": "list_transcripts",
+          "description": "Lists stored transcripts, optionally filtered by video and language and/or status. Returns a paginated set of transcripts ordered by most recently fetched first. Refuses UNAUTHORIZED/FORBIDDEN if the caller lacks access.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "video_id": {
+                "type": "string",
+                "description": "Filter by internal video id."
+              },
+              "youtube_video_id": {
+                "type": "string",
+                "description": "Filter by YouTube video id (11-char)."
+              },
+              "lang": {
+                "type": "string",
+                "description": "Filter by transcript language code."
+              },
+              "status": {
+                "type": "string",
+                "description": "Filter by transcript lifecycle status.",
+                "enum": [
+                  "active",
+                  "superseded",
+                  "deleted"
+                ]
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of items to return.",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_transcripts(video_id=None, youtube_video_id=None, lang=None, status=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, base64, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0543000\" if __import__(\"os\").path.isdir(\"./environment_mix/0543000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _norm_lang(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        s2 = s.strip().lower().replace(\"_\", \"-\")\n        return s2\n\n    def _log(endpoint, status_code, ok, credential_id=None, detail=None, started=None):\n        # Best-effort request log + rate/quota enforcement.\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        ts = _now_iso()\n        latency_ms = None\n        if started is not None:\n            latency_ms = int(max(0, (time.time() - started) * 1000))\n        row = {\n            \"id\": \"rl_\" + hashlib.sha256((ts + \"|\" + endpoint + \"|\" + str(time.time())).encode(\"utf-8\")).hexdigest()[:24],\n            \"timestamp\": ts,\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"http_status\": int(status_code) if isinstance(status_code, int) else None,\n            \"ok\": bool(ok),\n            \"latency_ms\": latency_ms,\n            \"detail\": detail,\n        }\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _enforce_limits(endpoint, started):\n        # If limits collections are absent, treat as unlimited.\n        rate_limits = _load(\"rate_limits.json\")\n        usage = _load(\"usage.json\")\n        logs = _load(\"request_logs.json\")\n\n        if not isinstance(rate_limits, list):\n            rate_limits = []\n        if not isinstance(usage, list):\n            usage = []\n        if not isinstance(logs, list):\n            logs = []\n\n        # Find a limit row that applies to this endpoint, else no limit.\n        # Expected shapes (best-effort):\n        # rate_limits: [{ \"endpoint\": \"list_transcripts\", \"per_minute\": 60, \"per_day\": 5000 }]\n        # usage: [{ \"date\": \"YYYY-MM-DD\", \"endpoint\": \"...\", \"count\": N, \"quota\": M }]\n        per_minute = None\n        per_day = None\n        for rl in rate_limits:\n            if isinstance(rl, dict) and rl.get(\"endpoint\") == endpoint:\n                if isinstance(rl.get(\"per_minute\"), int):\n                    per_minute = rl[\"per_minute\"]\n                if isinstance(rl.get(\"per_day\"), int):\n                    per_day = rl[\"per_day\"]\n                break\n\n        now = datetime.datetime.utcnow()\n        if per_minute is not None:\n            cutoff = now - datetime.timedelta(minutes=1)\n            cnt = 0\n            for r in logs:\n                if not isinstance(r, dict):\n                    continue\n                if r.get(\"endpoint\") != endpoint:\n                    continue\n                ts = r.get(\"timestamp\")\n                if not isinstance(ts, str):\n                    continue\n                try:\n                    t = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                except Exception:\n                    continue\n                if t >= cutoff:\n                    cnt += 1\n            if cnt >= per_minute:\n                _log(endpoint, 429, False, detail=\"rate_limit_per_minute\", started=started)\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded.\", http_status=429)\n\n        if per_day is not None:\n            today = now.date().isoformat()\n            # Count today from logs.\n            cnt = 0\n            for r in logs:\n                if not isinstance(r, dict):\n                    continue\n                if r.get(\"endpoint\") != endpoint:\n                    continue\n                ts = r.get(\"timestamp\")\n                if not isinstance(ts, str) or not ts.startswith(today):\n                    continue\n                cnt += 1\n            if cnt >= per_day:\n                _log(endpoint, 429, False, detail=\"quota_per_day\", started=started)\n                return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded.\", http_status=429)\n\n        return None\n\n    started = time.time()\n    endpoint = \"list_transcripts\"\n\n    # Enforce any configured rate/quota limits.\n    lim_err = _enforce_limits(endpoint, started)\n    if lim_err:\n        return lim_err\n\n    # Ambient authentication: if there is any access-control store, select a combination that allows reads.\n    # If none exists, authorize.\n    access = _load(\"access.json\")\n    if isinstance(access, list) and access:\n        allowed = any(isinstance(r, dict) and r.get(\"can_read_transcripts\") is True for r in access)\n        if not allowed:\n            _log(endpoint, 401, False, detail=\"no_access_row_allows_read\", started=started)\n            return _err(\"UNAUTHORIZED\", \"Caller lacks access to list transcripts.\", http_status=401)\n\n    # Validate inputs\n    if video_id is not None and not isinstance(video_id, str):\n        _log(endpoint, 400, False, detail=\"bad_video_id_type\", started=started)\n        return _err(\"VALIDATION_ERROR\", \"video_id must be a string.\")\n    if youtube_video_id is not None and not isinstance(youtube_video_id, str):\n        _log(endpoint, 400, False, detail=\"bad_youtube_video_id_type\", started=started)\n        return _err(\"VALIDATION_ERROR\", \"youtube_video_id must be a string.\")\n    if lang is not None and not isinstance(lang, str):\n        _log(endpoint, 400, False, detail=\"bad_lang_type\", started=started)\n        return _err(\"VALIDATION_ERROR\", \"lang must be a string.\")\n    if status is not None:\n        if not isinstance(status, str):\n            _log(endpoint, 400, False, detail=\"bad_status_type\", started=started)\n            return _err(\"VALIDATION_ERROR\", \"status must be a string.\")\n        if status not in (\"active\", \"superseded\", \"deleted\"):\n            _log(endpoint, 400, False, detail=\"bad_status_value\", started=started)\n            return _err(\"VALIDATION_ERROR\", \"Invalid status.\", allowed=[\"active\", \"superseded\", \"deleted\"])\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        _log(endpoint, 400, False, detail=\"bad_limit_type\", started=started)\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer.\")\n    if limit < 1 or limit > 200:\n        _log(endpoint, 400, False, detail=\"limit_out_of_range\", started=started)\n        return _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200.\")\n\n    if cursor is not None and not isinstance(cursor, str):\n        _log(endpoint, 400, False, detail=\"bad_cursor_type\", started=started)\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\")\n\n    norm_lang = _norm_lang(lang) if lang is not None else None\n    if lang is not None:\n        if norm_lang is None or len(norm_lang) == 0 or len(norm_lang) > 16:\n            _log(endpoint, 400, False, detail=\"lang_invalid\", started=started)\n            return _err(\"VALIDATION_ERROR\", \"lang must be non-empty and at most 16 characters (after normalization).\")\n\n    # Resolve youtube_video_id -> internal video_id if needed\n    vids = _load(\"videos.json\")\n    if not isinstance(vids, list):\n        vids = []\n\n    resolved_video_id = video_id\n    if youtube_video_id is not None:\n        # Find by youtube_video_id exact\n        match = None\n        for v in vids:\n            if isinstance(v, dict) and v.get(\"youtube_video_id\") == youtube_video_id:\n                match = v\n                break\n        if match is None:\n            # Filter matches nothing => empty result set.\n            _log(endpoint, 200, True, detail=\"no_matching_video\", started=started)\n            return {\n                \"object\": \"list\",\n                \"data\": [],\n                \"meta\": {\"total\": 0, \"limit\": limit, \"has_more\": False, \"next_cursor\": None},\n            }\n        resolved_video_id = match.get(\"id\")\n\n    # Cursor decoding\n    # Cursor is base64url(json({\"fetched_at\": \"...\", \"id\": \"...\" }))\n    after_fetched_at = None\n    after_id = None\n    if cursor:\n        try:\n            padded = cursor + \"=\" * (-len(cursor) % 4)\n            raw = base64.urlsafe_b64decode(padded.encode(\"utf-8\")).decode(\"utf-8\")\n            cobj = json.loads(raw)\n            if not isinstance(cobj, dict):\n                raise ValueError(\"cursor not an object\")\n            after_fetched_at = cobj.get(\"fetched_at\")\n            after_id = cobj.get(\"id\")\n            if after_fetched_at is not None and not isinstance(after_fetched_at, str):\n                raise ValueError(\"cursor fetched_at must be str\")\n            if after_id is not None and not isinstance(after_id, str):\n                raise ValueError(\"cursor id must be str\")\n        except Exception:\n            _log(endpoint, 400, False, detail=\"cursor_decode_failed\", started=started)\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n    transcripts = _load(\"transcripts.json\")\n    if not isinstance(transcripts, list):\n        transcripts = []\n\n    # Filter\n    rows = []\n    for t in transcripts:\n        if not isinstance(t, dict):\n            continue\n        if resolved_video_id is not None and t.get(\"video_id\") != resolved_video_id:\n            continue\n        if norm_lang is not None:\n            tlang = t.get(\"lang\")\n            if not isinstance(tlang, str) or _norm_lang(tlang) != norm_lang:\n                continue\n        if status is not None and t.get(\"status\") != status:\n            continue\n        rows.append(t)\n\n    def _key(t):\n        fa = t.get(\"fetched_at\")\n        # Treat missing/invalid fetched_at as oldest\n        try:\n            dt = datetime.datetime.fromisoformat(str(fa).replace(\"Z\", \"+00:00\"))\n        except Exception:\n            dt = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n        return (dt, str(t.get(\"id\") or \"\"))\n\n    # Sort by fetched_at desc, then id desc\n    rows.sort(key=_key, reverse=True)\n\n    # Apply cursor as \"start after\" (exclusive)\n    if after_fetched_at is not None or after_id is not None:\n        def _cursor_key():\n            try:\n                dtc = datetime.datetime.fromisoformat(str(after_fetched_at).replace(\"Z\", \"+00:00\"))\n            except Exception:\n                dtc = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n            return (dtc, str(after_id or \"\"))\n        ck = _cursor_key()\n        filtered = []\n        for t in rows:\n            if _key(t) < ck:\n                filtered.append(t)\n        rows = filtered\n\n    total = len(rows)\n    page = rows[:limit]\n    has_more = total > len(page)\n\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        payload = {\"fetched_at\": last.get(\"fetched_at\"), \"id\": last.get(\"id\")}\n        raw = json.dumps(payload, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(raw).decode(\"utf-8\").rstrip(\"=\")\n\n    _log(endpoint, 200, True, detail=\"ok\", started=started)\n    return {\n        \"object\": \"list\",\n        \"data\": page,\n        \"meta\": {\"total\": total, \"limit\": limit, \"has_more\": has_more, \"next_cursor\": next_cursor},\n    }\n"
+        },
+        {
+          "name": "update_transcript",
+          "description": "Updates mutable fields on a transcript and/or drives allowed lifecycle transitions (active→superseded/deleted, superseded→deleted). Returns the updated transcript. Refuses INVALID_STATE_TRANSITION if the requested status change is not allowed, and NOT_FOUND/UNAUTHORIZED/FORBIDDEN as appropriate.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "The transcript id to update."
+              },
+              "status": {
+                "type": "string",
+                "description": "New lifecycle status for the transcript (must be a valid transition).",
+                "enum": [
+                  "active",
+                  "superseded",
+                  "deleted"
+                ]
+              },
+              "source": {
+                "type": "string",
+                "description": "Optional source label for how the transcript was obtained (e.g., \"youtube\")."
+              },
+              "is_generated": {
+                "type": "boolean",
+                "description": "Whether the transcript is auto-generated."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_transcript(id, status=None, source=None, is_generated=None, **_extra):\n    import json, os, datetime, time, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0543000\" if __import__(\"os\").path.isdir(\"./environment_mix/0543000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started = time.time()\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, http_status, ok, detail=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            return\n        ts = _now_iso()\n        latency_ms = int(max(0, (time.time() - started) * 1000))\n        rid = \"rl_\" + hashlib.sha256((ts + \"|\" + endpoint + \"|\" + str(time.time())).encode(\"utf-8\")).hexdigest()[:24]\n        logs.append({\n            \"id\": rid,\n            \"timestamp\": ts,\n            \"endpoint\": endpoint,\n            \"credential_id\": None,\n            \"http_status\": int(http_status) if isinstance(http_status, int) else None,\n            \"ok\": bool(ok),\n            \"latency_ms\": latency_ms,\n            \"detail\": detail,\n        })\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(id, str) or not id.strip():\n        _log(\"update_transcript\", 400, False, \"VALIDATION_ERROR id\")\n        return _err(\"VALIDATION_ERROR\", \"id is required and must be a non-empty string\", field=\"id\")\n\n    # If optional fields provided, validate types/enums\n    allowed_status = {\"active\", \"superseded\", \"deleted\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            _log(\"update_transcript\", 400, False, \"VALIDATION_ERROR status\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: active, superseded, deleted\", field=\"status\")\n    if source is not None:\n        if not isinstance(source, str) or not source.strip():\n            _log(\"update_transcript\", 400, False, \"VALIDATION_ERROR source\")\n            return _err(\"VALIDATION_ERROR\", \"source must be a non-empty string when provided\", field=\"source\")\n        if len(source) > 64:\n            _log(\"update_transcript\", 400, False, \"VALIDATION_ERROR source length\")\n            return _err(\"VALIDATION_ERROR\", \"source too long\", field=\"source\")\n    if is_generated is not None and not isinstance(is_generated, bool):\n        _log(\"update_transcript\", 400, False, \"VALIDATION_ERROR is_generated\")\n        return _err(\"VALIDATION_ERROR\", \"is_generated must be a boolean when provided\", field=\"is_generated\")\n\n    transcripts = _load(\"transcripts.json\")\n    if not isinstance(transcripts, list):\n        transcripts = []\n\n    # IMPORTANT: audit shows callers may pass a videos.id here. If so, update the ACTIVE transcript for that video (any lang).\n    t_idx = next((i for i, t in enumerate(transcripts) if isinstance(t, dict) and t.get(\"id\") == id), None)\n    if t_idx is None and id.startswith(\"ytv_\"):\n        # choose latest active transcript for that video\n        candidates = [(i, t) for i, t in enumerate(transcripts)\n                      if isinstance(t, dict) and t.get(\"video_id\") == id and t.get(\"status\") == \"active\"]\n        if candidates:\n            # prefer most recently updated\n            candidates.sort(key=lambda it: (it[1].get(\"updated_at\") or it[1].get(\"created_at\") or \"\"), reverse=True)\n            t_idx = candidates[0][0]\n\n    if t_idx is None:\n        _log(\"update_transcript\", 404, False, \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Transcript not found for given id (expected transcript id like 'ytt_...' or a video id with an active transcript).\", http_status=404, id=id)\n\n    row = transcripts[t_idx]\n    old_status = row.get(\"status\")\n\n    transitions = {\n        \"active\": {\"superseded\", \"deleted\"},\n        \"superseded\": {\"deleted\"},\n        \"deleted\": set(),\n    }\n\n    if status is not None and status != old_status:\n        if old_status not in transitions or status not in transitions.get(old_status, set()):\n            _log(\"update_transcript\", 409, False, \"INVALID_TRANSITION\")\n            return _err(\n                \"INVALID_TRANSITION\",\n                \"Requested status change is not allowed by lifecycle rules.\",\n                from_status=old_status,\n                to_status=status,\n                rule=\"transcripts.status transitions: active→superseded/deleted, superseded→deleted, deleted→(none)\"\n            )\n        row[\"status\"] = status\n\n    # Mutability: allow source to be updated but enforce enum if it matches schema's known values; otherwise reject.\n    if source is not None:\n        allowed_source = {\"youtube_transcript_api\", \"scraped\", \"unknown\"}\n        # schema enum is strict; accept only these\n        if source not in allowed_source:\n            _log(\"update_transcript\", 400, False, \"VALIDATION_ERROR source enum\")\n            return _err(\"VALIDATION_ERROR\", \"source must be one of: youtube_transcript_api, scraped, unknown\", field=\"source\")\n        row[\"source\"] = source\n\n    if is_generated is not None:\n        row[\"is_generated\"] = is_generated\n\n    row[\"updated_at\"] = _now_iso()\n\n    transcripts[t_idx] = row\n    _save(\"transcripts.json\", transcripts)\n\n    _log(\"update_transcript\", 200, True, None)\n    return {\"transcript\": row}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0543000",
+    "index": 543,
+    "name": "Youtube Transcript",
+    "description": "This backend stores requests for YouTube video transcripts and the resulting transcript payloads segmented into timed cues. The main workflow is: accept a transcript request (url + preferred language), resolve the canonical YouTube video id, fetch/parse the transcript (or fail), store the attempt, a",
+    "taxonomy": {
+      "L1_id": "L1-03",
+      "L1_name": "Social Media & Community",
+      "L1_name_zh": "社交媒体与社区",
+      "L2_id": "L2-07",
+      "L2_name": "Video & Content Platforms",
+      "L2_name_zh": "视频与内容平台",
+      "L3_name": "YouTube Transcript & Caption Retrieval",
+      "L3_name_zh": "YouTube 转录与字幕获取"
+    },
+    "database_dir": "./environment_mix/0543000",
+    "mount_path": "/app/database",
+    "n_tools": 6,
+    "n_collections": 4,
+    "n_records": 127,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 6,
+      "loaded": 6,
+      "reads_returning_data": 4,
+      "read_operations": 4,
+      "mutations_persisted": 2,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 6,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_transcript",
+      "returned_chars": 2407
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

@@ -1,0 +1,420 @@
+{
+  "index": 150,
+  "local_files_dir": "./environment_mix/0150000",
+  "file_list": [
+    "./environment_mix/0150000/README.md",
+    "./environment_mix/0150000/api_clients.json",
+    "./environment_mix/0150000/credential_policies.json",
+    "./environment_mix/0150000/retrieval_audit_logs.json",
+    "./environment_mix/0150000/retrieval_sessions.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "api_clients.json": "12 rows",
+        "credential_policies.json": "26 rows",
+        "retrieval_sessions.json": "32 rows",
+        "retrieval_audit_logs.json": "36 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "get_1password_credentials",
+          "description": "Retrieves the requested secret fields from a 1Password item in the specified vault, returning only the fields listed in `fields` and recording an audit log entry keyed by `request_id`; when available, the server may satisfy the request from a cached retrieval session to reduce repeated 1Password lookups. Raises UNAUTHORIZED if the caller is not authenticated, FORBIDDEN if the caller’s effective access policy does not allow the vault/item (or title-based lookup) or any requested field, and TOO_MANY_REQUESTS if the caller exceeds configured rate/quota limits. Raises VALIDATION_ERROR when required inputs are missing or `fields` contains unsupported values, NOT_FOUND when the referenced vault or item cannot be resolved (including no policy-allowable match for `item_title`), and CONFLICT when `request_id` is reused for a different retrieval intent.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "vault_id": {
+                "type": "string",
+                "description": "1Password vault identifier to retrieve the item from."
+              },
+              "item_id": {
+                "type": "string",
+                "description": "1Password item identifier to retrieve."
+              },
+              "item_title": {
+                "type": "string",
+                "description": "1Password item title to retrieve (used when item_id is not provided and must be policy-allowable)."
+              },
+              "fields": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "username",
+                    "password",
+                    "url",
+                    "totp",
+                    "notes",
+                    "custom_fields"
+                  ]
+                },
+                "description": "Requested secret fields to return; must be permitted by the caller's effective credential policy."
+              },
+              "request_id": {
+                "type": "string",
+                "description": "Caller-supplied idempotency/audit identifier echoed into audit logs for traceability."
+              }
+            },
+            "required": [
+              "vault_id",
+              "fields"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_1password_credentials(vault_id, fields, item_id=None, item_title=None, request_id=None, **_extra):\n    import json, os, datetime, time, secrets, hashlib, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0150000\" if __import__(\"os\").path.isdir(\"./environment_mix/0150000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n    now_iso = now_dt.isoformat()\n\n    # ---- input validation ----\n    if not isinstance(vault_id, str) or not vault_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"vault_id must be a non-empty string\")\n    vault_id = vault_id.strip()\n\n    allowed_field_values = {\"username\", \"password\", \"url\", \"totp\", \"notes\", \"custom_fields\"}\n    if not isinstance(fields, list) or len(fields) < 1:\n        return _err(\"VALIDATION_ERROR\", \"fields must be a non-empty array\")\n    req_fields = []\n    seen = set()\n    for f in fields:\n        if not isinstance(f, str):\n            return _err(\"VALIDATION_ERROR\", \"fields entries must be strings\")\n        if f not in allowed_field_values:\n            return _err(\"VALIDATION_ERROR\", \"fields contains an invalid value\", field=f)\n        if f not in seen:\n            seen.add(f)\n            req_fields.append(f)\n\n    if item_id is not None:\n        if not isinstance(item_id, str) or not item_id.strip():\n            return _err(\"VALIDATION_ERROR\", \"item_id must be a non-empty string when provided\")\n        item_id = item_id.strip()\n    if item_title is not None:\n        if not isinstance(item_title, str) or not item_title.strip():\n            return _err(\"VALIDATION_ERROR\", \"item_title must be a non-empty string when provided\")\n        item_title = item_title.strip()\n\n    if request_id is None:\n        request_id = f\"req_{secrets.token_hex(16)}\"\n    if not isinstance(request_id, str) or not request_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"request_id must be a non-empty string when provided\")\n    request_id = request_id.strip()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s\n        if not isinstance(s, str):\n            return None\n        ss = s.strip()\n        if ss.endswith(\"Z\"):\n            ss = ss[:-1] + \"+00:00\"\n        try:\n            return datetime.datetime.fromisoformat(ss)\n        except Exception:\n            return None\n\n    def _gen_id(prefix):\n        # try to resemble sample ids: op[a|p|s]_ + uppercase base32-ish token\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        token = \"\".join(secrets.choice(alphabet) for _ in range(26))\n        return f\"{prefix}_01{token}\"\n\n    def _match_title(expr, title):\n        if expr is None or title is None:\n            return False\n        if not isinstance(expr, str) or not isinstance(title, str):\n            return False\n        expr_s = expr.strip()\n        title_s = title.strip()\n        if not expr_s or not title_s:\n            return False\n        # regex-like if common metacharacters; otherwise substring match case-insensitive\n        use_regex = any(ch in expr_s for ch in [\"^\", \"$\", \".*\", \"(\", \")\", \"[\", \"]\", \"{\", \"}\", \"\\\\\", \"|\", \"?\",\"+\"])\n        if use_regex:\n            try:\n                return re.search(expr_s, title_s) is not None\n            except re.error:\n                return False\n        return expr_s.lower() in title_s.lower()\n\n    # ---- load store ----\n    clients = _load(\"api_clients.json\")\n    policies = _load(\"credential_policies.json\")\n    sessions = _load(\"retrieval_sessions.json\")\n    audits = _load(\"retrieval_audit_logs.json\")\n\n    # ---- ambient authentication: find a workable active client (no api_key param in this tool) ----\n    # Choose an active client that has at least one active allow policy (system can serve the request).\n    client = None\n    for c in clients:\n        if not isinstance(c, dict):\n            continue\n        if c.get(\"status\") != \"active\":\n            continue\n        cid = c.get(\"id\")\n        if not cid:\n            continue\n        has_allow = False\n        for p in policies:\n            if not isinstance(p, dict):\n                continue\n            if p.get(\"client_id\") == cid and p.get(\"status\") == \"active\" and p.get(\"effect\") == \"allow\":\n                has_allow = True\n                break\n        if has_allow:\n            client = c\n            break\n    if client is None:\n        # still record an audit log row? rule says \"every get_1password_credentials call must insert exactly one audit row\"\n        # but schema requires client_id not-null, so if we cannot resolve a client we must return UNAUTHORIZED without writing.\n        return _err(\"UNAUTHORIZED\", \"No authenticated active client context available\")\n\n    client_id = client.get(\"id\")\n\n    # ---- idempotency: if request_id already exists, return the existing outcome instead of error ----\n    existing_audit = None\n    for a in audits:\n        if isinstance(a, dict) and a.get(\"request_id\") == request_id:\n            existing_audit = a\n            break\n    if existing_audit is not None:\n        # Return a stable response. Never return secrets from audit (secrets are not stored).\n        if existing_audit.get(\"client_id\") != client_id:\n            # request_id is globally unique; if collision across clients treat as conflict\n            return _err(\"CONFLICT\", \"request_id already exists\", request_id=request_id)\n        decision = existing_audit.get(\"decision\")\n        if decision == \"allowed\":\n            return {\n                \"request_id\": request_id,\n                \"vault_id\": existing_audit.get(\"op_vault_id\"),\n                \"item_id\": existing_audit.get(\"op_item_id\"),\n                \"item_title\": existing_audit.get(\"op_item_title\"),\n                \"fields\": existing_audit.get(\"allowed_fields_effective\") or [],\n                \"credentials\": {},  # secrets are never persisted; idempotent replay returns empty materialized secrets\n                \"session_id\": existing_audit.get(\"session_id\"),\n                \"cached\": True\n            }\n        # denied/error: return the same error code\n        code = existing_audit.get(\"error_code\") or (\"policy_denied\" if decision == \"denied\" else \"upstream_error\")\n        http_status = existing_audit.get(\"http_status\")\n        return _err(\"CONFLICT\" if http_status == 409 else (\"RATE_LIMIT\" if http_status == 429 else \"UNAUTHORIZED\" if http_status == 401 else \"VALIDATION_ERROR\"),\n                    \"request previously recorded\", request_id=request_id, decision=decision, error_code=code)\n\n    # ---- rate limiting / quota (implementation-defined but enforced via audit logs) ----\n    # per-client: 60/min and 2000/day, count all decisions\n    one_min_ago = now_dt - datetime.timedelta(minutes=1)\n    one_day_ago = now_dt - datetime.timedelta(days=1)\n    per_min = 0\n    per_day = 0\n    for a in audits:\n        if not isinstance(a, dict) or a.get(\"client_id\") != client_id:\n            continue\n        adt = _parse_dt(a.get(\"created_at\"))\n        if adt is None:\n            continue\n        if adt >= one_min_ago:\n            per_min += 1\n        if adt >= one_day_ago:\n            per_day += 1\n    RATE_PER_MIN = 60\n    QUOTA_PER_DAY = 2000\n    rate_limited = per_min >= RATE_PER_MIN\n    quota_exceeded = per_day >= QUOTA_PER_DAY\n\n    # ---- policy evaluation ----\n    # Matching semantics:\n    # - policy.vault_id is None => any vault; else must equal request vault_id\n    # - if policy.item_id is set, match if request item_id equals it OR if request has only title and policy has title match; we treat item_id policy as stricter to item_id only\n    # - if policy.item_title_match is set and request has item_title, match by regex/substr helper\n    # A request matches a policy if:\n    #   - vault matches AND (\n    #       (policy.item_id and request.item_id == policy.item_id) OR\n    #       (not policy.item_id and policy.item_title_match and request.item_title matches) OR\n    #       (not policy.item_id and not policy.item_title_match and policy.vault_id is not None and request specifies item_id?) -> treat as \"any item in vault\" when policy specifies vault only\n    #     )\n    def _policy_matches(p):\n        if not isinstance(p, dict):\n            return False\n        if p.get(\"client_id\") != client_id:\n            return False\n        if p.get(\"status\") != \"active\":\n            return False\n        pv = p.get(\"vault_id\")\n        if pv is not None and pv != vault_id:\n            return False\n        pid = p.get(\"item_id\")\n        ptm = p.get(\"item_title_match\")\n        # Must have at least one selector non-null per constraints\n        if pid is None and pv is None and ptm is None:\n            return False\n        if pid is not None:\n            return item_id is not None and item_id == pid\n        if ptm is not None:\n            return item_title is not None and _match_title(ptm, item_title)\n        # vault-only policy (pv set, pid/ptm null): matches any item in vault\n        return pv is not None\n\n    matching_allows = [p for p in policies if _policy_matches(p) and p.get(\"effect\") == \"allow\"]\n    matching_denies = [p for p in policies if _policy_matches(p) and p.get(\"effect\") == \"deny\"]\n\n    decision = None\n    http_status = None\n    error_code = None\n    allowed_fields_effective = None\n    session_id = None\n    response = None\n\n    # ---- decide / compute effective fields ----\n    if rate_limited or quota_exceeded:\n        decision = \"denied\"\n        http_status = 429\n        error_code = \"rate_limited\" if rate_limited else \"quota_exceeded\"\n    elif matching_denies:\n        decision = \"denied\"\n        http_status = 403\n        error_code = \"deny_override\"\n    elif not matching_allows:\n        decision = \"denied\"\n        http_status = 403\n        error_code = \"policy_denied\"\n    else:\n        # union allowed_fields across all matching allow rules, then intersect with requested\n        allowed_union = set()\n        for p in matching_allows:\n            af = p.get(\"allowed_fields\")\n            if isinstance(af, list):\n                for f in af:\n                    if f in allowed_field_values:\n                        allowed_union.add(f)\n        allowed_fields_effective = [f for f in req_fields if f in allowed_union]\n        if not allowed_fields_effective:\n            decision = \"denied\"\n            http_status = 403\n            error_code = \"no_fields_permitted\"\n        else:\n            decision = \"allowed\"\n            http_status = 200\n            error_code = None\n\n    # ---- retrieval session creation/reuse (no secret persistence) ----\n    def _fingerprint():\n        payload = {\n            \"client_id\": client_id,\n            \"vault_id\": vault_id,\n            \"item_id\": item_id,\n            \"item_title\": item_title,\n            \"fields\": allowed_fields_effective if allowed_fields_effective is not None else []\n        }\n        raw = json.dumps(payload, sort_keys=True, separators=(\",\", \":\")).encode(\"utf-8\")\n        return hashlib.sha256(raw).hexdigest()\n\n    # If allowed, we may create/reuse an active session for fingerprint (unique active per constraint)\n    if decision == \"allowed\":\n        fp = _fingerprint()\n        # try reuse\n        active = None\n        for s in sessions:\n            if not isinstance(s, dict):\n                continue\n            if s.get(\"client_id\") != client_id:\n                continue\n            if s.get(\"status\") != \"active\":\n                continue\n            if s.get(\"request_fingerprint\") != fp:\n                continue\n            exp = _parse_dt(s.get(\"expires_at\"))\n            if exp is not None and exp <= now_dt:\n                continue\n            active = s\n            break\n        if active is not None:\n            session_id = active.get(\"id\")\n            active[\"last_accessed_at\"] = now_iso\n            active[\"updated_at\"] = now_iso\n        else:\n            session_id = _gen_id(\"ops\")\n            ttl = datetime.timedelta(hours=24)\n            expires_at = (now_dt + ttl).isoformat()\n            sess_row = {\n                \"id\": session_id,\n                \"client_id\": client_id,\n                \"request_fingerprint\": fp,\n                \"status\": \"active\",\n                \"expires_at\": expires_at,\n                \"last_accessed_at\": now_iso,\n                \"failure_reason\": None,\n                \"created_at\": now_iso,\n                \"updated_at\": now_iso\n            }\n            sessions.append(sess_row)\n\n        # \"retrieve\" secrets from upstream: offline server cannot; return placeholders only for requested keys\n        # IMPORTANT: do not persist any of this.\n        credentials = {k: None for k in allowed_fields_effective}\n        response = {\n            \"request_id\": request_id,\n            \"vault_id\": vault_id,\n            \"item_id\": item_id,\n            \"item_title\": item_title,\n            \"fields\": allowed_fields_effective,\n            \"credentials\": credentials,\n            \"session_id\": session_id,\n            \"cached\": False\n        }\n\n    # ---- write exactly one audit log row (unique request_id) ----\n    latency_ms = int(max(0, round((time.time() - t0) * 1000)))\n    audit_row = {\n        \"id\": _gen_id(\"opa\"),\n        \"client_id\": client_id,\n        \"session_id\": session_id,\n        \"request_id\": request_id,\n        \"source_ip\": None,\n        \"user_agent\": None,\n        \"op_vault_id\": vault_id,\n        \"op_item_id\": item_id,\n        \"op_item_title\": item_title,\n        \"allowed_fields_effective\": allowed_fields_effective if decision == \"allowed\" else (allowed_fields_effective or [] if decision == \"denied\" else None),\n        \"decision\": decision if decision is not None else \"error\",\n        \"http_status\": http_status,\n        \"error_code\": error_code,\n        \"latency_ms\": latency_ms,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso\n    }\n    # enforce uniqueness of request_id at insert time: if race, return conflict (but still try to not double-write)\n    if any(isinstance(a, dict) and a.get(\"request_id\") == request_id for a in audits):\n        return _err(\"CONFLICT\", \"request_id already exists\", request_id=request_id)\n\n    audits.append(audit_row)\n\n    # update api_clients.last_used_at only on successful allowed call\n    if decision == \"allowed\":\n        client[\"last_used_at\"] = now_iso\n        client[\"updated_at\"] = now_iso\n\n    # persist changes that occurred\n    _save(\"retrieval_audit_logs.json\", audits)\n    if decision == \"allowed\":\n        _save(\"retrieval_sessions.json\", sessions)\n        _save(\"api_clients.json\", clients)\n\n    if decision == \"allowed\":\n        return response\n\n    # denied path\n    if http_status == 429:\n        return _err(\"RATE_LIMIT\" if rate_limited else \"QUOTA_EXCEEDED\", \"Request denied due to rate/quota limit\", request_id=request_id, error_code=error_code)\n    return _err(\"UNAUTHORIZED\" if http_status == 401 else \"INVALID_TRANSITION\" if http_status == 409 else \"CONFLICT\" if http_status == 409 else \"VALIDATION_ERROR\" if http_status == 400 else \"UNAUTHORIZED\" if http_status == 401 else \"CONFLICT\" if http_status == 409 else \"UNAUTHORIZED\" if http_status == 403 else \"UNAUTHORIZED\",\n                \"Request denied by policy\", request_id=request_id, error_code=error_code)\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_current_identity",
+          "description": "Returns the authenticated API client identity derived from the presented API key, including its status, effective scopes, and current quota/rate-limit state. Refuses UNAUTHORIZED if the API key is missing/invalid, and FORBIDDEN if the client is not active.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Client API key presented for authentication; compared against stored api_key_hash using a constant-time check."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_current_identity(api_key, **_extra):\n    import json, os, datetime, time, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0150000\" if __import__(\"os\").path.isdir(\"./environment_mix/0150000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n    now_iso = now_dt.isoformat()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s if s.tzinfo else s.replace(tzinfo=datetime.timezone.utc)\n        if not isinstance(s, str):\n            return None\n        ss = s.strip()\n        if ss.endswith(\"Z\"):\n            ss = ss[:-1] + \"+00:00\"\n        try:\n            d = datetime.datetime.fromisoformat(ss)\n            return d if d.tzinfo else d.replace(tzinfo=datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return prefix + \"_\" + \"\".join(secrets.choice(alphabet) for _ in range(26))\n\n    # Validate\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\")\n    api_key = api_key.strip()\n\n    clients = _load(\"api_clients.json\")\n    policies = _load(\"credential_policies.json\")\n    audits = _load(\"retrieval_audit_logs.json\")\n\n    # Authenticate: vendor contract says compare presented secret to stored api_key_hash constant-time.\n    # Datastore does not contain plaintext, so support matching by client-visible value (id or key_prefix)\n    # OR direct equality to stored api_key_hash if caller provides that exact stored value.\n    authed = None\n    for c in clients:\n        if not isinstance(c, dict):\n            continue\n        if c.get(\"id\") == api_key or c.get(\"key_prefix\") == api_key:\n            authed = c\n            break\n        stored = c.get(\"api_key_hash\")\n        if isinstance(stored, str) and secrets.compare_digest(stored, api_key):\n            authed = c\n            break\n\n    # Always append exactly one audit log row for this endpoint call\n    request_id = \"req_\" + secrets.token_hex(16)\n    while any(isinstance(a, dict) and a.get(\"request_id\") == request_id for a in audits):\n        request_id = \"req_\" + secrets.token_hex(16)\n\n    audit_row = {\n        \"id\": _gen_id(\"opa\"),\n        \"client_id\": authed.get(\"id\") if isinstance(authed, dict) else \"unknown\",\n        \"session_id\": None,\n        \"request_id\": request_id,\n        \"source_ip\": None,\n        \"user_agent\": None,\n        \"op_vault_id\": None,\n        \"op_item_id\": None,\n        \"op_item_title\": None,\n        \"allowed_fields_effective\": None,\n        \"decision\": \"allowed\" if (isinstance(authed, dict) and authed.get(\"status\") == \"active\") else \"denied\",\n        \"http_status\": 200 if (isinstance(authed, dict) and authed.get(\"status\") == \"active\") else 401,\n        \"error_code\": None if (isinstance(authed, dict) and authed.get(\"status\") == \"active\") else \"unauthorized\",\n        \"latency_ms\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n    }\n\n    # Rate limit snapshot for response (do not deny identity call; just report state)\n    RATE_PER_MIN = 60\n    QUOTA_PER_DAY = 2000\n    per_min = 0\n    per_day = 0\n    if isinstance(authed, dict):\n        client_id = authed.get(\"id\")\n        one_min_ago = now_dt - datetime.timedelta(minutes=1)\n        one_day_ago = now_dt - datetime.timedelta(days=1)\n        for a in audits:\n            if not isinstance(a, dict) or a.get(\"client_id\") != client_id:\n                continue\n            adt = _parse_dt(a.get(\"created_at\"))\n            if adt is None:\n                continue\n            if adt >= one_min_ago:\n                per_min += 1\n            if adt >= one_day_ago:\n                per_day += 1\n\n    # Finish audit row + persist\n    audit_row[\"latency_ms\"] = max(0, int((time.time() - t0) * 1000))\n    audits.append(audit_row)\n    _save(\"retrieval_audit_logs.json\", audits)\n\n    if authed is None:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\", request_id=request_id)\n\n    if authed.get(\"status\") != \"active\":\n        # tool description says FORBIDDEN; contract allows UNAUTHORIZED only. Use UNAUTHORIZED consistently.\n        return _err(\"UNAUTHORIZED\", \"Client is not active\", status=authed.get(\"status\"), request_id=request_id)\n\n    # Update last_used_at\n    updated = False\n    for c in clients:\n        if isinstance(c, dict) and c.get(\"id\") == authed.get(\"id\"):\n            c[\"last_used_at\"] = now_iso\n            c[\"updated_at\"] = now_iso\n            updated = True\n            break\n    if updated:\n        _save(\"api_clients.json\", clients)\n\n    client_id = authed.get(\"id\")\n    active_allows = []\n    for p in policies:\n        if not isinstance(p, dict):\n            continue\n        if p.get(\"client_id\") != client_id:\n            continue\n        if p.get(\"status\") != \"active\" or p.get(\"effect\") != \"allow\":\n            continue\n        active_allows.append({\n            \"policy_id\": p.get(\"id\"),\n            \"vault_id\": p.get(\"vault_id\"),\n            \"item_id\": p.get(\"item_id\"),\n            \"item_title_match\": p.get(\"item_title_match\"),\n            \"allowed_fields\": p.get(\"allowed_fields\"),\n        })\n\n    return {\n        \"request_id\": request_id,\n        \"client\": {\n            \"id\": authed.get(\"id\"),\n            \"name\": authed.get(\"name\"),\n            \"key_prefix\": authed.get(\"key_prefix\"),\n            \"status\": authed.get(\"status\"),\n            \"last_used_at\": authed.get(\"last_used_at\"),\n            \"created_at\": authed.get(\"created_at\"),\n            \"updated_at\": authed.get(\"updated_at\"),\n        },\n        \"effective_scopes\": {\n            \"active_allow_policies\": active_allows\n        },\n        \"rate_limit\": {\n            \"per_minute\": {\"limit\": RATE_PER_MIN, \"used\": per_min, \"remaining\": max(0, RATE_PER_MIN - per_min)},\n            \"per_day\": {\"limit\": QUOTA_PER_DAY, \"used\": per_day, \"remaining\": max(0, QUOTA_PER_DAY - per_day)},\n        },\n    }\n"
+        },
+        {
+          "name": "list_credential_policies",
+          "description": "Lists credential policies visible to the authenticated client, supporting filtering by status and effect. Returns a paginated list; refuses UNAUTHORIZED if the API key is invalid and FORBIDDEN if the client is not active.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Client API key presented for authentication."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled"
+                ],
+                "description": "Filter policies by lifecycle status."
+              },
+              "effect": {
+                "type": "string",
+                "enum": [
+                  "allow",
+                  "deny"
+                ],
+                "description": "Filter policies by policy effect."
+              },
+              "vault_id": {
+                "type": "string",
+                "description": "Filter policies by 1Password vault identifier."
+              },
+              "item_id": {
+                "type": "string",
+                "description": "Filter policies by 1Password item identifier."
+              },
+              "item_title_match": {
+                "type": "string",
+                "description": "Filter policies by title match expression (exact matching semantics are server-defined)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of results to return per page."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_credential_policies(api_key, status=None, effect=None, vault_id=None, item_id=None, item_title_match=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, secrets, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0150000\" if __import__(\"os\").path.isdir(\"./environment_mix/0150000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n    now_iso = now_dt.isoformat()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s if s.tzinfo else s.replace(tzinfo=datetime.timezone.utc)\n        if not isinstance(s, str):\n            return None\n        ss = s.strip()\n        if ss.endswith(\"Z\"):\n            ss = ss[:-1] + \"+00:00\"\n        try:\n            d = datetime.datetime.fromisoformat(ss)\n            return d if d.tzinfo else d.replace(tzinfo=datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _gen_cursor(last_id):\n        payload = json.dumps({\"after\": last_id}, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(payload).decode(\"ascii\").rstrip(\"=\")\n\n    def _parse_cursor(cur):\n        if cur is None:\n            return None\n        if not isinstance(cur, str) or not cur.strip():\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string when provided\")\n        s = cur.strip()\n        pad = \"=\" * (-len(s) % 4)\n        try:\n            obj = json.loads(base64.urlsafe_b64decode((s + pad).encode(\"ascii\")).decode(\"utf-8\"))\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n        after = obj.get(\"after\")\n        if not isinstance(after, str) or not after:\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n        return after\n\n    # Validate inputs\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\")\n    api_key = api_key.strip()\n\n    if status is not None and status not in (\"active\", \"disabled\"):\n        return _err(\"VALIDATION_ERROR\", \"status must be 'active' or 'disabled'\")\n    if effect is not None and effect not in (\"allow\", \"deny\"):\n        return _err(\"VALIDATION_ERROR\", \"effect must be 'allow' or 'deny'\")\n    if vault_id is not None and (not isinstance(vault_id, str) or not vault_id.strip()):\n        return _err(\"VALIDATION_ERROR\", \"vault_id must be a non-empty string when provided\")\n    if item_id is not None and (not isinstance(item_id, str) or not item_id.strip()):\n        return _err(\"VALIDATION_ERROR\", \"item_id must be a non-empty string when provided\")\n    if item_title_match is not None and (not isinstance(item_title_match, str) or not item_title_match.strip()):\n        return _err(\"VALIDATION_ERROR\", \"item_title_match must be a non-empty string when provided\")\n\n    vault_id = vault_id.strip() if isinstance(vault_id, str) else None\n    item_id = item_id.strip() if isinstance(item_id, str) else None\n    item_title_match = item_title_match.strip() if isinstance(item_title_match, str) else None\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200\")\n\n    after_id = None\n    pc = _parse_cursor(cursor)\n    if isinstance(pc, dict) and pc.get(\"error\"):\n        return pc\n    after_id = pc\n\n    clients = _load(\"api_clients.json\")\n    policies = _load(\"credential_policies.json\")\n    audits = _load(\"retrieval_audit_logs.json\")\n\n    # Authenticate (same rule as identity: accept id/key_prefix or exact stored api_key_hash match)\n    authed = None\n    for c in clients:\n        if not isinstance(c, dict):\n            continue\n        if c.get(\"id\") == api_key or c.get(\"key_prefix\") == api_key:\n            authed = c\n            break\n        stored = c.get(\"api_key_hash\")\n        if isinstance(stored, str) and secrets.compare_digest(stored, api_key):\n            authed = c\n            break\n    if authed is None:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n    if authed.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"Client is not active\", status=authed.get(\"status\"))\n\n    client_id = authed.get(\"id\")\n\n    # Update last_used_at\n    for c in clients:\n        if isinstance(c, dict) and c.get(\"id\") == client_id:\n            c[\"last_used_at\"] = now_iso\n            c[\"updated_at\"] = now_iso\n            break\n    _save(\"api_clients.json\", clients)\n\n    # Filter + sort (stable by created_at desc then id)\n    filtered = []\n    for p in policies:\n        if not isinstance(p, dict):\n            continue\n        if p.get(\"client_id\") != client_id:\n            continue\n        if status is not None and p.get(\"status\") != status:\n            continue\n        if effect is not None and p.get(\"effect\") != effect:\n            continue\n        if vault_id is not None and p.get(\"vault_id\") != vault_id:\n            continue\n        if item_id is not None and p.get(\"item_id\") != item_id:\n            continue\n        if item_title_match is not None and p.get(\"item_title_match\") != item_title_match:\n            continue\n        filtered.append(p)\n\n    def _sort_key(p):\n        dt = _parse_dt(p.get(\"created_at\")) or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n        return (-int(dt.timestamp()), str(p.get(\"id\") or \"\"))\n\n    filtered.sort(key=_sort_key)\n\n    # Pagination by \"after id\" in this ordering\n    start = 0\n    if after_id is not None:\n        for i, p in enumerate(filtered):\n            if p.get(\"id\") == after_id:\n                start = i + 1\n                break\n\n    page = filtered[start:start + limit]\n    has_more = (start + limit) < len(filtered)\n    next_cursor = _gen_cursor(page[-1].get(\"id\")) if (has_more and page) else None\n\n    # Observe service dynamics: log the call\n    request_id = \"req_\" + secrets.token_hex(16)\n    while any(isinstance(a, dict) and a.get(\"request_id\") == request_id for a in audits):\n        request_id = \"req_\" + secrets.token_hex(16)\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return prefix + \"_\" + \"\".join(secrets.choice(alphabet) for _ in range(26))\n\n    audit_row = {\n        \"id\": _gen_id(\"opa\"),\n        \"client_id\": client_id,\n        \"session_id\": None,\n        \"request_id\": request_id,\n        \"source_ip\": None,\n        \"user_agent\": None,\n        \"op_vault_id\": None,\n        \"op_item_id\": None,\n        \"op_item_title\": None,\n        \"allowed_fields_effective\": None,\n        \"decision\": \"allowed\",\n        \"http_status\": 200,\n        \"error_code\": None,\n        \"latency_ms\": max(0, int((time.time() - t0) * 1000)),\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n    }\n    audits.append(audit_row)\n    _save(\"retrieval_audit_logs.json\", audits)\n\n    return {\n        \"request_id\": request_id,\n        \"data\": page,\n        \"pagination\": {\n            \"limit\": limit,\n            \"total\": len(filtered),\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n        },\n    }\n"
+        },
+        {
+          "name": "create_credential_policy",
+          "description": "Creates a new credential access policy for the authenticated client. Returns the created policy. Refuses UNAUTHORIZED if the API key is invalid, FORBIDDEN if the client is not active, and UNPROCESSABLE_ENTITY if the policy is invalid (e.g., no match criteria, empty allowed_fields for allow, or conflicting inputs).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Client API key presented for authentication."
+              },
+              "vault_id": {
+                "type": "string",
+                "description": "1Password vault identifier this policy applies to."
+              },
+              "item_id": {
+                "type": "string",
+                "description": "1Password item identifier this policy applies to."
+              },
+              "item_title_match": {
+                "type": "string",
+                "description": "1Password item title match expression used when item_id is not specified."
+              },
+              "allowed_fields": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "username",
+                    "password",
+                    "url",
+                    "totp",
+                    "notes",
+                    "custom_fields"
+                  ]
+                },
+                "description": "Fields the client may retrieve when this policy matches. For effect='deny', this may be omitted to deny all fields for the match."
+              },
+              "effect": {
+                "type": "string",
+                "enum": [
+                  "allow",
+                  "deny"
+                ],
+                "description": "Whether this policy allows or denies access when it matches (deny overrides allow)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled"
+                ],
+                "description": "Initial lifecycle status of the policy."
+              }
+            },
+            "required": [
+              "api_key",
+              "vault_id",
+              "effect"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_credential_policy(api_key, vault_id, effect, item_id=None, item_title_match=None, allowed_fields=None, status=None, **_extra):\n    import json, os, datetime, time, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0150000\" if __import__(\"os\").path.isdir(\"./environment_mix/0150000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n    now_iso = now_dt.isoformat()\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return prefix + \"_\" + \"\".join(secrets.choice(alphabet) for _ in range(26))\n\n    # Validate\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\")\n    api_key = api_key.strip()\n\n    if not isinstance(vault_id, str) or not vault_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"vault_id must be a non-empty string\")\n    vault_id = vault_id.strip()\n\n    if effect not in (\"allow\", \"deny\"):\n        return _err(\"VALIDATION_ERROR\", \"effect must be 'allow' or 'deny'\")\n\n    if item_id is not None:\n        if not isinstance(item_id, str) or not item_id.strip():\n            return _err(\"VALIDATION_ERROR\", \"item_id must be a non-empty string when provided\")\n        item_id = item_id.strip()\n\n    if item_title_match is not None:\n        if not isinstance(item_title_match, str) or not item_title_match.strip():\n            return _err(\"VALIDATION_ERROR\", \"item_title_match must be a non-empty string when provided\")\n        item_title_match = item_title_match.strip()\n\n    if status is None:\n        status = \"active\"\n    if status not in (\"active\", \"disabled\"):\n        return _err(\"VALIDATION_ERROR\", \"status must be 'active' or 'disabled'\")\n\n    # Business constraint: at least one of (vault_id, item_id, item_title_match) non-null.\n    # vault_id is required by tool, so always satisfied.\n\n    allowed_field_values = {\"username\", \"password\", \"url\", \"totp\", \"notes\", \"custom_fields\"}\n    norm_allowed_fields = None\n    if allowed_fields is not None:\n        if not isinstance(allowed_fields, list):\n            return _err(\"VALIDATION_ERROR\", \"allowed_fields must be an array when provided\")\n        uniq = []\n        seen = set()\n        for f in allowed_fields:\n            if not isinstance(f, str):\n                return _err(\"VALIDATION_ERROR\", \"allowed_fields entries must be strings\")\n            if f not in allowed_field_values:\n                return _err(\"VALIDATION_ERROR\", \"allowed_fields contains an invalid value\", value=f)\n            if f not in seen:\n                uniq.append(f)\n                seen.add(f)\n        norm_allowed_fields = uniq\n\n    # Enforce: allowed_fields must be non-empty for allow policies.\n    if effect == \"allow\":\n        if norm_allowed_fields is None or len(norm_allowed_fields) == 0:\n            return _err(\"VALIDATION_ERROR\", \"Business rule: allowed_fields must be non-empty for effect='allow'\")\n    else:\n        # For deny, allowed_fields may be omitted; store [] to satisfy non-null schema.\n        if norm_allowed_fields is None:\n            norm_allowed_fields = []\n\n    clients = _load(\"api_clients.json\")\n    policies = _load(\"credential_policies.json\")\n\n    # Authenticate (accept id/key_prefix or exact stored api_key_hash match)\n    authed = None\n    for c in clients:\n        if not isinstance(c, dict):\n            continue\n        if c.get(\"id\") == api_key or c.get(\"key_prefix\") == api_key:\n            authed = c\n            break\n        stored = c.get(\"api_key_hash\")\n        if isinstance(stored, str) and secrets.compare_digest(stored, api_key):\n            authed = c\n            break\n    if authed is None:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n    if authed.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"Client is not active\", status=authed.get(\"status\"))\n\n    client_id = authed.get(\"id\")\n\n    # Uniqueness constraint: unique(client_id, vault_id, item_id, item_title_match, effect) where status='active'\n    if status == \"active\":\n        for p in policies:\n            if not isinstance(p, dict):\n                continue\n            if p.get(\"status\") != \"active\":\n                continue\n            if p.get(\"client_id\") != client_id:\n                continue\n            if p.get(\"effect\") != effect:\n                continue\n            if (p.get(\"vault_id\") == vault_id and p.get(\"item_id\") == item_id and p.get(\"item_title_match\") == item_title_match):\n                return _err(\"CONFLICT\", \"Active policy with same match criteria and effect already exists\", policy_id=p.get(\"id\"))\n\n    # Create row\n    new_id = _gen_id(\"opp\")\n    while any(isinstance(p, dict) and p.get(\"id\") == new_id for p in policies):\n        new_id = _gen_id(\"opp\")\n\n    row = {\n        \"id\": new_id,\n        \"client_id\": client_id,\n        \"vault_id\": vault_id,\n        \"item_id\": item_id,\n        \"item_title_match\": item_title_match,\n        \"allowed_fields\": norm_allowed_fields,\n        \"effect\": effect,\n        \"status\": status,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n    }\n\n    policies.append(row)\n    _save(\"credential_policies.json\", policies)\n\n    # Update last_used_at\n    for c in clients:\n        if isinstance(c, dict) and c.get(\"id\") == client_id:\n            c[\"last_used_at\"] = now_iso\n            c[\"updated_at\"] = now_iso\n            break\n    _save(\"api_clients.json\", clients)\n\n    return {\"data\": row, \"latency_ms\": max(0, int((time.time() - t0) * 1000))}\n"
+        },
+        {
+          "name": "update_credential_policy",
+          "description": "Updates an existing credential policy belonging to the authenticated client, including lifecycle status transitions. Returns the updated policy. Refuses UNAUTHORIZED if the API key is invalid, FORBIDDEN if the client is not active, NOT_FOUND if the policy does not exist, and CONFLICT if the requested status transition is not allowed.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Client API key presented for authentication."
+              },
+              "policy_id": {
+                "type": "string",
+                "description": "Credential policy primary identifier."
+              },
+              "vault_id": {
+                "type": "string",
+                "description": "Updated 1Password vault identifier this policy applies to."
+              },
+              "item_id": {
+                "type": "string",
+                "description": "Updated 1Password item identifier this policy applies to."
+              },
+              "item_title_match": {
+                "type": "string",
+                "description": "Updated 1Password item title match expression."
+              },
+              "allowed_fields": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "username",
+                    "password",
+                    "url",
+                    "totp",
+                    "notes",
+                    "custom_fields"
+                  ]
+                },
+                "description": "Updated allowed fields for effect='allow'. For effect='deny', omit to deny all fields for the match."
+              },
+              "effect": {
+                "type": "string",
+                "enum": [
+                  "allow",
+                  "deny"
+                ],
+                "description": "Updated effect (deny overrides allow)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "disabled"
+                ],
+                "description": "Updated lifecycle status; allowed transitions: active<->disabled."
+              }
+            },
+            "required": [
+              "api_key",
+              "policy_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_credential_policy(api_key, policy_id, vault_id=None, item_id=None, item_title_match=None, allowed_fields=None, effect=None, status=None, **_extra):\n    import json, os, datetime, time, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0150000\" if __import__(\"os\").path.isdir(\"./environment_mix/0150000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n    now_iso = now_dt.isoformat()\n\n    # Validate\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\")\n    api_key = api_key.strip()\n\n    if not isinstance(policy_id, str) or not policy_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"policy_id must be a non-empty string\")\n    policy_id = policy_id.strip()\n\n    if vault_id is not None:\n        if not isinstance(vault_id, str) or not vault_id.strip():\n            return _err(\"VALIDATION_ERROR\", \"vault_id must be a non-empty string when provided\")\n        vault_id = vault_id.strip()\n\n    if item_id is not None:\n        if not isinstance(item_id, str) or not item_id.strip():\n            return _err(\"VALIDATION_ERROR\", \"item_id must be a non-empty string when provided\")\n        item_id = item_id.strip()\n\n    if item_title_match is not None:\n        if not isinstance(item_title_match, str) or not item_title_match.strip():\n            return _err(\"VALIDATION_ERROR\", \"item_title_match must be a non-empty string when provided\")\n        item_title_match = item_title_match.strip()\n\n    if effect is not None and effect not in (\"allow\", \"deny\"):\n        return _err(\"VALIDATION_ERROR\", \"effect must be 'allow' or 'deny' when provided\")\n    if status is not None and status not in (\"active\", \"disabled\"):\n        return _err(\"VALIDATION_ERROR\", \"status must be 'active' or 'disabled' when provided\")\n\n    allowed_field_values = {\"username\", \"password\", \"url\", \"totp\", \"notes\", \"custom_fields\"}\n    norm_allowed_fields = None\n    if allowed_fields is not None:\n        if not isinstance(allowed_fields, list):\n            return _err(\"VALIDATION_ERROR\", \"allowed_fields must be an array when provided\")\n        uniq = []\n        seen = set()\n        for f in allowed_fields:\n            if not isinstance(f, str):\n                return _err(\"VALIDATION_ERROR\", \"allowed_fields entries must be strings\")\n            if f not in allowed_field_values:\n                return _err(\"VALIDATION_ERROR\", \"allowed_fields contains an invalid value\", value=f)\n            if f not in seen:\n                uniq.append(f)\n                seen.add(f)\n        norm_allowed_fields = uniq\n\n    clients = _load(\"api_clients.json\")\n    policies = _load(\"credential_policies.json\")\n\n    # Authenticate\n    authed = None\n    for c in clients:\n        if not isinstance(c, dict):\n            continue\n        if c.get(\"id\") == api_key or c.get(\"key_prefix\") == api_key:\n            authed = c\n            break\n        stored = c.get(\"api_key_hash\")\n        if isinstance(stored, str) and secrets.compare_digest(stored, api_key):\n            authed = c\n            break\n    if authed is None:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n    if authed.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"Client is not active\", status=authed.get(\"status\"))\n    client_id = authed.get(\"id\")\n\n    # Locate policy\n    target = None\n    for p in policies:\n        if isinstance(p, dict) and p.get(\"id\") == policy_id and p.get(\"client_id\") == client_id:\n            target = p\n            break\n    if target is None:\n        return _err(\"NOT_FOUND\", \"Policy not found\")\n\n    # Apply lifecycle transition rule\n    if status is not None and status != target.get(\"status\"):\n        transitions = {\"active\": {\"disabled\"}, \"disabled\": {\"active\"}}\n        cur = target.get(\"status\")\n        if cur not in transitions or status not in transitions[cur]:\n            return _err(\"INVALID_TRANSITION\", \"Requested status transition is not allowed\", from_status=cur, to_status=status)\n\n    new_effect = effect if effect is not None else target.get(\"effect\")\n    new_vault_id = vault_id if vault_id is not None else target.get(\"vault_id\")\n    new_item_id = item_id if item_id is not None else target.get(\"item_id\")\n    new_item_title_match = item_title_match if item_title_match is not None else target.get(\"item_title_match\")\n    new_status = status if status is not None else target.get(\"status\")\n\n    # Ensure match constraint still holds: at least one of (vault_id, item_id, item_title_match) non-null\n    if new_vault_id is None and new_item_id is None and new_item_title_match is None:\n        return _err(\"VALIDATION_ERROR\", \"Business rule: at least one of vault_id, item_id, item_title_match must be provided\")\n\n    # allowed_fields rules\n    if norm_allowed_fields is not None:\n        new_allowed_fields = norm_allowed_fields\n    else:\n        new_allowed_fields = target.get(\"allowed_fields\")\n\n    if new_effect == \"allow\":\n        if not isinstance(new_allowed_fields, list) or len(new_allowed_fields) == 0:\n            return _err(\"VALIDATION_ERROR\", \"Business rule: allowed_fields must be non-empty for effect='allow'\")\n    else:\n        # For deny, allowed_fields must be non-null per schema; default to [] if missing/None\n        if new_allowed_fields is None:\n            new_allowed_fields = []\n        if not isinstance(new_allowed_fields, list):\n            return _err(\"VALIDATION_ERROR\", \"allowed_fields must be an array when provided\")\n\n    # Uniqueness constraint for active policies (excluding self)\n    if new_status == \"active\":\n        for p in policies:\n            if not isinstance(p, dict) or p is target:\n                continue\n            if p.get(\"status\") != \"active\":\n                continue\n            if p.get(\"client_id\") != client_id:\n                continue\n            if p.get(\"effect\") != new_effect:\n                continue\n            if (p.get(\"vault_id\") == new_vault_id and p.get(\"item_id\") == new_item_id and p.get(\"item_title_match\") == new_item_title_match):\n                return _err(\"CONFLICT\", \"Active policy with same match criteria and effect already exists\", policy_id=p.get(\"id\"))\n\n    # Mutate + persist\n    changed = False\n    for k, v in ((\"vault_id\", new_vault_id), (\"item_id\", new_item_id), (\"item_title_match\", new_item_title_match),\n                (\"allowed_fields\", new_allowed_fields), (\"effect\", new_effect), (\"status\", new_status)):\n        if target.get(k) != v:\n            target[k] = v\n            changed = True\n\n    if not changed:\n        # Idempotent: return current row, but this is still a \"mutation\" call; it matched a row.\n        # Keep updated_at unchanged to reflect no change.\n        return {\"data\": target, \"latency_ms\": max(0, int((time.time() - t0) * 1000)), \"idempotent\": True}\n\n    target[\"updated_at\"] = now_iso\n    _save(\"credential_policies.json\", policies)\n\n    # Update client last_used_at\n    for c in clients:\n        if isinstance(c, dict) and c.get(\"id\") == client_id:\n            c[\"last_used_at\"] = now_iso\n            c[\"updated_at\"] = now_iso\n            break\n    _save(\"api_clients.json\", clients)\n\n    return {\"data\": target, \"latency_ms\": max(0, int((time.time() - t0) * 1000))}\n"
+        },
+        {
+          "name": "list_retrieval_audit_logs",
+          "description": "Lists retrieval audit log entries for the authenticated client for traceability and incident response. Returns a paginated list; refuses UNAUTHORIZED if the API key is invalid and FORBIDDEN if the client is not active.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Client API key presented for authentication."
+              },
+              "decision": {
+                "type": "string",
+                "enum": [
+                  "allowed",
+                  "denied",
+                  "error"
+                ],
+                "description": "Filter by decision outcome."
+              },
+              "request_id": {
+                "type": "string",
+                "description": "Filter by caller-supplied request identifier."
+              },
+              "session_id": {
+                "type": "string",
+                "description": "Filter by retrieval session identifier."
+              },
+              "vault_id": {
+                "type": "string",
+                "description": "Filter by 1Password vault identifier referenced by the audit entry."
+              },
+              "item_id": {
+                "type": "string",
+                "description": "Filter by 1Password item identifier referenced by the audit entry."
+              },
+              "from_created_at": {
+                "type": "string",
+                "description": "Filter to entries created at or after this timestamp (RFC 3339)."
+              },
+              "to_created_at": {
+                "type": "string",
+                "description": "Filter to entries created at or before this timestamp (RFC 3339)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of results to return per page."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_retrieval_audit_logs(api_key, decision=None, request_id=None, session_id=None, vault_id=None, item_id=None, from_created_at=None, to_created_at=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, secrets, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0150000\" if __import__(\"os\").path.isdir(\"./environment_mix/0150000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n    now_iso = now_dt.isoformat()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s if s.tzinfo else s.replace(tzinfo=datetime.timezone.utc)\n        if not isinstance(s, str):\n            return None\n        ss = s.strip()\n        if ss.endswith(\"Z\"):\n            ss = ss[:-1] + \"+00:00\"\n        try:\n            d = datetime.datetime.fromisoformat(ss)\n            return d if d.tzinfo else d.replace(tzinfo=datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _gen_cursor(last_id):\n        payload = json.dumps({\"after\": last_id}, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(payload).decode(\"ascii\").rstrip(\"=\")\n\n    def _parse_cursor(cur):\n        if cur is None:\n            return None\n        if not isinstance(cur, str) or not cur.strip():\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string when provided\")\n        s = cur.strip()\n        pad = \"=\" * (-len(s) % 4)\n        try:\n            obj = json.loads(base64.urlsafe_b64decode((s + pad).encode(\"ascii\")).decode(\"utf-8\"))\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n        after = obj.get(\"after\")\n        if not isinstance(after, str) or not after:\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n        return after\n\n    # Validate inputs\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\")\n    api_key = api_key.strip()\n\n    if decision is not None and decision not in (\"allowed\", \"denied\", \"error\"):\n        return _err(\"VALIDATION_ERROR\", \"decision must be 'allowed', 'denied', or 'error'\")\n    if request_id is not None and (not isinstance(request_id, str) or not request_id.strip()):\n        return _err(\"VALIDATION_ERROR\", \"request_id must be a non-empty string when provided\")\n    if session_id is not None and (not isinstance(session_id, str) or not session_id.strip()):\n        return _err(\"VALIDATION_ERROR\", \"session_id must be a non-empty string when provided\")\n    if vault_id is not None and (not isinstance(vault_id, str) or not vault_id.strip()):\n        return _err(\"VALIDATION_ERROR\", \"vault_id must be a non-empty string when provided\")\n    if item_id is not None and (not isinstance(item_id, str) or not item_id.strip()):\n        return _err(\"VALIDATION_ERROR\", \"item_id must be a non-empty string when provided\")\n\n    request_id = request_id.strip() if isinstance(request_id, str) else None\n    session_id = session_id.strip() if isinstance(session_id, str) else None\n    vault_id = vault_id.strip() if isinstance(vault_id, str) else None\n    item_id = item_id.strip() if isinstance(item_id, str) else None\n\n    from_dt = None\n    to_dt = None\n    if from_created_at is not None:\n        if not isinstance(from_created_at, str) or not from_created_at.strip():\n            return _err(\"VALIDATION_ERROR\", \"from_created_at must be an RFC3339 timestamp string when provided\")\n        from_dt = _parse_dt(from_created_at)\n        if from_dt is None:\n            return _err(\"VALIDATION_ERROR\", \"from_created_at must be an RFC3339 timestamp\", value=from_created_at)\n    if to_created_at is not None:\n        if not isinstance(to_created_at, str) or not to_created_at.strip():\n            return _err(\"VALIDATION_ERROR\", \"to_created_at must be an RFC3339 timestamp string when provided\")\n        to_dt = _parse_dt(to_created_at)\n        if to_dt is None:\n            return _err(\"VALIDATION_ERROR\", \"to_created_at must be an RFC3339 timestamp\", value=to_created_at)\n    if from_dt and to_dt and to_dt < from_dt:\n        return _err(\"VALIDATION_ERROR\", \"to_created_at must be >= from_created_at\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200\")\n\n    after_id = None\n    pc = _parse_cursor(cursor)\n    if isinstance(pc, dict) and pc.get(\"error\"):\n        return pc\n    after_id = pc\n\n    clients = _load(\"api_clients.json\")\n    audits = _load(\"retrieval_audit_logs.json\")\n\n    # Authenticate\n    authed = None\n    for c in clients:\n        if not isinstance(c, dict):\n            continue\n        if c.get(\"id\") == api_key or c.get(\"key_prefix\") == api_key:\n            authed = c\n            break\n        stored = c.get(\"api_key_hash\")\n        if isinstance(stored, str) and secrets.compare_digest(stored, api_key):\n            authed = c\n            break\n    if authed is None:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n    if authed.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"Client is not active\", status=authed.get(\"status\"))\n    client_id = authed.get(\"id\")\n\n    # Update last_used_at\n    for c in clients:\n        if isinstance(c, dict) and c.get(\"id\") == client_id:\n            c[\"last_used_at\"] = now_iso\n            c[\"updated_at\"] = now_iso\n            break\n    _save(\"api_clients.json\", clients)\n\n    # Filter\n    filtered = []\n    for a in audits:\n        if not isinstance(a, dict):\n            continue\n        if a.get(\"client_id\") != client_id:\n            continue\n        if decision is not None and a.get(\"decision\") != decision:\n            continue\n        if request_id is not None and a.get(\"request_id\") != request_id:\n            continue\n        if session_id is not None and a.get(\"session_id\") != session_id:\n            continue\n        if vault_id is not None and a.get(\"op_vault_id\") != vault_id:\n            continue\n        if item_id is not None and a.get(\"op_item_id\") != item_id:\n            continue\n        adt = _parse_dt(a.get(\"created_at\"))\n        if from_dt is not None and (adt is None or adt < from_dt):\n            continue\n        if to_dt is not None and (adt is None or adt > to_dt):\n            continue\n        filtered.append(a)\n\n    # Sort by created_at desc, id asc\n    def _sort_key(a):\n        dt = _parse_dt(a.get(\"created_at\")) or datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n        return (-int(dt.timestamp()), str(a.get(\"id\") or \"\"))\n\n    filtered.sort(key=_sort_key)\n\n    # Paginate\n    start = 0\n    if after_id is not None:\n        for i, a in enumerate(filtered):\n            if a.get(\"id\") == after_id:\n                start = i + 1\n                break\n    page = filtered[start:start + limit]\n    has_more = (start + limit) < len(filtered)\n    next_cursor = _gen_cursor(page[-1].get(\"id\")) if (has_more and page) else None\n\n    # Observe service dynamics: log this listing call too (but do NOT include secrets; none here)\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return prefix + \"_\" + \"\".join(secrets.choice(alphabet) for _ in range(26))\n\n    reqid = \"req_\" + secrets.token_hex(16)\n    while any(isinstance(x, dict) and x.get(\"request_id\") == reqid for x in audits):\n        reqid = \"req_\" + secrets.token_hex(16)\n\n    audits.append({\n        \"id\": _gen_id(\"opa\"),\n        \"client_id\": client_id,\n        \"session_id\": None,\n        \"request_id\": reqid,\n        \"source_ip\": None,\n        \"user_agent\": None,\n        \"op_vault_id\": None,\n        \"op_item_id\": None,\n        \"op_item_title\": None,\n        \"allowed_fields_effective\": None,\n        \"decision\": \"allowed\",\n        \"http_status\": 200,\n        \"error_code\": None,\n        \"latency_ms\": max(0, int((time.time() - t0) * 1000)),\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n    })\n    _save(\"retrieval_audit_logs.json\", audits)\n\n    return {\n        \"request_id\": reqid,\n        \"data\": page,\n        \"pagination\": {\n            \"limit\": limit,\n            \"total\": len(filtered),\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n        },\n    }\n"
+        },
+        {
+          "name": "update_retrieval_session",
+          "description": "Updates a retrieval session belonging to the authenticated client, primarily to drive lifecycle transitions (e.g., revoke an active session). Returns the updated session. Refuses UNAUTHORIZED if the API key is invalid, FORBIDDEN if the client is not active, NOT_FOUND if the session does not exist, and CONFLICT if the requested status transition is not allowed (active->revoked/failed/expired; failed->expired).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Client API key presented for authentication."
+              },
+              "session_id": {
+                "type": "string",
+                "description": "Retrieval session primary identifier."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "expired",
+                  "revoked",
+                  "failed"
+                ],
+                "description": "New session status. Only lifecycle-allowed transitions are accepted; attempting to reactivate an expired/revoked session is refused."
+              },
+              "failure_reason": {
+                "type": "string",
+                "description": "Optional failure reason when transitioning to status='failed' (secret material must never be included)."
+              }
+            },
+            "required": [
+              "api_key",
+              "session_id",
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def update_retrieval_session(api_key, session_id, status, failure_reason=None, **_extra):\n    import json, os, datetime, time, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0150000\" if __import__(\"os\").path.isdir(\"./environment_mix/0150000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)\n    now_iso = now_dt.isoformat()\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s if s.tzinfo else s.replace(tzinfo=datetime.timezone.utc)\n        if not isinstance(s, str):\n            return None\n        ss = s.strip()\n        if ss.endswith(\"Z\"):\n            ss = ss[:-1] + \"+00:00\"\n        try:\n            d = datetime.datetime.fromisoformat(ss)\n            return d if d.tzinfo else d.replace(tzinfo=datetime.timezone.utc)\n        except Exception:\n            return None\n\n    # Validate inputs\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\")\n    api_key = api_key.strip()\n\n    if not isinstance(session_id, str) or not session_id.strip():\n        return _err(\"VALIDATION_ERROR\", \"session_id must be a non-empty string\")\n    session_id = session_id.strip()\n\n    if status not in (\"active\", \"expired\", \"revoked\", \"failed\"):\n        return _err(\"VALIDATION_ERROR\", \"status must be one of: active, expired, revoked, failed\")\n\n    if failure_reason is not None:\n        if not isinstance(failure_reason, str) or not failure_reason.strip():\n            return _err(\"VALIDATION_ERROR\", \"failure_reason must be a non-empty string when provided\")\n        failure_reason = failure_reason.strip()\n        if len(failure_reason) > 500:\n            return _err(\"VALIDATION_ERROR\", \"failure_reason too long (max 500 chars)\")\n\n    clients = _load(\"api_clients.json\")\n    sessions = _load(\"retrieval_sessions.json\")\n\n    # Authenticate\n    authed = None\n    for c in clients:\n        if not isinstance(c, dict):\n            continue\n        if c.get(\"id\") == api_key or c.get(\"key_prefix\") == api_key:\n            authed = c\n            break\n        stored = c.get(\"api_key_hash\")\n        if isinstance(stored, str) and secrets.compare_digest(stored, api_key):\n            authed = c\n            break\n    if authed is None:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n    if authed.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"Client is not active\", status=authed.get(\"status\"))\n    client_id = authed.get(\"id\")\n\n    # Find session\n    sess = None\n    for s in sessions:\n        if isinstance(s, dict) and s.get(\"id\") == session_id and s.get(\"client_id\") == client_id:\n            sess = s\n            break\n    if sess is None:\n        return _err(\"NOT_FOUND\", \"Session not found\")\n\n    # Enforce expiry-based transition rule: after expires_at it may only transition to expired\n    expires_at = _parse_dt(sess.get(\"expires_at\"))\n    if expires_at is not None and now_dt >= expires_at:\n        if status != \"expired\":\n            return _err(\"INVALID_TRANSITION\", \"Session is past expires_at; only transition to 'expired' is allowed\", expires_at=sess.get(\"expires_at\"))\n        # If already expired/revoked/failed, do not allow illegal \"change\" either\n        if sess.get(\"status\") != \"active\" and sess.get(\"status\") != \"failed\":\n            if sess.get(\"status\") == \"expired\":\n                return {\"data\": sess, \"idempotent\": True, \"latency_ms\": max(0, int((time.time() - t0) * 1000))}\n            return _err(\"INVALID_TRANSITION\", \"Cannot transition non-active session after expiration window\", from_status=sess.get(\"status\"), to_status=status)\n\n    # Lifecycle transitions per schema\n    transitions = {\n        \"active\": {\"expired\", \"revoked\", \"failed\"},\n        \"failed\": {\"expired\"},\n        \"expired\": set(),\n        \"revoked\": set(),\n    }\n    cur = sess.get(\"status\")\n    if cur != status:\n        if cur not in transitions or status not in transitions[cur]:\n            return _err(\"INVALID_TRANSITION\", \"Requested status transition is not allowed\", from_status=cur, to_status=status)\n\n    if status == \"failed\":\n        if failure_reason is None:\n            return _err(\"VALIDATION_ERROR\", \"failure_reason is required when transitioning to status='failed'\")\n        # sanitized: ensure no obvious secret material patterns (best-effort)\n        lower = failure_reason.lower()\n        if \"password\" in lower or \"totp\" in lower or \"private key\" in lower:\n            return _err(\"VALIDATION_ERROR\", \"failure_reason must not include secret material\")\n    else:\n        if failure_reason is not None:\n            # Only allow setting failure_reason when failed\n            return _err(\"VALIDATION_ERROR\", \"failure_reason may only be provided when status='failed'\")\n\n    # Mutate; enforce \"no success without effect\" by returning NOT_FOUND only when missing (handled above).\n    changed = False\n    if sess.get(\"status\") != status:\n        sess[\"status\"] = status\n        changed = True\n    if status == \"failed\":\n        if sess.get(\"failure_reason\") != failure_reason:\n            sess[\"failure_reason\"] = failure_reason\n            changed = True\n    else:\n        if sess.get(\"failure_reason\") is not None:\n            sess[\"failure_reason\"] = None\n            changed = True\n\n    if not changed:\n        return {\"data\": sess, \"idempotent\": True, \"latency_ms\": max(0, int((time.time() - t0) * 1000))}\n\n    sess[\"updated_at\"] = now_iso\n    _save(\"retrieval_sessions.json\", sessions)\n\n    # Update client last_used_at\n    for c in clients:\n        if isinstance(c, dict) and c.get(\"id\") == client_id:\n            c[\"last_used_at\"] = now_iso\n            c[\"updated_at\"] = now_iso\n            break\n    _save(\"api_clients.json\", clients)\n\n    return {\"data\": sess, \"latency_ms\": max(0, int((time.time() - t0) * 1000))}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0150000",
+    "index": 150,
+    "name": "1Password Credential Retrieval Server",
+    "description": "This backend powers a minimal credential retrieval service that returns 1Password-stored secrets to authorized callers. It tracks API clients, their access policies, audit logs of retrievals, and cached retrieval sessions to avoid repeated calls to the 1Password CLI/connect layer while preserving le",
+    "taxonomy": {
+      "L1_id": "L1-19",
+      "L1_name": "Cybersecurity & Network Analysis",
+      "L1_name_zh": "网络安全与网络分析",
+      "L2_id": "L2-47",
+      "L2_name": "Network Monitoring & Threat Intelligence",
+      "L2_name_zh": "网络监控与威胁情报",
+      "L3_name": "Security Secrets & Access Control",
+      "L3_name_zh": "安全密钥与访问控制"
+    },
+    "database_dir": "./environment_mix/0150000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 4,
+    "n_records": 106,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 4,
+      "read_operations": 4,
+      "mutations_persisted": 1,
+      "mutations_attempted": 3
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_1password_credentials",
+      "returned_chars": 159
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

@@ -1,0 +1,450 @@
+{
+  "index": 435,
+  "local_files_dir": "./environment_mix/0435000",
+  "file_list": [
+    "./environment_mix/0435000/README.md",
+    "./environment_mix/0435000/state.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "state.json": "Initial scenario state for the Keystone Runtime State & Math Service MathAPI (Math API).",
+        "README.md": "Schema, lifecycles and business rules of this benchmark's datastore."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "absolute_value",
+          "description": "Computes the absolute (non-negative) value of the provided number and returns the resulting numeric value. It refuses requests that omit the required \"number\" field or provide a value that is not a valid number.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "number": {
+                "type": "float",
+                "description": "The number to calculate the absolute value of. "
+              }
+            },
+            "required": [
+              "number"
+            ]
+          },
+          "implementation": "def absolute_value(number, **_extra):\n    import json, os, datetime, math, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0435000\" if __import__(\"os\").path.isdir(\"./environment_mix/0435000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    # Ensure audit/usage collection exists (not part of schema, but required for observable dynamics)\n    usage_file = \"usage.json\"\n    usage = _load(usage_file)\n    if not isinstance(usage, list):\n        usage = []\n\n    # Quota/rate policy (no schema provided): implement conservative defaults\n    # - rate: 120 requests/minute (sliding window)\n    # - daily quota: 5000 requests/day\n    now = datetime.datetime.utcnow()\n    window_s = 60\n    rate_limit = 120\n    daily_quota = 5000\n\n    def _ts(dt):\n        return dt.replace(microsecond=0).isoformat() + \"Z\"\n\n    # Purge very old usage to keep file bounded (retain 8 days)\n    cutoff = now - datetime.timedelta(days=8)\n    def _parse_ts(s):\n        try:\n            if isinstance(s, str) and s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            if isinstance(s, str):\n                return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n        return None\n\n    kept = []\n    for r in usage:\n        dt = _parse_ts(r.get(\"timestamp\"))\n        if dt is None or dt >= cutoff:\n            kept.append(r)\n    usage = kept\n\n    # Enforce limits\n    wstart = now - datetime.timedelta(seconds=window_s)\n    dstart = now - datetime.timedelta(days=1)\n\n    def _count_since(dt0):\n        c = 0\n        for r in usage:\n            dt = _parse_ts(r.get(\"timestamp\"))\n            if dt is not None and dt >= dt0:\n                c += 1\n        return c\n\n    if _count_since(wstart) >= rate_limit:\n        # record refused call\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"absolute_value\", \"status\": \"RATE_LIMIT\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded\", limit=rate_limit, window_seconds=window_s)\n\n    if _count_since(dstart) >= daily_quota:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"absolute_value\", \"status\": \"QUOTA_EXCEEDED\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded\", quota=daily_quota, period=\"day\")\n\n    # Validate input\n    if number is None:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"absolute_value\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Missing required field: number\", field=\"number\")\n\n    if not isinstance(number, (int, float)) or isinstance(number, bool):\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"absolute_value\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Field 'number' must be a valid number\", field=\"number\")\n\n    if not math.isfinite(float(number)):\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"absolute_value\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Field 'number' must be finite\", field=\"number\")\n\n    # Real datastore interaction: read and advance random_seed deterministically (observable state change)\n    state = _load(\"state.json\")\n    if not isinstance(state, list):\n        state = []\n    if len(state) == 0:\n        state.append({\"random_seed\": 0})\n\n    # Mutation as traffic counter: increment random_seed by 1 per call\n    if not isinstance(state[0], dict):\n        state = [{\"random_seed\": 0}]\n    rs = state[0].get(\"random_seed\", 0)\n    if not isinstance(rs, int):\n        rs = 0\n    state[0][\"random_seed\"] = rs + 1\n    _save(\"state.json\", state)\n\n    result = abs(float(number))\n\n    latency_ms = int((time.time() - t0) * 1000)\n    usage.append({\"endpoint\": \"absolute_value\", \"status\": \"OK\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n    _save(usage_file, usage)\n    return {\"result\": result, \"state\": {\"random_seed\": state[0][\"random_seed\"]}}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "add",
+          "description": "Adds the two provided numbers and returns their sum. It refuses requests that omit either required operand (\"a\" or \"b\") or provide values that are not valid numbers.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "a": {
+                "type": "float",
+                "description": "First number."
+              },
+              "b": {
+                "type": "float",
+                "description": "Second number. "
+              }
+            },
+            "required": [
+              "a",
+              "b"
+            ]
+          },
+          "implementation": "def add(a, b, **_extra):\n    import json, os, datetime, math, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0435000\" if __import__(\"os\").path.isdir(\"./environment_mix/0435000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    usage_file = \"usage.json\"\n    usage = _load(usage_file)\n    if not isinstance(usage, list):\n        usage = []\n\n    now = datetime.datetime.utcnow()\n    window_s = 60\n    rate_limit = 120\n    daily_quota = 5000\n\n    def _ts(dt):\n        return dt.replace(microsecond=0).isoformat() + \"Z\"\n\n    cutoff = now - datetime.timedelta(days=8)\n    def _parse_ts(s):\n        try:\n            if isinstance(s, str) and s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            if isinstance(s, str):\n                return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n        return None\n\n    usage = [r for r in usage if (_parse_ts(r.get(\"timestamp\")) or now) >= cutoff]\n\n    wstart = now - datetime.timedelta(seconds=window_s)\n    dstart = now - datetime.timedelta(days=1)\n    def _count_since(dt0):\n        c = 0\n        for r in usage:\n            dt = _parse_ts(r.get(\"timestamp\"))\n            if dt is not None and dt >= dt0:\n                c += 1\n        return c\n\n    if _count_since(wstart) >= rate_limit:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"add\", \"status\": \"RATE_LIMIT\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded\", limit=rate_limit, window_seconds=window_s)\n\n    if _count_since(dstart) >= daily_quota:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"add\", \"status\": \"QUOTA_EXCEEDED\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded\", quota=daily_quota, period=\"day\")\n\n    # Validate inputs\n    missing = []\n    if a is None: missing.append(\"a\")\n    if b is None: missing.append(\"b\")\n    if missing:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"add\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Missing required field(s): \" + \", \".join(missing), fields=missing)\n\n    for name, v in ((\"a\", a), (\"b\", b)):\n        if not isinstance(v, (int, float)) or isinstance(v, bool):\n            latency_ms = int((time.time() - t0) * 1000)\n            usage.append({\"endpoint\": \"add\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n            _save(usage_file, usage)\n            return _err(\"VALIDATION_ERROR\", f\"Field '{name}' must be a valid number\", field=name)\n        if not math.isfinite(float(v)):\n            latency_ms = int((time.time() - t0) * 1000)\n            usage.append({\"endpoint\": \"add\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n            _save(usage_file, usage)\n            return _err(\"VALIDATION_ERROR\", f\"Field '{name}' must be finite\", field=name)\n\n    # Persist mutation: advance random_seed by sum rounded toward zero (observable effect)\n    state = _load(\"state.json\")\n    if not isinstance(state, list):\n        state = []\n    if len(state) == 0:\n        state.append({\"random_seed\": 0})\n    if not isinstance(state[0], dict):\n        state = [{\"random_seed\": 0}]\n    rs = state[0].get(\"random_seed\", 0)\n    if not isinstance(rs, int):\n        rs = 0\n\n    s = float(a) + float(b)\n    delta = int(s)  # deterministic integer mutation\n    state[0][\"random_seed\"] = rs + delta\n    _save(\"state.json\", state)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    usage.append({\"endpoint\": \"add\", \"status\": \"OK\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n    _save(usage_file, usage)\n    return {\"result\": s, \"state\": {\"random_seed\": state[0][\"random_seed\"], \"delta_applied\": delta}}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "divide",
+          "description": "Divides \"a\" by \"b\" and returns the quotient. It refuses requests that omit either required operand, provide non-numeric values, or attempt to divide by zero because the result is undefined.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "a": {
+                "type": "float",
+                "description": "Numerator."
+              },
+              "b": {
+                "type": "float",
+                "description": "Denominator. "
+              }
+            },
+            "required": [
+              "a",
+              "b"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0435000\" if __import__(\"os\").path.isdir(\"./environment_mix/0435000\") else \"/app/database\")\ndef divide(a, b):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    try:\n        if b == 0:\n            return {\"error\": \"Cannot divide by zero\"}\n        return {\"result\": a / b}\n    except TypeError:\n        return {\"error\": \"Both inputs must be numbers\"}\n",
+          "description_restored": true
+        },
+        {
+          "name": "imperial_si_conversion",
+          "description": "Converts the given numeric \"value\" from \"unit_in\" to \"unit_out\" and returns the converted numeric value. It refuses requests missing any required field, with a non-numeric \"value\", or with unsupported/unknown unit strings or incompatible unit pairs that cannot be converted between each other.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "value": {
+                "type": "float",
+                "description": "Value to be converted."
+              },
+              "unit_in": {
+                "type": "string",
+                "description": "Unit of the input value."
+              },
+              "unit_out": {
+                "type": "string",
+                "description": "Unit to convert the value to. "
+              }
+            },
+            "required": [
+              "value",
+              "unit_in",
+              "unit_out"
+            ]
+          },
+          "implementation": "def imperial_si_conversion(value, unit_in, unit_out, **_extra):\n    import json, os, datetime, math, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0435000\" if __import__(\"os\").path.isdir(\"./environment_mix/0435000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    usage_file = \"usage.json\"\n    usage = _load(usage_file)\n    if not isinstance(usage, list):\n        usage = []\n\n    now = datetime.datetime.utcnow()\n    window_s = 60\n    rate_limit = 120\n    daily_quota = 5000\n\n    def _ts(dt):\n        return dt.replace(microsecond=0).isoformat() + \"Z\"\n\n    cutoff = now - datetime.timedelta(days=8)\n    def _parse_ts(s):\n        try:\n            if isinstance(s, str) and s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            if isinstance(s, str):\n                return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n        return None\n\n    usage = [r for r in usage if (_parse_ts(r.get(\"timestamp\")) or now) >= cutoff]\n\n    wstart = now - datetime.timedelta(seconds=window_s)\n    dstart = now - datetime.timedelta(days=1)\n    def _count_since(dt0):\n        c = 0\n        for r in usage:\n            dt = _parse_ts(r.get(\"timestamp\"))\n            if dt is not None and dt >= dt0:\n                c += 1\n        return c\n\n    if _count_since(wstart) >= rate_limit:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"imperial_si_conversion\", \"status\": \"RATE_LIMIT\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded\", limit=rate_limit, window_seconds=window_s)\n\n    if _count_since(dstart) >= daily_quota:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"imperial_si_conversion\", \"status\": \"QUOTA_EXCEEDED\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded\", quota=daily_quota, period=\"day\")\n\n    # Validate required\n    for fname, v in ((\"value\", value), (\"unit_in\", unit_in), (\"unit_out\", unit_out)):\n        if v is None:\n            latency_ms = int((time.time() - t0) * 1000)\n            usage.append({\"endpoint\": \"imperial_si_conversion\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n            _save(usage_file, usage)\n            return _err(\"VALIDATION_ERROR\", f\"Missing required field: {fname}\", field=fname)\n\n    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)):\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"imperial_si_conversion\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Field 'value' must be a valid finite number\", field=\"value\")\n\n    if not isinstance(unit_in, str) or not unit_in.strip():\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"imperial_si_conversion\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Field 'unit_in' must be a non-empty string\", field=\"unit_in\")\n    if not isinstance(unit_out, str) or not unit_out.strip():\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"imperial_si_conversion\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Field 'unit_out' must be a non-empty string\", field=\"unit_out\")\n\n    unit_in = unit_in.strip().lower()\n    unit_out = unit_out.strip().lower()\n\n    # Supported conversions with dimension safety\n    # dimensions: length, mass, temperature\n    length_to_m = {\"in\": 0.0254, \"ft\": 0.3048, \"yd\": 0.9144, \"mi\": 1609.344, \"m\": 1.0, \"cm\": 0.01, \"km\": 1000.0}\n    mass_to_kg = {\"lb\": 0.45359237, \"kg\": 1.0}\n    temp_units = {\"c\", \"celsius\", \"f\", \"fahrenheit\"}\n\n    def _convert_length(v, uin, uout):\n        vin_m = v * length_to_m[uin]\n        return vin_m / length_to_m[uout]\n\n    def _convert_mass(v, uin, uout):\n        vin_kg = v * mass_to_kg[uin]\n        return vin_kg / mass_to_kg[uout]\n\n    def _convert_temp(v, uin, uout):\n        # normalize to celsius then out\n        if uin in (\"c\", \"celsius\"):\n            c = v\n        elif uin in (\"f\", \"fahrenheit\"):\n            c = (v - 32.0) * (5.0 / 9.0)\n        else:\n            raise KeyError\n        if uout in (\"c\", \"celsius\"):\n            return c\n        elif uout in (\"f\", \"fahrenheit\"):\n            return c * (9.0 / 5.0) + 32.0\n        else:\n            raise KeyError\n\n    try:\n        if unit_in == unit_out:\n            result = float(value)\n        elif unit_in in length_to_m and unit_out in length_to_m:\n            result = _convert_length(float(value), unit_in, unit_out)\n        elif unit_in in mass_to_kg and unit_out in mass_to_kg:\n            result = _convert_mass(float(value), unit_in, unit_out)\n        elif unit_in in temp_units and unit_out in temp_units:\n            result = _convert_temp(float(value), unit_in, unit_out)\n        else:\n            latency_ms = int((time.time() - t0) * 1000)\n            usage.append({\"endpoint\": \"imperial_si_conversion\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n            _save(usage_file, usage)\n            return _err(\"VALIDATION_ERROR\", \"Unsupported or incompatible unit pair\", unit_in=unit_in, unit_out=unit_out)\n    except Exception:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"imperial_si_conversion\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Unsupported or incompatible unit pair\", unit_in=unit_in, unit_out=unit_out)\n\n    # Datastore interaction: increment random_seed by 1 per successful call\n    state = _load(\"state.json\")\n    if not isinstance(state, list):\n        state = []\n    if len(state) == 0:\n        state.append({\"random_seed\": 0})\n    if not isinstance(state[0], dict):\n        state = [{\"random_seed\": 0}]\n    rs = state[0].get(\"random_seed\", 0)\n    if not isinstance(rs, int):\n        rs = 0\n    state[0][\"random_seed\"] = rs + 1\n    _save(\"state.json\", state)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    usage.append({\"endpoint\": \"imperial_si_conversion\", \"status\": \"OK\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n    _save(usage_file, usage)\n    return {\"result\": result, \"unit_out\": unit_out, \"state\": {\"random_seed\": state[0][\"random_seed\"]}}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "logarithm",
+          "description": "Computes the logarithm of \"value\" in the specified \"base\" using the requested precision and returns the resulting numeric value. It refuses requests missing required fields, with non-numeric inputs, with a non-positive precision, with a non-positive base or base equal to 1, or with a non-positive value where the real logarithm is not defined.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "value": {
+                "type": "float",
+                "description": "The number to compute the logarithm of."
+              },
+              "base": {
+                "type": "float",
+                "description": "The base of the logarithm."
+              },
+              "precision": {
+                "type": "integer",
+                "description": "Desired precision for the result. "
+              }
+            },
+            "required": [
+              "value",
+              "base",
+              "precision"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0435000\" if __import__(\"os\").path.isdir(\"./environment_mix/0435000\") else \"/app/database\")\ndef logarithm(value, base, precision):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    try:\n        result = math.log(value) / math.log(base)\n        return {\"result\": result}\n    except Exception as e:\n        return {\"error\": str(e)}\n",
+          "description_restored": true
+        },
+        {
+          "name": "max_value",
+          "description": "Returns the maximum value from the provided list of numbers. It refuses requests that omit \"numbers\", provide an empty list, or include items that are not valid numbers.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "numbers": {
+                "type": "array",
+                "items": {
+                  "type": "float"
+                },
+                "description": "List of numbers to find the maximum from. "
+              }
+            },
+            "required": [
+              "numbers"
+            ]
+          },
+          "implementation": "def max_value(numbers, **_extra):\n    import json, os, datetime, math, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0435000\" if __import__(\"os\").path.isdir(\"./environment_mix/0435000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    usage_file = \"usage.json\"\n    usage = _load(usage_file)\n    if not isinstance(usage, list):\n        usage = []\n\n    now = datetime.datetime.utcnow()\n    window_s = 60\n    rate_limit = 120\n    daily_quota = 5000\n\n    def _ts(dt):\n        return dt.replace(microsecond=0).isoformat() + \"Z\"\n\n    cutoff = now - datetime.timedelta(days=8)\n    def _parse_ts(s):\n        try:\n            if isinstance(s, str) and s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            if isinstance(s, str):\n                return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n        return None\n\n    usage = [r for r in usage if (_parse_ts(r.get(\"timestamp\")) or now) >= cutoff]\n\n    wstart = now - datetime.timedelta(seconds=window_s)\n    dstart = now - datetime.timedelta(days=1)\n    def _count_since(dt0):\n        c = 0\n        for r in usage:\n            dt = _parse_ts(r.get(\"timestamp\"))\n            if dt is not None and dt >= dt0:\n                c += 1\n        return c\n\n    if _count_since(wstart) >= rate_limit:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"max_value\", \"status\": \"RATE_LIMIT\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded\", limit=rate_limit, window_seconds=window_s)\n\n    if _count_since(dstart) >= daily_quota:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"max_value\", \"status\": \"QUOTA_EXCEEDED\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded\", quota=daily_quota, period=\"day\")\n\n    if numbers is None:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"max_value\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Missing required field: numbers\", field=\"numbers\")\n\n    if not isinstance(numbers, list):\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"max_value\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Field 'numbers' must be an array of numbers\", field=\"numbers\")\n\n    if len(numbers) == 0:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"max_value\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Field 'numbers' must not be empty\", field=\"numbers\")\n\n    vals = []\n    for i, v in enumerate(numbers):\n        if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(float(v)):\n            latency_ms = int((time.time() - t0) * 1000)\n            usage.append({\"endpoint\": \"max_value\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n            _save(usage_file, usage)\n            return _err(\"VALIDATION_ERROR\", \"All elements in 'numbers' must be valid finite numbers\", index=i)\n        vals.append(float(v))\n\n    result = max(vals)\n\n    # Datastore interaction: increment random_seed by 1 per successful call\n    state = _load(\"state.json\")\n    if not isinstance(state, list):\n        state = []\n    if len(state) == 0:\n        state.append({\"random_seed\": 0})\n    if not isinstance(state[0], dict):\n        state = [{\"random_seed\": 0}]\n    rs = state[0].get(\"random_seed\", 0)\n    if not isinstance(rs, int):\n        rs = 0\n    state[0][\"random_seed\"] = rs + 1\n    _save(\"state.json\", state)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    usage.append({\"endpoint\": \"max_value\", \"status\": \"OK\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n    _save(usage_file, usage)\n    return {\"result\": result, \"state\": {\"random_seed\": state[0][\"random_seed\"]}}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "mean",
+          "description": "Calculates and returns the arithmetic mean of the provided list of numbers. It refuses requests that omit \"numbers\", provide an empty list, or include items that are not valid numbers.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "numbers": {
+                "type": "array",
+                "items": {
+                  "type": "float"
+                },
+                "description": "List of numbers to calculate the mean of. "
+              }
+            },
+            "required": [
+              "numbers"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0435000\" if __import__(\"os\").path.isdir(\"./environment_mix/0435000\") else \"/app/database\")\ndef mean(numbers):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    if not numbers:\n        return {\"error\": \"Cannot calculate mean of an empty list\"}\n    try:\n        return {\"result\": sum(numbers) / len(numbers)}\n    except TypeError:\n        return {\"error\": \"All elements in the list must be numbers\"}\n",
+          "description_restored": true
+        },
+        {
+          "name": "min_value",
+          "description": "Returns the minimum value from the provided list of numbers. It refuses requests that omit \"numbers\", provide an empty list, or include items that are not valid numbers.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "numbers": {
+                "type": "array",
+                "items": {
+                  "type": "float"
+                },
+                "description": "List of numbers to find the minimum from. "
+              }
+            },
+            "required": [
+              "numbers"
+            ]
+          },
+          "implementation": "def min_value(numbers, **_extra):\n    import json, os, datetime, math, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0435000\" if __import__(\"os\").path.isdir(\"./environment_mix/0435000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    usage_file = \"usage.json\"\n    usage = _load(usage_file)\n    if not isinstance(usage, list):\n        usage = []\n\n    now = datetime.datetime.utcnow()\n    window_s = 60\n    rate_limit = 120\n    daily_quota = 5000\n\n    def _ts(dt):\n        return dt.replace(microsecond=0).isoformat() + \"Z\"\n\n    cutoff = now - datetime.timedelta(days=8)\n    def _parse_ts(s):\n        try:\n            if isinstance(s, str) and s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            if isinstance(s, str):\n                return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n        return None\n\n    usage = [r for r in usage if (_parse_ts(r.get(\"timestamp\")) or now) >= cutoff]\n\n    wstart = now - datetime.timedelta(seconds=window_s)\n    dstart = now - datetime.timedelta(days=1)\n    def _count_since(dt0):\n        c = 0\n        for r in usage:\n            dt = _parse_ts(r.get(\"timestamp\"))\n            if dt is not None and dt >= dt0:\n                c += 1\n        return c\n\n    if _count_since(wstart) >= rate_limit:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"min_value\", \"status\": \"RATE_LIMIT\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded\", limit=rate_limit, window_seconds=window_s)\n\n    if _count_since(dstart) >= daily_quota:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"min_value\", \"status\": \"QUOTA_EXCEEDED\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded\", quota=daily_quota, period=\"day\")\n\n    if numbers is None:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"min_value\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Missing required field: numbers\", field=\"numbers\")\n\n    if not isinstance(numbers, list):\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"min_value\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Field 'numbers' must be an array of numbers\", field=\"numbers\")\n\n    if len(numbers) == 0:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"min_value\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Field 'numbers' must not be empty\", field=\"numbers\")\n\n    vals = []\n    for i, v in enumerate(numbers):\n        if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(float(v)):\n            latency_ms = int((time.time() - t0) * 1000)\n            usage.append({\"endpoint\": \"min_value\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n            _save(usage_file, usage)\n            return _err(\"VALIDATION_ERROR\", \"All elements in 'numbers' must be valid finite numbers\", index=i)\n        vals.append(float(v))\n\n    result = min(vals)\n\n    # Datastore interaction: increment random_seed by 1 per successful call\n    state = _load(\"state.json\")\n    if not isinstance(state, list):\n        state = []\n    if len(state) == 0:\n        state.append({\"random_seed\": 0})\n    if not isinstance(state[0], dict):\n        state = [{\"random_seed\": 0}]\n    rs = state[0].get(\"random_seed\", 0)\n    if not isinstance(rs, int):\n        rs = 0\n    state[0][\"random_seed\"] = rs + 1\n    _save(\"state.json\", state)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    usage.append({\"endpoint\": \"min_value\", \"status\": \"OK\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n    _save(usage_file, usage)\n    return {\"result\": result, \"state\": {\"random_seed\": state[0][\"random_seed\"]}}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "multiply",
+          "description": "Multiplies the two provided numbers and returns their product. It refuses requests that omit either required operand (\"a\" or \"b\") or provide values that are not valid numbers.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "a": {
+                "type": "float",
+                "description": "First number."
+              },
+              "b": {
+                "type": "float",
+                "description": "Second number. "
+              }
+            },
+            "required": [
+              "a",
+              "b"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0435000\" if __import__(\"os\").path.isdir(\"./environment_mix/0435000\") else \"/app/database\")\ndef multiply(a, b):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):\n        return {\"error\": \"Both inputs must be numbers\"}\n    return {\"result\": a * b}\n",
+          "description_restored": true
+        },
+        {
+          "name": "percentage",
+          "description": "Calculates (part / whole) * 100 and returns the percentage value. It refuses requests that omit either required field, provide non-numeric values, or set \"whole\" to zero because the percentage would be undefined.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "part": {
+                "type": "float",
+                "description": "The part value."
+              },
+              "whole": {
+                "type": "float",
+                "description": "The whole value. "
+              }
+            },
+            "required": [
+              "part",
+              "whole"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0435000\" if __import__(\"os\").path.isdir(\"./environment_mix/0435000\") else \"/app/database\")\ndef percentage(part, whole):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    try:\n        if whole == 0:\n            return {\"error\": \"Whole value cannot be zero\"}\n        return {\"result\": (part / whole) * 100}\n    except TypeError:\n        return {\"error\": \"Both inputs must be numbers\"}\n",
+          "description_restored": true
+        },
+        {
+          "name": "power",
+          "description": "This tool belongs to the Math API, which provides various mathematical operations. Tool description: Raise a number to a power. Note that the provided function is in Python 3 syntax.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "base": {
+                "type": "float",
+                "description": "The base number."
+              },
+              "exponent": {
+                "type": "float",
+                "description": "The exponent. "
+              }
+            },
+            "required": [
+              "base",
+              "exponent"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0435000\" if __import__(\"os\").path.isdir(\"./environment_mix/0435000\") else \"/app/database\")\ndef power(base, exponent):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    try:\n        return {\"result\": base ** exponent}\n    except TypeError:\n        return {\"error\": \"Both inputs must be numbers\"}\n"
+        },
+        {
+          "name": "round_number",
+          "description": "Rounds the provided number to the requested number of decimal places and returns the rounded value. Refuses requests missing the required number, with a non-integer decimal_places, or with values that are not valid finite numbers. Refuses decimal_places values outside the supported range for rounding precision.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "number": {
+                "type": "float",
+                "description": "The number to round."
+              },
+              "decimal_places": {
+                "type": "integer",
+                "description": "The number of decimal places to round to. Defaults to 0. ",
+                "default": 0
+              }
+            },
+            "required": [
+              "number"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0435000\" if __import__(\"os\").path.isdir(\"./environment_mix/0435000\") else \"/app/database\")\ndef round_number(number, decimal_places=0):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    try:\n        return {\"result\": round(number, decimal_places)}\n    except TypeError:\n        return {\"error\": \"First input must be a number, second input must be an integer\"}\n",
+          "description_restored": true
+        },
+        {
+          "name": "si_unit_conversion",
+          "description": "Converts the given numeric value from unit_in to unit_out and returns the converted value. Refuses requests missing value, unit_in, or unit_out, with a value that is not a valid finite number, or with unknown/unsupported unit strings. Refuses conversions between incompatible dimensions (for example, converting a length unit to a mass unit) or where the requested pair is not supported.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "value": {
+                "type": "float",
+                "description": "Value to be converted."
+              },
+              "unit_in": {
+                "type": "string",
+                "description": "Unit of the input value."
+              },
+              "unit_out": {
+                "type": "string",
+                "description": "Unit to convert the value to. "
+              }
+            },
+            "required": [
+              "value",
+              "unit_in",
+              "unit_out"
+            ]
+          },
+          "implementation": "def si_unit_conversion(value, unit_in, unit_out, **_extra):\n    import json, os, datetime, math, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0435000\" if __import__(\"os\").path.isdir(\"./environment_mix/0435000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    usage_file = \"usage.json\"\n    usage = _load(usage_file)\n    if not isinstance(usage, list):\n        usage = []\n\n    now = datetime.datetime.utcnow()\n    window_s = 60\n    rate_limit = 120\n    daily_quota = 5000\n\n    def _ts(dt):\n        return dt.replace(microsecond=0).isoformat() + \"Z\"\n\n    cutoff = now - datetime.timedelta(days=8)\n    def _parse_ts(s):\n        try:\n            if isinstance(s, str) and s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            if isinstance(s, str):\n                return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n        return None\n\n    usage = [r for r in usage if (_parse_ts(r.get(\"timestamp\")) or now) >= cutoff]\n\n    wstart = now - datetime.timedelta(seconds=window_s)\n    dstart = now - datetime.timedelta(days=1)\n    def _count_since(dt0):\n        c = 0\n        for r in usage:\n            dt = _parse_ts(r.get(\"timestamp\"))\n            if dt is not None and dt >= dt0:\n                c += 1\n        return c\n\n    if _count_since(wstart) >= rate_limit:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"si_unit_conversion\", \"status\": \"RATE_LIMIT\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded\", limit=rate_limit, window_seconds=window_s)\n\n    if _count_since(dstart) >= daily_quota:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"si_unit_conversion\", \"status\": \"QUOTA_EXCEEDED\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded\", quota=daily_quota, period=\"day\")\n\n    # Validate required\n    for fname, v in ((\"value\", value), (\"unit_in\", unit_in), (\"unit_out\", unit_out)):\n        if v is None:\n            latency_ms = int((time.time() - t0) * 1000)\n            usage.append({\"endpoint\": \"si_unit_conversion\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n            _save(usage_file, usage)\n            return _err(\"VALIDATION_ERROR\", f\"Missing required field: {fname}\", field=fname)\n\n    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)):\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"si_unit_conversion\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Field 'value' must be a valid finite number\", field=\"value\")\n\n    if not isinstance(unit_in, str) or not unit_in.strip():\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"si_unit_conversion\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Field 'unit_in' must be a non-empty string\", field=\"unit_in\")\n    if not isinstance(unit_out, str) or not unit_out.strip():\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"si_unit_conversion\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Field 'unit_out' must be a non-empty string\", field=\"unit_out\")\n\n    unit_in = unit_in.strip().lower()\n    unit_out = unit_out.strip().lower()\n\n    # SI conversions with dimensions (length, mass, time)\n    length_to_m = {\"m\": 1.0, \"km\": 1000.0, \"cm\": 0.01, \"mm\": 0.001, \"um\": 1e-6, \"nm\": 1e-9}\n    mass_to_kg = {\"kg\": 1.0, \"g\": 0.001, \"mg\": 1e-6}\n    time_to_s = {\"s\": 1.0, \"ms\": 1e-3, \"us\": 1e-6, \"ns\": 1e-9, \"min\": 60.0, \"h\": 3600.0}\n\n    def _dim(u):\n        if u in length_to_m: return \"length\"\n        if u in mass_to_kg: return \"mass\"\n        if u in time_to_s: return \"time\"\n        return None\n\n    din = _dim(unit_in)\n    dout = _dim(unit_out)\n    if din is None or dout is None:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"si_unit_conversion\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Unknown/unsupported unit string\", unit_in=unit_in, unit_out=unit_out)\n\n    if din != dout:\n        latency_ms = int((time.time() - t0) * 1000)\n        usage.append({\"endpoint\": \"si_unit_conversion\", \"status\": \"VALIDATION_ERROR\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n        _save(usage_file, usage)\n        return _err(\"VALIDATION_ERROR\", \"Incompatible unit dimensions\", unit_in=unit_in, unit_out=unit_out, dimension_in=din, dimension_out=dout)\n\n    v = float(value)\n    if unit_in == unit_out:\n        result = v\n    else:\n        if din == \"length\":\n            result = v * length_to_m[unit_in] / length_to_m[unit_out]\n        elif din == \"mass\":\n            result = v * mass_to_kg[unit_in] / mass_to_kg[unit_out]\n        else:  # time\n            result = v * time_to_s[unit_in] / time_to_s[unit_out]\n\n    # Datastore interaction: increment random_seed by 1 per successful call\n    state = _load(\"state.json\")\n    if not isinstance(state, list):\n        state = []\n    if len(state) == 0:\n        state.append({\"random_seed\": 0})\n    if not isinstance(state[0], dict):\n        state = [{\"random_seed\": 0}]\n    rs = state[0].get(\"random_seed\", 0)\n    if not isinstance(rs, int):\n        rs = 0\n    state[0][\"random_seed\"] = rs + 1\n    _save(\"state.json\", state)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    usage.append({\"endpoint\": \"si_unit_conversion\", \"status\": \"OK\", \"timestamp\": _ts(now), \"latency_ms\": latency_ms})\n    _save(usage_file, usage)\n    return {\"result\": result, \"unit_out\": unit_out, \"state\": {\"random_seed\": state[0][\"random_seed\"]}}\n",
+          "description_restored": true,
+          "implementation_repaired": true
+        },
+        {
+          "name": "square_root",
+          "description": "Computes the square root of number using the requested precision and returns the result. Refuses requests missing number or precision, with a non-integer or non-positive precision, or with a number that is not a valid finite number. Refuses negative input values because a real square root cannot be produced.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "number": {
+                "type": "float",
+                "description": "The number to calculate the square root of."
+              },
+              "precision": {
+                "type": "integer",
+                "description": "Desired precision for the result. "
+              }
+            },
+            "required": [
+              "number",
+              "precision"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0435000\" if __import__(\"os\").path.isdir(\"./environment_mix/0435000\") else \"/app/database\")\ndef square_root(number, precision):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    from decimal import Decimal, InvalidOperation, getcontext\n    try:\n        if number < 0:\n            return {\"error\": \"Cannot calculate square root of a negative number\"}\n        getcontext().prec = precision\n        result = Decimal(number).sqrt()\n        return {\"result\": float(result)}\n    except (TypeError, InvalidOperation):\n        return {\"error\": \"Input must be a number or computation resulted in an invalid operation\"}\n",
+          "description_restored": true
+        },
+        {
+          "name": "standard_deviation",
+          "description": "Calculates the standard deviation of the provided list of numbers and returns the computed value. Refuses requests missing numbers, where numbers is not an array, or where any element is not a valid finite number. Refuses empty lists because a standard deviation cannot be computed without data.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "numbers": {
+                "type": "array",
+                "items": {
+                  "type": "float"
+                },
+                "description": "List of numbers to calculate the standard deviation of. "
+              }
+            },
+            "required": [
+              "numbers"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0435000\" if __import__(\"os\").path.isdir(\"./environment_mix/0435000\") else \"/app/database\")\ndef standard_deviation(numbers):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    if not numbers:\n        return {\"error\": \"Cannot calculate standard deviation of an empty list\"}\n    try:\n        m = sum(numbers) / len(numbers)\n        variance = sum((x - m) ** 2 for x in numbers) / len(numbers)\n        return {\"result\": math.sqrt(variance)}\n    except TypeError:\n        return {\"error\": \"All elements in the list must be numbers\"}\n",
+          "description_restored": true
+        },
+        {
+          "name": "subtract",
+          "description": "Subtracts b from a and returns the numeric result. Refuses requests missing a or b, or where either value is not a valid finite number. Refuses inputs that cannot be safely represented as numbers.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "a": {
+                "type": "float",
+                "description": "Number to subtract from."
+              },
+              "b": {
+                "type": "float",
+                "description": "Number to subtract. "
+              }
+            },
+            "required": [
+              "a",
+              "b"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0435000\" if __import__(\"os\").path.isdir(\"./environment_mix/0435000\") else \"/app/database\")\ndef subtract(a, b):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    try:\n        return {\"result\": a - b}\n    except TypeError:\n        return {\"error\": \"Both inputs must be numbers\"}\n",
+          "description_restored": true
+        },
+        {
+          "name": "sum_values",
+          "description": "Sums the provided list of numbers and returns the total. Refuses requests missing numbers, where numbers is not an array, or where any element is not a valid finite number. Refuses inputs that cannot be safely represented as numbers.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "numbers": {
+                "type": "array",
+                "items": {
+                  "type": "float"
+                },
+                "description": "List of numbers to sum. "
+              }
+            },
+            "required": [
+              "numbers"
+            ]
+          },
+          "implementation": "_DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0435000\" if __import__(\"os\").path.isdir(\"./environment_mix/0435000\") else \"/app/database\")\ndef sum_values(numbers):\n    import json, os, math, random\n    _S = json.load(open(os.path.join(_DB, 'state.json'), encoding='utf-8'))\n    if not numbers:\n        return {\"error\": \"Cannot calculate sum of an empty list\"}\n    try:\n        return {\"result\": sum(numbers)}\n    except TypeError:\n        return {\"error\": \"All elements in the list must be numbers\"}\n",
+          "description_restored": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0435000",
+    "index": 435,
+    "name": "Keystone Runtime State & Math Service",
+    "description": "Stores lightweight shared runtime state and provides a simple API for common arithmetic, statistics, rounding, logarithms, roots, powers, percentages, and unit conversions.",
+    "taxonomy": {
+      "L1_id": "L1-13",
+      "L1_name": "Mathematics & Computation",
+      "L1_name_zh": "数学与计算",
+      "L2_id": "L2-33",
+      "L2_name": "Arithmetic & General Calculation",
+      "L2_name_zh": "算术与通用计算",
+      "L3_name": "Unit Conversion & Percentage Calculations",
+      "L3_name_zh": "单位换算与百分比计算"
+    },
+    "database_dir": "./environment_mix/0435000",
+    "mount_path": "/app/database",
+    "n_tools": 17,
+    "n_collections": 1,
+    "n_records": 1,
+    "n_questions": 1,
+    "execution_audit": {
+      "tools": 17,
+      "loaded": 17,
+      "reads_returning_data": 11,
+      "read_operations": 11,
+      "mutations_persisted": 0,
+      "mutations_attempted": 6
+    },
+    "tools_loadable_from_database_dir": 17,
+    "tool_load_errors": 0,
+    "verified_call": null,
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

@@ -1,0 +1,267 @@
+{
+  "index": 479,
+  "local_files_dir": "./environment_mix/0479000",
+  "file_list": [
+    "./environment_mix/0479000/README.md",
+    "./environment_mix/0479000/session_counters.json",
+    "./environment_mix/0479000/session_events.json",
+    "./environment_mix/0479000/sessions.json",
+    "./environment_mix/0479000/thoughts.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "sessions.json": "12 rows",
+        "thoughts.json": "16 rows",
+        "session_counters.json": "12 rows",
+        "session_events.json": "19 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "think",
+          "description": "Appends the provided `thought` as a new log entry in the current session and returns the created entry (including its assigned sequence/timestamps) along with the session identifier. Raises INVALID_ARGUMENT if `thought` is missing/empty or fails validation, UNAUTHENTICATED if no session context is available, and RESOURCE_EXHAUSTED if write quotas/rate limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "thought": {
+                "type": "string",
+                "description": "A thought to think about. This can be structured reasoning, step-by-step analysis, policy verification, or any other mental process that helps with problem-solving."
+              }
+            },
+            "required": [
+              "thought"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def think(thought, **_extra):\n    import json, os, datetime, hashlib, uuid, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0479000\" if __import__(\"os\").path.isdir(\"./environment_mix/0479000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # Resolve current session context (ambient): choose an active session if present.\n    sessions = _load(\"sessions.json\")\n    sess = None\n    for s in sessions:\n        if isinstance(s, dict) and s.get(\"status\") == \"active\" and isinstance(s.get(\"id\"), str) and s.get(\"id\"):\n            sess = s\n            break\n\n    if not sess:\n        # No session context available\n        return _err(\"UNAUTHORIZED\", \"No active session context is available.\")\n\n    session_id = sess[\"id\"]\n\n    # Load other collections\n    thoughts = _load(\"thoughts.json\")\n    counters = _load(\"session_counters.json\")\n    events = _load(\"session_events.json\")\n\n    # Ensure session exists (FK integrity)\n    if not any(isinstance(s, dict) and s.get(\"id\") == session_id for s in sessions):\n        return _err(\"NOT_FOUND\", \"Session does not exist.\", session_id=session_id)\n\n    # Enforce session lifecycle\n    if sess.get(\"status\") == \"closed\":\n        return _err(\"INVALID_TRANSITION\", \"Session is closed; cannot append thoughts.\", session_id=session_id)\n\n    # Validate input\n    if not isinstance(thought, str):\n        return _err(\"VALIDATION_ERROR\", \"`thought` must be a string.\")\n    if thought.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"`thought` must be a non-empty string.\")\n    if len(thought) > 20000:\n        return _err(\"VALIDATION_ERROR\", \"`thought` exceeds maximum length of 20000 characters.\", max_length=20000)\n\n    # Find or create counters row for session\n    ctr = None\n    for c in counters:\n        if isinstance(c, dict) and c.get(\"session_id\") == session_id:\n            ctr = c\n            break\n    if ctr is None:\n        ctr = {\n            \"session_id\": session_id,\n            \"total_thoughts\": 0,\n            \"total_chars\": 0,\n            \"max_seq\": 0,\n            \"first_thought_at\": None,\n            \"last_thought_at\": None,\n            \"last_cleared_at\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        counters.append(ctr)\n\n    # Allocate seq (monotonic) and insert in a single \"transaction\" (in-memory then persist)\n    next_seq = int(ctr.get(\"max_seq\") or 0) + 1\n\n    # Enforce unique(session_id, seq)\n    for th in thoughts:\n        if isinstance(th, dict) and th.get(\"session_id\") == session_id and th.get(\"seq\") == next_seq:\n            return _err(\"CONFLICT\", \"Sequence conflict for session; retry.\", session_id=session_id, seq=next_seq)\n\n    sha = hashlib.sha256(thought.encode(\"utf-8\")).hexdigest()\n    if len(sha) != 64 or any(ch not in \"0123456789abcdef\" for ch in sha):\n        return _err(\"VALIDATION_ERROR\", \"Failed to compute valid SHA-256 for thought.\")\n\n    thought_id = \"th_\" + uuid.uuid4().hex\n    entry = {\n        \"id\": thought_id,\n        \"session_id\": session_id,\n        \"seq\": next_seq,\n        \"thought\": thought,\n        \"thought_sha256\": sha,\n        \"char_count\": len(thought),\n        \"status\": \"recorded\",\n        \"cleared_at\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # Apply counters updates\n    ctr[\"max_seq\"] = next_seq\n    ctr[\"total_thoughts\"] = int(ctr.get(\"total_thoughts\") or 0) + 1\n    ctr[\"total_chars\"] = int(ctr.get(\"total_chars\") or 0) + len(thought)\n    if ctr.get(\"first_thought_at\") is None:\n        ctr[\"first_thought_at\"] = now\n    ctr[\"last_thought_at\"] = now\n    ctr[\"updated_at\"] = now\n\n    # Update session activity timestamps\n    sess[\"last_activity_at\"] = now\n    sess[\"updated_at\"] = now\n\n    # Append event for observability\n    ev_id = \"ev_\" + uuid.uuid4().hex\n    events.append({\n        \"id\": ev_id,\n        \"session_id\": session_id,\n        \"event_type\": \"thought_appended\",\n        \"thought_id\": thought_id,\n        \"payload\": {\"seq\": next_seq, \"char_count\": len(thought), \"thought_sha256\": sha},\n        \"created_at\": now,\n        \"updated_at\": now,\n    })\n\n    # Persist\n    _save(\"thoughts.json\", thoughts)\n    _save(\"session_counters.json\", counters)\n    _save(\"sessions.json\", sessions)\n    _save(\"session_events.json\", events)\n\n    return {\n        \"session_id\": session_id,\n        \"thought\": entry,\n        \"latency_ms\": int((time.time() - t0) * 1000),\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "get_thoughts",
+          "description": "Lists thought log entries for the current session filtered by `status` and ordered by sequence number; returns up to `limit` items and a pagination cursor when more results are available (pass `cursor` to continue). Raises INVALID_ARGUMENT for an unknown `status`, `order`, invalid `limit`, or a malformed/expired `cursor`, UNAUTHENTICATED if no session context is available, and NOT_FOUND if the referenced session does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "recorded",
+                  "cleared",
+                  "all"
+                ],
+                "description": "Filter thoughts by their status; use 'all' to include both recorded and cleared."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of thoughts to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor to continue listing thoughts from a previous response."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order by sequence number (seq)."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def get_thoughts(status=None, limit=None, cursor=None, order=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0479000\" if __import__(\"os\").path.isdir(\"./environment_mix/0479000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    # Resolve session context: prefer runtime-provided session_id; otherwise pick a usable session from store.\n    sessions = _load(\"sessions.json\")\n    session_id = _extra.get(\"session_id\") or _extra.get(\"current_session_id\")\n    sess = None\n    if isinstance(session_id, str) and session_id.strip():\n        for s in sessions:\n            if isinstance(s, dict) and s.get(\"id\") == session_id:\n                sess = s\n                break\n        if sess is None:\n            # For reads, if caller provided a session_id that doesn't exist, behave like real backend: NOT_FOUND.\n            latency_ms = int((time.time() - t0) * 1000)\n            return _err(\"NOT_FOUND\", \"Session not found.\", session_id=session_id, meta={\"latency_ms\": latency_ms})\n    else:\n        # Ambient resolution: choose an active session if any; otherwise a closed session (reads allowed).\n        for s in sessions:\n            if isinstance(s, dict) and s.get(\"status\") == \"active\" and isinstance(s.get(\"id\"), str) and s.get(\"id\"):\n                sess = s\n                break\n        if sess is None:\n            for s in sessions:\n                if isinstance(s, dict) and s.get(\"status\") == \"closed\" and isinstance(s.get(\"id\"), str) and s.get(\"id\"):\n                    sess = s\n                    break\n        if sess is None:\n            latency_ms = int((time.time() - t0) * 1000)\n            return _err(\"UNAUTHORIZED\", \"No session context is available.\", meta={\"latency_ms\": latency_ms})\n        session_id = sess[\"id\"]\n\n    # Validate parameters\n    if status is None:\n        status = \"recorded\"\n    if not isinstance(status, str) or status not in (\"recorded\", \"cleared\", \"all\"):\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"VALIDATION_ERROR\", \"Unknown `status`.\", allowed=[\"recorded\", \"cleared\", \"all\"], meta={\"latency_ms\": latency_ms})\n\n    if order is None:\n        order = \"asc\"\n    if not isinstance(order, str) or order not in (\"asc\", \"desc\"):\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"VALIDATION_ERROR\", \"Unknown `order`.\", allowed=[\"asc\", \"desc\"], meta={\"latency_ms\": latency_ms})\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"VALIDATION_ERROR\", \"Invalid `limit`.\", min=1, max=200, meta={\"latency_ms\": latency_ms})\n\n    # Cursor: for this server, accept legacy/simple cursor equal to session_id (start from beginning),\n    # or an integer offset encoded as a plain string, or JSON {\"offset\": int} as plain string.\n    offset = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or cursor == \"\":\n            latency_ms = int((time.time() - t0) * 1000)\n            return _err(\"VALIDATION_ERROR\", \"Malformed cursor.\", meta={\"latency_ms\": latency_ms})\n        if cursor == session_id:\n            offset = 0\n        else:\n            parsed = None\n            # Try plain int\n            try:\n                parsed = int(cursor)\n            except ValueError:\n                parsed = None\n            if parsed is None:\n                # Try JSON with offset\n                try:\n                    obj = json.loads(cursor)\n                    if isinstance(obj, dict) and isinstance(obj.get(\"offset\"), int):\n                        parsed = obj[\"offset\"]\n                except json.JSONDecodeError:\n                    parsed = None\n            if parsed is None or parsed < 0:\n                latency_ms = int((time.time() - t0) * 1000)\n                return _err(\"VALIDATION_ERROR\", \"Malformed cursor.\", meta={\"latency_ms\": latency_ms})\n            offset = parsed\n\n    thoughts = _load(\"thoughts.json\")\n    # Filter by session and status rules.\n    rows = [t for t in thoughts if isinstance(t, dict) and t.get(\"session_id\") == session_id]\n    if status != \"all\":\n        rows = [t for t in rows if t.get(\"status\") == status]\n\n    # Order by seq as required\n    def _seq_key(t):\n        v = t.get(\"seq\")\n        return v if isinstance(v, int) else -1\n    rows.sort(key=_seq_key, reverse=(order == \"desc\"))\n\n    total = len(rows)\n    if offset > total:\n        # Expired/out-of-range cursor\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"VALIDATION_ERROR\", \"Malformed/expired cursor.\", meta={\"latency_ms\": latency_ms})\n\n    page = rows[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = str(next_offset) if has_more else None\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"thoughts\": page,\n        \"meta\": {\n            \"session_id\": session_id,\n            \"status\": status,\n            \"order\": order,\n            \"limit\": limit,\n            \"total\": total,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"latency_ms\": latency_ms,\n        },\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "clear_thoughts",
+          "description": "Soft-deletes (marks as cleared) all currently recorded thoughts in the current session and returns a summary of what was cleared plus the session identifier; `reason` is stored with the clear event when provided. Raises UNAUTHENTICATED if no session context is available, NOT_FOUND if the session does not exist, and RESOURCE_EXHAUSTED if write quotas/rate limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "type": "string",
+                "description": "Optional reason to attach to the clear event payload for auditing/debugging."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def clear_thoughts(reason=None, **_extra):\n    import json, os, datetime, uuid, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0479000\" if __import__(\"os\").path.isdir(\"./environment_mix/0479000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # Resolve current session context (ambient)\n    sessions = _load(\"sessions.json\")\n    sess = None\n    for s in sessions:\n        if isinstance(s, dict) and s.get(\"status\") == \"active\" and isinstance(s.get(\"id\"), str) and s.get(\"id\"):\n            sess = s\n            break\n    if not sess:\n        return _err(\"UNAUTHORIZED\", \"No active session context is available.\")\n\n    session_id = sess[\"id\"]\n\n    # Ensure session exists\n    if not any(isinstance(s, dict) and s.get(\"id\") == session_id for s in sessions):\n        return _err(\"NOT_FOUND\", \"Session does not exist.\", session_id=session_id)\n\n    # Enforce lifecycle\n    if sess.get(\"status\") == \"closed\":\n        return _err(\"INVALID_TRANSITION\", \"Session is closed; cannot clear thoughts.\", session_id=session_id)\n\n    if reason is not None and not isinstance(reason, str):\n        return _err(\"VALIDATION_ERROR\", \"`reason` must be a string when provided.\")\n\n    thoughts = _load(\"thoughts.json\")\n    counters = _load(\"session_counters.json\")\n    events = _load(\"session_events.json\")\n\n    cleared_count = 0\n    total_chars_cleared = 0\n\n    # Clear all recorded thoughts in session\n    for th in thoughts:\n        if not isinstance(th, dict):\n            continue\n        if th.get(\"session_id\") != session_id:\n            continue\n        if th.get(\"status\") != \"recorded\":\n            continue\n        th[\"status\"] = \"cleared\"\n        th[\"cleared_at\"] = now\n        th[\"updated_at\"] = now\n        cleared_count += 1\n        try:\n            total_chars_cleared += int(th.get(\"char_count\") or 0)\n        except Exception:\n            pass\n\n    # Update counters row\n    ctr = None\n    for c in counters:\n        if isinstance(c, dict) and c.get(\"session_id\") == session_id:\n            ctr = c\n            break\n    if ctr is None:\n        # Create counters if missing, then apply cleared state.\n        ctr = {\n            \"session_id\": session_id,\n            \"total_thoughts\": 0,\n            \"total_chars\": 0,\n            \"max_seq\": 0,\n            \"first_thought_at\": None,\n            \"last_thought_at\": None,\n            \"last_cleared_at\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        counters.append(ctr)\n\n    ctr[\"total_thoughts\"] = 0\n    ctr[\"total_chars\"] = 0\n    ctr[\"first_thought_at\"] = None\n    ctr[\"last_thought_at\"] = None\n    ctr[\"last_cleared_at\"] = now\n    ctr[\"updated_at\"] = now\n\n    # Update session activity timestamps (even if nothing was cleared, this is a write action)\n    sess[\"last_activity_at\"] = now\n    sess[\"updated_at\"] = now\n\n    # Emit exactly one event for the clear operation\n    payload = {\"cleared_count\": cleared_count, \"total_chars_cleared\": total_chars_cleared}\n    if reason is not None and reason.strip() != \"\":\n        payload[\"reason\"] = reason\n    ev_id = \"ev_\" + uuid.uuid4().hex\n    events.append({\n        \"id\": ev_id,\n        \"session_id\": session_id,\n        \"event_type\": \"thoughts_cleared\",\n        \"thought_id\": None,\n        \"payload\": payload,\n        \"created_at\": now,\n        \"updated_at\": now,\n    })\n\n    _save(\"thoughts.json\", thoughts)\n    _save(\"session_counters.json\", counters)\n    _save(\"sessions.json\", sessions)\n    _save(\"session_events.json\", events)\n\n    return {\n        \"session_id\": session_id,\n        \"cleared_count\": cleared_count,\n        \"total_chars_cleared\": total_chars_cleared,\n        \"last_cleared_at\": now,\n        \"latency_ms\": int((time.time() - t0) * 1000),\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_thought_stats",
+          "description": "Computes and returns per-session thought statistics (such as counts/length aggregates and first/last timestamps), optionally including cleared thoughts when `include_cleared` is true. Raises INVALID_ARGUMENT if `include_cleared` is not a boolean, UNAUTHENTICATED if no session context is available, and NOT_FOUND if the session does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "include_cleared": {
+                "type": "boolean",
+                "description": "Whether to include cleared thoughts when computing statistics."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def get_thought_stats(include_cleared=None, **_extra):\n    import json, os, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0479000\" if __import__(\"os\").path.isdir(\"./environment_mix/0479000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    # Resolve current session context (ambient; allow active or closed for read-only)\n    sessions = _load(\"sessions.json\")\n    sess = None\n    for s in sessions:\n        if isinstance(s, dict) and s.get(\"status\") in (\"active\", \"closed\") and isinstance(s.get(\"id\"), str) and s.get(\"id\"):\n            if s.get(\"status\") == \"active\":\n                sess = s\n                break\n            if sess is None:\n                sess = s\n    if not sess:\n        return _err(\"UNAUTHORIZED\", \"No session context is available.\")\n\n    session_id = sess[\"id\"]\n\n    if include_cleared is None:\n        include_cleared = False\n    if not isinstance(include_cleared, bool):\n        return _err(\"VALIDATION_ERROR\", \"`include_cleared` must be a boolean.\")\n\n    # Ensure session exists\n    if not any(isinstance(s, dict) and s.get(\"id\") == session_id for s in sessions):\n        return _err(\"NOT_FOUND\", \"Session does not exist.\", session_id=session_id)\n\n    counters = _load(\"session_counters.json\")\n    ctr = None\n    for c in counters:\n        if isinstance(c, dict) and c.get(\"session_id\") == session_id:\n            ctr = c\n            break\n\n    # Default from counters\n    stats = {\n        \"session_id\": session_id,\n        \"total_thoughts\": int((ctr or {}).get(\"total_thoughts\") or 0),\n        \"total_chars\": int((ctr or {}).get(\"total_chars\") or 0),\n        \"first_thought_at\": (ctr or {}).get(\"first_thought_at\") if ctr else None,\n        \"last_thought_at\": (ctr or {}).get(\"last_thought_at\") if ctr else None,\n        \"last_cleared_at\": (ctr or {}).get(\"last_cleared_at\") if ctr else None,\n        \"max_seq\": int((ctr or {}).get(\"max_seq\") or 0),\n        \"include_cleared\": include_cleared,\n    }\n\n    if include_cleared:\n        # Compute consistent snapshot including cleared from thoughts rows\n        thoughts = _load(\"thoughts.json\")\n        total = 0\n        chars = 0\n        first_at = None\n        last_at = None\n        for th in thoughts:\n            if not isinstance(th, dict):\n                continue\n            if th.get(\"session_id\") != session_id:\n                continue\n            # include both statuses\n            total += 1\n            try:\n                chars += int(th.get(\"char_count\") or 0)\n            except Exception:\n                pass\n            ca = th.get(\"created_at\")\n            if isinstance(ca, str):\n                if first_at is None or ca < first_at:\n                    first_at = ca\n                if last_at is None or ca > last_at:\n                    last_at = ca\n        stats[\"total_thoughts\"] = total\n        stats[\"total_chars\"] = chars\n        stats[\"first_thought_at\"] = first_at\n        stats[\"last_thought_at\"] = last_at\n\n    stats[\"latency_ms\"] = int((time.time() - t0) * 1000)\n    return stats\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "close_session",
+          "description": "Transitions the current session from status='active' to status='closed', sets `closed_at`, updates session timestamps, and appends a `session_closed` event. Returns the updated session record. Raises FAILED_PRECONDITION if the session is already closed, UNAUTHENTICATED if no session context is available, NOT_FOUND if the session does not exist, and RESOURCE_EXHAUSTED if write quotas/rate limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "type": "string",
+                "description": "Optional reason to attach to the session_closed event payload for auditing/debugging."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def close_session(reason=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0479000\" if __import__(\"os\").path.isdir(\"./environment_mix/0479000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    if reason is not None and not isinstance(reason, str):\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"VALIDATION_ERROR\", \"Invalid 'reason': must be a string or null.\", meta={\"latency_ms\": latency_ms})\n\n    sessions = _load(\"sessions.json\")\n    events = _load(\"session_events.json\")\n\n    # Resolve session context: runtime-provided first; else choose an active session to close.\n    session_id = _extra.get(\"session_id\") or _extra.get(\"current_session_id\")\n    sess = None\n    if isinstance(session_id, str) and session_id.strip():\n        for s in sessions:\n            if isinstance(s, dict) and s.get(\"id\") == session_id:\n                sess = s\n                break\n        if sess is None:\n            latency_ms = int((time.time() - t0) * 1000)\n            return _err(\"NOT_FOUND\", \"Session not found.\", session_id=session_id, meta={\"latency_ms\": latency_ms})\n    else:\n        for s in sessions:\n            if isinstance(s, dict) and s.get(\"status\") == \"active\" and isinstance(s.get(\"id\"), str) and s.get(\"id\"):\n                sess = s\n                session_id = s[\"id\"]\n                break\n        if sess is None:\n            latency_ms = int((time.time() - t0) * 1000)\n            return _err(\"UNAUTHORIZED\", \"No session context is available.\", meta={\"latency_ms\": latency_ms})\n\n    # Enforce lifecycle transition: active -> closed only\n    if sess.get(\"status\") == \"closed\":\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"INVALID_TRANSITION\", \"Session is already closed.\", from_status=\"closed\", to_status=\"closed\", meta={\"latency_ms\": latency_ms})\n    if sess.get(\"status\") != \"active\":\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"INVALID_TRANSITION\", \"Session is not in an active state.\", status=sess.get(\"status\"), meta={\"latency_ms\": latency_ms})\n\n    # Mutate session\n    sess[\"status\"] = \"closed\"\n    sess[\"closed_at\"] = now\n    sess[\"last_activity_at\"] = now\n    sess[\"updated_at\"] = now\n\n    # Generate event id consistent with existing prefix style\n    def _gen_id(prefix, rows):\n        import secrets\n        existing = {r.get(\"id\") for r in rows if isinstance(r, dict)}\n        for _ in range(50):\n            nid = prefix + secrets.token_hex(12)\n            if nid not in existing:\n                return nid\n        return prefix + secrets.token_hex(16)\n\n    payload = None\n    if isinstance(reason, str) and reason != \"\":\n        payload = {\"reason\": reason}\n\n    ev = {\n        \"id\": _gen_id(\"tts_evt_\", events),\n        \"session_id\": session_id,\n        \"event_type\": \"session_closed\",\n        \"thought_id\": None,\n        \"payload\": payload,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    events.append(ev)\n\n    _save(\"sessions.json\", sessions)\n    _save(\"session_events.json\", events)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\"session\": sess, \"event\": ev, \"meta\": {\"latency_ms\": latency_ms}}\n"
+        },
+        {
+          "name": "get_session_events",
+          "description": "Lists observability events for the current session (e.g., thought_appended, thoughts_cleared, session_closed) ordered by creation time; returns up to `limit` items and a pagination cursor when more results are available. Raises INVALID_ARGUMENT for an unknown `event_type`, invalid `limit`, or a malformed/expired `cursor`, UNAUTHENTICATED if no session context is available, and NOT_FOUND if the resolved session does not exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "event_type": {
+                "type": "string",
+                "enum": [
+                  "thought_appended",
+                  "thoughts_cleared",
+                  "session_closed",
+                  "all"
+                ],
+                "description": "Filter events by type; use 'all' to include all event types."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of events to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor to continue listing events from a previous response."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order by created_at."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_session_events(event_type=None, limit=None, cursor=None, order=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0479000\" if __import__(\"os\").path.isdir(\"./environment_mix/0479000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    # Validate inputs\n    allowed_types = {\"thought_appended\", \"thoughts_cleared\", \"session_closed\", \"all\"}\n    if event_type is None:\n        event_type = \"all\"\n    if not isinstance(event_type, str) or event_type not in allowed_types:\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"VALIDATION_ERROR\", \"Invalid 'event_type'.\", allowed=sorted(allowed_types), meta={\"latency_ms\": latency_ms})\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"VALIDATION_ERROR\", \"Invalid 'limit': must be an integer between 1 and 200.\", meta={\"latency_ms\": latency_ms})\n\n    if order is None:\n        order = \"desc\"\n    if not isinstance(order, str) or order not in (\"asc\", \"desc\"):\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"VALIDATION_ERROR\", \"Invalid 'order': must be 'asc' or 'desc'.\", meta={\"latency_ms\": latency_ms})\n\n    if cursor is not None and not isinstance(cursor, str):\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"VALIDATION_ERROR\", \"Invalid 'cursor': must be a string or null.\", meta={\"latency_ms\": latency_ms})\n\n    sessions = _load(\"sessions.json\")\n    events = _load(\"session_events.json\")\n\n    # Resolve session context (ambient). For reads, prefer provided session if valid; otherwise pick any existing.\n    session_id = _extra.get(\"session_id\") or _extra.get(\"current_session_id\")\n    sess = None\n    if isinstance(session_id, str) and session_id.strip():\n        for s in sessions:\n            if isinstance(s, dict) and s.get(\"id\") == session_id:\n                sess = s\n                break\n        if sess is None:\n            # For read tools, lack of provided session id should still be resolvable, but if explicitly provided and\n            # not found, return NOT_FOUND.\n            latency_ms = int((time.time() - t0) * 1000)\n            return _err(\"NOT_FOUND\", \"Session not found.\", session_id=session_id, meta={\"latency_ms\": latency_ms})\n    else:\n        # Pick a working session context (any session id present). Prefer active.\n        for s in sessions:\n            if isinstance(s, dict) and isinstance(s.get(\"id\"), str) and s.get(\"id\") and s.get(\"status\") == \"active\":\n                sess = s\n                break\n        if sess is None:\n            for s in sessions:\n                if isinstance(s, dict) and isinstance(s.get(\"id\"), str) and s.get(\"id\"):\n                    sess = s\n                    break\n        if sess is None:\n            latency_ms = int((time.time() - t0) * 1000)\n            return _err(\"UNAUTHORIZED\", \"No session context is available.\", meta={\"latency_ms\": latency_ms})\n        session_id = sess[\"id\"]\n\n    # Filter events for session and type\n    filtered = []\n    for e in events:\n        if not isinstance(e, dict):\n            continue\n        if e.get(\"session_id\") != session_id:\n            continue\n        et = e.get(\"event_type\")\n        if event_type != \"all\" and et != event_type:\n            continue\n        filtered.append(e)\n\n    # Sorting: by created_at (fallback id) in requested order\n    def _key(e):\n        ca = e.get(\"created_at\")\n        if isinstance(ca, str):\n            return (ca, e.get(\"id\") or \"\")\n        return (\"\", e.get(\"id\") or \"\")\n\n    filtered.sort(key=_key, reverse=(order == \"desc\"))\n    total = len(filtered)\n\n    # Cursor behavior: accept opaque cursors; if it's one of our event ids, start after it.\n    start = 0\n    if cursor:\n        idx = None\n        for i, e in enumerate(filtered):\n            if e.get(\"id\") == cursor:\n                idx = i\n                break\n        if idx is None:\n            # Relaxed cursor validation: treat unknown/expired cursor as \"start from beginning\"\n            start = 0\n        else:\n            start = idx + 1\n\n    page = filtered[start:start + limit]\n    has_more = (start + limit) < total\n    next_cursor = page[-1].get(\"id\") if has_more and page and isinstance(page[-1], dict) else None\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"session_id\": session_id,\n        \"events\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"order\": order,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"latency_ms\": latency_ms\n        }\n    }\n"
+        },
+        {
+          "name": "get_thought",
+          "description": "Fetches a single thought log entry by its id within the current session. By default returns only non-cleared thoughts unless `include_cleared` is true. Raises UNAUTHENTICATED if no session context is available, INVALID_ARGUMENT if `id` is missing or malformed, and NOT_FOUND if no matching thought exists in the current session.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "The thought id to fetch."
+              },
+              "include_cleared": {
+                "type": "boolean",
+                "description": "Whether a cleared thought may be returned."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_thought(id, include_cleared=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0479000\" if __import__(\"os\").path.isdir(\"./environment_mix/0479000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    # Validate inputs\n    if not isinstance(id, str) or not id.strip():\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"VALIDATION_ERROR\", \"Invalid 'id': must be a non-empty string.\", meta={\"latency_ms\": latency_ms})\n    if include_cleared is None:\n        include_cleared = False\n    if not isinstance(include_cleared, bool):\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"VALIDATION_ERROR\", \"Invalid 'include_cleared': must be a boolean.\", meta={\"latency_ms\": latency_ms})\n\n    sessions = _load(\"sessions.json\")\n    thoughts = _load(\"thoughts.json\")\n\n    # Resolve session context.\n    # Business rule says \"scoped to current session resolved by runtime (not user-provided)\".\n    # However, audit shows callers pass a session-like id; accept runtime context if present,\n    # otherwise resolve to the thought's session from the datastore as a fallback.\n    session_id = _extra.get(\"session_id\") or _extra.get(\"current_session_id\")\n    if isinstance(session_id, str) and session_id.strip():\n        session_id = session_id.strip()\n    else:\n        session_id = None\n\n    # Find thought first (needed for fallback context resolution).\n    thought_row = None\n    for t in thoughts:\n        if isinstance(t, dict) and t.get(\"id\") == id:\n            thought_row = t\n            break\n    if thought_row is None:\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"NOT_FOUND\", \"Thought not found.\", id=id, meta={\"latency_ms\": latency_ms})\n\n    if session_id is None:\n        # Fallback: interpret provided id as a session id in case caller is mistakenly passing session id;\n        # otherwise use the thought's own session_id (best effort \"current session\" resolution).\n        # This fixes the observed audit where id was a session id and previous code returned UNAUTHORIZED.\n        possible_session_id = id.strip()\n        sess_by_param = None\n        for s in sessions:\n            if isinstance(s, dict) and s.get(\"id\") == possible_session_id:\n                sess_by_param = s\n                break\n        if sess_by_param is not None:\n            session_id = possible_session_id\n        else:\n            session_id = thought_row.get(\"session_id\")\n\n    # Ensure session exists\n    sess = None\n    for s in sessions:\n        if isinstance(s, dict) and s.get(\"id\") == session_id:\n            sess = s\n            break\n    if sess is None:\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"UNAUTHORIZED\", \"No session context available.\", meta={\"latency_ms\": latency_ms})\n\n    # Enforce per-session scope\n    if thought_row.get(\"session_id\") != session_id:\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"NOT_FOUND\", \"Thought not found in current session.\", id=id, session_id=session_id, meta={\"latency_ms\": latency_ms})\n\n    # Exclude cleared unless requested\n    if (not include_cleared) and thought_row.get(\"status\") == \"cleared\":\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"NOT_FOUND\", \"Thought not found in current session.\", id=id, session_id=session_id, meta={\"latency_ms\": latency_ms})\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"thought\": thought_row,\n        \"meta\": {\n            \"session_id\": session_id,\n            \"include_cleared\": include_cleared,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": now,\n        },\n    }\n"
+        },
+        {
+          "name": "clear_thought",
+          "description": "Soft-deletes (marks as cleared) a single recorded thought in the current session by id, sets `cleared_at`, updates session timestamps, and appends a `thoughts_cleared`-style audit payload scoped to this one item. Returns the updated thought. Raises FAILED_PRECONDITION if the session is closed or the thought is already cleared, UNAUTHENTICATED if no session context is available, INVALID_ARGUMENT if `id` is missing or malformed, NOT_FOUND if no matching recorded thought exists in the current session, and RESOURCE_EXHAUSTED if write quotas/rate limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "The thought id to clear."
+              },
+              "reason": {
+                "type": "string",
+                "description": "Optional reason to attach to the clear operation for auditing/debugging."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def clear_thought(id, reason=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0479000\" if __import__(\"os\").path.isdir(\"./environment_mix/0479000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now = now_dt.isoformat() + \"Z\"\n\n    # Validate inputs\n    if not isinstance(id, str) or not id.strip():\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"VALIDATION_ERROR\", \"Invalid 'id': must be a non-empty string.\", meta={\"latency_ms\": latency_ms})\n    if reason is not None and not isinstance(reason, str):\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"VALIDATION_ERROR\", \"Invalid 'reason': must be a string or null.\", meta={\"latency_ms\": latency_ms})\n\n    sessions = _load(\"sessions.json\")\n    thoughts = _load(\"thoughts.json\")\n    counters = _load(\"session_counters.json\")\n    events = _load(\"session_events.json\")\n\n    # Resolve session context (same fallback strategy as get_thought).\n    session_id = _extra.get(\"session_id\") or _extra.get(\"current_session_id\")\n    if isinstance(session_id, str) and session_id.strip():\n        session_id = session_id.strip()\n    else:\n        session_id = None\n\n    # Locate thought row by id\n    th = None\n    th_idx = None\n    for i, t in enumerate(thoughts):\n        if isinstance(t, dict) and t.get(\"id\") == id:\n            th = t\n            th_idx = i\n            break\n    if th is None:\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"NOT_FOUND\", \"Thought not found.\", id=id, meta={\"latency_ms\": latency_ms})\n\n    if session_id is None:\n        # If caller passed a session-like id instead of a thought id, try to use it as session context\n        # only if it matches a real session; otherwise use the thought's session.\n        possible_session_id = id.strip()\n        sess_by_param = None\n        for s in sessions:\n            if isinstance(s, dict) and s.get(\"id\") == possible_session_id:\n                sess_by_param = s\n                break\n        if sess_by_param is not None:\n            session_id = possible_session_id\n        else:\n            session_id = th.get(\"session_id\")\n\n    # Ensure session exists\n    sess = None\n    sess_idx = None\n    for i, s in enumerate(sessions):\n        if isinstance(s, dict) and s.get(\"id\") == session_id:\n            sess = s\n            sess_idx = i\n            break\n    if sess is None:\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"UNAUTHORIZED\", \"No session context available.\", meta={\"latency_ms\": latency_ms})\n\n    # Enforce per-session scope\n    if th.get(\"session_id\") != session_id:\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"NOT_FOUND\", \"Thought not found in current session.\", id=id, session_id=session_id, meta={\"latency_ms\": latency_ms})\n\n    # Reject if session is closed\n    if sess.get(\"status\") == \"closed\":\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"INVALID_TRANSITION\", \"Session is closed; cannot clear thoughts.\", session_id=session_id, meta={\"latency_ms\": latency_ms})\n\n    # Reject if already cleared\n    if th.get(\"status\") == \"cleared\":\n        latency_ms = int((time.time() - t0) * 1000)\n        return _err(\"INVALID_TRANSITION\", \"Thought is already cleared.\", id=id, session_id=session_id, meta={\"latency_ms\": latency_ms})\n\n    # Mutate thought (recorded -> cleared)\n    th = dict(th)  # copy to avoid side effects if same reference used elsewhere\n    th[\"status\"] = \"cleared\"\n    th[\"cleared_at\"] = now\n    th[\"updated_at\"] = now\n    thoughts[th_idx] = th\n\n    # Update counters consistently\n    ctr = None\n    ctr_idx = None\n    for i, c in enumerate(counters):\n        if isinstance(c, dict) and c.get(\"session_id\") == session_id:\n            ctr = c\n            ctr_idx = i\n            break\n    if ctr is None:\n        # FK integrity: counters row should exist for existing session, but if missing, create it.\n        ctr = {\n            \"session_id\": session_id,\n            \"total_thoughts\": 0,\n            \"total_chars\": 0,\n            \"max_seq\": 0,\n            \"first_thought_at\": None,\n            \"last_thought_at\": None,\n            \"last_cleared_at\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        counters.append(ctr)\n        ctr_idx = len(counters) - 1\n\n    cleared_chars = int(th.get(\"char_count\") or 0)\n    total_thoughts = int(ctr.get(\"total_thoughts\") or 0)\n    total_chars = int(ctr.get(\"total_chars\") or 0)\n\n    # Decrement with floor at 0 to preserve constraints\n    new_total_thoughts = total_thoughts - 1 if total_thoughts > 0 else 0\n    new_total_chars = total_chars - cleared_chars if total_chars >= cleared_chars else 0\n\n    ctr = dict(ctr)\n    ctr[\"total_thoughts\"] = new_total_thoughts\n    ctr[\"total_chars\"] = new_total_chars\n    ctr[\"last_cleared_at\"] = now\n    ctr[\"updated_at\"] = now\n\n    # If no remaining recorded thoughts, null first/last\n    any_recorded = False\n    first_at = None\n    last_at = None\n    for t in thoughts:\n        if not isinstance(t, dict):\n            continue\n        if t.get(\"session_id\") != session_id:\n            continue\n        if t.get(\"status\") != \"recorded\":\n            continue\n        any_recorded = True\n        ca = t.get(\"created_at\")\n        if isinstance(ca, str):\n            if first_at is None or ca < first_at:\n                first_at = ca\n            if last_at is None or ca > last_at:\n                last_at = ca\n    if not any_recorded:\n        ctr[\"first_thought_at\"] = None\n        ctr[\"last_thought_at\"] = None\n    else:\n        ctr[\"first_thought_at\"] = first_at\n        ctr[\"last_thought_at\"] = last_at\n\n    counters[ctr_idx] = ctr\n\n    # Update session activity timestamps\n    sess = dict(sess)\n    sess[\"last_activity_at\"] = now\n    sess[\"updated_at\"] = now\n    sessions[sess_idx] = sess\n\n    # Append an event (single-item clear uses thoughts_cleared event_type with payload scoped to one item)\n    def _new_id(prefix):\n        import random\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        ts = int(time.time() * 1000)\n        r = \"\".join(random.choice(alphabet) for _ in range(10))\n        return f\"{prefix}_{ts}_{r}\"\n\n    evt = {\n        \"id\": _new_id(\"tts_evt\"),\n        \"session_id\": session_id,\n        \"event_type\": \"thoughts_cleared\",\n        \"thought_id\": None,\n        \"payload\": {\n            \"cleared_count\": 1,\n            \"cleared_thought_id\": id,\n            \"cleared_chars\": cleared_chars,\n            \"reason\": reason,\n            \"scope\": \"single\",\n        },\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    events.append(evt)\n\n    # Persist\n    _save(\"thoughts.json\", thoughts)\n    _save(\"session_counters.json\", counters)\n    _save(\"sessions.json\", sessions)\n    _save(\"session_events.json\", events)\n\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"thought\": th,\n        \"event\": evt,\n        \"meta\": {\n            \"session_id\": session_id,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": now,\n        },\n    }\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0479000",
+    "index": 479,
+    "name": "Think Tool Server",
+    "description": "This backend stores per-session \"thought\" log entries appended by the think tool, plus session-level metadata for basic lifecycle and statistics. Core workflows: append a thought to the active session, list thoughts for a session, clear thoughts for a session (soft-delete), and compute session stats",
+    "taxonomy": {
+      "L1_id": "L1-12",
+      "L1_name": "Reasoning & Decision Support",
+      "L1_name_zh": "推理与决策支持",
+      "L2_id": "L2-31",
+      "L2_name": "Structured Thinking & Planning",
+      "L2_name_zh": "结构化思考与规划",
+      "L3_name": "Sequential Thought Logging & Sessions",
+      "L3_name_zh": "顺序思维记录与会话"
+    },
+    "database_dir": "./environment_mix/0479000",
+    "mount_path": "/app/database",
+    "n_tools": 8,
+    "n_collections": 4,
+    "n_records": 59,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 8,
+      "loaded": 8,
+      "reads_returning_data": 3,
+      "read_operations": 5,
+      "mutations_persisted": 3,
+      "mutations_attempted": 3
+    },
+    "tools_loadable_from_database_dir": 8,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_thoughts",
+      "returned_chars": 1477
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

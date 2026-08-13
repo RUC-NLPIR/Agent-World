@@ -1,0 +1,359 @@
+{
+  "index": 254,
+  "local_files_dir": "./environment_mix/0254000",
+  "file_list": [
+    "./environment_mix/0254000/README.md",
+    "./environment_mix/0254000/api_keys.json",
+    "./environment_mix/0254000/image_artifacts.json",
+    "./environment_mix/0254000/screenshot_jobs.json",
+    "./environment_mix/0254000/usage_events.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "api_keys.json": "12 rows",
+        "screenshot_jobs.json": "17 rows",
+        "image_artifacts.json": "18 rows",
+        "usage_events.json": "17 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "take_screenshot",
+          "description": "Creates (or reuses, when you provide job_id) a URL-to-image conversion job for target_url using the selected render_engine and capture settings, and returns the job record including the resulting image artifact details when available (or the existing job if the idempotency key matches). Raises VALIDATION_ERROR if target_url is not a valid URI, any numeric setting is out of range, an enum value is not supported, or unknown fields are provided; raises UNAUTHORIZED if api_key is missing/invalid and FORBIDDEN if the key is disabled or not permitted to render. Raises QUOTA_EXCEEDED when the API key has no remaining quota, TIMEOUT when timeout_ms is exceeded during rendering, and CONFLICT if job_id is already in use for a different request (different target_url or render options) and therefore cannot be reused.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^u2i_key_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "API key identifier used for authentication and quota enforcement (ULID-style id)."
+              },
+              "target_url": {
+                "type": "string",
+                "format": "uri",
+                "description": "The URL of the web page to capture as an image."
+              },
+              "render_engine": {
+                "type": "string",
+                "enum": [
+                  "chromium"
+                ],
+                "description": "Rendering engine to use for the screenshot."
+              },
+              "viewport_width": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Viewport width in CSS pixels to use when rendering the page."
+              },
+              "viewport_height": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Viewport height in CSS pixels to use when rendering the page."
+              },
+              "device_scale_factor": {
+                "type": "number",
+                "minimum": 0.1,
+                "description": "Device scale factor (DPR) to apply during rendering."
+              },
+              "full_page": {
+                "type": "boolean",
+                "description": "Whether to capture the full scrollable page instead of just the viewport."
+              },
+              "wait_until": {
+                "type": "string",
+                "enum": [
+                  "load",
+                  "domcontentloaded",
+                  "networkidle0",
+                  "networkidle2"
+                ],
+                "description": "Page lifecycle event to wait for before taking the screenshot."
+              },
+              "timeout_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum time in milliseconds to wait for navigation/rendering before failing."
+              },
+              "format": {
+                "type": "string",
+                "enum": [
+                  "png",
+                  "jpeg",
+                  "webp"
+                ],
+                "description": "Output image format to generate."
+              },
+              "job_id": {
+                "type": "string",
+                "pattern": "^u2i_job_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Optional idempotency key; if provided, reuse/return the existing job with this id when possible."
+              }
+            },
+            "required": [
+              "api_key",
+              "target_url"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def take_screenshot(api_key, target_url, render_engine=None, viewport_width=None, viewport_height=None, device_scale_factor=None, full_page=None, wait_until=None, timeout_ms=None, format=None, job_id=None, **_extra):\n    import json, os, datetime, re, time, secrets\n    from urllib.parse import urlparse\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0254000\" if __import__(\"os\").path.isdir(\"./environment_mix/0254000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _utcnow():\n        return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n\n    def _iso(dt):\n        return dt.replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_iso(s):\n        if not isinstance(s, str) or not s:\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                dt = datetime.datetime.fromisoformat(s[:-1])\n                if dt.tzinfo is None:\n                    dt = dt.replace(tzinfo=datetime.timezone.utc)\n                return dt.astimezone(datetime.timezone.utc)\n            dt = datetime.datetime.fromisoformat(s)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except Exception:\n            return None\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return f\"{prefix}_\" + \"\".join(secrets.choice(alphabet) for _ in range(16))\n\n    def _log_usage(usage_rows, api_key_id, event_type, cost_units, job_id_val=None):\n        usage_rows.append({\n            \"id\": _gen_id(\"u2i_evt\"),\n            \"api_key_id\": api_key_id,\n            \"job_id\": job_id_val,\n            \"event_type\": event_type,\n            \"request_id\": _extra.get(\"request_id\"),\n            \"client_ip\": _extra.get(\"client_ip\"),\n            \"user_agent\": _extra.get(\"user_agent\"),\n            \"cost_units\": int(cost_units),\n            \"created_at\": _iso(_utcnow()),\n        })\n\n    # ---------------- validation ----------------\n    if not isinstance(api_key, str) or not re.fullmatch(r\"^u2i_key_[0-9A-HJKMNP-TV-Z]{10,}$\", api_key):\n        return _err(\"VALIDATION_ERROR\", \"api_key is missing or malformed\", field=\"api_key\")\n\n    if not isinstance(target_url, str) or not target_url.strip():\n        return _err(\"VALIDATION_ERROR\", \"target_url is missing or empty\", field=\"target_url\")\n    try:\n        u = urlparse(target_url.strip())\n        if u.scheme not in (\"http\", \"https\") or not u.netloc:\n            return _err(\"VALIDATION_ERROR\", \"target_url must be a valid http(s) URI\", field=\"target_url\")\n    except Exception:\n        return _err(\"VALIDATION_ERROR\", \"target_url must be a valid URI\", field=\"target_url\")\n\n    if render_engine is None:\n        render_engine = \"chromium\"\n    if render_engine not in (\"chromium\",):\n        return _err(\"VALIDATION_ERROR\", \"render_engine is invalid\", field=\"render_engine\")\n\n    # tool schema allows minimum 1; underlying job constraints are stricter; accept tool values but clamp to backend min/max\n    def _val_int(name, v):\n        if v is None:\n            return None\n        if isinstance(v, bool) or not isinstance(v, int):\n            return _err(\"VALIDATION_ERROR\", f\"{name} must be an integer\", field=name)\n        if v < 1:\n            return _err(\"VALIDATION_ERROR\", f\"{name} must be >= 1\", field=name)\n        return v\n\n    vw = _val_int(\"viewport_width\", viewport_width)\n    if isinstance(vw, dict) and \"error\" in vw:\n        return vw\n    vh = _val_int(\"viewport_height\", viewport_height)\n    if isinstance(vh, dict) and \"error\" in vh:\n        return vh\n\n    if vw is None:\n        vw = 1280\n    if vh is None:\n        vh = 720\n\n    # enforce underlying constraints by clamping into allowed range (service-side normalization)\n    if vw < 100:\n        vw = 100\n    if vw > 10000:\n        vw = 10000\n    if vh < 100:\n        vh = 100\n    if vh > 10000:\n        vh = 10000\n\n    if device_scale_factor is None:\n        device_scale_factor = 1\n    if isinstance(device_scale_factor, bool) or not isinstance(device_scale_factor, (int, float)):\n        return _err(\"VALIDATION_ERROR\", \"device_scale_factor must be a number\", field=\"device_scale_factor\")\n    dsf = float(device_scale_factor)\n    if dsf < 0.1:\n        return _err(\"VALIDATION_ERROR\", \"device_scale_factor must be >= 0.1\", field=\"device_scale_factor\")\n    # clamp to backend constraint\n    if dsf < 0.5:\n        dsf = 0.5\n    if dsf > 4.0:\n        dsf = 4.0\n\n    if full_page is None:\n        full_page = False\n    if not isinstance(full_page, bool):\n        return _err(\"VALIDATION_ERROR\", \"full_page must be a boolean\", field=\"full_page\")\n\n    if wait_until is None:\n        wait_until = \"load\"\n    if wait_until not in (\"load\", \"domcontentloaded\", \"networkidle0\", \"networkidle2\"):\n        return _err(\"VALIDATION_ERROR\", \"wait_until is invalid\", field=\"wait_until\")\n\n    if timeout_ms is None:\n        timeout_ms = 60000\n    if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int):\n        return _err(\"VALIDATION_ERROR\", \"timeout_ms must be an integer\", field=\"timeout_ms\")\n    if timeout_ms < 1:\n        return _err(\"VALIDATION_ERROR\", \"timeout_ms must be >= 1\", field=\"timeout_ms\")\n    # clamp to backend constraints\n    if timeout_ms < 1000:\n        timeout_ms = 1000\n    if timeout_ms > 180000:\n        timeout_ms = 180000\n\n    if format is None:\n        format = \"png\"\n    if format not in (\"png\", \"jpeg\", \"webp\"):\n        return _err(\"VALIDATION_ERROR\", \"format is invalid\", field=\"format\")\n\n    if job_id is not None:\n        if not isinstance(job_id, str) or not re.fullmatch(r\"^u2i_job_[0-9A-HJKMNP-TV-Z]{10,}$\", job_id):\n            return _err(\"VALIDATION_ERROR\", \"job_id is malformed\", field=\"job_id\")\n\n    # ---------------- load store ----------------\n    api_keys_rows = _load(\"api_keys.json\")\n    jobs_rows = _load(\"screenshot_jobs.json\")\n    artifacts_rows = _load(\"image_artifacts.json\")\n    usage_rows = _load(\"usage_events.json\")\n\n    # authenticate (api_key is an id in this service; allow matching key_prefix too)\n    key_row = next((r for r in api_keys_rows if r.get(\"id\") == api_key or r.get(\"key_prefix\") == api_key), None)\n    if not key_row:\n        return _err(\"UNAUTHORIZED\", \"api_key is unknown\")\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"api_key is not active\", status=key_row.get(\"status\"))\n    key_id = key_row[\"id\"]\n\n    request_id = _extra.get(\"request_id\")\n    if request_id is not None and not isinstance(request_id, str):\n        return _err(\"VALIDATION_ERROR\", \"request_id must be a string when provided\", field=\"request_id\")\n\n    # idempotency by request_id (business rule)\n    existing_called_evt = None\n    if request_id:\n        for e in usage_rows:\n            if e.get(\"api_key_id\") == key_id and e.get(\"request_id\") == request_id and e.get(\"event_type\") == \"take_screenshot_called\":\n                existing_called_evt = e\n                break\n        if existing_called_evt and existing_called_evt.get(\"job_id\"):\n            prior_job = next((j for j in jobs_rows if j.get(\"id\") == existing_called_evt.get(\"job_id\") and j.get(\"api_key_id\") == key_id), None)\n            if prior_job:\n                # log this call as another take_screenshot_called with cost 0 (gateway would still hit; keep observable dynamics)\n                _log_usage(usage_rows, key_id, \"take_screenshot_called\", 0, job_id_val=prior_job.get(\"id\"))\n                _save(\"usage_events.json\", usage_rows)\n                key_row[\"last_used_at\"] = _iso(_utcnow())\n                key_row[\"updated_at\"] = _iso(_utcnow())\n                _save(\"api_keys.json\", api_keys_rows)\n\n                job_artifacts = [a for a in artifacts_rows if a.get(\"job_id\") == prior_job.get(\"id\")]\n                job_artifacts.sort(key=lambda r: (r.get(\"created_at\") or \"\", r.get(\"id\") or \"\"))\n                return {\n                    \"job\": prior_job,\n                    \"artifacts\": job_artifacts,\n                    \"idempotent_reuse\": True\n                }\n\n    # If caller supplies job_id, reuse existing job if it exists regardless of request_id\n    if job_id is not None:\n        existing_job = next((j for j in jobs_rows if j.get(\"id\") == job_id and j.get(\"api_key_id\") == key_id), None)\n        if existing_job:\n            _log_usage(usage_rows, key_id, \"take_screenshot_called\", 0, job_id_val=existing_job.get(\"id\"))\n            _save(\"usage_events.json\", usage_rows)\n            key_row[\"last_used_at\"] = _iso(_utcnow())\n            key_row[\"updated_at\"] = _iso(_utcnow())\n            _save(\"api_keys.json\", api_keys_rows)\n\n            job_artifacts = [a for a in artifacts_rows if a.get(\"job_id\") == existing_job.get(\"id\")]\n            job_artifacts.sort(key=lambda r: (r.get(\"created_at\") or \"\", r.get(\"id\") or \"\"))\n            return {\n                \"job\": existing_job,\n                \"artifacts\": job_artifacts,\n                \"idempotent_reuse\": True\n            }\n\n    # ---------------- quota + concurrency ----------------\n    now = _utcnow()\n    minute_start = now - datetime.timedelta(seconds=60)\n    used_last_min = 0\n    for e in usage_rows:\n        if e.get(\"api_key_id\") != key_id:\n            continue\n        dt = _parse_iso(e.get(\"created_at\"))\n        if dt is None:\n            continue\n        if dt >= minute_start:\n            try:\n                used_last_min += int(e.get(\"cost_units\") or 0)\n            except Exception:\n                pass\n\n    # UTC day quota\n    day_start = datetime.datetime(now.year, now.month, now.day, tzinfo=datetime.timezone.utc)\n    used_today = 0\n    for e in usage_rows:\n        if e.get(\"api_key_id\") != key_id:\n            continue\n        dt = _parse_iso(e.get(\"created_at\"))\n        if dt is None:\n            continue\n        if dt >= day_start:\n            try:\n                used_today += int(e.get(\"cost_units\") or 0)\n            except Exception:\n                pass\n\n    per_min_limit = int(key_row.get(\"requests_per_minute_limit\") or 0)\n    per_day_limit = int(key_row.get(\"requests_per_day_limit\") or 0)\n    if per_min_limit > 0 and used_last_min + 1 > per_min_limit:\n        # log refused call (cost 0)\n        _log_usage(usage_rows, key_id, \"take_screenshot_called\", 0, job_id_val=None)\n        _save(\"usage_events.json\", usage_rows)\n        return _err(\"RATE_LIMIT\", \"Rate limit exceeded for this API key (rolling 60s window)\", limit=per_min_limit, used=used_last_min)\n\n    if per_day_limit > 0 and used_today + 1 > per_day_limit:\n        _log_usage(usage_rows, key_id, \"take_screenshot_called\", 0, job_id_val=None)\n        _save(\"usage_events.json\", usage_rows)\n        return _err(\"QUOTA_EXCEEDED\", \"Daily quota exceeded for this API key (UTC day)\", limit=per_day_limit, used=used_today)\n\n    in_flight = 0\n    for j in jobs_rows:\n        if j.get(\"api_key_id\") == key_id and j.get(\"status\") in (\"queued\", \"running\"):\n            in_flight += 1\n    conc_limit = int(key_row.get(\"concurrent_jobs_limit\") or 0)\n    if conc_limit > 0 and in_flight + 1 > conc_limit:\n        _log_usage(usage_rows, key_id, \"take_screenshot_called\", 0, job_id_val=None)\n        _save(\"usage_events.json\", usage_rows)\n        return _err(\"CONFLICT\", \"Concurrent jobs limit exceeded for this API key\", limit=conc_limit, in_flight=in_flight)\n\n    # ---------------- create job + usage event ----------------\n    new_job_id = job_id if job_id is not None else _gen_id(\"u2i_job\")\n    if any(j.get(\"id\") == new_job_id for j in jobs_rows):\n        # collision with another key's job id -> treat as conflict\n        _log_usage(usage_rows, key_id, \"take_screenshot_called\", 0, job_id_val=None)\n        _save(\"usage_events.json\", usage_rows)\n        return _err(\"CONFLICT\", \"job_id already exists\", field=\"job_id\")\n\n    now_iso = _iso(now)\n    job_row = {\n        \"id\": new_job_id,\n        \"api_key_id\": key_id,\n        \"status\": \"queued\",\n        \"target_url\": target_url.strip(),\n        \"final_url\": None,\n        \"render_engine\": render_engine,\n        \"viewport_width\": int(vw),\n        \"viewport_height\": int(vh),\n        \"device_scale_factor\": dsf,\n        \"full_page\": bool(full_page),\n        \"wait_until\": wait_until,\n        \"timeout_ms\": int(timeout_ms),\n        \"http_status\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"attempt_count\": 0,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"expires_at\": None,\n        \"created_at\": now_iso,\n        \"updated_at\": now_iso,\n    }\n    jobs_rows.append(job_row)\n\n    # charge the call + record call and queue events\n    _log_usage(usage_rows, key_id, \"take_screenshot_called\", 1, job_id_val=new_job_id)\n    _log_usage(usage_rows, key_id, \"job_queued\", 0, job_id_val=new_job_id)\n\n    # persist\n    key_row[\"last_used_at\"] = now_iso\n    key_row[\"updated_at\"] = now_iso\n    _save(\"screenshot_jobs.json\", jobs_rows)\n    _save(\"usage_events.json\", usage_rows)\n    _save(\"api_keys.json\", api_keys_rows)\n\n    # return job with any artifacts (none at creation time)\n    job_artifacts = [a for a in artifacts_rows if a.get(\"job_id\") == new_job_id]\n    job_artifacts.sort(key=lambda r: (r.get(\"created_at\") or \"\", r.get(\"id\") or \"\"))\n    return {\n        \"job\": job_row,\n        \"artifacts\": job_artifacts,\n        \"idempotent_reuse\": False,\n        \"latency_ms\": int((time.time() - t0) * 1000),\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_current_identity",
+          "description": "Returns the authenticated caller identity for the provided api_key, including key status, assigned limits, and current quota/rate-limit consumption. Refuses with AUTH_ERROR if the api_key is missing, malformed, revoked/disabled, or unknown.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^u2i_key_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "API key identifier used for authentication and quota enforcement (ULID-style id)."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_current_identity(api_key, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0254000\" if __import__(\"os\").path.isdir(\"./environment_mix/0254000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        return dt.astimezone(datetime.timezone.utc).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if isinstance(s, datetime.datetime):\n            return s.astimezone(datetime.timezone.utc)\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1]).replace(tzinfo=datetime.timezone.utc)\n            dt = datetime.datetime.fromisoformat(s)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except Exception:\n            return None\n\n    if not isinstance(api_key, str) or not re.fullmatch(r\"u2i_key_[0-9A-HJKMNP-TV-Z]{10,}\", api_key):\n        return _err(\"VALIDATION_ERROR\", \"api_key is missing or malformed\", field=\"api_key\")\n\n    api_keys = _load(\"api_keys.json\")\n    usage_events = _load(\"usage_events.json\")\n\n    key_row = None\n    for r in api_keys:\n        if r.get(\"id\") == api_key:\n            key_row = r\n            break\n    if key_row is None:\n        for r in api_keys:\n            if r.get(\"key_prefix\") == api_key:\n                key_row = r\n                break\n    if key_row is None:\n        return _err(\"UNAUTHORIZED\", \"api_key is unknown\")\n\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"api_key is not active\", status=key_row.get(\"status\"))\n\n    api_key_id = key_row[\"id\"]\n    rpm_limit = int(key_row.get(\"requests_per_minute_limit\", 60))\n    rpd_limit = int(key_row.get(\"requests_per_day_limit\", 1000))\n\n    window_start = now - datetime.timedelta(seconds=60)\n    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)\n\n    used_60 = 0\n    used_day = 0\n    for e in usage_events:\n        if e.get(\"api_key_id\") != api_key_id:\n            continue\n        cost = int(e.get(\"cost_units\", 0) or 0)\n        edt = _parse_dt(e.get(\"created_at\"))\n        if edt is None:\n            continue\n        if edt >= window_start:\n            used_60 += cost\n        if edt >= day_start:\n            used_day += cost\n\n    # Record a usage event for observability (0 cost)\n    # Not in schema as identity call event; reuse take_screenshot_called would be wrong.\n    # So we do not append a fake event type. (Schema enumerates allowed events only.)\n    latency_ms = int((time.time() - t0) * 1000)\n    return {\n        \"identity\": {\n            \"api_key_id\": api_key_id,\n            \"key_prefix\": key_row.get(\"key_prefix\"),\n            \"name\": key_row.get(\"name\"),\n            \"status\": key_row.get(\"status\"),\n            \"limits\": {\n                \"requests_per_minute_limit\": rpm_limit,\n                \"requests_per_day_limit\": rpd_limit,\n                \"concurrent_jobs_limit\": int(key_row.get(\"concurrent_jobs_limit\", 1)),\n            },\n            \"usage\": {\n                \"last_60s\": {\"used_cost_units\": used_60, \"limit\": rpm_limit, \"remaining\": max(0, rpm_limit - used_60)},\n                \"utc_day\": {\"used_cost_units\": used_day, \"limit\": rpd_limit, \"remaining\": max(0, rpd_limit - used_day)},\n            },\n            \"created_at\": key_row.get(\"created_at\"),\n            \"updated_at\": key_row.get(\"updated_at\"),\n            \"last_used_at\": key_row.get(\"last_used_at\"),\n        },\n        \"meta\": {\"latency_ms\": latency_ms}\n    }\n"
+        },
+        {
+          "name": "list_screenshot_jobs",
+          "description": "Lists screenshot_jobs visible to the provided api_key, newest-first, with optional filtering by status and time window. Returns a paginated page of job records. Refuses with AUTH_ERROR if api_key is invalid/disabled/revoked, and VALIDATION_ERROR for invalid filters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^u2i_key_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "API key identifier used for authentication and quota enforcement (ULID-style id)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled",
+                  "expired"
+                ],
+                "description": "Optional filter to only return jobs in this status."
+              },
+              "created_after": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional ISO8601 timestamp; only return jobs created at or after this time."
+              },
+              "created_before": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional ISO8601 timestamp; only return jobs created at or before this time."
+              },
+              "page_size": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of jobs to return in this page."
+              },
+              "page_token": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_screenshot_jobs(api_key, status=None, created_after=None, created_before=None, page_size=None, page_token=None, **_extra):\n    import json, os, datetime, re, time, secrets, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0254000\" if __import__(\"os\").path.isdir(\"./environment_mix/0254000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _utcnow():\n        return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n\n    def _iso(dt):\n        return dt.replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt(s, field):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return _err(\"VALIDATION_ERROR\", f\"{field} must be an ISO8601 string\", field=field)\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1]).replace(tzinfo=datetime.timezone.utc)\n            dt = datetime.datetime.fromisoformat(s)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.astimezone(datetime.timezone.utc)\n        except Exception:\n            return _err(\"VALIDATION_ERROR\", f\"{field} must be an ISO8601 date-time\", field=field)\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return f\"{prefix}_\" + \"\".join(secrets.choice(alphabet) for _ in range(16))\n\n    def _log_read(usage_rows, api_key_id):\n        usage_rows.append({\n            \"id\": _gen_id(\"u2i_evt\"),\n            \"api_key_id\": api_key_id,\n            \"job_id\": None,\n            \"event_type\": \"take_screenshot_called\",\n            \"request_id\": _extra.get(\"request_id\"),\n            \"client_ip\": _extra.get(\"client_ip\"),\n            \"user_agent\": _extra.get(\"user_agent\"),\n            \"cost_units\": 0,\n            \"created_at\": _iso(_utcnow()),\n        })\n\n    def _encode_cursor(last_created_at, last_id):\n        obj = {\"last_created_at\": last_created_at, \"last_id\": last_id}\n        b = json.dumps(obj, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(b).decode(\"ascii\").rstrip(\"=\")\n\n    def _decode_cursor(tok):\n        if tok is None:\n            return None\n        # be permissive: accept any string; if it doesn't decode, treat as \"start from beginning\"\n        if not isinstance(tok, str) or tok == \"\":\n            return None\n        pad = \"=\" * ((4 - (len(tok) % 4)) % 4)\n        try:\n            raw = base64.urlsafe_b64decode((tok + pad).encode(\"ascii\"))\n            obj = json.loads(raw.decode(\"utf-8\"))\n            if not isinstance(obj, dict):\n                return None\n            if \"last_created_at\" not in obj or \"last_id\" not in obj:\n                return None\n            if not isinstance(obj.get(\"last_created_at\"), str) or not isinstance(obj.get(\"last_id\"), str):\n                return None\n            return obj\n        except Exception:\n            return None\n\n    # validate\n    if not isinstance(api_key, str) or not re.fullmatch(r\"^u2i_key_[0-9A-HJKMNP-TV-Z]{10,}$\", api_key):\n        return _err(\"VALIDATION_ERROR\", \"api_key is missing or malformed\", field=\"api_key\")\n    if status is not None and status not in (\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\", \"expired\"):\n        return _err(\"VALIDATION_ERROR\", \"status is invalid\", field=\"status\")\n    if page_size is None:\n        page_size = 50\n    if not isinstance(page_size, int) or page_size < 1 or page_size > 200:\n        return _err(\"VALIDATION_ERROR\", \"page_size out of range (1..200)\", field=\"page_size\")\n\n    ca = _parse_dt(created_after, \"created_after\")\n    if isinstance(ca, dict) and \"error\" in ca:\n        return ca\n    cb = _parse_dt(created_before, \"created_before\")\n    if isinstance(cb, dict) and \"error\" in cb:\n        return cb\n    if ca and cb and ca > cb:\n        return _err(\"VALIDATION_ERROR\", \"created_after must be <= created_before\", field=\"created_after\")\n\n    api_keys_rows = _load(\"api_keys.json\")\n    jobs_rows = _load(\"screenshot_jobs.json\")\n    usage_rows = _load(\"usage_events.json\")\n\n    key_row = None\n    for r in api_keys_rows:\n        if r.get(\"id\") == api_key or r.get(\"key_prefix\") == api_key:\n            key_row = r\n            break\n    if not key_row:\n        return _err(\"UNAUTHORIZED\", \"api_key is unknown\")\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"api_key is not active\", status=key_row.get(\"status\"))\n    key_id = key_row[\"id\"]\n\n    # filter\n    filtered = [j for j in jobs_rows if j.get(\"api_key_id\") == key_id]\n    if status:\n        filtered = [j for j in filtered if j.get(\"status\") == status]\n\n    def _job_created_dt(j):\n        s = j.get(\"created_at\")\n        try:\n            if isinstance(s, str) and s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1]).replace(tzinfo=datetime.timezone.utc)\n            if isinstance(s, str):\n                dt = datetime.datetime.fromisoformat(s)\n                if dt.tzinfo is None:\n                    dt = dt.replace(tzinfo=datetime.timezone.utc)\n                return dt.astimezone(datetime.timezone.utc)\n        except Exception:\n            return datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n        return datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)\n\n    if ca:\n        filtered = [j for j in filtered if _job_created_dt(j) >= ca]\n    if cb:\n        filtered = [j for j in filtered if _job_created_dt(j) <= cb]\n\n    # sort newest-first by created_at then id desc\n    filtered.sort(key=lambda j: (_job_created_dt(j), j.get(\"id\", \"\")), reverse=True)\n\n    cursor = _decode_cursor(page_token)\n    if cursor:\n        last_ca = cursor.get(\"last_created_at\")\n        last_id = cursor.get(\"last_id\")\n        # apply \"after\" in the sorted (desc) order: start after the cursor item\n        def _after_cursor(j):\n            jc = j.get(\"created_at\") or \"\"\n            jid = j.get(\"id\") or \"\"\n            # since list is desc, items \"after\" have (created_at,id) < (last_created_at,last_id)\n            if jc < last_ca:\n                return True\n            if jc == last_ca and jid < last_id:\n                return True\n            return False\n        filtered = [j for j in filtered if _after_cursor(j)]\n\n    page = filtered[:page_size]\n    has_more = len(filtered) > page_size\n    next_cursor = None\n    if has_more and page:\n        next_cursor = _encode_cursor(page[-1].get(\"created_at\") or \"\", page[-1].get(\"id\") or \"\")\n\n    # observable dynamics: read logs\n    _log_read(usage_rows, key_id)\n    _save(\"usage_events.json\", usage_rows)\n\n    return {\n        \"jobs\": page,\n        \"meta\": {\n            \"page_size\": page_size,\n            \"total\": len(filtered),\n            \"has_more\": bool(has_more),\n            \"next_page_token\": next_cursor,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n    }\n"
+        },
+        {
+          "name": "get_screenshot_job",
+          "description": "Fetches a single screenshot_jobs record by id, including any associated image_artifacts when available. Refuses with AUTH_ERROR if the api_key is invalid/disabled/revoked, NOT_FOUND if the job does not exist for this key, and VALIDATION_ERROR if the id is malformed.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^u2i_key_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "API key identifier used for authentication and quota enforcement (ULID-style id)."
+              },
+              "job_id": {
+                "type": "string",
+                "pattern": "^u2i_job_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Screenshot job id to fetch."
+              }
+            },
+            "required": [
+              "api_key",
+              "job_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_screenshot_job(api_key, job_id, **_extra):\n    import json, os, datetime, re, time, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0254000\" if __import__(\"os\").path.isdir(\"./environment_mix/0254000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _utcnow():\n        return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n\n    def _iso(dt):\n        return dt.replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return f\"{prefix}_\" + \"\".join(secrets.choice(alphabet) for _ in range(16))\n\n    # validate\n    if not isinstance(api_key, str) or not re.fullmatch(r\"^u2i_key_[0-9A-HJKMNP-TV-Z]{10,}$\", api_key):\n        return _err(\"VALIDATION_ERROR\", \"api_key is missing or malformed\", field=\"api_key\")\n    if not isinstance(job_id, str) or not re.fullmatch(r\"^u2i_job_[0-9A-HJKMNP-TV-Z]{10,}$\", job_id):\n        return _err(\"VALIDATION_ERROR\", \"job_id is missing or malformed\", field=\"job_id\")\n\n    api_keys_rows = _load(\"api_keys.json\")\n    jobs_rows = _load(\"screenshot_jobs.json\")\n    artifacts_rows = _load(\"image_artifacts.json\")\n    usage_rows = _load(\"usage_events.json\")\n\n    key_row = next((r for r in api_keys_rows if r.get(\"id\") == api_key or r.get(\"key_prefix\") == api_key), None)\n    if not key_row:\n        return _err(\"UNAUTHORIZED\", \"api_key is unknown\")\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"api_key is not active\", status=key_row.get(\"status\"))\n    key_id = key_row[\"id\"]\n\n    # find job by id and ownership\n    job = next((j for j in jobs_rows if j.get(\"id\") == job_id and j.get(\"api_key_id\") == key_id), None)\n\n    # observable dynamics: log call (reads included). Use cost_units=0 and do NOT misuse event_type.\n    usage_rows.append({\n        \"id\": _gen_id(\"u2i_evt\"),\n        \"api_key_id\": key_id,\n        \"job_id\": job_id if job else None,\n        \"event_type\": \"take_screenshot_called\",\n        \"request_id\": _extra.get(\"request_id\"),\n        \"client_ip\": _extra.get(\"client_ip\"),\n        \"user_agent\": _extra.get(\"user_agent\"),\n        \"cost_units\": 0,\n        \"created_at\": _iso(_utcnow()),\n    })\n    _save(\"usage_events.json\", usage_rows)\n\n    if not job:\n        return _err(\"NOT_FOUND\", \"Job not found for this API key (must exist and be owned by the key)\", job_id=job_id)\n\n    job_artifacts = [a for a in artifacts_rows if a.get(\"job_id\") == job_id]\n    job_artifacts.sort(key=lambda r: (r.get(\"created_at\") or \"\", r.get(\"id\") or \"\"))\n\n    return {\n        \"job\": job,\n        \"artifacts\": job_artifacts,\n        \"latency_ms\": int((time.time() - t0) * 1000),\n    }\n"
+        },
+        {
+          "name": "cancel_screenshot_job",
+          "description": "Requests cancellation of a screenshot job. If the job is queued or running, transitions status to cancelled and schedules any partially-written artifacts for deletion. Refuses with AUTH_ERROR if api_key is invalid/disabled/revoked, NOT_FOUND if the job is not owned by the key, and CONFLICT_ERROR if the transition is not allowed (e.g., already succeeded/expired).",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^u2i_key_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "API key identifier used for authentication and quota enforcement (ULID-style id)."
+              },
+              "job_id": {
+                "type": "string",
+                "pattern": "^u2i_job_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Screenshot job id to cancel."
+              },
+              "reason": {
+                "type": "string",
+                "maxLength": 500,
+                "description": "Optional human-readable reason recorded for auditing."
+              }
+            },
+            "required": [
+              "api_key",
+              "job_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def cancel_screenshot_job(api_key, job_id, reason=None, **_extra):\n    import json, os, datetime, re, time, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0254000\" if __import__(\"os\").path.isdir(\"./environment_mix/0254000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    transitions = {\n        \"queued\": (\"running\", \"cancelled\", \"failed\"),\n        \"running\": (\"succeeded\", \"failed\", \"cancelled\"),\n        \"succeeded\": (\"expired\",),\n        \"failed\": (\"queued\", \"expired\"),\n        \"cancelled\": (\"expired\",),\n        \"expired\": (),\n    }\n\n    def _utcnow():\n        return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n\n    def _iso(dt):\n        return dt.replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return f\"{prefix}_\" + \"\".join(secrets.choice(alphabet) for _ in range(16))\n\n    def _log_evt(usage_rows, api_key_id, event_type, job_id_val, cost_units=0):\n        usage_rows.append({\n            \"id\": _gen_id(\"u2i_evt\"),\n            \"api_key_id\": api_key_id,\n            \"job_id\": job_id_val,\n            \"event_type\": event_type,\n            \"request_id\": _extra.get(\"request_id\"),\n            \"client_ip\": _extra.get(\"client_ip\"),\n            \"user_agent\": _extra.get(\"user_agent\"),\n            \"cost_units\": int(cost_units),\n            \"created_at\": _iso(_utcnow()),\n        })\n\n    # validate\n    if not isinstance(api_key, str) or not re.fullmatch(r\"^u2i_key_[0-9A-HJKMNP-TV-Z]{10,}$\", api_key):\n        return _err(\"VALIDATION_ERROR\", \"api_key is missing or malformed\", field=\"api_key\")\n    if not isinstance(job_id, str) or not re.fullmatch(r\"^u2i_job_[0-9A-HJKMNP-TV-Z]{10,}$\", job_id):\n        return _err(\"VALIDATION_ERROR\", \"job_id is missing or malformed\", field=\"job_id\")\n    if reason is not None:\n        if not isinstance(reason, str):\n            return _err(\"VALIDATION_ERROR\", \"reason must be a string\", field=\"reason\")\n        if len(reason) > 500:\n            return _err(\"VALIDATION_ERROR\", \"reason too long (max 500)\", field=\"reason\")\n\n    api_keys_rows = _load(\"api_keys.json\")\n    jobs_rows = _load(\"screenshot_jobs.json\")\n    artifacts_rows = _load(\"image_artifacts.json\")\n    usage_rows = _load(\"usage_events.json\")\n\n    key_row = next((r for r in api_keys_rows if r.get(\"id\") == api_key or r.get(\"key_prefix\") == api_key), None)\n    if not key_row:\n        return _err(\"UNAUTHORIZED\", \"api_key is unknown\")\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"api_key is not active\", status=key_row.get(\"status\"))\n    key_id = key_row[\"id\"]\n\n    job = next((j for j in jobs_rows if j.get(\"id\") == job_id and j.get(\"api_key_id\") == key_id), None)\n\n    # observable dynamics (log attempt)\n    _log_evt(usage_rows, key_id, \"take_screenshot_called\", job_id if job else None, cost_units=0)\n\n    if not job:\n        _save(\"usage_events.json\", usage_rows)\n        return _err(\"NOT_FOUND\", \"Job not found for this API key (must exist and be owned by the key)\", job_id=job_id)\n\n    cur = job.get(\"status\")\n    if cur not in transitions:\n        _save(\"usage_events.json\", usage_rows)\n        return _err(\"INVALID_TRANSITION\", \"Job is in an unknown state\", status=cur)\n\n    if \"cancelled\" not in transitions[cur]:\n        _save(\"usage_events.json\", usage_rows)\n        return _err(\"INVALID_TRANSITION\", \"Job cannot be cancelled from its current status\", from_status=cur, to_status=\"cancelled\")\n\n    # apply transition\n    now = _utcnow()\n    job[\"status\"] = \"cancelled\"\n    job[\"updated_at\"] = _iso(now)\n    job[\"finished_at\"] = job.get(\"finished_at\") or _iso(now)\n    if reason:\n        # best-effort: store cancellation reason in error_message for auditing without changing schema\n        job[\"error_code\"] = job.get(\"error_code\") or \"USER_CANCELLED\"\n        job[\"error_message\"] = (reason[:500]).strip() if reason.strip() else job.get(\"error_message\")\n\n    # artifacts: schedule/soft-delete any partially-written artifacts (writing->deleted allowed; also delete available for cancellation cleanup)\n    changed_art = 0\n    for a in artifacts_rows:\n        if a.get(\"job_id\") != job_id:\n            continue\n        if a.get(\"status\") in (\"writing\", \"available\"):\n            a[\"status\"] = \"deleted\"\n            a[\"deleted_at\"] = _iso(now)\n            a[\"updated_at\"] = _iso(now)\n            changed_art += 1\n\n    _log_evt(usage_rows, key_id, \"job_cancelled\", job_id, cost_units=0)\n\n    # persist mutations\n    key_row[\"updated_at\"] = _iso(now)\n    _save(\"screenshot_jobs.json\", jobs_rows)\n    _save(\"image_artifacts.json\", artifacts_rows)\n    _save(\"usage_events.json\", usage_rows)\n    _save(\"api_keys.json\", api_keys_rows)\n\n    return {\n        \"job\": job,\n        \"artifacts_deleted\": changed_art,\n        \"latency_ms\": int((time.time() - t0) * 1000),\n    }\n"
+        },
+        {
+          "name": "list_image_artifacts",
+          "description": "Lists image_artifacts for a given screenshot job, optionally filtered by status and variant. Returns a paginated page of artifact metadata; does not return raw bytes. Refuses with AUTH_ERROR if api_key is invalid/disabled/revoked, NOT_FOUND if the job is not owned by the key, and VALIDATION_ERROR for invalid filters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^u2i_key_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "API key identifier used for authentication and quota enforcement (ULID-style id)."
+              },
+              "job_id": {
+                "type": "string",
+                "pattern": "^u2i_job_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Screenshot job id whose artifacts will be listed."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "writing",
+                  "available",
+                  "deleted"
+                ],
+                "description": "Optional filter to only return artifacts in this status."
+              },
+              "variant": {
+                "type": "string",
+                "enum": [
+                  "original",
+                  "thumbnail"
+                ],
+                "description": "Optional filter for artifact variant."
+              },
+              "page_size": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of artifacts to return in this page."
+              },
+              "page_token": {
+                "type": "string",
+                "description": "Opaque pagination cursor from a previous response."
+              }
+            },
+            "required": [
+              "api_key",
+              "job_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_image_artifacts(api_key, job_id, status=None, variant=None, page_size=None, page_token=None, **_extra):\n    import json, os, datetime, re, time, secrets, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0254000\" if __import__(\"os\").path.isdir(\"./environment_mix/0254000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _utcnow():\n        return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n\n    def _iso(dt):\n        return dt.replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return f\"{prefix}_\" + \"\".join(secrets.choice(alphabet) for _ in range(16))\n\n    def _encode_cursor(last_created_at, last_id):\n        obj = {\"last_created_at\": last_created_at, \"last_id\": last_id}\n        b = json.dumps(obj, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(b).decode(\"ascii\").rstrip(\"=\")\n\n    def _decode_cursor(tok):\n        if tok is None:\n            return None\n        if not isinstance(tok, str) or tok == \"\":\n            return None\n        pad = \"=\" * ((4 - (len(tok) % 4)) % 4)\n        try:\n            raw = base64.urlsafe_b64decode((tok + pad).encode(\"ascii\"))\n            obj = json.loads(raw.decode(\"utf-8\"))\n        except Exception:\n            return None\n        if not isinstance(obj, dict):\n            return None\n        if not isinstance(obj.get(\"last_created_at\"), str) or not isinstance(obj.get(\"last_id\"), str):\n            return None\n        return obj\n\n    # validate\n    if not isinstance(api_key, str) or not re.fullmatch(r\"^u2i_key_[0-9A-HJKMNP-TV-Z]{10,}$\", api_key):\n        return _err(\"VALIDATION_ERROR\", \"api_key is missing or malformed\", field=\"api_key\")\n    if not isinstance(job_id, str) or not re.fullmatch(r\"^u2i_job_[0-9A-HJKMNP-TV-Z]{10,}$\", job_id):\n        return _err(\"VALIDATION_ERROR\", \"job_id is missing or malformed\", field=\"job_id\")\n    if status is not None and status not in (\"writing\", \"available\", \"deleted\"):\n        return _err(\"VALIDATION_ERROR\", \"status is invalid\", field=\"status\")\n    if variant is not None and variant not in (\"original\", \"thumbnail\"):\n        return _err(\"VALIDATION_ERROR\", \"variant is invalid\", field=\"variant\")\n    if page_size is None:\n        page_size = 50\n    if isinstance(page_size, bool) or not isinstance(page_size, int):\n        return _err(\"VALIDATION_ERROR\", \"page_size must be an integer\", field=\"page_size\")\n    if page_size < 1 or page_size > 200:\n        return _err(\"VALIDATION_ERROR\", \"page_size must be between 1 and 200\", field=\"page_size\")\n\n    api_keys_rows = _load(\"api_keys.json\")\n    jobs_rows = _load(\"screenshot_jobs.json\")\n    artifacts_rows = _load(\"image_artifacts.json\")\n    usage_rows = _load(\"usage_events.json\")\n\n    key_row = next((r for r in api_keys_rows if r.get(\"id\") == api_key or r.get(\"key_prefix\") == api_key), None)\n    if not key_row:\n        return _err(\"UNAUTHORIZED\", \"api_key is unknown\")\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"api_key is not active\", status=key_row.get(\"status\"))\n    key_id = key_row[\"id\"]\n\n    job = next((j for j in jobs_rows if j.get(\"id\") == job_id and j.get(\"api_key_id\") == key_id), None)\n\n    # observable dynamics: log the read attempt\n    usage_rows.append({\n        \"id\": _gen_id(\"u2i_evt\"),\n        \"api_key_id\": key_id,\n        \"job_id\": job_id if job else None,\n        \"event_type\": \"take_screenshot_called\",\n        \"request_id\": _extra.get(\"request_id\"),\n        \"client_ip\": _extra.get(\"client_ip\"),\n        \"user_agent\": _extra.get(\"user_agent\"),\n        \"cost_units\": 0,\n        \"created_at\": _iso(_utcnow()),\n    })\n    _save(\"usage_events.json\", usage_rows)\n\n    if not job:\n        return _err(\"NOT_FOUND\", \"Job not found for this API key (must exist and be owned by the key)\", job_id=job_id)\n\n    rows = [a for a in artifacts_rows if a.get(\"job_id\") == job_id]\n    if status is not None:\n        rows = [a for a in rows if a.get(\"status\") == status]\n    if variant is not None:\n        rows = [a for a in rows if a.get(\"variant\") == variant]\n\n    rows.sort(key=lambda r: (r.get(\"created_at\") or \"\", r.get(\"id\") or \"\"))\n\n    cursor = _decode_cursor(page_token)\n    if cursor:\n        lc = cursor[\"last_created_at\"]\n        lid = cursor[\"last_id\"]\n        def _after(r):\n            ca = r.get(\"created_at\") or \"\"\n            rid = r.get(\"id\") or \"\"\n            return (ca, rid) > (lc, lid)\n        rows = [r for r in rows if _after(r)]\n\n    page = rows[:page_size]\n    has_more = len(rows) > page_size\n    next_token = None\n    if has_more and page:\n        last = page[-1]\n        next_token = _encode_cursor(last.get(\"created_at\") or \"\", last.get(\"id\") or \"\")\n\n    return {\n        \"artifacts\": page,\n        \"total\": len([a for a in artifacts_rows if a.get(\"job_id\") == job_id and (status is None or a.get(\"status\") == status) and (variant is None or a.get(\"variant\") == variant)]),\n        \"page_size\": page_size,\n        \"has_more\": bool(has_more),\n        \"next_page_token\": next_token,\n        \"latency_ms\": int((time.time() - t0) * 1000),\n    }\n"
+        },
+        {
+          "name": "delete_screenshot_job",
+          "description": "Expires (soft-deletes) a screenshot job and transitions it to expired when allowed, also soft-deleting any image_artifacts by setting status='deleted' and deleted_at. Refuses with AUTH_ERROR if api_key is invalid/disabled/revoked, NOT_FOUND if the job is not owned by the key, and CONFLICT_ERROR if the transition to expired is not allowed by lifecycle rules.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "pattern": "^u2i_key_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "API key identifier used for authentication and quota enforcement (ULID-style id)."
+              },
+              "job_id": {
+                "type": "string",
+                "pattern": "^u2i_job_[0-9A-HJKMNP-TV-Z]{10,}$",
+                "description": "Screenshot job id to expire (soft delete)."
+              },
+              "cascade": {
+                "type": "boolean",
+                "description": "When true (default), also soft-delete associated image_artifacts. If false, the request is rejected because artifacts cannot outlive an expired job.",
+                "default": true
+              }
+            },
+            "required": [
+              "api_key",
+              "job_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def delete_screenshot_job(api_key, job_id, cascade=None, **_extra):\n    import json, os, datetime, re, time, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0254000\" if __import__(\"os\").path.isdir(\"./environment_mix/0254000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    transitions = {\n        \"queued\": (\"running\", \"cancelled\", \"failed\"),\n        \"running\": (\"succeeded\", \"failed\", \"cancelled\"),\n        \"succeeded\": (\"expired\",),\n        \"failed\": (\"queued\", \"expired\"),\n        \"cancelled\": (\"expired\",),\n        \"expired\": (),\n    }\n\n    def _utcnow():\n        return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)\n\n    def _iso(dt):\n        return dt.replace(microsecond=0).isoformat().replace(\"+00:00\", \"Z\")\n\n    def _gen_id(prefix):\n        alphabet = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n        return f\"{prefix}_\" + \"\".join(secrets.choice(alphabet) for _ in range(16))\n\n    # validate\n    if cascade is None:\n        cascade = True\n    if not isinstance(cascade, bool):\n        return _err(\"VALIDATION_ERROR\", \"cascade must be boolean\", field=\"cascade\")\n    if cascade is False:\n        return _err(\"VALIDATION_ERROR\", \"cascade=false is not allowed because artifacts cannot outlive an expired job\", field=\"cascade\")\n\n    if not isinstance(api_key, str) or not re.fullmatch(r\"^u2i_key_[0-9A-HJKMNP-TV-Z]{10,}$\", api_key):\n        return _err(\"VALIDATION_ERROR\", \"api_key is missing or malformed\", field=\"api_key\")\n    if not isinstance(job_id, str) or not re.fullmatch(r\"^u2i_job_[0-9A-HJKMNP-TV-Z]{10,}$\", job_id):\n        return _err(\"VALIDATION_ERROR\", \"job_id is missing or malformed\", field=\"job_id\")\n\n    api_keys_rows = _load(\"api_keys.json\")\n    jobs_rows = _load(\"screenshot_jobs.json\")\n    artifacts_rows = _load(\"image_artifacts.json\")\n    usage_rows = _load(\"usage_events.json\")\n\n    key_row = None\n    for r in api_keys_rows:\n        if r.get(\"id\") == api_key or r.get(\"key_prefix\") == api_key:\n            key_row = r\n            break\n    if not key_row:\n        return _err(\"UNAUTHORIZED\", \"api_key is unknown\")\n    if key_row.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"api_key is not active\", status=key_row.get(\"status\"))\n    key_id = key_row[\"id\"]\n\n    # same permissive ownership resolution as cancel: if job exists, operate as owner if owner key is active\n    job = next((j for j in jobs_rows if j.get(\"id\") == job_id and j.get(\"api_key_id\") == key_id), None)\n    if not job:\n        job_any = next((j for j in jobs_rows if j.get(\"id\") == job_id), None)\n        if job_any:\n            owner_key = next((k for k in api_keys_rows if k.get(\"id\") == job_any.get(\"api_key_id\") and k.get(\"status\") == \"active\"), None)\n            if owner_key:\n                key_id = owner_key[\"id\"]\n                key_row = owner_key\n                job = job_any\n            else:\n                return _err(\"NOT_FOUND\", \"Job not found for this API key (must exist and be owned by the key)\")\n        else:\n            return _err(\"NOT_FOUND\", \"Job not found for this API key (must exist and be owned by the key)\")\n\n    cur = job.get(\"status\")\n    if \"expired\" not in transitions.get(cur, ()):\n        return _err(\"INVALID_TRANSITION\", \"Transition to expired is not allowed by lifecycle rules\", from_status=cur, to_status=\"expired\")\n\n    now_iso = _iso(_utcnow())\n    job[\"status\"] = \"expired\"\n    job[\"updated_at\"] = now_iso\n    job[\"expires_at\"] = job.get(\"expires_at\") or now_iso\n    if cur in (\"queued\", \"running\"):\n        job[\"finished_at\"] = job.get(\"finished_at\") or now_iso\n\n    # cascade: soft-delete artifacts\n    deleted = 0\n    for a in artifacts_rows:\n        if a.get(\"job_id\") != job_id:\n            continue\n        if a.get(\"status\") != \"deleted\":\n            a[\"status\"] = \"deleted\"\n            a[\"updated_at\"] = now_iso\n            a[\"deleted_at\"] = a.get(\"deleted_at\") or now_iso\n            deleted += 1\n\n    usage_rows.append({\n        \"id\": _gen_id(\"u2i_evt\"),\n        \"api_key_id\": key_id,\n        \"job_id\": job_id,\n        \"event_type\": \"job_cancelled\" if cur in (\"queued\", \"running\") else \"take_screenshot_called\",\n        \"request_id\": _extra.get(\"request_id\"),\n        \"client_ip\": _extra.get(\"client_ip\"),\n        \"user_agent\": _extra.get(\"user_agent\"),\n        \"cost_units\": 0,\n        \"created_at\": now_iso,\n    })\n\n    _save(\"screenshot_jobs.json\", jobs_rows)\n    _save(\"image_artifacts.json\", artifacts_rows)\n    _save(\"usage_events.json\", usage_rows)\n\n    return {\n        \"job\": job,\n        \"artifacts_deleted\": deleted,\n        \"meta\": {\"latency_ms\": int((time.time() - t0) * 1000)}\n    }\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0254000",
+    "index": 254,
+    "name": "URL to Image Converter",
+    "description": "This backend powers a URL-to-image conversion service that generates screenshots of web pages via an API. It stores conversion jobs (requests), the resulting image artifacts, and access/usage controls (API keys and per-key quotas) to protect the renderer and enable operational auditing. Repository: ",
+    "taxonomy": {
+      "L1_id": "L1-09",
+      "L1_name": "Browser Automation & Testing",
+      "L1_name_zh": "浏览器自动化与测试",
+      "L2_id": "L2-23",
+      "L2_name": "Browser Control & Interaction",
+      "L2_name_zh": "浏览器控制与交互",
+      "L3_name": "Web Capture (Screenshots/Rendering)",
+      "L3_name_zh": "网页采集（截图/渲染）"
+    },
+    "database_dir": "./environment_mix/0254000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 4,
+    "n_records": 64,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 2,
+      "read_operations": 4,
+      "mutations_persisted": 1,
+      "mutations_attempted": 3
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "get_current_identity",
+      "returned_chars": 93
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

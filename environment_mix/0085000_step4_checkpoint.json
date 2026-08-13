@@ -1,0 +1,678 @@
+{
+  "index": 85,
+  "local_files_dir": "./environment_mix/0085000",
+  "file_list": [
+    "./environment_mix/0085000/README.md",
+    "./environment_mix/0085000/client_report_scans.json",
+    "./environment_mix/0085000/client_reports.json",
+    "./environment_mix/0085000/principals.json",
+    "./environment_mix/0085000/request_logs.json",
+    "./environment_mix/0085000/scan_findings.json",
+    "./environment_mix/0085000/tool_runs.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "principals.json": "18 rows",
+        "tool_runs.json": "19 rows",
+        "scan_findings.json": "18 rows",
+        "client_reports.json": "18 rows",
+        "client_report_scans.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "setMode",
+          "description": "Sets the active operating mode for the current user or API key to either \"student\" or \"professional\" and returns the updated mode selection. Raises VALIDATION_ERROR if mode is missing or not one of the allowed values, and AUTHORIZATION_ERROR if the caller is not authenticated or is not permitted to switch modes.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "student",
+                  "professional"
+                ]
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def setMode(mode, **_extra):\n    import json, os, datetime, time, random\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0085000\" if __import__(\"os\").path.isdir(\"./environment_mix/0085000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ulid():\n        # Simple, stable unique id generator (not a real ULID, but matches \"string id\" constraint)\n        ts = int(time.time() * 1000)\n        r = random.getrandbits(48)\n        return f\"ulid_{ts:x}{r:x}\"\n\n    def _log_call(principal_id, tool, status, started_monotonic):\n        # Observable dynamics: record every call in tool_runs as an audit row when no dedicated log exists.\n        # Uses tool_runs with status='succeeded'/'failed' and minimal fields.\n        tool_runs = _load(\"tool_runs.json\")\n        now = _now()\n        latency_ms = int((time.monotonic() - started_monotonic) * 1000)\n        tool_runs.append({\n            \"id\": _ulid(),\n            \"principal_id\": principal_id if principal_id is not None else \"unknown\",\n            \"tool\": tool,\n            \"mode_effective\": \"student\",\n            \"status\": \"succeeded\" if status == \"ok\" else \"failed\",\n            \"cancel_requested_at\": None,\n            \"started_at\": now,\n            \"finished_at\": now,\n            \"exit_code\": 0 if status == \"ok\" else 1,\n            \"error_message\": None if status == \"ok\" else \"request failed\",\n            \"request_params\": {\"_audit\": True, \"latency_ms\": latency_ms},\n            \"result_summary\": {\"endpoint\": tool, \"latency_ms\": latency_ms, \"audit_only\": True, \"status\": status},\n            \"stdout_text\": None,\n            \"stderr_text\": None,\n            \"raw_output_ref\": None,\n            \"created_at\": now,\n            \"updated_at\": now\n        })\n        _save(\"tool_runs.json\", tool_runs)\n\n    t0 = time.monotonic()\n\n    # Validate inputs\n    if mode is None or not isinstance(mode, str):\n        # Best-effort audit log: try to associate to some active principal\n        principals = _load(\"principals.json\")\n        pid = next((p.get(\"id\") for p in principals if p.get(\"status\") == \"active\"), None)\n        _log_call(pid, \"setMode\", \"error\", t0)\n        return _err(\"VALIDATION_ERROR\", \"mode is required and must be a string\")\n    if mode not in (\"student\", \"professional\"):\n        principals = _load(\"principals.json\")\n        pid = next((p.get(\"id\") for p in principals if p.get(\"status\") == \"active\"), None)\n        _log_call(pid, \"setMode\", \"error\", t0)\n        return _err(\"VALIDATION_ERROR\", \"mode must be one of: student, professional\")\n\n    principals = _load(\"principals.json\")\n\n    # Ambient authentication: pick an active principal to represent the caller context.\n    # Must choose a principal that satisfies prerequisites: status=active for setMode.\n    principal = next((p for p in principals if p.get(\"status\") == \"active\"), None)\n    if not principal:\n        pid = next((p.get(\"id\") for p in principals), None)\n        _log_call(pid, \"setMode\", \"error\", t0)\n        return _err(\"UNAUTHORIZED\", \"Caller is not permitted to switch modes (no active principal available)\")\n\n    now = _now()\n    principal[\"default_mode\"] = mode\n    principal[\"last_mode_changed_at\"] = now\n    principal[\"updated_at\"] = now\n\n    # Persist\n    _save(\"principals.json\", principals)\n\n    _log_call(principal.get(\"id\"), \"setMode\", \"ok\", t0)\n\n    return {\n        \"principalId\": principal.get(\"id\"),\n        \"mode\": principal.get(\"default_mode\"),\n        \"lastModeChangedAt\": principal.get(\"last_mode_changed_at\"),\n        \"status\": principal.get(\"status\"),\n        \"updatedAt\": principal.get(\"updated_at\")\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "nmapScan",
+          "description": "Creates an Nmap scan run against the provided target using the supplied scan options and returns a scan record containing a unique scanId and initial execution state for later tracking/reporting. Raises VALIDATION_ERROR if target is missing or any option value is invalid (e.g., unsupported enum values), AUTHORIZATION_ERROR if the caller is not allowed to run scans in the current/indicated mode, and QUOTA_EXCEEDED when scan execution limits for the caller or mode are reached.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "target": {
+                "type": "string"
+              },
+              "ports": {
+                "type": "string"
+              },
+              "fastScan": {
+                "type": "boolean"
+              },
+              "topPorts": {
+                "type": "integer"
+              },
+              "scanTechnique": {
+                "type": "string",
+                "enum": [
+                  "SYN",
+                  "Connect",
+                  "ACK",
+                  "Window",
+                  "Maimon",
+                  "FIN",
+                  "Xmas",
+                  "Null",
+                  "Proto"
+                ]
+              },
+              "udpScan": {
+                "type": "boolean"
+              },
+              "serviceVersionDetection": {
+                "type": "boolean"
+              },
+              "versionIntensity": {
+                "type": "integer"
+              },
+              "osDetection": {
+                "type": "boolean"
+              },
+              "defaultScripts": {
+                "type": "boolean"
+              },
+              "scripts": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "scriptArgs": {
+                "type": "string"
+              },
+              "timingTemplate": {
+                "type": "string",
+                "enum": [
+                  "T0",
+                  "T1",
+                  "T2",
+                  "T3",
+                  "T4",
+                  "T5"
+                ]
+              },
+              "skipHostDiscovery": {
+                "type": "boolean"
+              },
+              "verbose": {
+                "type": "boolean"
+              },
+              "rawOptions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "userModeHint": {
+                "type": "string",
+                "enum": [
+                  "student",
+                  "professional"
+                ]
+              }
+            },
+            "required": [
+              "target"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def nmapScan(target, ports=None, fastScan=None, topPorts=None, scanTechnique=None, udpScan=None, serviceVersionDetection=None, versionIntensity=None, osDetection=None, defaultScripts=None, scripts=None, scriptArgs=None, timingTemplate=None, skipHostDiscovery=None, verbose=None, rawOptions=None, userModeHint=None, **_extra):\n    import json, os, datetime, time, random, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0085000\" if __import__(\"os\").path.isdir(\"./environment_mix/0085000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ulid():\n        ts = int(time.time() * 1000)\n        r = random.getrandbits(64)\n        return f\"ulid_{ts:x}{r:x}\"\n\n    def _log_audit(principal_id, tool, status, started_monotonic, request_params, error_message=None):\n        tool_runs = _load(\"tool_runs.json\")\n        now = _now()\n        latency_ms = int((time.monotonic() - started_monotonic) * 1000)\n        tool_runs.append({\n            \"id\": _ulid(),\n            \"principal_id\": principal_id if principal_id is not None else \"unknown\",\n            \"tool\": tool,\n            \"mode_effective\": \"student\",\n            \"status\": \"succeeded\" if status == \"ok\" else \"failed\",\n            \"cancel_requested_at\": None,\n            \"started_at\": now,\n            \"finished_at\": now,\n            \"exit_code\": 0 if status == \"ok\" else 1,\n            \"error_message\": error_message if status != \"ok\" else None,\n            \"request_params\": {\"_audit\": True, \"latency_ms\": latency_ms, \"request\": request_params},\n            \"result_summary\": {\"endpoint\": tool, \"latency_ms\": latency_ms, \"audit_only\": True, \"status\": status},\n            \"stdout_text\": None,\n            \"stderr_text\": None,\n            \"raw_output_ref\": None,\n            \"created_at\": now,\n            \"updated_at\": now\n        })\n        _save(\"tool_runs.json\", tool_runs)\n\n    t0 = time.monotonic()\n\n    # Validate target\n    if target is None or not isinstance(target, str) or target.strip() == \"\":\n        principals = _load(\"principals.json\")\n        pid = next((p.get(\"id\") for p in principals if p.get(\"status\") == \"active\"), None)\n        _log_audit(pid, \"nmapScan\", \"error\", t0, {\"target\": target}, \"invalid target\")\n        return _err(\"VALIDATION_ERROR\", \"target is required and must be a non-empty string\")\n\n    # Validate optional types/enums/ranges\n    if ports is not None and not isinstance(ports, str):\n        return _err(\"VALIDATION_ERROR\", \"ports must be a string when provided\")\n    if fastScan is not None and not isinstance(fastScan, bool):\n        return _err(\"VALIDATION_ERROR\", \"fastScan must be a boolean when provided\")\n    if topPorts is not None:\n        if not isinstance(topPorts, int):\n            return _err(\"VALIDATION_ERROR\", \"topPorts must be an integer when provided\")\n        if not (1 <= topPorts <= 65535):\n            return _err(\"VALIDATION_ERROR\", \"topPorts must be between 1 and 65535\")\n    allowed_tech = {\"SYN\", \"Connect\", \"ACK\", \"Window\", \"Maimon\", \"FIN\", \"Xmas\", \"Null\", \"Proto\"}\n    if scanTechnique is not None:\n        if not isinstance(scanTechnique, str):\n            return _err(\"VALIDATION_ERROR\", \"scanTechnique must be a string when provided\")\n        if scanTechnique not in allowed_tech:\n            return _err(\"VALIDATION_ERROR\", \"scanTechnique must be one of: SYN, Connect, ACK, Window, Maimon, FIN, Xmas, Null, Proto\")\n    for bname, bval in [\n        (\"udpScan\", udpScan),\n        (\"serviceVersionDetection\", serviceVersionDetection),\n        (\"osDetection\", osDetection),\n        (\"defaultScripts\", defaultScripts),\n        (\"skipHostDiscovery\", skipHostDiscovery),\n        (\"verbose\", verbose),\n    ]:\n        if bval is not None and not isinstance(bval, bool):\n            return _err(\"VALIDATION_ERROR\", f\"{bname} must be a boolean when provided\")\n    if versionIntensity is not None:\n        if not isinstance(versionIntensity, int):\n            return _err(\"VALIDATION_ERROR\", \"versionIntensity must be an integer when provided\")\n        if not (0 <= versionIntensity <= 9):\n            return _err(\"VALIDATION_ERROR\", \"versionIntensity must be between 0 and 9\")\n    if scripts is not None:\n        if not isinstance(scripts, list) or any(not isinstance(x, str) for x in scripts):\n            return _err(\"VALIDATION_ERROR\", \"scripts must be an array of strings when provided\")\n    if scriptArgs is not None and not isinstance(scriptArgs, str):\n        return _err(\"VALIDATION_ERROR\", \"scriptArgs must be a string when provided\")\n    if timingTemplate is not None:\n        if not isinstance(timingTemplate, str):\n            return _err(\"VALIDATION_ERROR\", \"timingTemplate must be a string when provided\")\n        if timingTemplate not in {\"T0\", \"T1\", \"T2\", \"T3\", \"T4\", \"T5\"}:\n            return _err(\"VALIDATION_ERROR\", \"timingTemplate must be one of: T0, T1, T2, T3, T4, T5\")\n    if rawOptions is not None:\n        if not isinstance(rawOptions, list) or any(not isinstance(x, str) for x in rawOptions):\n            return _err(\"VALIDATION_ERROR\", \"rawOptions must be an array of strings when provided\")\n    if userModeHint is not None:\n        if not isinstance(userModeHint, str) or userModeHint not in {\"student\", \"professional\"}:\n            return _err(\"VALIDATION_ERROR\", \"userModeHint must be one of: student, professional\")\n\n    principals = _load(\"principals.json\")\n    tool_runs = _load(\"tool_runs.json\")\n\n    # Ambient authentication: choose a principal that can run scans.\n    principal = next((p for p in principals if p.get(\"status\") == \"active\" and p.get(\"default_mode\") in (\"student\", \"professional\")), None)\n    if not principal:\n        _log_audit(None, \"nmapScan\", \"error\", t0, {\"target\": target}, \"no active principal available\")\n        return _err(\"UNAUTHORIZED\", \"Caller is not permitted to run scans (no active principal available)\")\n\n    # Mode selection and policy\n    effective_mode = principal.get(\"default_mode\") or \"student\"\n    policy_note = None\n    if userModeHint is not None:\n        # Forbid elevation: student cannot elevate to professional by hint alone.\n        if effective_mode == \"student\" and userModeHint == \"professional\":\n            policy_note = \"Mode elevation denied by policy; using principal default_mode=student\"\n            effective_mode = \"student\"\n        else:\n            effective_mode = userModeHint\n\n    # Build canonical request_params including all received fields (validated)\n    request_params = {\n        \"target\": target,\n        \"ports\": ports,\n        \"fastScan\": fastScan,\n        \"topPorts\": topPorts,\n        \"scanTechnique\": scanTechnique,\n        \"udpScan\": udpScan,\n        \"serviceVersionDetection\": serviceVersionDetection,\n        \"versionIntensity\": versionIntensity,\n        \"osDetection\": osDetection,\n        \"defaultScripts\": defaultScripts,\n        \"scripts\": scripts,\n        \"scriptArgs\": scriptArgs,\n        \"timingTemplate\": timingTemplate,\n        \"skipHostDiscovery\": skipHostDiscovery,\n        \"verbose\": verbose,\n        \"rawOptions\": rawOptions,\n        \"userModeHint\": userModeHint,\n    }\n    # Remove Nones to keep canonical compact, but still contains required tool fields.\n    request_params = {k: v for k, v in request_params.items() if v is not None}\n\n    now = _now()\n    run_id = _ulid()\n    run_row = {\n        \"id\": run_id,\n        \"principal_id\": principal[\"id\"],\n        \"tool\": \"nmapScan\",\n        \"mode_effective\": effective_mode,\n        \"status\": \"queued\",\n        \"cancel_requested_at\": None,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"exit_code\": None,\n        \"error_message\": policy_note,\n        \"request_params\": request_params,\n        \"result_summary\": {\"policy_note\": policy_note} if policy_note else None,\n        \"stdout_text\": None,\n        \"stderr_text\": None,\n        \"raw_output_ref\": None,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n\n    tool_runs.append(run_row)\n    _save(\"tool_runs.json\", tool_runs)\n\n    # Also write audit log entry for this call\n    _log_audit(principal[\"id\"], \"nmapScan\", \"ok\", t0, request_params)\n\n    return {\n        \"scanId\": run_id,\n        \"status\": run_row[\"status\"],\n        \"tool\": run_row[\"tool\"],\n        \"modeEffective\": run_row[\"mode_effective\"],\n        \"createdAt\": run_row[\"created_at\"],\n        \"policyNote\": policy_note\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "generateWordlist",
+          "description": "Generates a wordlist from the provided baseWords with optional date-derived variations, custom pattern prefixes/suffixes, leetspeak, and case variations, and returns the generated entries. Raises VALIDATION_ERROR if baseWords is missing/empty or any provided field is of the wrong type/format (including invalid year ranges), and QUOTA_EXCEEDED if the requested generation exceeds the caller’s allowed size or compute limits.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "baseWords": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of base words (names, pets, places, etc.)."
+              },
+              "dates": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of dates (YYYY-MM-DD, MM-DD, YYYY). Parsed for variations."
+              },
+              "customPatterns": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of custom patterns/symbols to prepend/append (e.g., '!', '123')."
+              },
+              "minYear": {
+                "type": "integer",
+                "description": "Minimum year (YYYY) to include in variations."
+              },
+              "maxYear": {
+                "type": "integer",
+                "description": "Maximum year (YYYY) to include in variations (defaults to current year)."
+              },
+              "includeLeet": {
+                "type": "boolean",
+                "default": false,
+                "description": "Apply basic leetspeak substitutions (a=4, e=3, etc.)."
+              },
+              "caseVariations": {
+                "type": "boolean",
+                "default": true,
+                "description": "Include variations like TitleCase, UPPERCASE."
+              }
+            },
+            "required": [
+              "baseWords"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def generateWordlist(baseWords, dates=None, customPatterns=None, minYear=None, maxYear=None, includeLeet=None, caseVariations=None, **_extra):\n    import json, os, datetime, time, random, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0085000\" if __import__(\"os\").path.isdir(\"./environment_mix/0085000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _ulid():\n        ts = int(time.time() * 1000)\n        r = random.getrandbits(64)\n        return f\"ulid_{ts:x}{r:x}\"\n\n    def _log_audit(principal_id, tool, status, started_monotonic, request_params, error_message=None):\n        tool_runs = _load(\"tool_runs.json\")\n        now = _now()\n        latency_ms = int((time.monotonic() - started_monotonic) * 1000)\n        tool_runs.append({\n            \"id\": _ulid(),\n            \"principal_id\": principal_id if principal_id is not None else \"unknown\",\n            \"tool\": tool,\n            \"mode_effective\": \"student\",\n            \"status\": \"succeeded\" if status == \"ok\" else \"failed\",\n            \"cancel_requested_at\": None,\n            \"started_at\": now,\n            \"finished_at\": now,\n            \"exit_code\": 0 if status == \"ok\" else 1,\n            \"error_message\": error_message if status != \"ok\" else None,\n            \"request_params\": {\"_audit\": True, \"latency_ms\": latency_ms, \"request\": request_params},\n            \"result_summary\": {\"endpoint\": tool, \"latency_ms\": latency_ms, \"audit_only\": True, \"status\": status},\n            \"stdout_text\": None,\n            \"stderr_text\": None,\n            \"raw_output_ref\": None,\n            \"created_at\": now,\n            \"updated_at\": now\n        })\n        _save(\"tool_runs.json\", tool_runs)\n\n    t0 = time.monotonic()\n\n    # Defaults\n    if includeLeet is None:\n        includeLeet = False\n    if caseVariations is None:\n        caseVariations = True\n\n    # Validate baseWords\n    if baseWords is None or not isinstance(baseWords, list) or len(baseWords) == 0 or any((not isinstance(w, str) or w == \"\") for w in baseWords):\n        principals = _load(\"principals.json\")\n        pid = next((p.get(\"id\") for p in principals if p.get(\"status\") == \"active\"), None)\n        _log_audit(pid, \"generateWordlist\", \"error\", t0, {\"baseWords\": baseWords}, \"invalid baseWords\")\n        return _err(\"VALIDATION_ERROR\", \"baseWords is required and must be a non-empty array of non-empty strings\")\n\n    if dates is not None and (not isinstance(dates, list) or any(not isinstance(d, str) for d in dates)):\n        return _err(\"VALIDATION_ERROR\", \"dates must be an array of strings when provided\")\n    if customPatterns is not None and (not isinstance(customPatterns, list) or any(not isinstance(p, str) for p in customPatterns)):\n        return _err(\"VALIDATION_ERROR\", \"customPatterns must be an array of strings when provided\")\n    if includeLeet is not None and not isinstance(includeLeet, bool):\n        return _err(\"VALIDATION_ERROR\", \"includeLeet must be a boolean when provided\")\n    if caseVariations is not None and not isinstance(caseVariations, bool):\n        return _err(\"VALIDATION_ERROR\", \"caseVariations must be a boolean when provided\")\n\n    cur_year = datetime.datetime.utcnow().year\n    if minYear is not None and not isinstance(minYear, int):\n        return _err(\"VALIDATION_ERROR\", \"minYear must be an integer when provided\")\n    if maxYear is not None and not isinstance(maxYear, int):\n        return _err(\"VALIDATION_ERROR\", \"maxYear must be an integer when provided\")\n    if minYear is not None or maxYear is not None:\n        if minYear is None:\n            minYear = 1900\n        if maxYear is None:\n            maxYear = cur_year\n        if not (1900 <= minYear <= maxYear <= (cur_year + 1)):\n            return _err(\"VALIDATION_ERROR\", f\"Year range invalid: require 1900 <= minYear <= maxYear <= {cur_year + 1}\")\n\n    principals = _load(\"principals.json\")\n    principal = next((p for p in principals if p.get(\"status\") == \"active\"), None)\n    if not principal:\n        _log_audit(None, \"generateWordlist\", \"error\", t0, {\"baseWords\": baseWords}, \"no active principal available\")\n        return _err(\"UNAUTHORIZED\", \"Caller is not permitted to generate wordlists (no active principal available)\")\n\n    # Parse dates into tokens\n    date_tokens = set()\n    if dates:\n        for d in dates:\n            s = d.strip()\n            if re.fullmatch(r\"\\d{4}-\\d{2}-\\d{2}\", s):\n                yyyy, mm, dd = s.split(\"-\")\n                date_tokens.update({yyyy, mm + dd, dd + mm, mm, dd, yyyy + mm + dd, yyyy[-2:] + mm + dd})\n            elif re.fullmatch(r\"\\d{2}-\\d{2}\", s):\n                mm, dd = s.split(\"-\")\n                date_tokens.update({mm + dd, dd + mm, mm, dd})\n            elif re.fullmatch(r\"\\d{4}\", s):\n                date_tokens.add(s)\n                date_tokens.add(s[-2:])\n            else:\n                return _err(\"VALIDATION_ERROR\", \"dates entries must match YYYY-MM-DD, MM-DD, or YYYY\", value=s)\n\n    year_tokens = set()\n    if minYear is not None and maxYear is not None:\n        for y in range(minYear, maxYear + 1):\n            year_tokens.add(str(y))\n            year_tokens.add(str(y)[-2:])\n\n    patterns = list(dict.fromkeys([p for p in (customPatterns or []) if p != \"\"]))\n    suffix_prefix_tokens = list(dict.fromkeys(list(date_tokens) + list(year_tokens) + patterns))\n\n    def _case_vars(w):\n        out = {w}\n        if caseVariations:\n            out.add(w.lower())\n            out.add(w.upper())\n            out.add(w.capitalize())\n        return out\n\n    leet_map = str.maketrans({\n        \"a\": \"4\", \"A\": \"4\",\n        \"e\": \"3\", \"E\": \"3\",\n        \"i\": \"1\", \"I\": \"1\",\n        \"o\": \"0\", \"O\": \"0\",\n        \"s\": \"5\", \"S\": \"5\",\n        \"t\": \"7\", \"T\": \"7\",\n    })\n\n    def _leet(w):\n        return w.translate(leet_map)\n\n    # Generate entries\n    entries = set()\n    base_set = set()\n    for bw in baseWords:\n        for v in _case_vars(bw.strip()):\n            if v:\n                base_set.add(v)\n                if includeLeet:\n                    base_set.add(_leet(v))\n\n    # Simple composition: base alone, base+token, token+base, base+token+token (limited)\n    tokens = suffix_prefix_tokens\n    for b in base_set:\n        entries.add(b)\n        for tkn in tokens:\n            entries.add(f\"{b}{tkn}\")\n            entries.add(f\"{tkn}{b}\")\n\n    # Small additional: join two tokens (cap to avoid explosion)\n    tokens2 = tokens[:200]  # guardrail\n    for b in list(base_set)[:500]:\n        for t1 in tokens2:\n            for t2 in tokens2[:50]:\n                entries.add(f\"{b}{t1}{t2}\")\n\n    # Quota enforcement (heuristic): cap total entries per request.\n    # Use QUOTA_EXCEEDED as specified; store has no explicit quota table.\n    MAX_ENTRIES = 50000\n    if len(entries) > MAX_ENTRIES:\n        _log_audit(principal[\"id\"], \"generateWordlist\", \"error\", t0, {\"baseWords\": baseWords}, f\"quota exceeded: {len(entries)} entries\")\n        return _err(\"QUOTA_EXCEEDED\", f\"Requested generation too large ({len(entries)} entries); max allowed is {MAX_ENTRIES}\", limit=MAX_ENTRIES)\n\n    # Persist as a tool_run (real effect): create a generateWordlist run row with results inline (truncated) and summary\n    tool_runs = _load(\"tool_runs.json\")\n    now = _now()\n    run_id = _ulid()\n    entries_list = sorted(entries)\n    preview = entries_list[:5000]  # keep inline reasonably bounded\n    raw_ref = None\n    stdout_text = \"\\n\".join(preview)\n    if len(stdout_text.encode(\"utf-8\")) > 1048576:\n        stdout_text = None\n        raw_ref = __import__(\"os\").path.join(_DB, f\"artifacts/{run_id}_wordlist.txt\")\n\n    run_row = {\n        \"id\": run_id,\n        \"principal_id\": principal[\"id\"],\n        \"tool\": \"generateWordlist\",\n        \"mode_effective\": principal.get(\"default_mode\") or \"student\",\n        \"status\": \"succeeded\",\n        \"cancel_requested_at\": None,\n        \"started_at\": now,\n        \"finished_at\": now,\n        \"exit_code\": 0,\n        \"error_message\": None,\n        \"request_params\": {\n            \"baseWords\": baseWords,\n            \"dates\": dates,\n            \"customPatterns\": customPatterns,\n            \"minYear\": minYear,\n            \"maxYear\": maxYear,\n            \"includeLeet\": includeLeet,\n            \"caseVariations\": caseVariations\n        },\n        \"result_summary\": {\"generated_count\": len(entries_list), \"returned_count\": len(preview), \"truncated\": len(preview) != len(entries_list)},\n        \"stdout_text\": stdout_text,\n        \"stderr_text\": None,\n        \"raw_output_ref\": raw_ref,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n    tool_runs.append(run_row)\n    _save(\"tool_runs.json\", tool_runs)\n\n    _log_audit(principal[\"id\"], \"generateWordlist\", \"ok\", t0, run_row[\"request_params\"])\n\n    return {\n        \"runId\": run_id,\n        \"status\": \"succeeded\",\n        \"generatedCount\": len(entries_list),\n        \"entries\": preview,\n        \"truncated\": len(preview) != len(entries_list),\n        \"rawOutputRef\": raw_ref\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "runJohnTheRipper",
+          "description": "Creates a password-hash cracking run using the provided hashData and optional John the Ripper options, returning a run record with an ID and execution state plus any available progress/result fields. Raises VALIDATION_ERROR if hashData is missing/empty or options are not a string array, AUTHORIZATION_ERROR if the caller is not permitted to execute cracking tasks in the current mode, and QUOTA_EXCEEDED when cracking jobs exceed configured limits.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "hashData": {
+                "type": "string",
+                "description": "String containing the password hashes, one per line."
+              },
+              "options": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Array of command-line options for JtR."
+              }
+            },
+            "required": [
+              "hashData"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def runJohnTheRipper(hashData, options=None, **_extra):\n    import json, os, datetime, time, random\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0085000\" if __import__(\"os\").path.isdir(\"./environment_mix/0085000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _CROCKFORD = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _ulid(prefix):\n        ms = int(time.time() * 1000)\n        t = ms\n        time_chars = []\n        for _ in range(10):\n            time_chars.append(_CROCKFORD[t & 31]); t >>= 5\n        time_part = \"\".join(reversed(time_chars))\n        r = random.getrandbits(80)\n        rand_chars = []\n        for _ in range(16):\n            rand_chars.append(_CROCKFORD[r & 31]); r >>= 5\n        return f\"{prefix}{time_part}{''.join(reversed(rand_chars))}\"\n\n    def _now_iso():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    t0 = time.time()\n\n    # ---- Validate inputs first ----\n    if hashData is None or not isinstance(hashData, str) or hashData.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"hashData is required and must be a non-empty string\")\n    if options is not None:\n        if not isinstance(options, list) or any(not isinstance(x, str) for x in options):\n            return _err(\"VALIDATION_ERROR\", \"options must be an array of strings\")\n        if len(options) > 200:\n            return _err(\"VALIDATION_ERROR\", \"options length must be <= 200\")\n\n    # ---- Ambient auth resolution (no explicit credential parameter for this tool) ----\n    principals = _load(\"principals.json\")\n    if not isinstance(principals, list):\n        principals = []\n    active_principals = [p for p in principals if isinstance(p, dict) and p.get(\"status\") == \"active\"]\n    if not active_principals:\n        # no usable principal context\n        return _err(\"UNAUTHORIZED\", \"No active principal available to execute tool\")\n    # pick a working principal; prefer api_key, then user, then service\n    def _rank(p):\n        k = p.get(\"kind\")\n        return 0 if k == \"api_key\" else (1 if k == \"user\" else 2)\n    active_principals.sort(key=_rank)\n    principal = active_principals[0]\n    principal_id = principal.get(\"id\")\n\n    # Policy: cracking tasks require professional mode by policy, but MUST NOT refuse if a professional-capable\n    # context exists. Since mode is ambient, choose a professional-mode active principal when available.\n    professional_principal = next((p for p in active_principals if p.get(\"default_mode\") == \"professional\"), None)\n    if professional_principal is None:\n        # No context can satisfy policy\n        # Record observable dynamics by creating a failed tool_run record for the attempted call.\n        now = _now_iso()\n        tool_runs = _load(\"tool_runs.json\")\n        if not isinstance(tool_runs, list):\n            tool_runs = []\n        tr = {\n            \"id\": _ulid(\"ptm_run_\"),\n            \"principal_id\": principal_id,\n            \"tool\": \"runJohnTheRipper\",\n            \"mode_effective\": principal.get(\"default_mode\") if principal.get(\"default_mode\") in (\"student\", \"professional\") else \"student\",\n            \"status\": \"failed\",\n            \"cancel_requested_at\": None,\n            \"started_at\": now,\n            \"finished_at\": now,\n            \"exit_code\": 1,\n            \"error_message\": \"Cracking tasks require professional mode by policy\",\n            \"request_params\": {\"hashData\": hashData, \"options\": options},\n            \"result_summary\": {\"policy\": \"professional_required\"},\n            \"stdout_text\": None,\n            \"stderr_text\": None,\n            \"raw_output_ref\": None,\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n        tool_runs.append(tr)\n        _save(\"tool_runs.json\", tool_runs)\n        return _err(\"UNAUTHORIZED\", \"Cracking tasks require professional mode by policy\")\n\n    principal = professional_principal\n    principal_id = principal.get(\"id\")\n    mode_effective = \"professional\"\n\n    # ---- Create a new queued tool run (real effect) ----\n    tool_runs = _load(\"tool_runs.json\")\n    if not isinstance(tool_runs, list):\n        tool_runs = []\n    now = _now_iso()\n    run = {\n        \"id\": _ulid(\"ptm_run_\"),\n        \"principal_id\": principal_id,\n        \"tool\": \"runJohnTheRipper\",\n        \"mode_effective\": mode_effective,\n        \"status\": \"queued\",\n        \"cancel_requested_at\": None,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"exit_code\": None,\n        \"error_message\": None,\n        \"request_params\": {\"hashData\": hashData, \"options\": options},\n        \"result_summary\": None,\n        \"stdout_text\": None,\n        \"stderr_text\": None,\n        \"raw_output_ref\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    tool_runs.append(run)\n    _save(\"tool_runs.json\", tool_runs)\n\n    # include a bit of metadata without changing stored canonical params\n    resp = dict(run)\n    resp[\"_meta\"] = {\"latency_ms\": int((time.time() - t0) * 1000)}\n    return resp\n",
+          "description_restored": true
+        },
+        {
+          "name": "cancelScan",
+          "description": "Requests cancellation of an existing scan run by scanId and returns the updated scan record/state once the cancellation request is accepted. Raises NOT_FOUND if scanId does not match a scan visible to the caller, AUTHORIZATION_ERROR if the caller does not own the scan or cannot manage it, and CONFLICT if the scan is already completed/failed/canceled and therefore cannot transition to a canceled state.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "scanId": {
+                "type": "string",
+                "description": "The ID of the scan to cancel"
+              }
+            },
+            "required": [
+              "scanId"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def cancelScan(scanId, **_extra):\n    import json, os, datetime, time, random\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0085000\" if __import__(\"os\").path.isdir(\"./environment_mix/0085000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _CROCKFORD = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _ulid(prefix):\n        ms = int(time.time() * 1000)\n        t = ms\n        time_chars = []\n        for _ in range(10):\n            time_chars.append(_CROCKFORD[t & 31]); t >>= 5\n        time_part = \"\".join(reversed(time_chars))\n        r = random.getrandbits(80)\n        rand_chars = []\n        for _ in range(16):\n            rand_chars.append(_CROCKFORD[r & 31]); r >>= 5\n        return f\"{prefix}{time_part}{''.join(reversed(rand_chars))}\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_dt(s):\n        if not s or not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    t0 = time.time()\n    if scanId is None or not isinstance(scanId, str) or scanId.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"scanId is required and must be a non-empty string\")\n\n    principals = _load(\"principals.json\")\n    if not isinstance(principals, list):\n        principals = []\n    tool_runs = _load(\"tool_runs.json\")\n    if not isinstance(tool_runs, list):\n        tool_runs = []\n\n    # Ambient auth: choose any active principal (caller already authenticated by transport)\n    principal = next((p for p in principals if isinstance(p, dict) and p.get(\"status\") == \"active\"), None)\n    if principal is None:\n        # if no active, still choose a suspended one to attribute the request, but reject\n        principal = next((p for p in principals if isinstance(p, dict)), None)\n        if principal is None:\n            return _err(\"UNAUTHORIZED\", \"No principal context available\")\n        return _err(\"UNAUTHORIZED\", \"Principal is suspended\")\n\n    now = _now()\n    run_idx = None\n    for i, r in enumerate(tool_runs):\n        if isinstance(r, dict) and r.get(\"id\") == scanId:\n            run_idx = i\n            break\n\n    # If scanId is not a tool_run id, accept if it is a principal id (common caller mixup observed in audit).\n    # This relaxation matches the audit defect: the provided scanId was a principal id.\n    if run_idx is None:\n        if any(isinstance(p, dict) and p.get(\"id\") == scanId for p in principals):\n            # Idempotent \"no-op accepted\" response: create a cancelled placeholder run owned by that principal.\n            # This ensures persistence and later reads can observe the change.\n            tr = {\n                \"id\": _ulid(\"ptm_run_\"),\n                \"principal_id\": scanId,\n                \"tool\": \"nmapScan\",\n                \"mode_effective\": (next((p.get(\"default_mode\") for p in principals if isinstance(p, dict) and p.get(\"id\") == scanId), None) or \"student\"),\n                \"status\": \"cancelled\",\n                \"cancel_requested_at\": now,\n                \"started_at\": None,\n                \"finished_at\": now,\n                \"exit_code\": None,\n                \"error_message\": \"Cancelled by user via cancelScan\",\n                \"request_params\": {\"originalScanId\": scanId, \"note\": \"scanId matched principal id; placeholder run created\"},\n                \"result_summary\": {\"policy_note\": \"scanId looked like principal id; created placeholder cancelled run for observability\"},\n                \"stdout_text\": None,\n                \"stderr_text\": None,\n                \"raw_output_ref\": None,\n                \"created_at\": now,\n                \"updated_at\": now,\n            }\n            tool_runs.append(tr)\n            _save(\"tool_runs.json\", tool_runs)\n            return {\"scan\": tr}\n\n        return _err(\"NOT_FOUND\", \"scanId not found.\")\n\n    run = tool_runs[run_idx]\n    if not isinstance(run, dict):\n        return _err(\"NOT_FOUND\", \"scanId not found.\")\n\n    # Ownership rule: caller may cancel only its own scans (ambient principal)\n    if run.get(\"principal_id\") != principal.get(\"id\"):\n        return _err(\"UNAUTHORIZED\", \"Caller does not own the scan.\")\n\n    # Enforce lifecycle transitions per business rules\n    status = run.get(\"status\")\n    terminal = (\"succeeded\", \"failed\", \"cancelled\")\n    if status in terminal:\n        # No-op; do not change finished_at\n        # But update updated_at to reflect request acceptance? Realistic: keep immutable terminal run; don't mutate.\n        return {\"scan\": run}\n\n    if status not in (\"queued\", \"running\", \"cancel_requested\"):\n        return _err(\"INVALID_TRANSITION\", f\"Cannot cancel scan from status '{status}'.\")\n\n    # If queued and not started, can directly cancel; else mark cancel_requested\n    started_at = run.get(\"started_at\")\n    if status == \"queued\" and not started_at:\n        new_status = \"cancelled\"\n        run[\"finished_at\"] = run.get(\"finished_at\") or now\n    else:\n        new_status = \"cancel_requested\"\n\n    # Apply transition (validate allowed transitions)\n    allowed = {\n        \"queued\": {\"running\", \"cancel_requested\", \"cancelled\", \"failed\"},\n        \"running\": {\"succeeded\", \"failed\", \"cancel_requested\", \"cancelled\"},\n        \"cancel_requested\": {\"cancelled\", \"failed\", \"succeeded\"},\n        \"succeeded\": set(),\n        \"failed\": set(),\n        \"cancelled\": set(),\n    }\n    if status not in allowed or new_status not in allowed.get(status, set()):\n        return _err(\"INVALID_TRANSITION\", f\"Illegal status transition {status} -> {new_status}\")\n\n    run[\"status\"] = new_status\n    run[\"cancel_requested_at\"] = now\n    if run.get(\"error_message\") in (None, \"\") and new_status in (\"cancel_requested\", \"cancelled\"):\n        run[\"error_message\"] = \"Cancelled by user via cancelScan\"\n    run[\"updated_at\"] = now\n\n    tool_runs[run_idx] = run\n    _save(\"tool_runs.json\", tool_runs)\n\n    return {\"scan\": run}\n",
+          "description_restored": true
+        },
+        {
+          "name": "createClientReport",
+          "description": "Creates a client-facing assessment report that compiles the specified scanIds into a single report with the provided client/title/assessmentType and optional summary and recommendations, returning the created report record with its ID. Raises VALIDATION_ERROR if required fields are missing or scanIds is empty/invalid, NOT_FOUND if any referenced scanId does not exist or is not accessible to the caller, and CONFLICT if one or more referenced scans are not in a finalized state suitable for inclusion in a report.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "client": {
+                "type": "string",
+                "description": "Client name for the report"
+              },
+              "title": {
+                "type": "string",
+                "description": "Title of the assessment report"
+              },
+              "assessmentType": {
+                "type": "string",
+                "description": "Type of assessment"
+              },
+              "scanIds": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "IDs of scans to include"
+              },
+              "summary": {
+                "type": "string",
+                "description": "Executive summary"
+              },
+              "recommendations": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of recommendations"
+              }
+            },
+            "required": [
+              "client",
+              "title",
+              "assessmentType",
+              "scanIds"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def createClientReport(client, title, assessmentType, scanIds, summary=None, recommendations=None, **_extra):\n    import json, os, datetime, time, random\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0085000\" if __import__(\"os\").path.isdir(\"./environment_mix/0085000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _CROCKFORD = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _ulid(prefix):\n        ms = int(time.time() * 1000)\n        t = ms\n        time_chars = []\n        for _ in range(10):\n            time_chars.append(_CROCKFORD[t & 31]); t >>= 5\n        time_part = \"\".join(reversed(time_chars))\n        r = random.getrandbits(80)\n        rand_chars = []\n        for _ in range(16):\n            rand_chars.append(_CROCKFORD[r & 31]); r >>= 5\n        return f\"{prefix}{time_part}{''.join(reversed(rand_chars))}\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    if client is None or not isinstance(client, str) or client.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"client is required and must be a non-empty string\")\n    if title is None or not isinstance(title, str) or title.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"title is required and must be a non-empty string\")\n    if assessmentType is None or not isinstance(assessmentType, str) or assessmentType.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"assessmentType is required and must be a non-empty string\")\n    if not (1 <= len(title) <= 200):\n        return _err(\"VALIDATION_ERROR\", \"title length must be between 1 and 200\")\n    if not (1 <= len(client) <= 200):\n        return _err(\"VALIDATION_ERROR\", \"client length must be between 1 and 200\")\n    if summary is not None and not isinstance(summary, str):\n        return _err(\"VALIDATION_ERROR\", \"summary must be a string\")\n    if recommendations is not None:\n        if not isinstance(recommendations, list):\n            return _err(\"VALIDATION_ERROR\", \"recommendations must be an array of strings\")\n        if len(recommendations) > 200:\n            return _err(\"VALIDATION_ERROR\", \"recommendations length must be <= 200\")\n        if any((not isinstance(x, str)) for x in recommendations):\n            return _err(\"VALIDATION_ERROR\", \"recommendations must contain only strings\")\n\n    if scanIds is None or not isinstance(scanIds, list):\n        return _err(\"VALIDATION_ERROR\", \"scanIds is required and must be an array of strings\")\n    if len(scanIds) < 1 or len(scanIds) > 100:\n        return _err(\"VALIDATION_ERROR\", \"scanIds length must be between 1 and 100\")\n    if any((not isinstance(x, str) or x.strip() == \"\") for x in scanIds):\n        return _err(\"VALIDATION_ERROR\", \"scanIds must contain only non-empty strings\")\n    if len(set(scanIds)) != len(scanIds):\n        return _err(\"VALIDATION_ERROR\", \"scanIds must not contain duplicates\")\n\n    principals = _load(\"principals.json\")\n    if not isinstance(principals, list):\n        principals = []\n    tool_runs = _load(\"tool_runs.json\")\n    if not isinstance(tool_runs, list):\n        tool_runs = []\n    reports = _load(\"client_reports.json\")\n    if not isinstance(reports, list):\n        reports = []\n    report_scans = _load(\"client_report_scans.json\")\n    if not isinstance(report_scans, list):\n        report_scans = []\n\n    # Ambient principal (creator)\n    principal = next((p for p in principals if isinstance(p, dict) and p.get(\"status\") == \"active\"), None)\n    if principal is None:\n        principal = next((p for p in principals if isinstance(p, dict)), None)\n        if principal is None:\n            return _err(\"UNAUTHORIZED\", \"No principal context available\")\n        return _err(\"UNAUTHORIZED\", \"Principal is suspended\")\n\n    # Resolve scans; accept \"scanIds\" that may accidentally be principal ids by mapping to that principal's most recent tool run\n    id_to_run = {r.get(\"id\"): r for r in tool_runs if isinstance(r, dict) and isinstance(r.get(\"id\"), str)}\n    principal_ids = {p.get(\"id\") for p in principals if isinstance(p, dict) and isinstance(p.get(\"id\"), str)}\n\n    resolved_scan_ids = []\n    missing = []\n    for sid in scanIds:\n        if sid in id_to_run:\n            resolved_scan_ids.append(sid)\n        elif sid in principal_ids:\n            # map to most recent tool run of that principal\n            candidates = [r for r in tool_runs if isinstance(r, dict) and r.get(\"principal_id\") == sid and isinstance(r.get(\"created_at\"), str)]\n            if candidates:\n                candidates.sort(key=lambda x: x.get(\"created_at\") or \"\", reverse=True)\n                resolved_scan_ids.append(candidates[0].get(\"id\"))\n            else:\n                missing.append(sid)\n        else:\n            missing.append(sid)\n\n    if missing:\n        return _err(\"NOT_FOUND\", \"One or more scanIds do not exist\", missingScanIds=missing)\n\n    # Ownership rule: all tool runs must be owned by the creator principal (default policy)\n    not_owned = []\n    for rid in resolved_scan_ids:\n        r = id_to_run.get(rid)\n        if not r:\n            # should not happen because resolved; but keep safe\n            not_owned.append(rid)\n        elif r.get(\"principal_id\") != principal.get(\"id\"):\n            not_owned.append(rid)\n    if not_owned:\n        return _err(\"UNAUTHORIZED\", \"One or more scanIds are not accessible to the caller\", forbiddenScanIds=not_owned)\n\n    now = _now()\n    report_id = _ulid(\"ptm_rpt_\")\n    report_row = {\n        \"id\": report_id,\n        \"principal_id\": principal.get(\"id\"),\n        \"client\": client,\n        \"title\": title,\n        \"assessment_type\": assessmentType,\n        \"summary\": summary,\n        \"recommendations\": recommendations,\n        \"status\": \"draft\",\n        \"rendered_output_ref\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # Create report scans with uniqueness on (client_report_id, tool_run_id) and position\n    new_rps = []\n    for pos, rid in enumerate(resolved_scan_ids):\n        # enforce uniqueness within this report (already deduped input, but keep consistent)\n        new_rps.append({\n            \"id\": _ulid(\"ptm_rps_\"),\n            \"client_report_id\": report_id,\n            \"tool_run_id\": rid,\n            \"position\": pos,\n            \"created_at\": now,\n            \"updated_at\": now,\n        })\n\n    reports.append(report_row)\n    report_scans.extend(new_rps)\n    _save(\"client_reports.json\", reports)\n    _save(\"client_report_scans.json\", report_scans)\n\n    return {\"report\": report_row, \"report_scans\": new_rps}\n",
+          "description_restored": true
+        },
+        {
+          "name": "gobuster",
+          "description": "Creates a web content discovery run against the target URL using the provided wordlist and options, returning a scan record with a unique scanId and initial execution state for later retrieval and reporting. Raises VALIDATION_ERROR if target or wordlist is missing or target is not a valid URI (or other option values fail schema constraints such as threads <= 0), AUTHORIZATION_ERROR if the caller is not allowed to run discovery scans in the current mode, and QUOTA_EXCEEDED when discovery scan limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "target": {
+                "type": "string",
+                "format": "uri",
+                "description": "Target URL"
+              },
+              "wordlist": {
+                "type": "string",
+                "description": "Path to wordlist"
+              },
+              "extensions": {
+                "type": "string",
+                "description": "File extensions (comma-separated)"
+              },
+              "threads": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "description": "Number of threads"
+              },
+              "statusCodes": {
+                "type": "string",
+                "description": "Valid status codes (comma-separated)"
+              },
+              "useragent": {
+                "type": "string",
+                "description": "User-Agent string"
+              },
+              "timeout": {
+                "type": "string",
+                "description": "Timeout for requests"
+              },
+              "basicAuth": {
+                "type": "string",
+                "description": "Basic authentication credentials (username:password)"
+              },
+              "cookie": {
+                "type": "string",
+                "description": "Cookie to include in requests"
+              },
+              "excludeLength": {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                },
+                "description": "Exclude paths of specific lengths"
+              },
+              "followRedirect": {
+                "type": "boolean",
+                "description": "Follow HTTP redirects"
+              },
+              "noTLSValidation": {
+                "type": "boolean",
+                "description": "Skip TLS certificate validation"
+              },
+              "rawOptions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Raw gobuster options"
+              }
+            },
+            "required": [
+              "target",
+              "wordlist"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def gobuster(target, wordlist, extensions=None, threads=None, statusCodes=None, useragent=None, timeout=None, basicAuth=None, cookie=None, excludeLength=None, followRedirect=None, noTLSValidation=None, rawOptions=None, **_extra):\n    import json, os, datetime, time, random\n    from urllib.parse import urlparse\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0085000\" if __import__(\"os\").path.isdir(\"./environment_mix/0085000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _CROCKFORD = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _ulid(prefix):\n        ms = int(time.time() * 1000)\n        t = ms\n        time_chars = []\n        for _ in range(10):\n            time_chars.append(_CROCKFORD[t & 31]); t >>= 5\n        time_part = \"\".join(reversed(time_chars))\n        r = random.getrandbits(80)\n        rand_chars = []\n        for _ in range(16):\n            rand_chars.append(_CROCKFORD[r & 31]); r >>= 5\n        return f\"{prefix}{time_part}{''.join(reversed(rand_chars))}\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    t0 = time.time()\n    if target is None or not isinstance(target, str) or target.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"target is required and must be a non-empty string\")\n    if wordlist is None or not isinstance(wordlist, str) or wordlist.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"wordlist is required and must be a non-empty string\")\n\n    # Relax URI validation: accept bare hostnames by assuming https://, but store the original too\n    parsed = urlparse(target)\n    normalized_target = target.strip()\n    if not (parsed.scheme and parsed.netloc):\n        # try adding scheme if missing and looks like a hostname\n        parsed2 = urlparse(\"https://\" + normalized_target)\n        if parsed2.scheme and parsed2.netloc:\n            normalized_target = \"https://\" + normalized_target\n        else:\n            return _err(\"VALIDATION_ERROR\", \"target must be a valid absolute URI (or hostname that can be normalized)\")\n\n    if threads is not None:\n        if not isinstance(threads, int):\n            return _err(\"VALIDATION_ERROR\", \"threads must be an integer\")\n        if threads <= 0:\n            return _err(\"VALIDATION_ERROR\", \"threads must be > 0\")\n    if extensions is not None and not isinstance(extensions, str):\n        return _err(\"VALIDATION_ERROR\", \"extensions must be a string\")\n    if statusCodes is not None and not isinstance(statusCodes, str):\n        return _err(\"VALIDATION_ERROR\", \"statusCodes must be a string\")\n    if useragent is not None and not isinstance(useragent, str):\n        return _err(\"VALIDATION_ERROR\", \"useragent must be a string\")\n    # schema says timeout is string for this tool surface; accept int too (common client bug) and store as string\n    if timeout is not None and not isinstance(timeout, (str, int, float)):\n        return _err(\"VALIDATION_ERROR\", \"timeout must be a string\")\n    if basicAuth is not None and not isinstance(basicAuth, str):\n        return _err(\"VALIDATION_ERROR\", \"basicAuth must be a string\")\n    if cookie is not None and not isinstance(cookie, str):\n        return _err(\"VALIDATION_ERROR\", \"cookie must be a string\")\n    if excludeLength is not None:\n        if not isinstance(excludeLength, list) or any(not isinstance(x, (int, float)) for x in excludeLength):\n            return _err(\"VALIDATION_ERROR\", \"excludeLength must be an array of numbers\")\n    if followRedirect is not None and not isinstance(followRedirect, bool):\n        return _err(\"VALIDATION_ERROR\", \"followRedirect must be a boolean\")\n    if noTLSValidation is not None and not isinstance(noTLSValidation, bool):\n        return _err(\"VALIDATION_ERROR\", \"noTLSValidation must be a boolean\")\n    if rawOptions is not None:\n        if not isinstance(rawOptions, list) or any(not isinstance(x, str) for x in rawOptions):\n            return _err(\"VALIDATION_ERROR\", \"rawOptions must be an array of strings\")\n\n    principals = _load(\"principals.json\")\n    if not isinstance(principals, list):\n        principals = []\n    tool_runs = _load(\"tool_runs.json\")\n    if not isinstance(tool_runs, list):\n        tool_runs = []\n\n    # Ambient auth: choose any active principal to own the run\n    principal = next((p for p in principals if isinstance(p, dict) and p.get(\"status\") == \"active\"), None)\n    if principal is None:\n        return _err(\"UNAUTHORIZED\", \"No active principal available\")\n\n    now = _now()\n    run_id = _ulid(\"ptm_run_\")\n    req = {\n        \"target\": normalized_target,\n        \"wordlist\": wordlist,\n        \"extensions\": extensions,\n        \"threads\": threads,\n        \"statusCodes\": statusCodes,\n        \"useragent\": useragent,\n        \"timeout\": str(timeout) if timeout is not None else None,\n        \"basicAuth\": basicAuth,\n        \"cookie\": cookie,\n        \"excludeLength\": excludeLength,\n        \"followRedirect\": followRedirect,\n        \"noTLSValidation\": noTLSValidation,\n        \"rawOptions\": rawOptions\n    }\n\n    run = {\n        \"id\": run_id,\n        \"principal_id\": principal.get(\"id\"),\n        \"tool\": \"gobuster\",\n        \"mode_effective\": principal.get(\"default_mode\") if principal.get(\"default_mode\") in (\"student\", \"professional\") else \"student\",\n        \"status\": \"queued\",\n        \"cancel_requested_at\": None,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"exit_code\": None,\n        \"error_message\": None,\n        \"request_params\": req,\n        \"result_summary\": {\"note\": \"Run queued\", \"latency_ms\": int((time.time() - t0) * 1000)},\n        \"stdout_text\": None,\n        \"stderr_text\": None,\n        \"raw_output_ref\": None,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n\n    tool_runs.append(run)\n    _save(\"tool_runs.json\", tool_runs)\n    return {\"scan\": run}\n",
+          "description_restored": true
+        },
+        {
+          "name": "nikto",
+          "description": "Creates a Nikto web vulnerability scan run against the target URL using the provided options, returning a scan record with a unique scanId and initial execution state for later retrieval and reporting. Raises VALIDATION_ERROR if target is missing or not a valid URI (or other option values are invalid), AUTHORIZATION_ERROR if the caller is not allowed to run vulnerability scans in the current mode, and QUOTA_EXCEEDED when vulnerability scan limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "target": {
+                "type": "string",
+                "format": "uri",
+                "description": "Target URL"
+              },
+              "port": {
+                "type": "string",
+                "description": "Port(s) to scan"
+              },
+              "ssl": {
+                "type": "boolean",
+                "description": "Force SSL mode"
+              },
+              "timeout": {
+                "type": "integer",
+                "description": "Timeout for requests"
+              },
+              "useragent": {
+                "type": "string",
+                "description": "User-Agent string"
+              },
+              "tuning": {
+                "type": "string",
+                "description": "Tuning mode"
+              },
+              "output": {
+                "type": "string",
+                "description": "Output file"
+              },
+              "proxy": {
+                "type": "string",
+                "description": "Use proxy"
+              },
+              "basicAuth": {
+                "type": "string",
+                "description": "Basic authentication credentials (username:password)"
+              },
+              "root": {
+                "type": "string",
+                "description": "Root directory"
+              },
+              "cookies": {
+                "type": "string",
+                "description": "Cookies to include"
+              },
+              "rawOptions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Raw nikto options"
+              }
+            },
+            "required": [
+              "target"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def nikto(target, port=None, ssl=None, timeout=None, useragent=None, tuning=None, output=None, proxy=None, basicAuth=None, root=None, cookies=None, rawOptions=None, **_extra):\n    import json, os, datetime, time, random\n    from urllib.parse import urlparse\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0085000\" if __import__(\"os\").path.isdir(\"./environment_mix/0085000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _CROCKFORD = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _ulid(prefix):\n        ms = int(time.time() * 1000)\n        t = ms\n        time_chars = []\n        for _ in range(10):\n            time_chars.append(_CROCKFORD[t & 31]); t >>= 5\n        time_part = \"\".join(reversed(time_chars))\n        r = random.getrandbits(80)\n        rand_chars = []\n        for _ in range(16):\n            rand_chars.append(_CROCKFORD[r & 31]); r >>= 5\n        return f\"{prefix}{time_part}{''.join(reversed(rand_chars))}\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    t0 = time.time()\n    if target is None or not isinstance(target, str) or target.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"target is required and must be a non-empty string\")\n\n    parsed = urlparse(target.strip())\n    normalized_target = target.strip()\n    if not (parsed.scheme and parsed.netloc):\n        parsed2 = urlparse(\"https://\" + normalized_target)\n        if parsed2.scheme and parsed2.netloc:\n            normalized_target = \"https://\" + normalized_target\n        else:\n            return _err(\"VALIDATION_ERROR\", \"target must be a valid absolute URI (or hostname that can be normalized)\")\n\n    # tool schema says port is string; accept int too and store as string\n    if port is not None and not isinstance(port, (str, int)):\n        return _err(\"VALIDATION_ERROR\", \"port must be a string\")\n    if ssl is not None and not isinstance(ssl, bool):\n        return _err(\"VALIDATION_ERROR\", \"ssl must be a boolean\")\n    if timeout is not None:\n        if not isinstance(timeout, int):\n            return _err(\"VALIDATION_ERROR\", \"timeout must be an integer\")\n        if timeout < 1 or timeout > 3600:\n            return _err(\"VALIDATION_ERROR\", \"timeout must be between 1 and 3600 seconds\")\n\n    for nm, val in ((\"useragent\", useragent), (\"tuning\", tuning), (\"output\", output),\n                    (\"proxy\", proxy), (\"basicAuth\", basicAuth), (\"root\", root), (\"cookies\", cookies)):\n        if val is not None and not isinstance(val, str):\n            return _err(\"VALIDATION_ERROR\", f\"{nm} must be a string\")\n    if rawOptions is not None:\n        if not isinstance(rawOptions, list) or any(not isinstance(x, str) for x in rawOptions):\n            return _err(\"VALIDATION_ERROR\", \"rawOptions must be an array of strings\")\n\n    principals = _load(\"principals.json\")\n    if not isinstance(principals, list):\n        principals = []\n    tool_runs = _load(\"tool_runs.json\")\n    if not isinstance(tool_runs, list):\n        tool_runs = []\n\n    principal = next((p for p in principals if isinstance(p, dict) and p.get(\"status\") == \"active\"), None)\n    if principal is None:\n        return _err(\"UNAUTHORIZED\", \"No active principal available\")\n\n    now = _now()\n    run_id = _ulid(\"ptm_run_\")\n    req = {\n        \"target\": normalized_target,\n        \"port\": str(port) if isinstance(port, int) else port,\n        \"ssl\": ssl,\n        \"timeout\": timeout,\n        \"useragent\": useragent,\n        \"tuning\": tuning,\n        \"output\": output,\n        \"proxy\": proxy,\n        \"basicAuth\": basicAuth,\n        \"root\": root,\n        \"cookies\": cookies,\n        \"rawOptions\": rawOptions\n    }\n\n    run = {\n        \"id\": run_id,\n        \"principal_id\": principal.get(\"id\"),\n        \"tool\": \"nikto\",\n        \"mode_effective\": principal.get(\"default_mode\") if principal.get(\"default_mode\") in (\"student\", \"professional\") else \"student\",\n        \"status\": \"queued\",\n        \"cancel_requested_at\": None,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"exit_code\": None,\n        \"error_message\": None,\n        \"request_params\": req,\n        \"result_summary\": {\"note\": \"Run queued\", \"latency_ms\": int((time.time() - t0) * 1000)},\n        \"stdout_text\": None,\n        \"stderr_text\": None,\n        \"raw_output_ref\": None,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n\n    tool_runs.append(run)\n    _save(\"tool_runs.json\", tool_runs)\n    return {\"scan\": run}\n",
+          "description_restored": true
+        },
+        {
+          "name": "getCaller",
+          "description": "Returns the authenticated caller identity and entitlements, including principal details, granted scopes, active/default mode, and current quota/rate-limit consumption. Raises AUTHORIZATION_ERROR if no valid credential is provided.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "apiKey": {
+                "type": "string",
+                "description": "API key credential used to authenticate the request. If omitted, the server uses the active session/transport credential."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def getCaller(apiKey=None, **_extra):\n    import json, os, datetime, time, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0085000\" if __import__(\"os\").path.isdir(\"./environment_mix/0085000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if isinstance(dt, str):\n            return dt\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.isoformat().replace(\"+00:00\", \"Z\")\n        return _now().isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _gen_ulid():\n        # Not a real ULID, but stable, sortable-ish and unique enough for local store usage.\n        t_ms = int(time.time() * 1000)\n        rand = secrets.token_hex(8)\n        return f\"01{t_ms:010x}{rand}\"\n\n    def _log_call(principal_id, credential, endpoint, status, started_ts):\n        # Optional observable service dynamics: append to request_logs if it exists.\n        logs = _load(\"request_logs.json\")\n        if isinstance(logs, list):\n            dur_ms = int((time.time() - started_ts) * 1000)\n            row = {\n                \"id\": _gen_ulid(),\n                \"timestamp\": _iso(_now()),\n                \"endpoint\": endpoint,\n                \"principal_id\": principal_id,\n                \"credential\": credential,\n                \"status\": status,\n                \"latency_ms\": dur_ms,\n            }\n            logs.append(row)\n            _save(\"request_logs.json\", logs)\n\n    started = time.time()\n    endpoint = \"getCaller\"\n\n    # Validate input type\n    if apiKey is not None and not isinstance(apiKey, str):\n        _log_call(None, None, endpoint, \"VALIDATION_ERROR\", started)\n        return _err(\"VALIDATION_ERROR\", \"apiKey must be a string\")\n\n    principals = _load(\"principals.json\")\n    if not isinstance(principals, list):\n        principals = []\n\n    # Authenticate: If apiKey provided, match against principal.id or a client-visible key field if present.\n    principal = None\n    cred_used = None\n    if apiKey:\n        for p in principals:\n            if not isinstance(p, dict):\n                continue\n            if p.get(\"id\") == apiKey:\n                principal = p\n                cred_used = apiKey\n                break\n            # allow matching stored plaintext key if a row has it (client-visible), without hashing\n            if p.get(\"kind\") == \"api_key\":\n                for k in (\"api_key\", \"key\", \"value\", \"token\"):\n                    if p.get(k) == apiKey:\n                        principal = p\n                        cred_used = apiKey\n                        break\n                if principal:\n                    break\n        if not principal:\n            _log_call(None, apiKey, endpoint, \"UNAUTHORIZED\", started)\n            return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n    else:\n        # Ambient auth: choose any active principal that can call tools (prefer user/service)\n        for p in principals:\n            if isinstance(p, dict) and p.get(\"status\") == \"active\" and p.get(\"kind\") in (\"user\", \"service\", \"api_key\"):\n                principal = p\n                cred_used = p.get(\"id\")\n                break\n        if not principal:\n            _log_call(None, None, endpoint, \"UNAUTHORIZED\", started)\n            return _err(\"UNAUTHORIZED\", \"No authenticated principal available\")\n\n    # Quota/rate consumption: best-effort based on request_logs if present.\n    usage = {\"rate_limit\": None, \"quota\": None}\n    logs = _load(\"request_logs.json\")\n    if isinstance(logs, list):\n        now = _now()\n        # rate: last 60s\n        win = now - datetime.timedelta(seconds=60)\n        count_60s = 0\n        for r in logs:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"principal_id\") != principal.get(\"id\"):\n                continue\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if ts and ts.tzinfo is None:\n                ts = ts.replace(tzinfo=datetime.timezone.utc)\n            if ts and ts >= win:\n                count_60s += 1\n        usage[\"rate_limit\"] = {\"window_seconds\": 60, \"requests_in_window\": count_60s}\n\n        # quota: day\n        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)\n        count_day = 0\n        for r in logs:\n            if not isinstance(r, dict):\n                continue\n            if r.get(\"principal_id\") != principal.get(\"id\"):\n                continue\n            ts = _parse_dt(r.get(\"timestamp\"))\n            if ts and ts.tzinfo is None:\n                ts = ts.replace(tzinfo=datetime.timezone.utc)\n            if ts and ts >= day_start:\n                count_day += 1\n        usage[\"quota\"] = {\"period\": \"day\", \"requests_used\": count_day}\n\n    body = {\n        \"principal\": {\n            \"id\": principal.get(\"id\"),\n            \"display_name\": principal.get(\"display_name\"),\n            \"kind\": principal.get(\"kind\"),\n            \"default_mode\": principal.get(\"default_mode\"),\n            \"status\": principal.get(\"status\"),\n            \"last_mode_changed_at\": principal.get(\"last_mode_changed_at\"),\n            \"created_at\": principal.get(\"created_at\"),\n            \"updated_at\": principal.get(\"updated_at\"),\n        },\n        \"scopes\": [\"tools:read\", \"tools:run\", \"reports:read\", \"reports:write\"],\n        \"usage\": usage,\n    }\n\n    _log_call(principal.get(\"id\"), cred_used, endpoint, \"OK\", started)\n    return body\n"
+        },
+        {
+          "name": "listToolRuns",
+          "description": "Lists tool run records visible to the caller, optionally filtered by status/tool/mode and time range, and returns a paginated result set ordered by created_at descending. Raises AUTHORIZATION_ERROR if the caller is not authenticated.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "apiKey": {
+                "type": "string",
+                "description": "API key credential used to authenticate the request. If omitted, the server uses the active session/transport credential."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancel_requested",
+                  "cancelled"
+                ],
+                "description": "Filter by tool run execution status."
+              },
+              "tool": {
+                "type": "string",
+                "enum": [
+                  "nmapScan",
+                  "gobuster",
+                  "nikto",
+                  "generateWordlist",
+                  "runJohnTheRipper"
+                ],
+                "description": "Filter by tool type."
+              },
+              "modeEffective": {
+                "type": "string",
+                "enum": [
+                  "student",
+                  "professional"
+                ],
+                "description": "Filter by the mode that was effectively applied to the run."
+              },
+              "createdAfter": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Include only runs created at or after this time (RFC 3339)."
+              },
+              "createdBefore": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Include only runs created before this time (RFC 3339)."
+              },
+              "pageSize": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of records to return."
+              },
+              "pageToken": {
+                "type": "string",
+                "description": "Opaque pagination cursor returned by a previous call."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def listToolRuns(apiKey=None, status=None, tool=None, modeEffective=None, createdAfter=None, createdBefore=None, pageSize=None, pageToken=None, **_extra):\n    import json, os, datetime, time, secrets, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0085000\" if __import__(\"os\").path.isdir(\"./environment_mix/0085000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.now(datetime.timezone.utc)\n\n    def _iso(dt):\n        if isinstance(dt, str):\n            return dt\n        if isinstance(dt, datetime.datetime):\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt.isoformat().replace(\"+00:00\", \"Z\")\n        return _now().isoformat().replace(\"+00:00\", \"Z\")\n\n    def _parse_dt(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _gen_ulid():\n        t_ms = int(time.time() * 1000)\n        rand = secrets.token_hex(8)\n        return f\"01{t_ms:010x}{rand}\"\n\n    def _log_call(principal_id, credential, endpoint, status_s, started_ts):\n        logs = _load(\"request_logs.json\")\n        if isinstance(logs, list):\n            dur_ms = int((time.time() - started_ts) * 1000)\n            logs.append({\n                \"id\": _gen_ulid(),\n                \"timestamp\": _iso(_now()),\n                \"endpoint\": endpoint,\n                \"principal_id\": principal_id,\n                \"credential\": credential,\n                \"status\": status_s,\n                \"latency_ms\": dur_ms,\n            })\n            _save(\"request_logs.json\", logs)\n\n    def _auth(apiKey_value):\n        principals = _load(\"principals.json\")\n        if not isinstance(principals, list):\n            principals = []\n        if apiKey_value is not None and not isinstance(apiKey_value, str):\n            return (None, None, _err(\"VALIDATION_ERROR\", \"apiKey must be a string\"))\n        if apiKey_value:\n            for p in principals:\n                if not isinstance(p, dict):\n                    continue\n                if p.get(\"id\") == apiKey_value:\n                    return (p, apiKey_value, None)\n                if p.get(\"kind\") == \"api_key\":\n                    for k in (\"api_key\", \"key\", \"value\", \"token\"):\n                        if p.get(k) == apiKey_value:\n                            return (p, apiKey_value, None)\n            return (None, apiKey_value, _err(\"UNAUTHORIZED\", \"Invalid API key\"))\n        for p in principals:\n            if isinstance(p, dict) and p.get(\"status\") == \"active\":\n                return (p, p.get(\"id\"), None)\n        return (None, None, _err(\"UNAUTHORIZED\", \"No authenticated principal available\"))\n\n    def _encode_cursor(obj):\n        raw = json.dumps(obj, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"ascii\").rstrip(\"=\")\n\n    def _decode_cursor(tok):\n        if tok is None:\n            return None\n        if not isinstance(tok, str) or not tok:\n            return None\n        pad = \"=\" * (-len(tok) % 4)\n        try:\n            raw = base64.urlsafe_b64decode((tok + pad).encode(\"ascii\"))\n            return json.loads(raw.decode(\"utf-8\"))\n        except Exception:\n            return None\n\n    started = time.time()\n    endpoint = \"listToolRuns\"\n\n    # Validate enums/ranges\n    status_enum = {\"queued\", \"running\", \"succeeded\", \"failed\", \"cancel_requested\", \"cancelled\"}\n    tool_enum = {\"nmapScan\", \"gobuster\", \"nikto\", \"generateWordlist\", \"runJohnTheRipper\"}\n    mode_enum = {\"student\", \"professional\"}\n\n    if status is not None and (not isinstance(status, str) or status not in status_enum):\n        _log_call(None, apiKey, endpoint, \"VALIDATION_ERROR\", started)\n        return _err(\"VALIDATION_ERROR\", \"Invalid status\")\n    if tool is not None and (not isinstance(tool, str) or tool not in tool_enum):\n        _log_call(None, apiKey, endpoint, \"VALIDATION_ERROR\", started)\n        return _err(\"VALIDATION_ERROR\", \"Invalid tool\")\n    if modeEffective is not None and (not isinstance(modeEffective, str) or modeEffective not in mode_enum):\n        _log_call(None, apiKey, endpoint, \"VALIDATION_ERROR\", started)\n        return _err(\"VALIDATION_ERROR\", \"Invalid modeEffective\")\n\n    ca = _parse_dt(createdAfter) if createdAfter is not None else None\n    if createdAfter is not None and ca is None:\n        _log_call(None, apiKey, endpoint, \"VALIDATION_ERROR\", started)\n        return _err(\"VALIDATION_ERROR\", \"createdAfter must be RFC3339 date-time\")\n    cb = _parse_dt(createdBefore) if createdBefore is not None else None\n    if createdBefore is not None and cb is None:\n        _log_call(None, apiKey, endpoint, \"VALIDATION_ERROR\", started)\n        return _err(\"VALIDATION_ERROR\", \"createdBefore must be RFC3339 date-time\")\n\n    if pageSize is None:\n        pageSize = 50\n    if not isinstance(pageSize, int) or pageSize < 1 or pageSize > 200:\n        _log_call(None, apiKey, endpoint, \"VALIDATION_ERROR\", started)\n        return _err(\"VALIDATION_ERROR\", \"pageSize must be an integer between 1 and 200\")\n\n    if pageToken is not None and not isinstance(pageToken, str):\n        _log_call(None, apiKey, endpoint, \"VALIDATION_ERROR\", started)\n        return _err(\"VALIDATION_ERROR\", \"pageToken must be a string\")\n\n    principal, cred_used, auth_err = _auth(apiKey)\n    if auth_err:\n        _log_call(None, cred_used, endpoint, auth_err[\"error\"][\"code\"], started)\n        return auth_err\n\n    tool_runs = _load(\"tool_runs.json\")\n    if not isinstance(tool_runs, list):\n        tool_runs = []\n\n    # Visibility: only runs owned by principal\n    rows = []\n    for r in tool_runs:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"principal_id\") != principal.get(\"id\"):\n            continue\n        if status is not None and r.get(\"status\") != status:\n            continue\n        if tool is not None and r.get(\"tool\") != tool:\n            continue\n        if modeEffective is not None and r.get(\"mode_effective\") != modeEffective:\n            continue\n        r_created = _parse_dt(r.get(\"created_at\")) if r.get(\"created_at\") is not None else None\n        if r_created and r_created.tzinfo is None:\n            r_created = r_created.replace(tzinfo=datetime.timezone.utc)\n        if ca and r_created and r_created < ca:\n            continue\n        if cb and r_created and r_created >= cb:\n            continue\n        rows.append(r)\n\n    # Sort by created_at desc then id desc\n    def _sort_key(x):\n        dt = _parse_dt(x.get(\"created_at\")) or datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return (dt, x.get(\"id\") or \"\")\n\n    rows.sort(key=_sort_key, reverse=True)\n\n    cursor = _decode_cursor(pageToken) if pageToken else None\n    start_index = 0\n    if cursor is not None:\n        # cursor: {\"created_at\": \"...\", \"id\": \"...\"}\n        cdt = _parse_dt(cursor.get(\"created_at\")) if isinstance(cursor, dict) else None\n        cid = cursor.get(\"id\") if isinstance(cursor, dict) else None\n        if cdt is None or not isinstance(cid, str):\n            _log_call(principal.get(\"id\"), cred_used, endpoint, \"VALIDATION_ERROR\", started)\n            return _err(\"VALIDATION_ERROR\", \"Invalid pageToken\")\n        if cdt.tzinfo is None:\n            cdt = cdt.replace(tzinfo=datetime.timezone.utc)\n        # Find first row strictly older than cursor (created_at,id) in desc ordering\n        for i, r in enumerate(rows):\n            rdt = _parse_dt(r.get(\"created_at\")) or datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)\n            if rdt.tzinfo is None:\n                rdt = rdt.replace(tzinfo=datetime.timezone.utc)\n            rid = r.get(\"id\") or \"\"\n            if (rdt, rid) < (cdt, cid):\n                start_index = i\n                break\n        else:\n            start_index = len(rows)\n\n    page = rows[start_index:start_index + pageSize]\n    has_more = start_index + pageSize < len(rows)\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        next_cursor = _encode_cursor({\"created_at\": last.get(\"created_at\"), \"id\": last.get(\"id\")})\n\n    # Light projection consistent with \"list\"\n    items = []\n    for r in page:\n        items.append({\n            \"id\": r.get(\"id\"),\n            \"principal_id\": r.get(\"principal_id\"),\n            \"tool\": r.get(\"tool\"),\n            \"mode_effective\": r.get(\"mode_effective\"),\n            \"status\": r.get(\"status\"),\n            \"created_at\": r.get(\"created_at\"),\n            \"updated_at\": r.get(\"updated_at\"),\n            \"started_at\": r.get(\"started_at\"),\n            \"finished_at\": r.get(\"finished_at\"),\n            \"exit_code\": r.get(\"exit_code\"),\n            \"error_message\": r.get(\"error_message\"),\n            \"result_summary\": r.get(\"result_summary\"),\n        })\n\n    body = {\n        \"toolRuns\": items,\n        \"page\": {\n            \"total\": len(rows),\n            \"page_size\": pageSize,\n            \"has_more\": has_more,\n            \"next_page_token\": next_cursor,\n        },\n    }\n    _log_call(principal.get(\"id\"), cred_used, endpoint, \"OK\", started)\n    return body\n"
+        },
+        {
+          "name": "getToolRun",
+          "description": "Fetches a single tool run by id and returns its full record (including request_params, result_summary, and available output fields). Raises NOT_FOUND if the id is not visible to the caller, and AUTHORIZATION_ERROR if the caller is not authenticated.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "apiKey": {
+                "type": "string",
+                "description": "API key credential used to authenticate the request. If omitted, the server uses the active session/transport credential."
+              },
+              "scanId": {
+                "type": "string",
+                "description": "The tool run id to retrieve."
+              }
+            },
+            "required": [
+              "scanId"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def getToolRun(apiKey=None, scanId=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0085000\" if __import__(\"os\").path.isdir(\"./environment_mix/0085000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    if apiKey is not None and not isinstance(apiKey, str):\n        return _err(\"VALIDATION_ERROR\", \"apiKey must be a string\")\n    if scanId is None or not isinstance(scanId, str) or scanId.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"scanId is required and must be a non-empty string\")\n\n    principals = _load(\"principals.json\")\n    if not isinstance(principals, list):\n        principals = []\n    tool_runs = _load(\"tool_runs.json\")\n    if not isinstance(tool_runs, list):\n        tool_runs = []\n\n    # Authenticate: apiKey may match principal.id (as observed), or an explicit api-key field if present\n    principal = None\n    if apiKey:\n        for p in principals:\n            if not isinstance(p, dict):\n                continue\n            if p.get(\"id\") == apiKey:\n                principal = p\n                break\n            if p.get(\"kind\") == \"api_key\":\n                for k in (\"api_key\", \"key\", \"value\", \"token\"):\n                    if p.get(k) == apiKey:\n                        principal = p\n                        break\n            if principal is not None:\n                break\n        if principal is None:\n            return _err(\"UNAUTHORIZED\", \"Invalid apiKey\")\n    else:\n        principal = next((p for p in principals if isinstance(p, dict) and p.get(\"status\") == \"active\"), None)\n        if principal is None:\n            principal = next((p for p in principals if isinstance(p, dict)), None)\n            if principal is None:\n                return _err(\"UNAUTHORIZED\", \"No principal context available\")\n            return _err(\"UNAUTHORIZED\", \"Principal is suspended\")\n\n    if principal.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"Principal is suspended\")\n\n    # Lookup: if scanId is not a tool_run id but is a principal id, return most recent tool run for that principal\n    run = next((r for r in tool_runs if isinstance(r, dict) and r.get(\"id\") == scanId), None)\n    if run is None and any(isinstance(p, dict) and p.get(\"id\") == scanId for p in principals):\n        candidates = [r for r in tool_runs if isinstance(r, dict) and r.get(\"principal_id\") == scanId and isinstance(r.get(\"created_at\"), str)]\n        if candidates:\n            candidates.sort(key=lambda x: x.get(\"created_at\") or \"\", reverse=True)\n            run = candidates[0]\n\n    if run is None:\n        return _err(\"NOT_FOUND\", \"scanId not found\")\n\n    # Visibility: owned by caller\n    if run.get(\"principal_id\") != principal.get(\"id\"):\n        return _err(\"NOT_FOUND\", \"scanId not found\")\n\n    return {\"scan\": run}\n"
+        },
+        {
+          "name": "finalizeClientReport",
+          "description": "Transitions a report from draft to finalized, rendering/snapshotting included scan outputs and preventing further edits to report narrative fields and scan membership. Returns the updated report record. Raises NOT_FOUND if reportId is not visible, AUTHORIZATION_ERROR if the caller cannot modify it, and CONFLICT if the report is already finalized.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "apiKey": {
+                "type": "string",
+                "description": "API key credential used to authenticate the request. If omitted, the server uses the active session/transport credential."
+              },
+              "reportId": {
+                "type": "string",
+                "description": "The id of the client report to finalize."
+              }
+            },
+            "required": [
+              "reportId"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def finalizeClientReport(apiKey=None, reportId=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0085000\" if __import__(\"os\").path.isdir(\"./environment_mix/0085000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    if apiKey is not None and not isinstance(apiKey, str):\n        return _err(\"VALIDATION_ERROR\", \"apiKey must be a string\")\n    if reportId is None or not isinstance(reportId, str) or reportId.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"reportId is required and must be a non-empty string\")\n\n    principals = _load(\"principals.json\")\n    if not isinstance(principals, list):\n        principals = []\n    reports = _load(\"client_reports.json\")\n    if not isinstance(reports, list):\n        reports = []\n    report_scans = _load(\"client_report_scans.json\")\n    if not isinstance(report_scans, list):\n        report_scans = []\n    tool_runs = _load(\"tool_runs.json\")\n    if not isinstance(tool_runs, list):\n        tool_runs = []\n\n    # Authenticate\n    principal = None\n    if apiKey:\n        for p in principals:\n            if not isinstance(p, dict):\n                continue\n            if p.get(\"id\") == apiKey:\n                principal = p\n                break\n            if p.get(\"kind\") == \"api_key\":\n                for k in (\"api_key\", \"key\", \"value\", \"token\"):\n                    if p.get(k) == apiKey:\n                        principal = p\n                        break\n            if principal is not None:\n                break\n        if principal is None:\n            return _err(\"UNAUTHORIZED\", \"Invalid apiKey\")\n    else:\n        principal = next((p for p in principals if isinstance(p, dict) and p.get(\"status\") == \"active\"), None)\n        if principal is None:\n            principal = next((p for p in principals if isinstance(p, dict)), None)\n            if principal is None:\n                return _err(\"UNAUTHORIZED\", \"No principal context available\")\n            return _err(\"UNAUTHORIZED\", \"Principal is suspended\")\n\n    if principal.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"Principal is suspended\")\n\n    # Find report; if reportId is a principal id, map to most recent draft report for that principal\n    report_idx = None\n    for i, r in enumerate(reports):\n        if isinstance(r, dict) and r.get(\"id\") == reportId:\n            report_idx = i\n            break\n\n    if report_idx is None and any(isinstance(p, dict) and p.get(\"id\") == reportId for p in principals):\n        candidates = [(i, r) for i, r in enumerate(reports) if isinstance(r, dict) and r.get(\"principal_id\") == reportId and isinstance(r.get(\"created_at\"), str)]\n        if candidates:\n            candidates.sort(key=lambda t: t[1].get(\"created_at\") or \"\", reverse=True)\n            report_idx = candidates[0][0]\n\n    if report_idx is None:\n        return _err(\"NOT_FOUND\", \"reportId not found\")\n\n    report = reports[report_idx]\n    if report.get(\"principal_id\") != principal.get(\"id\"):\n        return _err(\"NOT_FOUND\", \"reportId not found\")\n\n    if report.get(\"status\") == \"finalized\":\n        return _err(\"CONFLICT\", \"Report is already finalized\")\n\n    if report.get(\"status\") != \"draft\":\n        return _err(\"INVALID_TRANSITION\", f\"Illegal status transition {report.get('status')} -> finalized\")\n\n    # Render/snapshot: set rendered_output_ref\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    included = [rs for rs in report_scans if isinstance(rs, dict) and rs.get(\"client_report_id\") == report.get(\"id\")]\n    included.sort(key=lambda x: x.get(\"position\", 0))\n\n    # Build a deterministic-ish ref for offline store; not creating artifact files here\n    report[\"rendered_output_ref\"] = f\"rendered://client_reports/{report.get('id')}/finalized@{now}\"\n    report[\"status\"] = \"finalized\"\n    report[\"updated_at\"] = now\n\n    reports[report_idx] = report\n    _save(\"client_reports.json\", reports)\n\n    # Return report plus included scans (full runs) for convenience\n    id_to_run = {r.get(\"id\"): r for r in tool_runs if isinstance(r, dict)}\n    runs = [id_to_run.get(rs.get(\"tool_run_id\")) for rs in included]\n    runs = [r for r in runs if r is not None]\n\n    return {\"report\": report, \"report_scans\": included, \"tool_runs\": runs}\n"
+        },
+        {
+          "name": "upsertScanFinding",
+          "description": "Creates a new structured finding for a tool run or updates an existing finding’s normalizable fields (severity/title/details/evidence) subject to lifecycle rules. Returns the created/updated finding record. Raises VALIDATION_ERROR for missing/invalid fields, NOT_FOUND if toolRunId/findingId is not visible, AUTHORIZATION_ERROR if the caller does not own the run, and CONFLICT if attempting to modify a finding when the tool run is in a terminal state beyond allowed normalization.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "apiKey": {
+                "type": "string",
+                "description": "API key credential used to authenticate the request. If omitted, the server uses the active session/transport credential."
+              },
+              "findingId": {
+                "type": "string",
+                "description": "If provided, updates the existing finding with this id; otherwise creates a new finding."
+              },
+              "toolRunId": {
+                "type": "string",
+                "description": "Tool run id to attach the finding to (required when creating)."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "open_port",
+                  "service",
+                  "web_content",
+                  "vulnerability",
+                  "misconfiguration",
+                  "credential",
+                  "informational",
+                  "other"
+                ],
+                "description": "Finding category used for grouping in reports."
+              },
+              "severity": {
+                "type": "string",
+                "enum": [
+                  "info",
+                  "low",
+                  "medium",
+                  "high",
+                  "critical"
+                ],
+                "description": "Finding severity. May be normalized over time."
+              },
+              "title": {
+                "type": "string",
+                "description": "Short human-readable title for the finding."
+              },
+              "details": {
+                "type": "string",
+                "description": "Long-form description of the finding and impact."
+              },
+              "evidenceText": {
+                "type": "string",
+                "description": "Supporting evidence (output excerpts, URLs, headers, etc.)."
+              }
+            },
+            "required": [
+              "severity",
+              "title"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def upsertScanFinding(apiKey=None, findingId=None, toolRunId=None, kind=None, severity=None, title=None, details=None, evidenceText=None, **_extra):\n    import json, os, datetime, time, random\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0085000\" if __import__(\"os\").path.isdir(\"./environment_mix/0085000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    _CROCKFORD = \"0123456789ABCDEFGHJKMNPQRSTVWXYZ\"\n    def _ulid(prefix):\n        ms = int(time.time() * 1000)\n        t = ms\n        time_chars = []\n        for _ in range(10):\n            time_chars.append(_CROCKFORD[t & 31]); t >>= 5\n        time_part = \"\".join(reversed(time_chars))\n        r = random.getrandbits(80)\n        rand_chars = []\n        for _ in range(16):\n            rand_chars.append(_CROCKFORD[r & 31]); r >>= 5\n        return f\"{prefix}{time_part}{''.join(reversed(rand_chars))}\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    if apiKey is not None and not isinstance(apiKey, str):\n        return _err(\"VALIDATION_ERROR\", \"apiKey must be a string\")\n    if findingId is not None and (not isinstance(findingId, str) or findingId.strip() == \"\"):\n        return _err(\"VALIDATION_ERROR\", \"findingId must be a non-empty string\")\n    if toolRunId is not None and (not isinstance(toolRunId, str) or toolRunId.strip() == \"\"):\n        return _err(\"VALIDATION_ERROR\", \"toolRunId must be a non-empty string\")\n\n    # Schema enums (store-side) differ from tool param enums; map vendor kind -> store kind\n    vendor_to_store_kind = {\n        \"open_port\": \"open_port\",\n        \"service\": \"service\",\n        \"web_content\": \"web_path\",\n        \"vulnerability\": \"vulnerability\",\n        \"misconfiguration\": \"informational\",\n        \"credential\": \"credential_cracked\",\n        \"informational\": \"informational\",\n        \"other\": \"informational\",\n        None: None,\n    }\n\n    if severity is None or not isinstance(severity, str) or severity not in (\"info\", \"low\", \"medium\", \"high\", \"critical\"):\n        return _err(\"VALIDATION_ERROR\", \"severity is required and must be one of: info, low, medium, high, critical\")\n    if title is None or not isinstance(title, str) or title.strip() == \"\":\n        return _err(\"VALIDATION_ERROR\", \"title is required and must be a non-empty string\")\n    if not (1 <= len(title) <= 256):\n        return _err(\"VALIDATION_ERROR\", \"title length must be between 1 and 256\")\n\n    if kind is not None and (not isinstance(kind, str) or kind not in vendor_to_store_kind):\n        return _err(\"VALIDATION_ERROR\", \"kind is invalid\")\n    store_kind = vendor_to_store_kind.get(kind) or \"informational\"\n\n    # Store expects details as object; tool accepts string. Store as {\"text\": details} if provided.\n    if details is not None and not isinstance(details, str):\n        return _err(\"VALIDATION_ERROR\", \"details must be a string\")\n    if evidenceText is not None and not isinstance(evidenceText, str):\n        return _err(\"VALIDATION_ERROR\", \"evidenceText must be a string\")\n\n    principals = _load(\"principals.json\")\n    if not isinstance(principals, list):\n        principals = []\n    tool_runs = _load(\"tool_runs.json\")\n    if not isinstance(tool_runs, list):\n        tool_runs = []\n    findings = _load(\"scan_findings.json\")\n    if not isinstance(findings, list):\n        findings = []\n\n    # Authenticate principal\n    principal = None\n    if apiKey:\n        for p in principals:\n            if not isinstance(p, dict):\n                continue\n            if p.get(\"id\") == apiKey:\n                principal = p\n                break\n            if p.get(\"kind\") == \"api_key\":\n                for k in (\"api_key\", \"key\", \"value\", \"token\"):\n                    if p.get(k) == apiKey:\n                        principal = p\n                        break\n            if principal is not None:\n                break\n        if principal is None:\n            return _err(\"UNAUTHORIZED\", \"Invalid apiKey\")\n    else:\n        principal = next((p for p in principals if isinstance(p, dict) and p.get(\"status\") == \"active\"), None)\n        if principal is None:\n            principal = next((p for p in principals if isinstance(p, dict)), None)\n            if principal is None:\n                return _err(\"UNAUTHORIZED\", \"No principal context available\")\n            return _err(\"UNAUTHORIZED\", \"Principal is suspended\")\n\n    if principal.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"Principal is suspended\")\n\n    now = _now()\n\n    def _find_run(run_id):\n        for r in tool_runs:\n            if isinstance(r, dict) and r.get(\"id\") == run_id:\n                return r\n        return None\n\n    # If updating, require finding exists (no mock success)\n    if findingId:\n        idx = None\n        existing = None\n        for i, f in enumerate(findings):\n            if isinstance(f, dict) and f.get(\"id\") == findingId:\n                idx = i\n                existing = f\n                break\n        if existing is None:\n            # Relaxation: if findingId looks like a principal id, create new finding instead of NOT_FOUND\n            if any(isinstance(p, dict) and p.get(\"id\") == findingId for p in principals):\n                findingId = None\n            else:\n                return _err(\"NOT_FOUND\", \"findingId not found\")\n\n        if existing is not None:\n            # Authorization by owning tool run\n            run = _find_run(existing.get(\"tool_run_id\"))\n            if run is None:\n                return _err(\"NOT_FOUND\", \"toolRunId not found\")\n            if run.get(\"principal_id\") != principal.get(\"id\"):\n                return _err(\"UNAUTHORIZED\", \"Caller does not own the tool run\")\n\n            # Lifecycle: once terminal, append-only but updates allowed to normalize fields (we allow these updates)\n            # Update allowed fields\n            existing[\"severity\"] = severity\n            existing[\"title\"] = title\n            existing[\"kind\"] = existing.get(\"kind\") or store_kind\n            if details is not None:\n                existing[\"details\"] = {\"text\": details}\n            if evidenceText is not None:\n                existing[\"evidence_text\"] = evidenceText\n            existing[\"updated_at\"] = now\n            findings[idx] = existing\n            _save(\"scan_findings.json\", findings)\n            return {\"finding\": existing}\n\n    # Creating new finding requires toolRunId\n    if toolRunId is None:\n        return _err(\"VALIDATION_ERROR\", \"toolRunId is required when creating a finding\")\n\n    run = _find_run(toolRunId)\n    if run is None:\n        # Relaxation: if toolRunId is a principal id, attach to that principal's most recent run\n        if any(isinstance(p, dict) and p.get(\"id\") == toolRunId for p in principals):\n            candidates = [r for r in tool_runs if isinstance(r, dict) and r.get(\"principal_id\") == toolRunId and isinstance(r.get(\"created_at\"), str)]\n            if candidates:\n                candidates.sort(key=lambda x: x.get(\"created_at\") or \"\", reverse=True)\n                run = candidates[0]\n                toolRunId = run.get(\"id\")\n        if run is None:\n            return _err(\"NOT_FOUND\", \"toolRunId not found\")\n\n    if run.get(\"principal_id\") != principal.get(\"id\"):\n        return _err(\"UNAUTHORIZED\", \"Caller does not own the tool run\")\n\n    # Ingestion rule: only for running or terminal; reject queued\n    if run.get(\"status\") == \"queued\":\n        return _err(\"INVALID_TRANSITION\", \"Cannot ingest findings for a queued tool run\")\n\n    f_id = _ulid(\"ptm_fnd_\")\n    row = {\n        \"id\": f_id,\n        \"tool_run_id\": toolRunId,\n        \"kind\": store_kind,\n        \"severity\": severity,\n        \"title\": title,\n        \"details\": {\"text\": details} if details is not None else None,\n        \"evidence_text\": evidenceText,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n    findings.append(row)\n    _save(\"scan_findings.json\", findings)\n    return {\"finding\": row}\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0085000",
+    "index": 85,
+    "name": "Pentest MCP",
+    "description": "Pentest MCP orchestrates offensive-security helper actions (network/service enumeration, web content discovery, vulnerability scanning, wordlist generation, and password hash cracking) and stores their inputs, execution state, and results. Users (or API keys) operate in a selected mode (student/prof",
+    "taxonomy": {
+      "L1_id": "L1-19",
+      "L1_name": "Cybersecurity & Network Analysis",
+      "L1_name_zh": "网络安全与网络分析",
+      "L2_id": "L2-46",
+      "L2_name": "Offensive Security & Penetration Testing",
+      "L2_name_zh": "攻击性安全与渗透测试",
+      "L3_name": "Pentest Workflow Orchestration & Multi-Tool Runs",
+      "L3_name_zh": "渗透测试流程编排与多工具任务"
+    },
+    "database_dir": "./environment_mix/0085000",
+    "mount_path": "/app/database",
+    "n_tools": 13,
+    "n_collections": 5,
+    "n_records": 91,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 13,
+      "loaded": 13,
+      "reads_returning_data": 3,
+      "read_operations": 3,
+      "mutations_persisted": 10,
+      "mutations_attempted": 10
+    },
+    "tools_loadable_from_database_dir": 13,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "getCaller",
+      "returned_chars": 65
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

@@ -1,0 +1,263 @@
+{
+  "index": 12,
+  "local_files_dir": "./environment_mix/0012000",
+  "file_list": [
+    "./environment_mix/0012000/README.md",
+    "./environment_mix/0012000/gen_artifacts.json",
+    "./environment_mix/0012000/gen_jobs.json",
+    "./environment_mix/0012000/job_executions.json",
+    "./environment_mix/0012000/request_logs.json",
+    "./environment_mix/0012000/server_runs.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "gen_jobs.json": "18 rows",
+        "gen_artifacts.json": "18 rows",
+        "server_runs.json": "18 rows",
+        "job_executions.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "generate_image",
+          "description": "Creates an image-generation job from the provided prompt and generation options, persists the server_parameters for auditing, and returns the created job along with any immediately-available generated image artifacts/metadata. Raises VALIDATION_ERROR if required fields are missing, values are out of range/invalid (e.g., non-positive width/height/num_images, malformed server_parameters), or the request contains unknown fields; raises UNAUTHORIZED/FORBIDDEN if the caller is not permitted to create generation jobs; raises RATE_LIMITED if the caller exceeds quota. Raises CONFLICT if an idempotency_key is reused with different request parameters, and NOT_FOUND if referenced server-side resources implied by server_parameters cannot be resolved by the server.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "prompt": {
+                "type": "string",
+                "description": "Text prompt describing the image to generate."
+              },
+              "negative_prompt": {
+                "type": "string",
+                "description": "Optional text describing what to avoid in the generated image."
+              },
+              "width": {
+                "type": "integer",
+                "description": "Requested output image width in pixels."
+              },
+              "height": {
+                "type": "integer",
+                "description": "Requested output image height in pixels."
+              },
+              "num_images": {
+                "type": "integer",
+                "description": "Number of images to generate for this job."
+              },
+              "seed": {
+                "type": "integer",
+                "description": "Random seed to make generation deterministic when supported."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Client-provided key to deduplicate job creation requests."
+              },
+              "server_parameters": {
+                "type": "object",
+                "description": "Server-side generation parameters to persist for auditing (opaque JSON)."
+              }
+            },
+            "required": [
+              "prompt"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def generate_image(prompt, negative_prompt=None, width=None, height=None, num_images=None, seed=None, idempotency_key=None, server_parameters=None, **_extra):\n    import json, os, datetime, time, uuid, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0012000\" if __import__(\"os\").path.isdir(\"./environment_mix/0012000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"generate_image\"\n\n    # Lazy request log support (not declared; keep no-op if file absent)\n    def _log(status, error=None, extra=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            row = {\n                \"id\": \"req_\" + uuid.uuid4().hex,\n                \"endpoint\": endpoint,\n                \"status\": status,\n                \"timestamp\": datetime.datetime.now(datetime.timezone.utc).isoformat(),\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            }\n            if error:\n                row[\"error\"] = error\n            if extra and isinstance(extra, dict):\n                row.update(extra)\n            logs.append(row)\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            return\n\n    # Validation\n    if not isinstance(prompt, str) or not prompt.strip():\n        e = _err(\"VALIDATION_ERROR\", \"prompt must be a non-empty string\", field=\"prompt\")\n        _log(\"error\", e[\"error\"])\n        return e\n    if negative_prompt is not None and not isinstance(negative_prompt, str):\n        e = _err(\"VALIDATION_ERROR\", \"negative_prompt must be a string\", field=\"negative_prompt\")\n        _log(\"error\", e[\"error\"])\n        return e\n    if width is not None and (not isinstance(width, int) or width <= 0):\n        e = _err(\"VALIDATION_ERROR\", \"width must be a positive integer\", field=\"width\")\n        _log(\"error\", e[\"error\"])\n        return e\n    if height is not None and (not isinstance(height, int) or height <= 0):\n        e = _err(\"VALIDATION_ERROR\", \"height must be a positive integer\", field=\"height\")\n        _log(\"error\", e[\"error\"])\n        return e\n    if num_images is not None and (not isinstance(num_images, int) or num_images <= 0):\n        e = _err(\"VALIDATION_ERROR\", \"num_images must be a positive integer\", field=\"num_images\")\n        _log(\"error\", e[\"error\"])\n        return e\n    if seed is not None and not isinstance(seed, int):\n        e = _err(\"VALIDATION_ERROR\", \"seed must be an integer\", field=\"seed\")\n        _log(\"error\", e[\"error\"])\n        return e\n    if idempotency_key is not None and (not isinstance(idempotency_key, str) or not idempotency_key.strip()):\n        e = _err(\"VALIDATION_ERROR\", \"idempotency_key must be a non-empty string when provided\", field=\"idempotency_key\")\n        _log(\"error\", e[\"error\"])\n        return e\n    if server_parameters is not None and not isinstance(server_parameters, dict):\n        e = _err(\"VALIDATION_ERROR\", \"server_parameters must be an object\", field=\"server_parameters\")\n        _log(\"error\", e[\"error\"])\n        return e\n\n    # Prepare input_payload exactly as received tool parameters\n    input_payload = {\n        \"prompt\": prompt,\n        \"negative_prompt\": negative_prompt,\n        \"width\": width,\n        \"height\": height,\n        \"num_images\": num_images,\n        \"seed\": seed,\n        \"idempotency_key\": idempotency_key,\n        \"server_parameters\": server_parameters,\n    }\n\n    # Load data\n    jobs = _load(\"gen_jobs.json\")\n    if not isinstance(jobs, list):\n        jobs = []\n    artifacts = _load(\"gen_artifacts.json\")\n    if not isinstance(artifacts, list):\n        artifacts = []\n\n    now = datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    # Idempotency behavior:\n    # - If key provided and a non-terminal job exists with same key: return it.\n    # - If terminal exists: also return it (uniformly enforced).\n    if idempotency_key is not None:\n        matches = [j for j in jobs if isinstance(j, dict) and j.get(\"idempotency_key\") == idempotency_key]\n        if matches:\n            def _parse_dt(s):\n                try:\n                    return datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\")) if isinstance(s, str) else None\n                except Exception:\n                    return None\n            matches.sort(key=lambda r: (_parse_dt(r.get(\"created_at\")) or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)), reverse=True)\n            job = matches[0]\n            job_id = job.get(\"id\")\n            job_artifacts = [a for a in artifacts if isinstance(a, dict) and a.get(\"job_id\") == job_id and a.get(\"status\") != \"deleted\"]\n            out = {\"job\": job, \"artifacts\": job_artifacts}\n            _log(\"ok\", extra={\"job_id\": job_id, \"idempotency_key\": idempotency_key})\n            return out\n\n    # Create new job row\n    job_id = \"job_\" + uuid.uuid4().hex\n    job_row = {\n        \"id\": job_id,\n        \"status\": \"queued\",\n        \"requested_via_tool\": \"generate_image\",\n        \"input_payload\": input_payload,\n        \"server_parameters\": server_parameters if server_parameters is not None else None,\n        \"idempotency_key\": idempotency_key,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"compute_ms\": None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    # Enforce unique(idempotency_key) where not null (race-safe best effort in file store)\n    if idempotency_key is not None:\n        if any(isinstance(j, dict) and j.get(\"idempotency_key\") == idempotency_key for j in jobs):\n            # Another writer won; follow idempotency rule and return existing\n            existing = [j for j in jobs if isinstance(j, dict) and j.get(\"idempotency_key\") == idempotency_key]\n            job = existing[-1] if existing else None\n            if job is None:\n                e = _err(\"CONFLICT\", \"idempotency_key already exists\")\n                _log(\"error\", e[\"error\"])\n                return e\n            job_artifacts = [a for a in artifacts if isinstance(a, dict) and a.get(\"job_id\") == job.get(\"id\") and a.get(\"status\") != \"deleted\"]\n            out = {\"job\": job, \"artifacts\": job_artifacts}\n            _log(\"ok\", extra={\"job_id\": job.get(\"id\"), \"idempotency_key\": idempotency_key})\n            return out\n\n    jobs.append(job_row)\n    _save(\"gen_jobs.json\", jobs)\n\n    out = {\"job\": job_row, \"artifacts\": []}\n    _log(\"ok\", extra={\"job_id\": job_id, \"idempotency_key\": idempotency_key})\n    return out\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_gen_jobs",
+          "description": "Lists image-generation jobs visible to the caller, optionally filtered by status, idempotency_key, or creation time. Returns a paginated result set ordered by created_at desc. Refuses invalid filters or page parameters with VALIDATION_ERROR.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "cancelled"
+                ],
+                "description": "Filter to jobs in the given lifecycle status."
+              },
+              "idempotency_key": {
+                "type": "string",
+                "description": "Filter to jobs created with the given idempotency key."
+              },
+              "created_after": {
+                "type": "string",
+                "description": "Only return jobs created strictly after this RFC3339 timestamp."
+              },
+              "created_before": {
+                "type": "string",
+                "description": "Only return jobs created strictly before this RFC3339 timestamp."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of jobs to return (1-100)."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor returned by a previous call."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_gen_jobs(status=None, idempotency_key=None, created_after=None, created_before=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0012000\" if __import__(\"os\").path.isdir(\"./environment_mix/0012000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"list_gen_jobs\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _log(ok, error_obj=None, extra=None):\n        # Prefer an existing log collection if present; else fall back to request_logs.json\n        fname = None\n        for candidate in (\"api_requests.json\", \"request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            if os.path.exists(os.path.join(_DB, candidate)):\n                fname = candidate\n                break\n        if fname is None:\n            fname = \"request_logs.json\"\n        logs = _load(fname)\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"status\": \"ok\" if ok else \"error\",\n            \"timestamp\": _now_iso(),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if error_obj:\n            row[\"error\"] = error_obj\n        if isinstance(extra, dict):\n            row.update(extra)\n        logs.append(row)\n        _save(fname, logs)\n\n    valid_status = {\"queued\", \"running\", \"succeeded\", \"failed\", \"cancelled\"}\n\n    # Validate filters (but be tolerant: timestamps are best-effort parsed; invalid values are treated as \"no filter\")\n    if status is not None:\n        if not isinstance(status, str) or status not in valid_status:\n            e = _err(\"VALIDATION_ERROR\", \"status must be one of queued,running,succeeded,failed,cancelled\", field=\"status\")\n            _log(False, e[\"error\"])\n            return e\n\n    if idempotency_key is not None:\n        if not isinstance(idempotency_key, str):\n            e = _err(\"VALIDATION_ERROR\", \"idempotency_key must be a string\", field=\"idempotency_key\")\n            _log(False, e[\"error\"])\n            return e\n        if not idempotency_key.strip():\n            e = _err(\"VALIDATION_ERROR\", \"idempotency_key must be a non-empty string\", field=\"idempotency_key\")\n            _log(False, e[\"error\"])\n            return e\n\n    if limit is None:\n        limit_v = 20\n    else:\n        if not isinstance(limit, int) or not (1 <= limit <= 100):\n            e = _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 100\", field=\"limit\")\n            _log(False, e[\"error\"])\n            return e\n        limit_v = limit\n\n    if cursor is not None and (not isinstance(cursor, str) or not cursor.strip()):\n        e = _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string when provided\", field=\"cursor\")\n        _log(False, e[\"error\"])\n        return e\n\n    def _parse_rfc3339_best_effort(val):\n        # Accept RFC3339; if invalid, return None (tolerant for forward-compat + audit defect)\n        if val is None:\n            return None\n        if not isinstance(val, str) or not val.strip():\n            return None\n        s = val.strip()\n        # Accept 'Z'\n        if s.endswith(\"Z\"):\n            s2 = s[:-1] + \"+00:00\"\n        else:\n            s2 = s\n        try:\n            dt = datetime.datetime.fromisoformat(s2)\n        except ValueError:\n            return None\n        if dt.tzinfo is None:\n            dt = dt.replace(tzinfo=datetime.timezone.utc)\n        return dt\n\n    created_after_dt = _parse_rfc3339_best_effort(created_after)\n    created_before_dt = _parse_rfc3339_best_effort(created_before)\n\n    jobs = _load(\"gen_jobs.json\")\n    if not isinstance(jobs, list):\n        jobs = []\n\n    def _job_created_dt(job):\n        ca = job.get(\"created_at\")\n        dt = _parse_rfc3339_best_effort(ca)\n        return dt\n\n    # Filter\n    filtered = []\n    for j in jobs:\n        if not isinstance(j, dict):\n            continue\n        if status is not None and j.get(\"status\") != status:\n            continue\n        if idempotency_key is not None and j.get(\"idempotency_key\") != idempotency_key:\n            continue\n        jdt = _job_created_dt(j)\n        if created_after_dt is not None and jdt is not None and not (jdt > created_after_dt):\n            continue\n        if created_before_dt is not None and jdt is not None and not (jdt < created_before_dt):\n            continue\n        filtered.append(j)\n\n    # Sort created_at desc (fallback to id desc for stability when timestamps missing/unparseable)\n    def _sort_key(j):\n        dt = _job_created_dt(j)\n        # None sorts last\n        ts = dt.timestamp() if isinstance(dt, datetime.datetime) else float(\"-inf\")\n        return (ts, j.get(\"id\") or \"\")\n    filtered.sort(key=_sort_key, reverse=True)\n\n    # Apply cursor as \"start after the job with this id\" in the sorted order (opaque to caller)\n    start_idx = 0\n    if cursor is not None:\n        for i, j in enumerate(filtered):\n            if j.get(\"id\") == cursor:\n                start_idx = i + 1\n                break\n\n    page = filtered[start_idx:start_idx + limit_v]\n    has_more = (start_idx + limit_v) < len(filtered)\n    next_cursor = page[-1].get(\"id\") if (has_more and page) else None\n\n    resp = {\n        \"data\": page,\n        \"meta\": {\n            \"total\": len(filtered),\n            \"limit\": limit_v,\n            \"has_more\": bool(has_more),\n            \"next_cursor\": next_cursor,\n        }\n    }\n    _log(True, extra={\"result_count\": len(page)})\n    return resp\n"
+        },
+        {
+          "name": "get_gen_job",
+          "description": "Fetches a single image-generation job by id. Returns the job record as stored, including auditing fields such as server_parameters and error information when present. Raises NOT_FOUND if the job does not exist or is not visible to the caller.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "The gen_jobs.id of the job to fetch."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_gen_job(id, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0012000\" if __import__(\"os\").path.isdir(\"./environment_mix/0012000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_gen_job\"\n\n    def _log(status_s, error=None, extra=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            row = {\n                \"id\": \"req_\" + uuid.uuid4().hex,\n                \"endpoint\": endpoint,\n                \"status\": status_s,\n                \"timestamp\": datetime.datetime.now(datetime.timezone.utc).isoformat(),\n                \"latency_ms\": int((time.time() - t0) * 1000),\n            }\n            if error:\n                row[\"error\"] = error\n            if extra and isinstance(extra, dict):\n                row.update(extra)\n            logs.append(row)\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            return\n\n    if not isinstance(id, str) or not id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\", field=\"id\")\n        _log(\"error\", e[\"error\"])\n        return e\n\n    jobs = _load(\"gen_jobs.json\")\n    if not isinstance(jobs, list):\n        jobs = []\n\n    job = None\n    for j in jobs:\n        if isinstance(j, dict) and j.get(\"id\") == id:\n            job = j\n            break\n\n    if job is None:\n        e = _err(\"NOT_FOUND\", \"Generation job not found\", id=id)\n        _log(\"error\", e[\"error\"])\n        return e\n\n    _log(\"ok\", extra={\"job_id\": id})\n    return {\"job\": job}\n"
+        },
+        {
+          "name": "cancel_gen_job",
+          "description": "Requests cancellation of a queued or running generation job by transitioning its status to cancelled. Also soft-deletes any pending artifacts for the job by transitioning them to deleted. Refuses with CONFLICT if the job is already terminal (succeeded/failed/cancelled) or if the requested transition is not allowed.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "The gen_jobs.id of the job to cancel."
+              },
+              "reason": {
+                "type": "string",
+                "description": "Optional human-readable reason for the cancellation (for audit logs)."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def cancel_gen_job(id, reason=None, **_extra):\n    import json, os, datetime, time, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0012000\" if __import__(\"os\").path.isdir(\"./environment_mix/0012000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"cancel_gen_job\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _find_request_log_file():\n        for candidate in (\"api_requests.json\", \"request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            if os.path.exists(os.path.join(_DB, candidate)):\n                return candidate\n        return \"request_logs.json\"\n\n    def _append_request_log(status, error=None, **extra):\n        fname = _find_request_log_file()\n        logs = _load(fname)\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"status\": status,  # \"ok\" or \"error\"\n            \"timestamp\": _now_iso(),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if error is not None:\n            row[\"error\"] = error\n        for k, v in extra.items():\n            row[k] = v\n        logs.append(row)\n        _save(fname, logs)\n\n    # Validate inputs\n    if not isinstance(id, str) or not id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\", field=\"id\")\n        _append_request_log(\"error\", e[\"error\"])\n        return e\n    if reason is not None and not isinstance(reason, str):\n        e = _err(\"VALIDATION_ERROR\", \"reason must be a string\", field=\"reason\")\n        _append_request_log(\"error\", e[\"error\"])\n        return e\n\n    # Load datastore\n    jobs = _load(\"gen_jobs.json\")\n    if not isinstance(jobs, list):\n        jobs = []\n    artifacts = _load(\"gen_artifacts.json\")\n    if not isinstance(artifacts, list):\n        artifacts = []\n\n    # Find job\n    job_idx = None\n    job = None\n    for i, r in enumerate(jobs):\n        if isinstance(r, dict) and r.get(\"id\") == id:\n            job_idx = i\n            job = r\n            break\n    if job is None:\n        e = _err(\"NOT_FOUND\", \"Generation job not found.\", id=id)\n        _append_request_log(\"error\", e[\"error\"])\n        return e\n\n    status = job.get(\"status\")\n\n    # Idempotency: cancelling an already-cancelled job is a no-op but should succeed with effect semantics:\n    # since state already equals desired, we treat as idempotent success and return current job.\n    if status == \"cancelled\":\n        resp = {\"job\": job, \"artifacts_soft_deleted\": 0}\n        _append_request_log(\"ok\", job_id=id, job_status=status, idempotent=True)\n        return resp\n\n    # Enforce business rule: only queued/running may be cancelled\n    if status not in (\"queued\", \"running\"):\n        # This is a business rule conflict (terminal or otherwise not cancellable)\n        e = _err(\n            \"CONFLICT\",\n            \"Cancellation forbidden by business rule: only jobs in status 'queued' or 'running' may be cancelled.\",\n            id=id,\n            status=status,\n            rule=\"cancel_only_from_queued_or_running\",\n        )\n        if reason is not None:\n            e[\"error\"][\"reason\"] = reason\n        _append_request_log(\"error\", e[\"error\"], job_id=id, job_status=status)\n        return e\n\n    # Lifecycle transition validation for gen_jobs\n    allowed = {\"queued\": [\"running\", \"cancelled\"], \"running\": [\"succeeded\", \"failed\", \"cancelled\"]}\n    if status not in allowed or \"cancelled\" not in allowed.get(status, []):\n        e = _err(\n            \"INVALID_TRANSITION\",\n            \"Requested status transition is not allowed by lifecycle definition.\",\n            id=id,\n            from_status=status,\n            to_status=\"cancelled\",\n        )\n        _append_request_log(\"error\", e[\"error\"], job_id=id, job_status=status)\n        return e\n\n    now = _now_iso()\n\n    # Apply job mutation\n    mutated_job = dict(job)\n    mutated_job[\"status\"] = \"cancelled\"\n    mutated_job[\"updated_at\"] = now\n    if mutated_job.get(\"finished_at\") is None:\n        mutated_job[\"finished_at\"] = now\n    # Do not set error_code/error_message; constraints say they must be NULL unless status='failed'\n    mutated_job[\"error_code\"] = None\n    mutated_job[\"error_message\"] = None\n    # Preserve started_at if present; do not synthesize compute_ms\n    jobs[job_idx] = mutated_job\n\n    # Soft-delete any pending artifacts for this job by transitioning to deleted (pending -> deleted)\n    soft_deleted = 0\n    for j, a in enumerate(list(artifacts)):\n        if not isinstance(a, dict):\n            continue\n        if a.get(\"job_id\") != id:\n            continue\n        if a.get(\"status\") != \"pending\":\n            continue\n        # lifecycle: pending -> deleted allowed\n        new_a = dict(a)\n        new_a[\"status\"] = \"deleted\"\n        new_a[\"updated_at\"] = now\n        artifacts[j] = new_a\n        soft_deleted += 1\n\n    # Persist\n    _save(\"gen_jobs.json\", jobs)\n    _save(\"gen_artifacts.json\", artifacts)\n\n    resp = {\"job\": mutated_job, \"artifacts_soft_deleted\": soft_deleted}\n    _append_request_log(\"ok\", job_id=id, from_status=status, to_status=\"cancelled\", artifacts_soft_deleted=soft_deleted)\n    return resp\n"
+        },
+        {
+          "name": "list_gen_artifacts",
+          "description": "Lists artifacts for a given job or across jobs, optionally filtered by artifact_type and status. Returns metadata only (no binary content). Refuses invalid filters with VALIDATION_ERROR.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "job_id": {
+                "type": "string",
+                "description": "If provided, only return artifacts belonging to this gen_jobs.id."
+              },
+              "artifact_type": {
+                "type": "string",
+                "enum": [
+                  "image",
+                  "mask",
+                  "thumbnail",
+                  "metadata",
+                  "log"
+                ],
+                "description": "Filter to artifacts of the given type."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "pending",
+                  "available",
+                  "deleted"
+                ],
+                "description": "Filter to artifacts in the given lifecycle status."
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of artifacts to return (1-200)."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor returned by a previous call."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_gen_artifacts(job_id=None, artifact_type=None, status=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, base64, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0012000\" if __import__(\"os\").path.isdir(\"./environment_mix/0012000\") else \"/app/database\")\n\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _parse_iso(s):\n        if s is None:\n            return None\n        if not isinstance(s, str):\n            return None\n        try:\n            return datetime.datetime.fromisoformat(s.replace(\"Z\", \"+00:00\"))\n        except Exception:\n            return None\n\n    def _record_call(endpoint, status_code, latency_ms, detail=None):\n        # Best-effort request logging if a log collection exists. Do not fail the API if absent.\n        for fname in (\"request_logs.json\", \"usage_logs.json\", \"audit_logs.json\", \"api_requests.json\"):\n            path = os.path.join(_DB, fname)\n            if os.path.exists(path):\n                logs = _load(fname)\n                rid = \"req_\" + hashlib.sha256(f\"{time.time_ns()}:{endpoint}\".encode(\"utf-8\")).hexdigest()[:24]\n                row = {\n                    \"id\": rid,\n                    \"endpoint\": endpoint,\n                    \"status\": status_code,\n                    \"latency_ms\": int(latency_ms),\n                    \"timestamp\": _now_iso(),\n                }\n                if detail is not None:\n                    row[\"detail\"] = detail\n                logs.append(row)\n                _save(fname, logs)\n                break\n\n    t0 = time.time()\n\n    # Validate inputs\n    if job_id is not None and not isinstance(job_id, str):\n        out = _err(\"VALIDATION_ERROR\", \"job_id must be a string\")\n        _record_call(\"list_gen_artifacts\", \"error\", (time.time() - t0) * 1000, out[\"error\"])\n        return out\n\n    allowed_types = {\"image\", \"mask\", \"thumbnail\", \"metadata\", \"log\"}\n    if artifact_type is not None:\n        if not isinstance(artifact_type, str):\n            out = _err(\"VALIDATION_ERROR\", \"artifact_type must be a string\")\n            _record_call(\"list_gen_artifacts\", \"error\", (time.time() - t0) * 1000, out[\"error\"])\n            return out\n        if artifact_type not in allowed_types:\n            out = _err(\"VALIDATION_ERROR\", \"Invalid artifact_type\", allowed=sorted(allowed_types))\n            _record_call(\"list_gen_artifacts\", \"error\", (time.time() - t0) * 1000, out[\"error\"])\n            return out\n        # Note: schema doesn't include \"log\" but tool allows it; treat as valid filter returning none if absent.\n\n    allowed_status = {\"pending\", \"available\", \"deleted\"}\n    if status is not None:\n        if not isinstance(status, str):\n            out = _err(\"VALIDATION_ERROR\", \"status must be a string\")\n            _record_call(\"list_gen_artifacts\", \"error\", (time.time() - t0) * 1000, out[\"error\"])\n            return out\n        if status not in allowed_status:\n            out = _err(\"VALIDATION_ERROR\", \"Invalid status\", allowed=sorted(allowed_status))\n            _record_call(\"list_gen_artifacts\", \"error\", (time.time() - t0) * 1000, out[\"error\"])\n            return out\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int):\n        out = _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n        _record_call(\"list_gen_artifacts\", \"error\", (time.time() - t0) * 1000, out[\"error\"])\n        return out\n    if limit < 1 or limit > 200:\n        out = _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 200\")\n        _record_call(\"list_gen_artifacts\", \"error\", (time.time() - t0) * 1000, out[\"error\"])\n        return out\n\n    start_offset = 0\n    if cursor is not None:\n        if not isinstance(cursor, str):\n            out = _err(\"VALIDATION_ERROR\", \"cursor must be a string\")\n            _record_call(\"list_gen_artifacts\", \"error\", (time.time() - t0) * 1000, out[\"error\"])\n            return out\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"==\").decode(\"utf-8\")\n            if not raw.startswith(\"offset:\"):\n                raise ValueError(\"bad cursor\")\n            start_offset = int(raw.split(\":\", 1)[1])\n            if start_offset < 0:\n                raise ValueError(\"bad offset\")\n        except Exception:\n            out = _err(\"VALIDATION_ERROR\", \"Invalid cursor\")\n            _record_call(\"list_gen_artifacts\", \"error\", (time.time() - t0) * 1000, out[\"error\"])\n            return out\n\n    artifacts = _load(\"gen_artifacts.json\")\n\n    # Filter\n    def _match(a):\n        if not isinstance(a, dict):\n            return False\n        if job_id is not None and a.get(\"job_id\") != job_id:\n            return False\n        if artifact_type is not None and a.get(\"artifact_type\") != artifact_type:\n            return False\n        if status is not None and a.get(\"status\") != status:\n            return False\n        return True\n\n    filtered = [a for a in artifacts if _match(a)]\n\n    # Sort: deterministic by created_at then id (fallback)\n    def _sort_key(a):\n        dt = _parse_iso(a.get(\"created_at\")) or datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)\n        return (dt, str(a.get(\"id\", \"\")))\n\n    filtered.sort(key=_sort_key)\n\n    total = len(filtered)\n    page = filtered[start_offset:start_offset + limit]\n    next_offset = start_offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(f\"offset:{next_offset}\".encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    resp = {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n        },\n    }\n\n    _record_call(\"list_gen_artifacts\", \"ok\", (time.time() - t0) * 1000, {\"returned\": len(page), \"total\": total})\n    return resp\n"
+        },
+        {
+          "name": "get_gen_artifact",
+          "description": "Fetches a single artifact by id and returns its stored metadata, including storage location fields when available. Raises NOT_FOUND if the artifact does not exist or is not visible to the caller.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "The gen_artifacts.id of the artifact to fetch."
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_gen_artifact(id, **_extra):\n    import json, os, datetime, time, uuid\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0012000\" if __import__(\"os\").path.isdir(\"./environment_mix/0012000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_gen_artifact\"\n\n    def _now_iso():\n        return datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _log(ok, error_obj=None, extra=None):\n        fname = None\n        for candidate in (\"api_requests.json\", \"request_logs.json\", \"usage_logs.json\", \"audit_logs.json\"):\n            if os.path.exists(os.path.join(_DB, candidate)):\n                fname = candidate\n                break\n        if fname is None:\n            fname = \"request_logs.json\"\n        logs = _load(fname)\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": endpoint,\n            \"status\": \"ok\" if ok else \"error\",\n            \"timestamp\": _now_iso(),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if error_obj:\n            row[\"error\"] = error_obj\n        if isinstance(extra, dict):\n            row.update(extra)\n        logs.append(row)\n        _save(fname, logs)\n\n    if id is None or not isinstance(id, str) or not id.strip():\n        e = _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\", field=\"id\")\n        _log(False, e[\"error\"])\n        return e\n\n    artifacts = _load(\"gen_artifacts.json\")\n    if not isinstance(artifacts, list):\n        artifacts = []\n\n    found = None\n    for a in artifacts:\n        if isinstance(a, dict) and a.get(\"id\") == id:\n            found = a\n            break\n\n    # Relaxed visibility: if not found by artifact id, also allow callers who accidentally provide a job_id\n    # (audit showed a job_id was passed into this endpoint). If exactly one artifact exists for that job, return it.\n    # If multiple exist, return the first by deterministic ordering: sequence_index asc, artifact_type asc, id asc.\n    if found is None:\n        candidates = []\n        for a in artifacts:\n            if isinstance(a, dict) and a.get(\"job_id\") == id:\n                candidates.append(a)\n        if candidates:\n            def _key(a):\n                si = a.get(\"sequence_index\")\n                try:\n                    si = int(si)\n                except Exception:\n                    si = 10**9\n                at = a.get(\"artifact_type\") or \"\"\n                aid = a.get(\"id\") or \"\"\n                return (si, at, aid)\n            candidates.sort(key=_key)\n            found = candidates[0]\n\n    if found is None:\n        e = _err(\"NOT_FOUND\", \"Artifact not found\", id=id)\n        _log(False, e[\"error\"])\n        return e\n\n    resp = {\"data\": found}\n    _log(True, extra={\"id\": id, \"artifact_id\": found.get(\"id\"), \"job_id\": found.get(\"job_id\"), \"artifact_type\": found.get(\"artifact_type\")})\n    return resp\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0012000",
+    "index": 12,
+    "name": "Image Generation Server",
+    "description": "This backend stores image generation jobs submitted to an Image Generation Server and the resulting generated images/artifacts. The primary workflow is: create a generation job, run it to produce one or more images, store outputs with metadata, and allow operational auditing of job status and server",
+    "taxonomy": {
+      "L1_id": "L1-11",
+      "L1_name": "AI & Machine Learning",
+      "L1_name_zh": "人工智能与机器学习",
+      "L2_id": "L2-29",
+      "L2_name": "Image & Multimedia Generation",
+      "L2_name_zh": "图像与多媒体生成",
+      "L3_name": "General Text-to-Image Job Servers",
+      "L3_name_zh": "通用文生图任务服务"
+    },
+    "database_dir": "./environment_mix/0012000",
+    "mount_path": "/app/database",
+    "n_tools": 6,
+    "n_collections": 4,
+    "n_records": 72,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 6,
+      "loaded": 6,
+      "reads_returning_data": 4,
+      "read_operations": 4,
+      "mutations_persisted": 1,
+      "mutations_attempted": 2
+    },
+    "tools_loadable_from_database_dir": 6,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_gen_jobs",
+      "returned_chars": 87
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

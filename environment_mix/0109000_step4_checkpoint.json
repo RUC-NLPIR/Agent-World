@@ -1,0 +1,547 @@
+{
+  "index": 109,
+  "local_files_dir": "./environment_mix/0109000",
+  "file_list": [
+    "./environment_mix/0109000/README.md",
+    "./environment_mix/0109000/assistant_tools.json",
+    "./environment_mix/0109000/assistants.json",
+    "./environment_mix/0109000/calls.json",
+    "./environment_mix/0109000/phone_numbers.json",
+    "./environment_mix/0109000/request_logs.json",
+    "./environment_mix/0109000/tools.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "assistants.json": "19 rows",
+        "phone_numbers.json": "17 rows",
+        "calls.json": "19 rows",
+        "tools.json": "18 rows",
+        "assistant_tools.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "list_assistants",
+          "description": "Lists assistants in your account and returns a page of assistant records filtered by status and sorted by the requested field/order; results are paginated with limit and an opaque cursor, and the response includes a next cursor when more results are available. Raises VALIDATION_ERROR if any filter/sort/pagination parameter is invalid (including limit out of range) and AUTHORIZATION_ERROR if your credentials cannot access assistants for the account. Raises RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "active",
+                  "disabled",
+                  "archived"
+                ],
+                "description": "Filter assistants by lifecycle status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of assistants to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              },
+              "sort_by": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "display_name"
+                ],
+                "description": "Field to sort assistants by."
+              },
+              "sort_order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order for results."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_assistants(status=None, limit=None, cursor=None, sort_by=None, sort_order=None, **_extra):\n    import json, os, datetime, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0109000\" if __import__(\"os\").path.isdir(\"./environment_mix/0109000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_iso_z(s):\n        if not isinstance(s, str):\n            return None\n        try:\n            # Normalize Z and timezone offsets\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1] + \"+00:00\")\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _log(ok, error_obj=None):\n        # Must not break API if logging fails.\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            logs.append({\n                \"request_id\": \"req_\" + base64.urlsafe_b64encode(os.urandom(12)).decode(\"ascii\").rstrip(\"=\"),\n                \"endpoint\": \"list_assistants\",\n                \"timestamp\": _now(),\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"status\": \"ok\" if ok else \"error\",\n                \"error_code\": None if ok else (error_obj.get(\"error\", {}) or {}).get(\"code\"),\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    def _rate_limit_check():\n        cfg = _load(\"service_limits.json\")\n        if not isinstance(cfg, dict):\n            return None\n        rpm = cfg.get(\"requests_per_minute\")\n        if not (isinstance(rpm, int) and rpm > 0):\n            return None\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            return None\n        cutoff = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc) - datetime.timedelta(seconds=60)\n        cnt = 0\n        for r in logs:\n            ts = r.get(\"timestamp\")\n            dt = _parse_iso_z(ts)\n            if not dt:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt >= cutoff:\n                cnt += 1\n        if cnt >= rpm:\n            return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n        return None\n\n    # Enforce rate limit (logged as an error)\n    rl = _rate_limit_check()\n    if rl:\n        _log(False, rl)\n        return rl\n\n    # Validate inputs\n    allowed_status = {\"draft\", \"active\", \"disabled\", \"archived\"}\n    if status is not None:\n        if not isinstance(status, str):\n            e = _err(\"VALIDATION_ERROR\", \"status must be a string\", field=\"status\")\n            _log(False, e)\n            return e\n        if status not in allowed_status:\n            e = _err(\"VALIDATION_ERROR\", \"status must be one of: draft, active, disabled, archived\", field=\"status\")\n            _log(False, e)\n            return e\n\n    if limit is None:\n        limit = 20\n    if not isinstance(limit, int):\n        e = _err(\"VALIDATION_ERROR\", \"limit must be an integer\", field=\"limit\")\n        _log(False, e)\n        return e\n    if limit < 1 or limit > 100:\n        e = _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 100\", field=\"limit\")\n        _log(False, e)\n        return e\n\n    allowed_sort_by = {\"created_at\", \"updated_at\", \"display_name\"}\n    if sort_by is None:\n        sort_by = \"updated_at\"\n    if not isinstance(sort_by, str) or sort_by not in allowed_sort_by:\n        e = _err(\"VALIDATION_ERROR\", \"sort_by must be one of: created_at, updated_at, display_name\", field=\"sort_by\")\n        _log(False, e)\n        return e\n\n    allowed_sort_order = {\"asc\", \"desc\"}\n    if sort_order is None:\n        sort_order = \"desc\"\n    if not isinstance(sort_order, str) or sort_order not in allowed_sort_order:\n        e = _err(\"VALIDATION_ERROR\", \"sort_order must be one of: asc, desc\", field=\"sort_order\")\n        _log(False, e)\n        return e\n\n    if cursor is not None and not isinstance(cursor, str):\n        e = _err(\"VALIDATION_ERROR\", \"cursor must be a string\", field=\"cursor\")\n        _log(False, e)\n        return e\n\n    data = _load(\"assistants.json\")\n    if isinstance(data, dict) and isinstance(data.get(\"rows\"), list):\n        rows = data[\"rows\"]\n    elif isinstance(data, list):\n        rows = data\n    else:\n        rows = []\n\n    # Business rule: list_assistants returns assistants where status != 'archived' (unless explicitly filtered by status='archived')\n    filtered = []\n    for r in rows:\n        if not isinstance(r, dict):\n            continue\n        st = r.get(\"status\")\n        if status is None:\n            if st == \"archived\":\n                continue\n        else:\n            if st != status:\n                continue\n        filtered.append(r)\n\n    # Sorting\n    def _key(r):\n        if sort_by in (\"created_at\", \"updated_at\"):\n            dt = _parse_iso_z(r.get(sort_by))\n            # Put unparseable at the end consistently\n            if not dt:\n                dt = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc) if sort_order == \"asc\" else datetime.datetime(9999, 1, 1, tzinfo=datetime.timezone.utc)\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            return dt\n        if sort_by == \"display_name\":\n            v = r.get(\"display_name\")\n            return v.lower() if isinstance(v, str) else \"\"\n        return \"\"\n\n    reverse = (sort_order == \"desc\")\n    try:\n        filtered.sort(key=_key, reverse=reverse)\n    except Exception:\n        # If any weird types slip through, fall back to stable ordering by assistant_id\n        filtered.sort(key=lambda r: (str(r.get(\"assistant_id\") or \"\")), reverse=reverse)\n\n    # Cursor semantics: treat cursor as the last seen assistant_id from previous page.\n    # Must be \"opaque\" and not strictly validated; if it doesn't match anything, return empty page (not an error).\n    start_index = 0\n    if cursor:\n        idx = None\n        for i, r in enumerate(filtered):\n            if r.get(\"assistant_id\") == cursor:\n                idx = i\n                break\n        if idx is None:\n            # Relaxed behavior: unknown cursor yields empty result page (no error)\n            start_index = len(filtered)\n        else:\n            start_index = idx + 1\n\n    page = filtered[start_index:start_index + limit]\n    has_more = (start_index + limit) < len(filtered)\n    next_cursor = page[-1].get(\"assistant_id\") if (has_more and page) else None\n\n    resp = {\n        \"data\": page,\n        \"meta\": {\n            \"total\": len(filtered),\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"sort_by\": sort_by,\n            \"sort_order\": sort_order,\n        }\n    }\n    _log(True, None)\n    return resp\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_assistant",
+          "description": "Creates a new assistant with the provided display name, voice_config, and model_config, and returns the created assistant record. Raises VALIDATION_ERROR if required fields are missing, status is not one of the allowed lifecycle values, or configuration objects are malformed, and AUTHORIZATION_ERROR if you are not allowed to create assistants in the account. Raises RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "display_name": {
+                "type": "string",
+                "description": "Human-friendly name for the assistant."
+              },
+              "description": {
+                "type": "string",
+                "description": "Description of what the assistant does."
+              },
+              "voice_config": {
+                "type": "object",
+                "description": "Voice configuration object for the assistant (provider/voice/settings)."
+              },
+              "model_config": {
+                "type": "object",
+                "description": "Model configuration object for the assistant (model, prompts, parameters)."
+              },
+              "webhook_url": {
+                "type": "string",
+                "description": "Webhook URL to receive assistant/call lifecycle events."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "active",
+                  "disabled",
+                  "archived"
+                ],
+                "description": "Initial lifecycle status of the assistant."
+              }
+            },
+            "required": [
+              "display_name",
+              "voice_config",
+              "model_config"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_assistant(display_name, voice_config, model_config, description=None, webhook_url=None, status=None, **_extra):\n    import json, os, datetime, time, base64, re\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0109000\" if __import__(\"os\").path.isdir(\"./environment_mix/0109000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _parse_ts(s):\n        if not isinstance(s, str):\n            return None\n        try:\n            if s.endswith(\"Z\"):\n                return datetime.datetime.fromisoformat(s[:-1])\n            return datetime.datetime.fromisoformat(s)\n        except Exception:\n            return None\n\n    def _load_rows(filename):\n        data = _load(filename)\n        if isinstance(data, dict) and isinstance(data.get(\"rows\"), list):\n            return data[\"rows\"], data, \"dict\"\n        if isinstance(data, list):\n            return data, None, \"list\"\n        return [], None, \"unknown\"\n\n    def _save_rows(filename, rows, container, kind):\n        if kind == \"dict\" and isinstance(container, dict):\n            container[\"rows\"] = rows\n            _save(filename, container)\n        else:\n            _save(filename, rows)\n\n    def _append_log(status_code, error_code=None):\n        logs, logs_container, logs_kind = _load_rows(\"request_logs.json\")\n        entry = {\n            \"request_id\": \"req_\" + base64.urlsafe_b64encode(os.urandom(12)).decode(\"ascii\").rstrip(\"=\"),\n            \"endpoint\": \"create_assistant\",\n            \"timestamp\": _now(),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"status\": int(status_code) if isinstance(status_code, int) else status_code,\n            \"error_code\": error_code,\n        }\n        logs.append(entry)\n        _save_rows(\"request_logs.json\", logs, logs_container, logs_kind)\n\n    def _enforce_limits():\n        cfg = _load(\"service_limits.json\")\n        if not isinstance(cfg, dict):\n            return None\n\n        logs, _, _ = _load_rows(\"request_logs.json\")\n        now = datetime.datetime.utcnow()\n\n        rpm = cfg.get(\"requests_per_minute\")\n        if isinstance(rpm, int) and rpm > 0:\n            window_start = now - datetime.timedelta(minutes=1)\n            recent = 0\n            for l in logs:\n                ts = _parse_ts(l.get(\"timestamp\"))\n                if ts is not None and ts >= window_start:\n                    recent += 1\n            if recent >= rpm:\n                return _err(\"RATE_LIMIT\", \"Rate limit exceeded (requests_per_minute).\", rule=\"requests_per_minute\", limit=rpm)\n\n        daily = cfg.get(\"requests_per_day\")\n        if isinstance(daily, int) and daily > 0:\n            window_start = now - datetime.timedelta(days=1)\n            recent = 0\n            for l in logs:\n                ts = _parse_ts(l.get(\"timestamp\"))\n                if ts is not None and ts >= window_start:\n                    recent += 1\n            if recent >= daily:\n                return _err(\"QUOTA_EXCEEDED\", \"Daily request quota exceeded (requests_per_day).\", rule=\"requests_per_day\", limit=daily)\n\n        return None\n\n    # Enforce rate/quota based on persisted request logs, then continue.\n    limit_err = _enforce_limits()\n    if limit_err:\n        _append_log(429, limit_err[\"error\"][\"code\"])\n        return limit_err\n\n    # Validate required fields/types.\n    if not isinstance(display_name, str) or not display_name.strip():\n        _append_log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"display_name is required and must be a non-empty string.\", field=\"display_name\")\n    if not isinstance(voice_config, dict):\n        _append_log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"voice_config must be an object.\", field=\"voice_config\")\n    if not isinstance(model_config, dict):\n        _append_log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"model_config must be an object.\", field=\"model_config\")\n    if description is not None and not isinstance(description, str):\n        _append_log(400, \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"description must be a string or null.\", field=\"description\")\n    if webhook_url is not None:\n        if not isinstance(webhook_url, str):\n            _append_log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"webhook_url must be a string or null.\", field=\"webhook_url\")\n        if webhook_url != \"\" and not webhook_url.startswith(\"https://\"):\n            _append_log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"webhook_url must start with 'https://'.\", field=\"webhook_url\", rule=\"webhook_url like 'https://%'\")\n    allowed_status = {\"draft\", \"active\", \"disabled\", \"archived\"}\n    if status is not None:\n        if not isinstance(status, str) or status not in allowed_status:\n            _append_log(400, \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of: draft, active, disabled, archived.\", field=\"status\", allowed=sorted(list(allowed_status)))\n\n    # Business rule: create_assistant inserts a new assistants row with status='draft' and version=1.\n    # Even if caller provides status, the backend behavior is to initialize as draft.\n    init_status = \"draft\"\n\n    # Load existing assistants, enforce uniqueness by display_name (exact match).\n    assistants, assistants_container, assistants_kind = _load_rows(\"assistants.json\")\n    dn = display_name.strip()\n\n    for a in assistants:\n        if isinstance(a, dict) and a.get(\"display_name\") == dn:\n            # If this exists, it's a real conflict.\n            _append_log(409, \"CONFLICT\")\n            return _err(\n                \"CONFLICT\",\n                \"display_name must be unique (constraint unique(display_name)).\",\n                field=\"display_name\",\n                rule=\"unique(display_name)\"\n            )\n\n    # Generate assistant_id (avoid collisions).\n    def _gen_id(prefix, rows, pk):\n        for _ in range(25):\n            candidate = prefix + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\")\n            if not any(isinstance(r, dict) and r.get(pk) == candidate for r in rows):\n                return candidate\n        return None\n\n    assistant_id = _gen_id(\"asst_\", assistants, \"assistant_id\")\n    if assistant_id is None:\n        _append_log(500, \"CONFLICT\")\n        return _err(\"CONFLICT\", \"Unable to allocate unique assistant_id.\", rule=\"id_generation\")\n\n    now = _now()\n    row = {\n        \"assistant_id\": assistant_id,\n        \"display_name\": dn,\n        \"description\": description if description is not None else None,\n        \"voice_config\": voice_config,\n        \"model_config\": model_config,\n        \"webhook_url\": webhook_url if webhook_url is not None else None,\n        \"status\": init_status,\n        \"version\": 1,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    assistants.append(row)\n    _save_rows(\"assistants.json\", assistants, assistants_container, assistants_kind)\n\n    _append_log(201, None)\n    return {\"assistant\": row}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_assistant",
+          "description": "Retrieves a single assistant by assistant_id and returns the full assistant record. Raises VALIDATION_ERROR if assistant_id does not match the expected format, NOT_FOUND if no assistant with that ID exists in your account, and AUTHORIZATION_ERROR if you do not have access to it. Raises RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "assistant_id": {
+                "type": "string",
+                "pattern": "^vapi_asst_[0-9A-Z]{18,}$",
+                "description": "Unique ID of the assistant to retrieve."
+              }
+            },
+            "required": [
+              "assistant_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_assistant(assistant_id, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0109000\" if __import__(\"os\").path.isdir(\"./environment_mix/0109000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code_local, error=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            row = {\n                \"request_id\": \"req_\" + base64.urlsafe_b64encode(os.urandom(12)).decode(\"ascii\").rstrip(\"=\"),\n                \"endpoint\": \"get_assistant\",\n                \"timestamp\": _now(),\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"status\": \"error\" if status_code_local != \"ok\" else \"ok\",\n                \"error_code\": None if not error else error.get(\"code\"),\n            }\n            logs.append(row)\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    def _rate_limit_check():\n        cfg = _load(\"service_limits.json\")\n        if isinstance(cfg, dict):\n            rpm = cfg.get(\"requests_per_minute\")\n            if isinstance(rpm, int) and rpm > 0:\n                logs = _load(\"request_logs.json\")\n                if not isinstance(logs, list):\n                    return None\n                cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=60)\n                cnt = 0\n                for r in logs:\n                    ts = r.get(\"timestamp\")\n                    if isinstance(ts, str):\n                        try:\n                            dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                        except Exception:\n                            continue\n                        if dt >= cutoff:\n                            cnt += 1\n                if cnt >= rpm:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n        return None\n\n    rl = _rate_limit_check()\n    if rl:\n        _log(\"RATE_LIMIT\", rl[\"error\"])\n        return rl\n\n    if not isinstance(assistant_id, str):\n        e = _err(\"VALIDATION_ERROR\", \"assistant_id must be a string\", field=\"assistant_id\")\n        _log(\"VALIDATION_ERROR\", e[\"error\"])\n        return e\n\n    if not re.match(r\"^vapi_asst_[0-9A-Z]{18,}$\", assistant_id):\n        e = _err(\"VALIDATION_ERROR\", \"assistant_id is malformed\", field=\"assistant_id\")\n        _log(\"VALIDATION_ERROR\", e[\"error\"])\n        return e\n\n    assistants = _load(\"assistants.json\")\n    if not isinstance(assistants, list):\n        assistants = []\n\n    for a in assistants:\n        if isinstance(a, dict) and a.get(\"assistant_id\") == assistant_id:\n            _log(\"ok\")\n            return {\"data\": a}\n\n    e = _err(\"NOT_FOUND\", \"Assistant not found\", assistant_id=assistant_id)\n    _log(\"NOT_FOUND\", e[\"error\"])\n    return e\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "update_assistant",
+          "description": "Updates an existing assistant by assistant_id and returns the updated assistant record with any provided fields applied. Raises VALIDATION_ERROR if assistant_id is malformed, any provided field value is invalid, or the requested status value is not allowed, NOT_FOUND if the assistant does not exist, and AUTHORIZATION_ERROR if you cannot modify it. Raises RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "assistant_id": {
+                "type": "string",
+                "pattern": "^vapi_asst_[0-9A-Z]{18,}$",
+                "description": "Unique ID of the assistant to update."
+              },
+              "display_name": {
+                "type": "string",
+                "description": "Updated human-friendly name for the assistant."
+              },
+              "description": {
+                "type": "string",
+                "description": "Updated description of what the assistant does."
+              },
+              "voice_config": {
+                "type": "object",
+                "description": "Updated voice configuration object for the assistant."
+              },
+              "model_config": {
+                "type": "object",
+                "description": "Updated model configuration object for the assistant."
+              },
+              "webhook_url": {
+                "type": "string",
+                "description": "Updated webhook URL to receive assistant/call lifecycle events."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "draft",
+                  "active",
+                  "disabled",
+                  "archived"
+                ],
+                "description": "Updated lifecycle status of the assistant."
+              }
+            },
+            "required": [
+              "assistant_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def update_assistant(assistant_id, display_name=None, description=None, voice_config=None, model_config=None, webhook_url=None, status=None, **_extra):\n    import json, os, datetime, time, re, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0109000\" if __import__(\"os\").path.isdir(\"./environment_mix/0109000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code_local, error=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            row = {\n                \"request_id\": \"req_\" + base64.urlsafe_b64encode(os.urandom(12)).decode(\"ascii\").rstrip(\"=\"),\n                \"endpoint\": \"update_assistant\",\n                \"timestamp\": _now(),\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"status\": \"error\" if status_code_local != \"ok\" else \"ok\",\n                \"error_code\": None if not error else error.get(\"code\"),\n            }\n            logs.append(row)\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    def _rate_limit_check():\n        cfg = _load(\"service_limits.json\")\n        if isinstance(cfg, dict):\n            rpm = cfg.get(\"requests_per_minute\")\n            if isinstance(rpm, int) and rpm > 0:\n                logs = _load(\"request_logs.json\")\n                if not isinstance(logs, list):\n                    return None\n                cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=60)\n                cnt = 0\n                for r in logs:\n                    ts = r.get(\"timestamp\")\n                    if isinstance(ts, str):\n                        try:\n                            dt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n                        except Exception:\n                            continue\n                        if dt >= cutoff:\n                            cnt += 1\n                if cnt >= rpm:\n                    return _err(\"RATE_LIMIT\", \"Rate limit exceeded\")\n        return None\n\n    rl = _rate_limit_check()\n    if rl:\n        _log(\"RATE_LIMIT\", rl[\"error\"])\n        return rl\n\n    if not isinstance(assistant_id, str):\n        e = _err(\"VALIDATION_ERROR\", \"assistant_id must be a string\", field=\"assistant_id\")\n        _log(\"VALIDATION_ERROR\", e[\"error\"])\n        return e\n    if not re.match(r\"^vapi_asst_[0-9A-Z]{18,}$\", assistant_id):\n        e = _err(\"VALIDATION_ERROR\", \"assistant_id is malformed\", field=\"assistant_id\")\n        _log(\"VALIDATION_ERROR\", e[\"error\"])\n        return e\n\n    if display_name is not None and (not isinstance(display_name, str) or not display_name.strip()):\n        e = _err(\"VALIDATION_ERROR\", \"display_name must be a non-empty string\", field=\"display_name\")\n        _log(\"VALIDATION_ERROR\", e[\"error\"])\n        return e\n    if isinstance(display_name, str):\n        display_name = display_name.strip()\n\n    if description is not None and not isinstance(description, str):\n        e = _err(\"VALIDATION_ERROR\", \"description must be a string\", field=\"description\")\n        _log(\"VALIDATION_ERROR\", e[\"error\"])\n        return e\n\n    if voice_config is not None and not isinstance(voice_config, dict):\n        e = _err(\"VALIDATION_ERROR\", \"voice_config must be an object\", field=\"voice_config\")\n        _log(\"VALIDATION_ERROR\", e[\"error\"])\n        return e\n\n    if model_config is not None and not isinstance(model_config, dict):\n        e = _err(\"VALIDATION_ERROR\", \"model_config must be an object\", field=\"model_config\")\n        _log(\"VALIDATION_ERROR\", e[\"error\"])\n        return e\n\n    if webhook_url is not None:\n        if not isinstance(webhook_url, str):\n            e = _err(\"VALIDATION_ERROR\", \"webhook_url must be a string\", field=\"webhook_url\")\n            _log(\"VALIDATION_ERROR\", e[\"error\"])\n            return e\n        if webhook_url != \"\" and not webhook_url.startswith(\"https://\"):\n            e = _err(\"VALIDATION_ERROR\", \"webhook_url must start with 'https://'\", field=\"webhook_url\")\n            _log(\"VALIDATION_ERROR\", e[\"error\"])\n            return e\n\n    allowed_status = {\"draft\", \"active\", \"disabled\", \"archived\"}\n    if status is not None and (not isinstance(status, str) or status not in allowed_status):\n        e = _err(\"VALIDATION_ERROR\", \"Invalid status\", field=\"status\")\n        _log(\"VALIDATION_ERROR\", e[\"error\"])\n        return e\n\n    assistants = _load(\"assistants.json\")\n    if not isinstance(assistants, list):\n        assistants = []\n\n    idx = None\n    for i, a in enumerate(assistants):\n        if isinstance(a, dict) and a.get(\"assistant_id\") == assistant_id:\n            idx = i\n            break\n    if idx is None:\n        e = _err(\"NOT_FOUND\", \"Assistant not found\", assistant_id=assistant_id)\n        _log(\"NOT_FOUND\", e[\"error\"])\n        return e\n\n    current = assistants[idx]\n    if not isinstance(current, dict):\n        e = _err(\"CONFLICT\", \"Corrupt assistant record\", assistant_id=assistant_id)\n        _log(\"CONFLICT\", e[\"error\"])\n        return e\n\n    # unique(display_name)\n    if display_name is not None and display_name != current.get(\"display_name\"):\n        for a in assistants:\n            if isinstance(a, dict) and a.get(\"display_name\") == display_name and a.get(\"assistant_id\") != assistant_id:\n                e = _err(\"CONFLICT\", \"display_name must be unique\", field=\"display_name\")\n                _log(\"CONFLICT\", e[\"error\"])\n                return e\n\n    # Status transition enforcement\n    transitions = {\n        \"draft\": {\"active\", \"archived\"},\n        \"active\": {\"disabled\", \"archived\"},\n        \"disabled\": {\"active\", \"archived\"},\n        \"archived\": set()\n    }\n    if status is not None:\n        cur_status = current.get(\"status\")\n        if cur_status not in transitions:\n            e = _err(\"CONFLICT\", \"Assistant has invalid current status\", current_status=cur_status)\n            _log(\"CONFLICT\", e[\"error\"])\n            return e\n        if status != cur_status:\n            if status not in transitions[cur_status]:\n                e = _err(\"INVALID_TRANSITION\", \"Illegal status transition\", from_status=cur_status, to_status=status)\n                _log(\"INVALID_TRANSITION\", e[\"error\"])\n                return e\n\n    # Apply updates\n    changed = False\n    if display_name is not None:\n        current[\"display_name\"] = display_name\n        changed = True\n    if description is not None:\n        current[\"description\"] = description\n        changed = True\n    if voice_config is not None:\n        current[\"voice_config\"] = voice_config\n        changed = True\n    if model_config is not None:\n        current[\"model_config\"] = model_config\n        changed = True\n    if webhook_url is not None:\n        current[\"webhook_url\"] = webhook_url\n        changed = True\n    if status is not None and status != current.get(\"status\"):\n        current[\"status\"] = status\n        changed = True\n\n    if not changed:\n        # Still a mutation call; real APIs typically return current resource. But \"no success without effect\"\n        # applies to matched-no-row; here we matched a row. Return current without changing version.\n        _log(\"ok\")\n        return {\"data\": current}\n\n    # version increment and timestamps\n    v = current.get(\"version\")\n    if not isinstance(v, int) or v < 1:\n        v = 1\n    current[\"version\"] = v + 1\n    current[\"updated_at\"] = _now()\n    if \"created_at\" not in current or not isinstance(current.get(\"created_at\"), str):\n        current[\"created_at\"] = current[\"updated_at\"]\n\n    assistants[idx] = current\n    try:\n        _save(\"assistants.json\", assistants)\n    except Exception as ex:\n        e = _err(\"CONFLICT\", \"Failed to persist assistant update\", detail=str(ex))\n        _log(\"CONFLICT\", e[\"error\"])\n        return e\n\n    _log(\"ok\")\n    return {\"data\": current}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_calls",
+          "description": "Lists outbound calls in your account and returns a page of call records filtered by assistant, originating phone number, destination E.164, and/or call status; results are paginated with limit and an opaque cursor, and the response includes a next cursor when more results are available. Raises VALIDATION_ERROR if any filter/sort/pagination parameter is invalid (including malformed IDs or limit out of range) and AUTHORIZATION_ERROR if you cannot access calls for the account. Raises RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "assistant_id": {
+                "type": "string",
+                "pattern": "^vapi_asst_[0-9A-Z]{18,}$",
+                "description": "Filter calls by assistant ID."
+              },
+              "from_phone_number_id": {
+                "type": "string",
+                "pattern": "^vapi_pn_[0-9A-Z]{18,}$",
+                "description": "Filter calls by originating (from) phone number ID."
+              },
+              "to_e164": {
+                "type": "string",
+                "description": "Filter calls by destination E.164 number."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "dialing",
+                  "in_progress",
+                  "completed",
+                  "failed",
+                  "canceled"
+                ],
+                "description": "Filter calls by status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of calls to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              },
+              "sort_by": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "started_at",
+                  "ended_at"
+                ],
+                "description": "Field to sort calls by."
+              },
+              "sort_order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order for results."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_calls(assistant_id=None, from_phone_number_id=None, to_e164=None, status=None, limit=None, cursor=None, sort_by=None, sort_order=None, **_extra):\n    import json, os, datetime, re, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0109000\" if __import__(\"os\").path.isdir(\"./environment_mix/0109000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"list_calls\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code, err=None, extra=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"request_id\": \"req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n            \"timestamp\": _now(),\n            \"endpoint\": endpoint,\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if err:\n            row[\"error\"] = err\n        if extra and isinstance(extra, dict):\n            row.update(extra)\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _parse_cursor(cur):\n        if cur is None:\n            return 0\n        if not isinstance(cur, str) or not cur:\n            return None\n        try:\n            pad = \"=\" * (-len(cur) % 4)\n            raw = base64.urlsafe_b64decode((cur + pad).encode(\"ascii\")).decode(\"utf-8\")\n            if not raw.startswith(\"offset:\"):\n                return None\n            off = int(raw.split(\":\", 1)[1])\n            if off < 0:\n                return None\n            return off\n        except (ValueError, UnicodeDecodeError, base64.binascii.Error):\n            return None\n\n    def _make_cursor(off):\n        raw = f\"offset:{off}\".encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"ascii\").rstrip(\"=\")\n\n    def _dt_key(v):\n        if v is None:\n            return None\n        if isinstance(v, str):\n            s = v\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                return datetime.datetime.fromisoformat(s)\n            except ValueError:\n                return None\n        return None\n\n    # Validate inputs\n    try:\n        if assistant_id is not None:\n            if not isinstance(assistant_id, str) or not re.match(r\"^vapi_asst_[0-9A-Z]{18,}$\", assistant_id):\n                _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"assistant_id is invalid\"})\n                return _err(\"VALIDATION_ERROR\", \"assistant_id is invalid\")\n        if from_phone_number_id is not None:\n            if not isinstance(from_phone_number_id, str) or not re.match(r\"^vapi_pn_[0-9A-Z]{18,}$\", from_phone_number_id):\n                _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"from_phone_number_id is invalid\"})\n                return _err(\"VALIDATION_ERROR\", \"from_phone_number_id is invalid\")\n        if to_e164 is not None:\n            if not isinstance(to_e164, str) or not to_e164.startswith(\"+\") or len(to_e164) < 2:\n                _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"to_e164 must be a valid E.164 string\"})\n                return _err(\"VALIDATION_ERROR\", \"to_e164 must be a valid E.164 string\")\n        if status is not None:\n            if not isinstance(status, str) or status not in (\"queued\", \"dialing\", \"in_progress\", \"completed\", \"failed\", \"canceled\"):\n                _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"status is invalid\"})\n                return _err(\"VALIDATION_ERROR\", \"status is invalid\")\n        if limit is None:\n            limit_v = 20\n        else:\n            if not isinstance(limit, int):\n                _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"limit must be an integer\"})\n                return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n            if limit < 1 or limit > 100:\n                _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"limit out of range\"})\n                return _err(\"VALIDATION_ERROR\", \"limit out of range\")\n            limit_v = limit\n        if sort_by is None:\n            sort_by_v = \"created_at\"\n        else:\n            if not isinstance(sort_by, str) or sort_by not in (\"created_at\", \"updated_at\", \"started_at\", \"ended_at\"):\n                _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"sort_by is invalid\"})\n                return _err(\"VALIDATION_ERROR\", \"sort_by is invalid\")\n            sort_by_v = sort_by\n        if sort_order is None:\n            sort_order_v = \"desc\"\n        else:\n            if not isinstance(sort_order, str) or sort_order not in (\"asc\", \"desc\"):\n                _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"sort_order is invalid\"})\n                return _err(\"VALIDATION_ERROR\", \"sort_order is invalid\")\n            sort_order_v = sort_order\n\n        offset = _parse_cursor(cursor)\n        if offset is None:\n            _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"cursor is invalid\"})\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n    except Exception as e:\n        _log(500, {\"code\": \"VALIDATION_ERROR\", \"message\": \"invalid parameters\"})\n        return _err(\"VALIDATION_ERROR\", \"invalid parameters\")\n\n    calls = _load(\"calls.json\")\n    if not isinstance(calls, list):\n        calls = []\n\n    # Filter\n    filtered = []\n    for c in calls:\n        if not isinstance(c, dict):\n            continue\n        if assistant_id is not None and c.get(\"assistant_id\") != assistant_id:\n            continue\n        if from_phone_number_id is not None and c.get(\"from_phone_number_id\") != from_phone_number_id:\n            continue\n        if to_e164 is not None and c.get(\"to_e164\") != to_e164:\n            continue\n        if status is not None and c.get(\"status\") != status:\n            continue\n        filtered.append(c)\n\n    # Sort\n    reverse = (sort_order_v == \"desc\")\n\n    def _sort_key(c):\n        v = c.get(sort_by_v)\n        dt = _dt_key(v)\n        # None values: place last in asc, first in desc? Most APIs place nulls last; do that.\n        null_rank = 1 if dt is None else 0\n        if reverse:\n            null_rank = -null_rank  # keep nulls last even when reverse by flipping rank\n        # Secondary sort stable by call_id\n        return (null_rank, dt if dt is not None else datetime.datetime.min, c.get(\"call_id\") or \"\")\n\n    # To keep nulls last in both orders, we sort twice: compute key without reverse and handle reverse manually.\n    # Simpler: sort with reverse on dt, but also keep nulls last.\n    def _sort_key2(c):\n        dt = _dt_key(c.get(sort_by_v))\n        null_rank = 1 if dt is None else 0\n        cid = c.get(\"call_id\") or \"\"\n        return (null_rank, dt if dt is not None else datetime.datetime.min, cid)\n\n    filtered.sort(key=_sort_key2, reverse=reverse)\n    total = len(filtered)\n\n    page = filtered[offset:offset + limit_v]\n    next_off = offset + len(page)\n    has_more = next_off < total\n    next_cursor = _make_cursor(next_off) if has_more else None\n\n    resp = {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit_v,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"sort_by\": sort_by_v,\n            \"sort_order\": sort_order_v,\n        }\n    }\n    _log(200, extra={\"result_count\": len(page), \"total\": total})\n    return resp\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_call",
+          "description": "Creates an outbound call for the specified assistant to the destination to_e164 and returns the created call record, optionally using a specific owned from_phone_number_id or an allowed from_e164_override and attaching metadata. Raises VALIDATION_ERROR if required fields are missing, IDs are malformed, or to_e164/from_e164_override are not valid E.164 values, NOT_FOUND if the referenced assistant_id or from_phone_number_id does not exist, and AUTHORIZATION_ERROR if you are not permitted to place calls for the account. Raises CONFLICT if the call cannot be created due to an invalid call state request (e.g., attempting to create a call against a non-usable assistant/number status), and RATE_LIMITED when call/request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "assistant_id": {
+                "type": "string",
+                "pattern": "^vapi_asst_[0-9A-Z]{18,}$",
+                "description": "Assistant ID that will place and run the outbound call."
+              },
+              "from_phone_number_id": {
+                "type": "string",
+                "pattern": "^vapi_pn_[0-9A-Z]{18,}$",
+                "description": "Owned phone number ID to place the call from."
+              },
+              "from_e164_override": {
+                "type": "string",
+                "description": "Optional E.164 caller ID override (if allowed by provider/account)."
+              },
+              "to_e164": {
+                "type": "string",
+                "description": "Destination phone number in E.164 format."
+              },
+              "metadata": {
+                "type": "object",
+                "description": "Arbitrary metadata to attach to the call for tracking."
+              }
+            },
+            "required": [
+              "assistant_id",
+              "to_e164"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_call(assistant_id, to_e164, from_phone_number_id=None, from_e164_override=None, metadata=None, **_extra):\n    import json, os, datetime, re, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0109000\" if __import__(\"os\").path.isdir(\"./environment_mix/0109000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"create_call\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code, err=None, extra=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"request_id\": \"req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n            \"timestamp\": _now(),\n            \"endpoint\": endpoint,\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if err:\n            row[\"error\"] = err\n        if extra and isinstance(extra, dict):\n            row.update(extra)\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    # Validate inputs\n    if not isinstance(assistant_id, str) or not re.match(r\"^vapi_asst_[0-9A-Z]{18,}$\", assistant_id):\n        _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"assistant_id is invalid\"})\n        return _err(\"VALIDATION_ERROR\", \"assistant_id is invalid\")\n    if not isinstance(to_e164, str) or not to_e164.startswith(\"+\") or len(to_e164) < 2:\n        _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"to_e164 must be a valid E.164 string\"})\n        return _err(\"VALIDATION_ERROR\", \"to_e164 must be a valid E.164 string\")\n\n    if from_phone_number_id is not None:\n        if not isinstance(from_phone_number_id, str) or not re.match(r\"^vapi_pn_[0-9A-Z]{18,}$\", from_phone_number_id):\n            _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"from_phone_number_id is invalid\"})\n            return _err(\"VALIDATION_ERROR\", \"from_phone_number_id is invalid\")\n\n    if from_e164_override is not None:\n        if not isinstance(from_e164_override, str) or not from_e164_override.startswith(\"+\") or len(from_e164_override) < 2:\n            _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"from_e164_override must be a valid E.164 string\"})\n            return _err(\"VALIDATION_ERROR\", \"from_e164_override must be a valid E.164 string\")\n\n    if from_phone_number_id is not None and from_e164_override is not None:\n        _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"Provide only one of from_phone_number_id or from_e164_override\"})\n        return _err(\"VALIDATION_ERROR\", \"Provide only one of from_phone_number_id or from_e164_override\")\n\n    if metadata is not None and not isinstance(metadata, dict):\n        _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"metadata must be an object\"})\n        return _err(\"VALIDATION_ERROR\", \"metadata must be an object\")\n\n    assistants = _load(\"assistants.json\")\n    if not isinstance(assistants, list):\n        assistants = []\n    asst = next((a for a in assistants if isinstance(a, dict) and a.get(\"assistant_id\") == assistant_id), None)\n    if not asst:\n        _log(404, {\"code\": \"NOT_FOUND\", \"message\": \"Assistant not found\"})\n        return _err(\"NOT_FOUND\", \"Assistant not found\")\n    if asst.get(\"status\") != \"active\":\n        _log(409, {\"code\": \"CONFLICT\", \"message\": \"Assistant must be active to create calls\", \"assistant_status\": asst.get(\"status\")})\n        return _err(\"CONFLICT\", \"Assistant must be active to create calls\", assistant_status=asst.get(\"status\"))\n\n    if from_phone_number_id is not None:\n        phone_numbers = _load(\"phone_numbers.json\")\n        if not isinstance(phone_numbers, list):\n            phone_numbers = []\n        pn = next((p for p in phone_numbers if isinstance(p, dict) and p.get(\"phone_number_id\") == from_phone_number_id), None)\n        if not pn:\n            _log(404, {\"code\": \"NOT_FOUND\", \"message\": \"Phone number not found\"})\n            return _err(\"NOT_FOUND\", \"Phone number not found\")\n        if pn.get(\"status\") != \"active\":\n            _log(409, {\"code\": \"CONFLICT\", \"message\": \"Phone number must be active to use as from_phone_number_id\", \"phone_number_status\": pn.get(\"status\")})\n            return _err(\"CONFLICT\", \"Phone number must be active to use as from_phone_number_id\", phone_number_status=pn.get(\"status\"))\n\n    calls = _load(\"calls.json\")\n    if not isinstance(calls, list):\n        calls = []\n\n    # Generate ID\n    call_id = \"vapi_call_\" + base64.b32encode(os.urandom(12)).decode(\"ascii\").rstrip(\"=\")\n\n    now = _now()\n    row = {\n        \"call_id\": call_id,\n        \"assistant_id\": assistant_id,\n        \"from_phone_number_id\": from_phone_number_id,\n        \"from_e164_override\": from_e164_override,\n        \"to_e164\": to_e164,\n        \"direction\": \"outbound\",\n        \"status\": \"queued\",\n        \"started_at\": None,\n        \"ended_at\": None,\n        \"duration_seconds\": None,\n        \"error_code\": None,\n        \"error_message\": None,\n        \"metadata\": metadata if metadata is not None else None,\n        \"created_at\": now,\n        \"updated_at\": now,\n    }\n\n    calls.append(row)\n    _save(\"calls.json\", calls)\n\n    _log(201, extra={\"call_id\": call_id, \"assistant_id\": assistant_id})\n    return {\"data\": row}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_call",
+          "description": "Retrieves a single call by call_id and returns its current details and lifecycle state. Raises VALIDATION_ERROR if call_id does not match the expected format, NOT_FOUND if no call with that ID exists in your account, and AUTHORIZATION_ERROR if you do not have access to it. Raises RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "call_id": {
+                "type": "string",
+                "pattern": "^vapi_call_[0-9A-Z]{18,}$",
+                "description": "Unique ID of the call to retrieve."
+              }
+            },
+            "required": [
+              "call_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_call(call_id, **_extra):\n    import json, os, datetime, re, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0109000\" if __import__(\"os\").path.isdir(\"./environment_mix/0109000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_call\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code, err=None, extra=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"request_id\": \"req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n            \"timestamp\": _now(),\n            \"endpoint\": endpoint,\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if err:\n            row[\"error\"] = err\n        if extra and isinstance(extra, dict):\n            row.update(extra)\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    if not isinstance(call_id, str) or not re.match(r\"^vapi_call_[0-9A-Z]{18,}$\", call_id):\n        _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"call_id is invalid\"})\n        return _err(\"VALIDATION_ERROR\", \"call_id is invalid\")\n\n    calls = _load(\"calls.json\")\n    if not isinstance(calls, list):\n        calls = []\n    call = next((c for c in calls if isinstance(c, dict) and c.get(\"call_id\") == call_id), None)\n    if not call:\n        _log(404, {\"code\": \"NOT_FOUND\", \"message\": \"Call not found\"})\n        return _err(\"NOT_FOUND\", \"Call not found\")\n\n    _log(200, extra={\"call_id\": call_id})\n    return {\"data\": call}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_phone_numbers",
+          "description": "Lists phone numbers attached to your account and returns a page of phone number records filtered by status, provider, and/or country code; results are paginated with limit and an opaque cursor, and the response includes a next cursor when more results are available. Raises VALIDATION_ERROR if any filter/sort/pagination parameter is invalid (including limit out of range or invalid country code) and AUTHORIZATION_ERROR if you cannot access phone numbers for the account. Raises RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "provisioning",
+                  "active",
+                  "suspended",
+                  "released"
+                ],
+                "description": "Filter phone numbers by provisioning/status."
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "twilio",
+                  "vonage",
+                  "telnyx",
+                  "other"
+                ],
+                "description": "Filter phone numbers by telephony provider."
+              },
+              "country_code": {
+                "type": "string",
+                "description": "Filter phone numbers by ISO country code (e.g., US, GB)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of phone numbers to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              },
+              "sort_by": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "e164"
+                ],
+                "description": "Field to sort phone numbers by."
+              },
+              "sort_order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort order for results."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_phone_numbers(status=None, provider=None, country_code=None, limit=None, cursor=None, sort_by=None, sort_order=None, **_extra):\n    import json, os, datetime, re, time, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0109000\" if __import__(\"os\").path.isdir(\"./environment_mix/0109000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"list_phone_numbers\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(status_code, err=None, extra=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        row = {\n            \"request_id\": \"req_\" + base64.urlsafe_b64encode(os.urandom(9)).decode(\"ascii\").rstrip(\"=\"),\n            \"timestamp\": _now(),\n            \"endpoint\": endpoint,\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if err:\n            row[\"error\"] = err\n        if extra and isinstance(extra, dict):\n            row.update(extra)\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _parse_cursor(cur):\n        if cur is None:\n            return 0\n        if not isinstance(cur, str) or not cur:\n            return None\n        try:\n            pad = \"=\" * (-len(cur) % 4)\n            raw = base64.urlsafe_b64decode((cur + pad).encode(\"ascii\")).decode(\"utf-8\")\n            if not raw.startswith(\"offset:\"):\n                return None\n            off = int(raw.split(\":\", 1)[1])\n            if off < 0:\n                return None\n            return off\n        except (ValueError, UnicodeDecodeError, base64.binascii.Error):\n            return None\n\n    def _make_cursor(off):\n        raw = f\"offset:{off}\".encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"ascii\").rstrip(\"=\")\n\n    def _dt_key(v):\n        if v is None:\n            return None\n        if isinstance(v, str):\n            s = v\n            if s.endswith(\"Z\"):\n                s = s[:-1] + \"+00:00\"\n            try:\n                return datetime.datetime.fromisoformat(s)\n            except ValueError:\n                return None\n        return None\n\n    # Validate\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"provisioning\", \"active\", \"suspended\", \"released\"):\n            _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"status is invalid\"})\n            return _err(\"VALIDATION_ERROR\", \"status is invalid\")\n    if provider is not None:\n        if not isinstance(provider, str) or provider not in (\"twilio\", \"vonage\", \"telnyx\", \"other\"):\n            _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"provider is invalid\"})\n            return _err(\"VALIDATION_ERROR\", \"provider is invalid\")\n    if country_code is not None:\n        if not isinstance(country_code, str):\n            _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"country_code must be a string\"})\n            return _err(\"VALIDATION_ERROR\", \"country_code must be a string\")\n        cc = country_code.strip()\n        if cc and not re.match(r\"^[A-Z]{2}$\", cc.upper()):\n            _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"country_code must be a 2-letter ISO code\"})\n            return _err(\"VALIDATION_ERROR\", \"country_code must be a 2-letter ISO code\")\n        country_code_v = cc.upper()\n    else:\n        country_code_v = None\n\n    if limit is None:\n        limit_v = 20\n    else:\n        if not isinstance(limit, int):\n            _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"limit must be an integer\"})\n            return _err(\"VALIDATION_ERROR\", \"limit must be an integer\")\n        if limit < 1 or limit > 100:\n            _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"limit out of range\"})\n            return _err(\"VALIDATION_ERROR\", \"limit out of range\")\n        limit_v = limit\n\n    if sort_by is None:\n        sort_by_v = \"created_at\"\n    else:\n        if not isinstance(sort_by, str) or sort_by not in (\"created_at\", \"updated_at\", \"e164\"):\n            _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"sort_by is invalid\"})\n            return _err(\"VALIDATION_ERROR\", \"sort_by is invalid\")\n        sort_by_v = sort_by\n\n    if sort_order is None:\n        sort_order_v = \"desc\"\n    else:\n        if not isinstance(sort_order, str) or sort_order not in (\"asc\", \"desc\"):\n            _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"sort_order is invalid\"})\n            return _err(\"VALIDATION_ERROR\", \"sort_order is invalid\")\n        sort_order_v = sort_order\n\n    offset = _parse_cursor(cursor)\n    if offset is None:\n        _log(400, {\"code\": \"VALIDATION_ERROR\", \"message\": \"cursor is invalid\"})\n        return _err(\"VALIDATION_ERROR\", \"cursor is invalid\")\n\n    phone_numbers = _load(\"phone_numbers.json\")\n    if not isinstance(phone_numbers, list):\n        phone_numbers = []\n\n    # Business rule: default list excludes released\n    filtered = []\n    for p in phone_numbers:\n        if not isinstance(p, dict):\n            continue\n        if p.get(\"status\") == \"released\":\n            # excluded unless explicitly filtering for released? Rule says list_phone_numbers returns where status != 'released'\n            # Keep strict: never return released.\n            continue\n        if status is not None and p.get(\"status\") != status:\n            continue\n        if provider is not None and p.get(\"provider\") != provider:\n            continue\n        if country_code_v is not None:\n            val = p.get(\"country_code\")\n            if not isinstance(val, str) or val.upper() != country_code_v:\n                continue\n        filtered.append(p)\n\n    reverse = (sort_order_v == \"desc\")\n\n    def _sort_key(p):\n        if sort_by_v in (\"created_at\", \"updated_at\"):\n            dt = _dt_key(p.get(sort_by_v))\n            null_rank = 1 if dt is None else 0\n            return (null_rank, dt if dt is not None else datetime.datetime.min, p.get(\"phone_number_id\") or \"\")\n        # e164\n        e = p.get(\"e164\")\n        e_s = e if isinstance(e, str) else \"\"\n        return (e_s, p.get(\"phone_number_id\") or \"\")\n\n    filtered.sort(key=_sort_key, reverse=reverse)\n    total = len(filtered)\n\n    page = filtered[offset:offset + limit_v]\n    next_off = offset + len(page)\n    has_more = next_off < total\n    next_cursor = _make_cursor(next_off) if has_more else None\n\n    resp = {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit_v,\n            \"cursor\": cursor,\n            \"next_cursor\": next_cursor,\n            \"has_more\": has_more,\n            \"sort_by\": sort_by_v,\n            \"sort_order\": sort_order_v,\n        }\n    }\n    _log(200, extra={\"result_count\": len(page), \"total\": total})\n    return resp\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_phone_number",
+          "description": "Retrieves a single phone number by phone_number_id and returns its details, including provider and current status. Raises VALIDATION_ERROR if phone_number_id does not match the expected format, NOT_FOUND if no phone number with that ID exists in your account, and AUTHORIZATION_ERROR if you do not have access to it. Raises RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "phone_number_id": {
+                "type": "string",
+                "pattern": "^vapi_pn_[0-9A-Z]{18,}$",
+                "description": "The ID of the phone number to fetch (e.g., vapi_pn_01H8XXXXXXXXXXXXXXX)."
+              }
+            },
+            "required": [
+              "phone_number_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_phone_number(phone_number_id, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0109000\" if __import__(\"os\").path.isdir(\"./environment_mix/0109000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_phone_number\"\n\n    # --- quota / rate limiting (best-effort, based on request_logs if present) ---\n    def _log(status, credential_id=None, error_code=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        ts = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n        logs = _load(\"request_logs.json\")\n        row = {\n            \"request_log_id\": \"req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": ts,\n        }\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limited():\n        logs = _load(\"request_logs.json\")\n        now = datetime.datetime.utcnow()\n        # Simple default limits if no dedicated quota config exists:\n        # - 120 requests/minute\n        # - 10,000 requests/day\n        per_min = 120\n        per_day = 10000\n        m = 0\n        d = 0\n        for r in logs:\n            ts = r.get(\"created_at\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                rt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                continue\n            delta = now - rt\n            if delta.total_seconds() <= 60:\n                m += 1\n            if delta.total_seconds() <= 86400:\n                d += 1\n        if m >= per_min:\n            return (\"RATE_LIMIT\", f\"Rate limit exceeded: {per_min}/minute.\")\n        if d >= per_day:\n            return (\"QUOTA_EXCEEDED\", f\"Daily quota exceeded: {per_day}/day.\")\n        return None\n\n    rl = _rate_limited()\n    if rl:\n        code, msg = rl\n        _log(status=429, error_code=code)\n        return _err(code, msg)\n\n    # --- validation ---\n    if not isinstance(phone_number_id, str) or not re.match(r\"^vapi_pn_[0-9A-Z]{18,}$\", phone_number_id):\n        _log(status=400, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"phone_number_id is invalid.\", field=\"phone_number_id\")\n\n    phone_numbers = _load(\"phone_numbers.json\")\n    pn = None\n    for r in phone_numbers:\n        if isinstance(r, dict) and r.get(\"phone_number_id\") == phone_number_id:\n            pn = r\n            break\n\n    if not pn:\n        _log(status=404, error_code=\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Phone number not found.\", phone_number_id=phone_number_id)\n\n    # No explicit auth model in provided schema; ambient auth assumed.\n    _log(status=200)\n    return {\"phone_number\": pn}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_tools",
+          "description": "Lists callable tools in the catalog and returns a page of tool records filtered by integration_type, status, and/or exact slug; results are paginated with limit and an opaque cursor, and the response includes a next cursor when more results are available. Raises VALIDATION_ERROR if any filter/sort/pagination parameter is invalid (including limit out of range) and AUTHORIZATION_ERROR if you cannot access the tools catalog for the account. Raises RATE_LIMITED when request quotas are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "integration_type": {
+                "type": "string",
+                "enum": [
+                  "builtin",
+                  "webhook",
+                  "mcp"
+                ],
+                "description": "Filter tools by integration type."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "deprecated",
+                  "disabled"
+                ],
+                "description": "Filter tools by lifecycle status."
+              },
+              "slug": {
+                "type": "string",
+                "description": "Filter tools by exact slug."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of tools to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for fetching the next page."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "display_name",
+                  "slug"
+                ],
+                "description": "Field to sort results by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_tools(integration_type=None, status=None, slug=None, limit=None, cursor=None, sort=None, order=None, **_extra):\n    import json, os, datetime, time, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0109000\" if __import__(\"os\").path.isdir(\"./environment_mix/0109000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"list_tools\"\n\n    def _log(status_code, credential_id=None, error_code=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        ts = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n        logs = _load(\"request_logs.json\")\n        row = {\n            \"request_log_id\": \"req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": ts,\n        }\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limited():\n        logs = _load(\"request_logs.json\")\n        now = datetime.datetime.utcnow()\n        per_min = 120\n        per_day = 10000\n        m = 0\n        d = 0\n        for r in logs:\n            ts = r.get(\"created_at\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                rt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                continue\n            delta = now - rt\n            if delta.total_seconds() <= 60:\n                m += 1\n            if delta.total_seconds() <= 86400:\n                d += 1\n        if m >= per_min:\n            return (\"RATE_LIMIT\", f\"Rate limit exceeded: {per_min}/minute.\")\n        if d >= per_day:\n            return (\"QUOTA_EXCEEDED\", f\"Daily quota exceeded: {per_day}/day.\")\n        return None\n\n    rl = _rate_limited()\n    if rl:\n        code, msg = rl\n        _log(429, error_code=code)\n        return _err(code, msg)\n\n    # --- validation ---\n    if integration_type is not None:\n        if not isinstance(integration_type, str) or integration_type not in (\"builtin\", \"webhook\", \"mcp\"):\n            _log(400, error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"integration_type is invalid.\", field=\"integration_type\")\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"active\", \"deprecated\", \"disabled\"):\n            _log(400, error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status is invalid.\", field=\"status\")\n    if slug is not None and not isinstance(slug, str):\n        _log(400, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"slug must be a string.\", field=\"slug\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 100:\n        _log(400, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit out of range (1-100).\", field=\"limit\")\n    if cursor is not None and not isinstance(cursor, str):\n        _log(400, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string.\", field=\"cursor\")\n    if sort is not None:\n        if not isinstance(sort, str) or sort not in (\"created_at\", \"updated_at\", \"display_name\", \"slug\"):\n            _log(400, error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"sort is invalid.\", field=\"sort\")\n    if order is not None:\n        if not isinstance(order, str) or order not in (\"asc\", \"desc\"):\n            _log(400, error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"order is invalid.\", field=\"order\")\n\n    tools = _load(\"tools.json\")\n    rows = [r for r in tools if isinstance(r, dict)]\n\n    # Business rule: list_tools returns tools where status in ('active','deprecated')\n    rows = [r for r in rows if r.get(\"status\") in (\"active\", \"deprecated\")]\n\n    # Additional filters\n    if integration_type is not None:\n        rows = [r for r in rows if r.get(\"integration_type\") == integration_type]\n    if status is not None:\n        # allow filtering to disabled even though default list excludes; but business rule says list_tools returns only active/deprecated\n        # so filtering to disabled yields empty.\n        rows = [r for r in rows if r.get(\"status\") == status]\n    if slug is not None:\n        rows = [r for r in rows if r.get(\"slug\") == slug]\n\n    # Sorting: default display_name asc per business rule\n    if sort is None:\n        sort = \"display_name\"\n    if order is None:\n        order = \"asc\"\n\n    def _key(v):\n        x = v.get(sort)\n        if x is None:\n            return \"\"\n        return x\n\n    rev = (order == \"desc\")\n    try:\n        rows.sort(key=_key, reverse=rev)\n    except TypeError:\n        # Mixed types; coerce to string\n        rows.sort(key=lambda r: str(r.get(sort, \"\")), reverse=rev)\n\n    # Cursor: opaque base64 of integer offset\n    offset = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            offset = int(raw.decode(\"utf-8\"))\n            if offset < 0:\n                raise ValueError()\n        except Exception:\n            _log(400, error_code=\"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"cursor is invalid.\", field=\"cursor\")\n\n    total = len(rows)\n    page = rows[offset:offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(str(next_offset).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    _log(200)\n    return {\n        \"tools\": page,\n        \"pagination\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor\n        }\n    }\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_tool",
+          "description": "Retrieves a single tool by ID and returns the tool’s full definition and metadata. Raises VALIDATION_ERROR if tool_id is missing or does not match the required vapi_tool_… format, UNAUTHORIZED if the caller is not authenticated, FORBIDDEN if the caller does not have access to the tool’s owning account, and NOT_FOUND if no tool with that ID exists.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "tool_id": {
+                "type": "string",
+                "pattern": "^vapi_tool_[0-9A-Z]{18,}$",
+                "description": "The ID of the tool to fetch (e.g., vapi_tool_01H8XXXXXXXXXXXXXXX)."
+              }
+            },
+            "required": [
+              "tool_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_tool(tool_id, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0109000\" if __import__(\"os\").path.isdir(\"./environment_mix/0109000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_tool\"\n\n    def _log(status_code, credential_id=None, error_code=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        ts = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n        logs = _load(\"request_logs.json\")\n        row = {\n            \"request_log_id\": \"req_\" + datetime.datetime.utcnow().strftime(\"%Y%m%d%H%M%S%f\"),\n            \"endpoint\": endpoint,\n            \"credential_id\": credential_id,\n            \"status\": status_code,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"created_at\": ts,\n        }\n        logs.append(row)\n        _save(\"request_logs.json\", logs)\n\n    def _rate_limited():\n        logs = _load(\"request_logs.json\")\n        now = datetime.datetime.utcnow()\n        per_min = 120\n        per_day = 10000\n        m = 0\n        d = 0\n        for r in logs:\n            ts = r.get(\"created_at\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                rt = datetime.datetime.fromisoformat(ts.replace(\"Z\", \"+00:00\")).replace(tzinfo=None)\n            except Exception:\n                continue\n            delta = now - rt\n            if delta.total_seconds() <= 60:\n                m += 1\n            if delta.total_seconds() <= 86400:\n                d += 1\n        if m >= per_min:\n            return (\"RATE_LIMIT\", f\"Rate limit exceeded: {per_min}/minute.\")\n        if d >= per_day:\n            return (\"QUOTA_EXCEEDED\", f\"Daily quota exceeded: {per_day}/day.\")\n        return None\n\n    rl = _rate_limited()\n    if rl:\n        code, msg = rl\n        _log(429, error_code=code)\n        return _err(code, msg)\n\n    if not isinstance(tool_id, str) or not re.match(r\"^vapi_tool_[0-9A-Z]{18,}$\", tool_id):\n        _log(400, error_code=\"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"tool_id is invalid.\", field=\"tool_id\")\n\n    tools = _load(\"tools.json\")\n    tool = None\n    for r in tools:\n        if isinstance(r, dict) and r.get(\"tool_id\") == tool_id:\n            tool = r\n            break\n\n    if not tool:\n        _log(404, error_code=\"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"Tool not found.\", tool_id=tool_id)\n\n    # Ambient auth; no ownership model in schema to enforce FORBIDDEN.\n    _log(200)\n    return {\"tool\": tool}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0109000",
+    "index": 109,
+    "name": "Vapi MCP Server",
+    "description": "This backend stores configuration for voice AI assistants, the phone numbers attached to an account, and the lifecycle of outbound calls placed through those assistants. It also catalogs callable “tools” that assistants can invoke, and tracks which tools are enabled per assistant so the API can list",
+    "taxonomy": {
+      "L1_id": "L1-20",
+      "L1_name": "Communication & General Utilities",
+      "L1_name_zh": "通信与通用工具",
+      "L2_id": "L2-48",
+      "L2_name": "Messaging & Notification",
+      "L2_name_zh": "即时通信与通知",
+      "L3_name": "Voice Calling & Voice Agents",
+      "L3_name_zh": "语音呼叫与语音智能体"
+    },
+    "database_dir": "./environment_mix/0109000",
+    "mount_path": "/app/database",
+    "n_tools": 11,
+    "n_collections": 5,
+    "n_records": 91,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 11,
+      "loaded": 11,
+      "reads_returning_data": 8,
+      "read_operations": 8,
+      "mutations_persisted": 2,
+      "mutations_attempted": 3
+    },
+    "tools_loadable_from_database_dir": 11,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_assistants",
+      "returned_chars": 133
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

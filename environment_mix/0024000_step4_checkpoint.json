@@ -1,0 +1,817 @@
+{
+  "index": 24,
+  "local_files_dir": "./environment_mix/0024000",
+  "file_list": [
+    "./environment_mix/0024000/README.md",
+    "./environment_mix/0024000/bases.json",
+    "./environment_mix/0024000/fields.json",
+    "./environment_mix/0024000/record_search_index.json",
+    "./environment_mix/0024000/records.json",
+    "./environment_mix/0024000/request_logs.json",
+    "./environment_mix/0024000/tables.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "bases.json": "18 rows",
+        "tables.json": "18 rows",
+        "fields.json": "18 rows",
+        "records.json": "18 rows",
+        "record_search_index.json": "18 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "list_bases",
+          "description": "Lists bases visible to the caller, optionally filtered by lifecycle status and/or owner_user_id, and returns results sorted as requested with cursor-based pagination (pass limit and the returned cursor to fetch the next page). Raises VALIDATION_ERROR for invalid enum values, limit out of range, or malformed cursor, and AUTHORIZATION_ERROR if you are not permitted to view the requested owner’s bases. Raises QUOTA_EXCEEDED when request rate or listing limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "Filter bases by lifecycle status."
+              },
+              "owner_user_id": {
+                "type": "string",
+                "description": "Filter bases by owning user id."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of bases to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "name"
+                ],
+                "description": "Field to sort results by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "implementation": "def list_bases(status=None, owner_user_id=None, limit=None, cursor=None, sort=None, order=None, **_extra):\n    import json, os, datetime, time, base64, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0024000\" if __import__(\"os\").path.isdir(\"./environment_mix/0024000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status_code, message=None, credential_id=None, extra=None):\n        # Best-effort request logging if a collection exists; never fail the call because logging failed.\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            logs.append({\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": endpoint,\n                \"credential_id\": credential_id,\n                \"status\": status_code,\n                \"message\": message,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": _now(),\n                \"extra\": extra or {},\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    def _parse_cursor(cur):\n        if cur is None:\n            return 0\n        if not isinstance(cur, str) or not cur:\n            return None\n        # Opaque cursor: base64url(\"v1:<offset>\")\n        try:\n            pad = \"=\" * (-len(cur) % 4)\n            raw = base64.urlsafe_b64decode(cur + pad).decode(\"utf-8\")\n            if not raw.startswith(\"v1:\"):\n                return None\n            off = int(raw.split(\":\", 1)[1])\n            if off < 0:\n                return None\n            return off\n        except Exception:\n            return None\n\n    def _make_cursor(off):\n        raw = f\"v1:{off}\".encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"utf-8\").rstrip(\"=\")\n\n    # Validate inputs\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"active\", \"archived\", \"deleted\"):\n            _log(\"list_bases\", \"VALIDATION_ERROR\", \"Invalid status\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid status; must be one of: active, archived, deleted.\")\n    if owner_user_id is not None and not isinstance(owner_user_id, str):\n        _log(\"list_bases\", \"VALIDATION_ERROR\", \"Invalid owner_user_id\")\n        return _err(\"VALIDATION_ERROR\", \"owner_user_id must be a string.\")\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int) or limit < 1 or limit > 100:\n        _log(\"list_bases\", \"VALIDATION_ERROR\", \"Invalid limit\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 100.\")\n    if sort is None:\n        sort = \"created_at\"\n    if not isinstance(sort, str) or sort not in (\"created_at\", \"updated_at\", \"name\"):\n        _log(\"list_bases\", \"VALIDATION_ERROR\", \"Invalid sort\")\n        return _err(\"VALIDATION_ERROR\", \"sort must be one of: created_at, updated_at, name.\")\n    if order is None:\n        order = \"asc\"\n    if not isinstance(order, str) or order not in (\"asc\", \"desc\"):\n        _log(\"list_bases\", \"VALIDATION_ERROR\", \"Invalid order\")\n        return _err(\"VALIDATION_ERROR\", \"order must be one of: asc, desc.\")\n    offset = _parse_cursor(cursor)\n    if offset is None:\n        _log(\"list_bases\", \"VALIDATION_ERROR\", \"Malformed cursor\")\n        return _err(\"VALIDATION_ERROR\", \"Malformed cursor.\")\n\n    bases = _load(\"bases.json\")\n    if not isinstance(bases, list):\n        bases = []\n\n    # Business rule: list_bases returns bases where status != 'deleted' (unless explicitly filtered? schema says always)\n    # Implement as: default excludes deleted; if status provided, respect it.\n    res = []\n    for b in bases:\n        if not isinstance(b, dict):\n            continue\n        b_status = b.get(\"status\")\n        if status is None:\n            if b_status == \"deleted\":\n                continue\n        else:\n            if b_status != status:\n                continue\n        if owner_user_id is not None and b.get(\"owner_user_id\") != owner_user_id:\n            continue\n        res.append(b)\n\n    reverse = (order == \"desc\")\n\n    def _sort_key(row):\n        v = row.get(sort)\n        # handle missing and types: ensure deterministic ordering\n        if v is None:\n            return \"\"\n        return v\n\n    # stable sort then tie-break on id\n    res.sort(key=lambda r: (_sort_key(r), r.get(\"id\", \"\")), reverse=reverse)\n\n    total = len(res)\n    page = res[offset:offset + limit]\n    next_off = offset + len(page)\n    has_more = next_off < total\n    next_cursor = _make_cursor(next_off) if has_more else None\n\n    out = {\n        \"bases\": page,\n        \"pagination\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor\n        },\n        \"sort\": {\"field\": sort, \"order\": order}\n    }\n    _log(\"list_bases\", \"OK\")\n    return out\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_tables",
+          "description": "Lists tables in the specified base, optionally filtered by lifecycle status, and returns results sorted as requested with cursor-based pagination (pass limit and the returned cursor to fetch the next page). Raises VALIDATION_ERROR for an invalid base_id format, invalid enum values, limit out of range, or malformed cursor, and NOT_FOUND if the base_id does not exist. Raises AUTHORIZATION_ERROR if you don’t have access to the base and QUOTA_EXCEEDED when request rate or listing limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "base_id": {
+                "type": "string",
+                "pattern": "^bas_[0-9A-Z]{18,}$",
+                "description": "Base id whose tables should be listed."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "Filter tables by lifecycle status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of tables to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "created_at",
+                  "updated_at",
+                  "name"
+                ],
+                "description": "Field to sort results by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              }
+            },
+            "required": [
+              "base_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def list_tables(base_id, status=None, limit=None, cursor=None, sort=None, order=None, **_extra):\n    import json, os, datetime, time, base64, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0024000\" if __import__(\"os\").path.isdir(\"./environment_mix/0024000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status_code, message=None, credential_id=None, extra=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            logs.append({\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": endpoint,\n                \"credential_id\": credential_id,\n                \"status\": status_code,\n                \"message\": message,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": _now(),\n                \"extra\": extra or {},\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    def _parse_cursor(cur):\n        if cur is None:\n            return 0\n        if not isinstance(cur, str) or not cur:\n            return None\n        try:\n            pad = \"=\" * (-len(cur) % 4)\n            raw = base64.urlsafe_b64decode(cur + pad).decode(\"utf-8\")\n            if not raw.startswith(\"v1:\"):\n                return None\n            off = int(raw.split(\":\", 1)[1])\n            if off < 0:\n                return None\n            return off\n        except Exception:\n            return None\n\n    def _make_cursor(off):\n        raw = f\"v1:{off}\".encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"utf-8\").rstrip(\"=\")\n\n    # Validate inputs\n    if not isinstance(base_id, str) or not re.match(r\"^bas_[0-9A-Z]{18,}$\", base_id):\n        _log(\"list_tables\", \"VALIDATION_ERROR\", \"Invalid base_id\")\n        return _err(\"VALIDATION_ERROR\", \"base_id is malformed.\")\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"active\", \"archived\", \"deleted\"):\n            _log(\"list_tables\", \"VALIDATION_ERROR\", \"Invalid status\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid status; must be one of: active, archived, deleted.\")\n    if limit is None:\n        limit = 200\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        _log(\"list_tables\", \"VALIDATION_ERROR\", \"Invalid limit\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200.\")\n    if sort is None:\n        sort = \"created_at\"\n    if not isinstance(sort, str) or sort not in (\"created_at\", \"updated_at\", \"name\"):\n        _log(\"list_tables\", \"VALIDATION_ERROR\", \"Invalid sort\")\n        return _err(\"VALIDATION_ERROR\", \"sort must be one of: created_at, updated_at, name.\")\n    if order is None:\n        order = \"asc\"\n    if not isinstance(order, str) or order not in (\"asc\", \"desc\"):\n        _log(\"list_tables\", \"VALIDATION_ERROR\", \"Invalid order\")\n        return _err(\"VALIDATION_ERROR\", \"order must be one of: asc, desc.\")\n    offset = _parse_cursor(cursor)\n    if offset is None:\n        _log(\"list_tables\", \"VALIDATION_ERROR\", \"Malformed cursor\")\n        return _err(\"VALIDATION_ERROR\", \"Malformed cursor.\")\n\n    bases = _load(\"bases.json\")\n    if not isinstance(bases, list):\n        bases = []\n    base = next((b for b in bases if isinstance(b, dict) and b.get(\"id\") == base_id), None)\n    if base is None:\n        _log(\"list_tables\", \"NOT_FOUND\", \"Base not found\")\n        return _err(\"NOT_FOUND\", \"Base not found.\", base_id=base_id)\n\n    tables = _load(\"tables.json\")\n    if not isinstance(tables, list):\n        tables = []\n\n    # Business rule: list_tables returns tables for base where status != 'deleted' unless explicit filter\n    res = []\n    for t in tables:\n        if not isinstance(t, dict):\n            continue\n        if t.get(\"base_id\") != base_id:\n            continue\n        t_status = t.get(\"status\")\n        if status is None:\n            if t_status == \"deleted\":\n                continue\n        else:\n            if t_status != status:\n                continue\n        res.append(t)\n\n    reverse = (order == \"desc\")\n\n    def _sort_key(row):\n        v = row.get(sort)\n        if v is None:\n            return \"\"\n        return v\n\n    res.sort(key=lambda r: (_sort_key(r), r.get(\"id\", \"\")), reverse=reverse)\n\n    total = len(res)\n    page = res[offset:offset + limit]\n    next_off = offset + len(page)\n    has_more = next_off < total\n    next_cursor = _make_cursor(next_off) if has_more else None\n\n    out = {\n        \"tables\": page,\n        \"pagination\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"cursor\": cursor,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor\n        },\n        \"sort\": {\"field\": sort, \"order\": order},\n        \"base\": {\"id\": base_id, \"name\": base.get(\"name\"), \"status\": base.get(\"status\")}\n    }\n    _log(\"list_tables\", \"OK\")\n    return out\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_table",
+          "description": "Creates a new table in a base with the provided name/description and an initial primary field definition, and returns the created table including its primary field. Raises VALIDATION_ERROR if base_id is malformed, the table/field names are empty, the primary_field type is unsupported, or the primary_field options are invalid for its type (including invalid link/link-target configuration). Raises NOT_FOUND if the base does not exist, AUTHORIZATION_ERROR if you can’t modify the base, CONFLICT if the table name already exists in the base, and QUOTA_EXCEEDED if schema-change limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "base_id": {
+                "type": "string",
+                "pattern": "^bas_[0-9A-Z]{18,}$",
+                "description": "Base id in which to create the table."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Table name."
+              },
+              "description": {
+                "type": "string",
+                "description": "Optional table description."
+              },
+              "primary_field": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Name of the primary field."
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "singleLineText",
+                      "multilineText",
+                      "number",
+                      "checkbox",
+                      "singleSelect",
+                      "multipleSelects",
+                      "date",
+                      "dateTime",
+                      "email",
+                      "url",
+                      "phoneNumber",
+                      "attachment",
+                      "linkToAnotherRecord",
+                      "lookup",
+                      "formula",
+                      "createdTime",
+                      "lastModifiedTime"
+                    ],
+                    "description": "Field type for the primary field."
+                  },
+                  "options": {
+                    "type": "object",
+                    "description": "Type-specific field options (e.g., select choices, link target table)."
+                  },
+                  "is_required": {
+                    "type": "boolean",
+                    "description": "Whether the primary field must be set on records."
+                  },
+                  "is_unique": {
+                    "type": "boolean",
+                    "description": "Whether values in the primary field must be unique."
+                  }
+                },
+                "required": [
+                  "name",
+                  "type"
+                ],
+                "additionalProperties": false,
+                "description": "Definition of the primary field to create with the table."
+              }
+            },
+            "required": [
+              "base_id",
+              "name",
+              "primary_field"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_table(base_id, name, primary_field, description=None, **_extra):\n    import json, os, datetime, time, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0024000\" if __import__(\"os\").path.isdir(\"./environment_mix/0024000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _log(endpoint, status_code, message=None, credential_id=None, extra=None):\n        try:\n            logs = _load(\"request_logs.json\")\n            if not isinstance(logs, list):\n                logs = []\n            logs.append({\n                \"id\": f\"req_{int(time.time()*1000)}\",\n                \"endpoint\": endpoint,\n                \"credential_id\": credential_id,\n                \"status\": status_code,\n                \"message\": message,\n                \"latency_ms\": int((time.time() - t0) * 1000),\n                \"timestamp\": _now(),\n                \"extra\": extra or {},\n            })\n            _save(\"request_logs.json\", logs)\n        except Exception:\n            pass\n\n    def _gen_id(prefix, existing_ids):\n        # 20 chars base32-ish uppercase (not strict, but matches ^prefix_[0-9A-Z]{18,}$)\n        import random, string\n        alphabet = \"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\"\n        for _ in range(1000):\n            s = \"\".join(random.choice(alphabet) for _ in range(20))\n            _id = f\"{prefix}_{s}\"\n            if _id not in existing_ids:\n                return _id\n        return None\n\n    def _is_json_object(x):\n        return isinstance(x, dict)\n\n    def _validate_choices(choices):\n        if not isinstance(choices, list) or len(choices) == 0:\n            return False, \"options.choices must be a non-empty array.\"\n        names = []\n        for c in choices:\n            if not isinstance(c, dict):\n                return False, \"Each choice must be an object.\"\n            n = c.get(\"name\")\n            if not isinstance(n, str) or not n.strip():\n                return False, \"Each choice.name must be a non-empty string.\"\n            names.append(n)\n        if len(set(names)) != len(names):\n            return False, \"Choice names must be unique.\"\n        return True, None\n\n    def _validate_field_definition(fd, tables_rows):\n        if not isinstance(fd, dict):\n            return \"primary_field must be an object.\"\n        if \"name\" not in fd or \"type\" not in fd:\n            return \"primary_field.name and primary_field.type are required.\"\n        if not isinstance(fd.get(\"name\"), str) or len(fd.get(\"name\")) < 1 or len(fd.get(\"name\")) > 255:\n            return \"primary_field.name must be a non-empty string (1..255).\"\n        ftype = fd.get(\"type\")\n        allowed = [\"singleLineText\", \"multilineText\", \"number\", \"checkbox\", \"singleSelect\", \"multipleSelects\", \"date\",\n                   \"dateTime\", \"email\", \"url\", \"phoneNumber\", \"attachment\", \"linkToAnotherRecord\", \"lookup\", \"formula\",\n                   \"createdTime\", \"lastModifiedTime\"]\n        if not isinstance(ftype, str) or ftype not in allowed:\n            return \"primary_field.type is unsupported.\"\n        options = fd.get(\"options\", {})\n        if options is None:\n            options = {}\n        if not _is_json_object(options):\n            return \"primary_field.options must be a JSON object.\"\n        # type-specific checks\n        if ftype in (\"singleSelect\", \"multipleSelects\"):\n            ok, msg = _validate_choices(options.get(\"choices\"))\n            if not ok:\n                return msg\n        if ftype == \"linkToAnotherRecord\":\n            linked = options.get(\"linked_table_id\")\n            if not isinstance(linked, str) or not re.match(r\"^tbl_[0-9A-Z]{18,}$\", linked):\n                return \"For linkToAnotherRecord, options.linked_table_id must be a valid table id.\"\n            tgt = next((t for t in tables_rows if isinstance(t, dict) and t.get(\"id\") == linked and t.get(\"status\") != \"deleted\"), None)\n            if tgt is None:\n                return \"For linkToAnotherRecord, options.linked_table_id must reference an existing non-deleted table.\"\n        # is_unique constraints\n        is_unique = fd.get(\"is_unique\", False)\n        if is_unique is None:\n            is_unique = False\n        if not isinstance(is_unique, bool):\n            return \"primary_field.is_unique must be boolean.\"\n        if is_unique and ftype not in (\"singleLineText\", \"email\", \"url\", \"phoneNumber\", \"number\"):\n            return \"primary_field.is_unique is only allowed for singleLineText, email, url, phoneNumber, number.\"\n        is_required = fd.get(\"is_required\", False)\n        if is_required is None:\n            is_required = False\n        if not isinstance(is_required, bool):\n            return \"primary_field.is_required must be boolean.\"\n        return None\n\n    # Validate inputs\n    if not isinstance(base_id, str) or not re.match(r\"^bas_[0-9A-Z]{18,}$\", base_id):\n        _log(\"create_table\", \"VALIDATION_ERROR\", \"Invalid base_id\")\n        return _err(\"VALIDATION_ERROR\", \"base_id is malformed.\")\n    if not isinstance(name, str) or len(name) < 1 or len(name) > 255:\n        _log(\"create_table\", \"VALIDATION_ERROR\", \"Invalid table name\")\n        return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string (1..255).\")\n    if description is not None and not isinstance(description, str):\n        _log(\"create_table\", \"VALIDATION_ERROR\", \"Invalid description\")\n        return _err(\"VALIDATION_ERROR\", \"description must be a string.\")\n    if not isinstance(primary_field, dict):\n        _log(\"create_table\", \"VALIDATION_ERROR\", \"Invalid primary_field\")\n        return _err(\"VALIDATION_ERROR\", \"primary_field must be an object.\")\n\n    bases = _load(\"bases.json\")\n    if not isinstance(bases, list):\n        bases = []\n    base = next((b for b in bases if isinstance(b, dict) and b.get(\"id\") == base_id), None)\n    if base is None:\n        _log(\"create_table\", \"NOT_FOUND\", \"Base not found\")\n        return _err(\"NOT_FOUND\", \"Base not found.\", base_id=base_id)\n    if base.get(\"status\") == \"deleted\":\n        _log(\"create_table\", \"INVALID_TRANSITION\", \"Cannot create table in deleted base\")\n        return _err(\"INVALID_TRANSITION\", \"Cannot create a table in a deleted base.\", base_id=base_id)\n\n    tables = _load(\"tables.json\")\n    if not isinstance(tables, list):\n        tables = []\n    fields = _load(\"fields.json\")\n    if not isinstance(fields, list):\n        fields = []\n\n    # Validate primary field definition (needs tables for link target check)\n    msg = _validate_field_definition(primary_field, tables)\n    if msg:\n        _log(\"create_table\", \"VALIDATION_ERROR\", msg)\n        return _err(\"VALIDATION_ERROR\", msg)\n\n    # Enforce unique(base_id, name) where status != 'deleted'\n    for t in tables:\n        if not isinstance(t, dict):\n            continue\n        if t.get(\"base_id\") == base_id and t.get(\"name\") == name and t.get(\"status\") != \"deleted\":\n            _log(\"create_table\", \"CONFLICT\", \"Table name already exists\")\n            return _err(\"CONFLICT\", \"A non-deleted table with this name already exists in the base.\", base_id=base_id, name=name)\n\n    existing_table_ids = {t.get(\"id\") for t in tables if isinstance(t, dict)}\n    existing_field_ids = {f.get(\"id\") for f in fields if isinstance(f, dict)}\n\n    tbl_id = _gen_id(\"tbl\", existing_table_ids)\n    fld_id = _gen_id(\"fld\", existing_field_ids)\n    if tbl_id is None or fld_id is None:\n        _log(\"create_table\", \"CONFLICT\", \"ID generation failed\")\n        return _err(\"CONFLICT\", \"Could not allocate a new id; please retry.\")\n\n    now = _now()\n\n    # Create table + primary field\n    table_row = {\n        \"id\": tbl_id,\n        \"base_id\": base_id,\n        \"name\": name,\n        \"description\": description,\n        \"primary_field_id\": fld_id,\n        \"schema_version\": 1,\n        \"status\": \"active\",\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n\n    # position: next available in table (1 since new table)\n    field_row = {\n        \"id\": fld_id,\n        \"table_id\": tbl_id,\n        \"name\": primary_field.get(\"name\"),\n        \"type\": primary_field.get(\"type\"),\n        \"options\": primary_field.get(\"options\", {}) if primary_field.get(\"options\", {}) is not None else {},\n        \"is_required\": bool(primary_field.get(\"is_required\", False)),\n        \"is_unique\": bool(primary_field.get(\"is_unique\", False)),\n        \"is_indexed\": True if primary_field.get(\"type\") in (\"singleLineText\", \"multilineText\", \"email\", \"url\", \"phoneNumber\") else False,\n        \"position\": 1,\n        \"status\": \"active\",\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n\n    # Persist\n    tables.append(table_row)\n    fields.append(field_row)\n    _save(\"tables.json\", tables)\n    _save(\"fields.json\", fields)\n\n    out = {\"table\": table_row, \"primary_field\": field_row}\n    _log(\"create_table\", \"OK\", extra={\"table_id\": tbl_id, \"base_id\": base_id})\n    return out\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "update_table",
+          "description": "Updates a table’s metadata (name/description), primary field assignment, and/or lifecycle status, and returns the updated table. Raises VALIDATION_ERROR for malformed ids, empty name, unsupported status, or if primary_field_id is not a field in the table. Raises NOT_FOUND if the table does not exist, AUTHORIZATION_ERROR if you can’t modify the table, and CONFLICT if the requested name collides with another table in the same base or if the requested status transition is not allowed.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "table_id": {
+                "type": "string",
+                "pattern": "^tbl_[0-9A-Z]{18,}$",
+                "description": "Table id to update."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "New table name."
+              },
+              "description": {
+                "type": "string",
+                "description": "New table description."
+              },
+              "primary_field_id": {
+                "type": "string",
+                "pattern": "^fld_[0-9A-Z]{18,}$",
+                "description": "Field id to set as the table's primary field."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "archived",
+                  "deleted"
+                ],
+                "description": "New lifecycle status for the table."
+              }
+            },
+            "required": [
+              "table_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def update_table(table_id, name=None, description=None, primary_field_id=None, status=None, **_extra):\n    import json, os, datetime, time, re, secrets\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0024000\" if __import__(\"os\").path.isdir(\"./environment_mix/0024000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"update_table\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _get_log_store():\n        for fn in (\"request_logs.json\", \"requests.json\", \"usage.json\", \"audit_logs.json\", \"api_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fn)):\n                return fn\n        return None\n\n    def _log(status_s, code=None, message=None, meta=None):\n        fn = _get_log_store()\n        if not fn:\n            return\n        rows = _load(fn)\n        if not isinstance(rows, list):\n            rows = []\n        row = {\n            \"id\": \"req_\" + secrets.token_hex(12),\n            \"endpoint\": endpoint,\n            \"status\": status_s,\n            \"timestamp\": _now(),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if code is not None:\n            row[\"error_code\"] = code\n        if message is not None:\n            row[\"error_message\"] = message\n        if isinstance(meta, dict) and meta:\n            row[\"meta\"] = meta\n        rows.append(row)\n        _save(fn, rows)\n\n    # Validate inputs first (but accept plausible IDs even if they don't match strict regex, to avoid false negatives)\n    if not isinstance(table_id, str) or not table_id.startswith(\"tbl_\"):\n        out = _err(\"VALIDATION_ERROR\", \"Malformed table_id.\", field=\"table_id\")\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n\n    if name is not None and (not isinstance(name, str) or not (1 <= len(name) <= 255)):\n        out = _err(\"VALIDATION_ERROR\", \"name must be a non-empty string (1..255).\", field=\"name\")\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n    if description is not None and not isinstance(description, str):\n        out = _err(\"VALIDATION_ERROR\", \"description must be a string.\", field=\"description\")\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n    if primary_field_id is not None and (not isinstance(primary_field_id, str) or not primary_field_id.startswith(\"fld_\")):\n        out = _err(\"VALIDATION_ERROR\", \"primary_field_id is malformed.\", field=\"primary_field_id\")\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n    if status is not None and (not isinstance(status, str) or status not in (\"active\", \"archived\", \"deleted\")):\n        out = _err(\"VALIDATION_ERROR\", \"Unsupported status.\", field=\"status\", allowed=[\"active\", \"archived\", \"deleted\"])\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n\n    tables = _load(\"tables.json\")\n    if not isinstance(tables, list):\n        tables = []\n    tbl_idx = next((i for i, t in enumerate(tables) if t.get(\"id\") == table_id), None)\n    if tbl_idx is None:\n        out = _err(\"NOT_FOUND\", \"Table not found.\", table_id=table_id)\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n    table = tables[tbl_idx]\n    if table.get(\"status\") == \"deleted\":\n        out = _err(\"NOT_FOUND\", \"Table not found.\", table_id=table_id)\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n\n    # Enforce rename uniqueness within base among non-deleted tables\n    if name is not None:\n        base_id = table.get(\"base_id\")\n        for t in tables:\n            if t.get(\"id\") != table_id and t.get(\"base_id\") == base_id and t.get(\"status\") != \"deleted\" and t.get(\"name\") == name:\n                out = _err(\"CONFLICT\", \"A non-deleted table with this name already exists in the base.\", base_id=base_id, name=name)\n                _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n                return out\n\n    # Validate primary_field_id belongs to same table and is active\n    if primary_field_id is not None:\n        fields_rows = _load(\"fields.json\")\n        if not isinstance(fields_rows, list):\n            fields_rows = []\n        pf = next((f for f in fields_rows if f.get(\"id\") == primary_field_id), None)\n        if not pf or pf.get(\"status\") != \"active\" or pf.get(\"table_id\") != table_id:\n            out = _err(\n                \"VALIDATION_ERROR\",\n                \"primary_field_id must reference an active field in the same table.\",\n                field=\"primary_field_id\",\n                table_id=table_id,\n                primary_field_id=primary_field_id,\n            )\n            _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n            return out\n\n    # Enforce lifecycle transitions\n    if status is not None:\n        cur = table.get(\"status\")\n        allowed = {\"active\": [\"archived\", \"deleted\"], \"archived\": [\"active\", \"deleted\"], \"deleted\": []}\n        if cur not in allowed:\n            out = _err(\"INVALID_TRANSITION\", \"Table is in an unknown lifecycle state.\", current=cur)\n            _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n            return out\n        if status != cur and status not in allowed[cur]:\n            out = _err(\"INVALID_TRANSITION\", \"Illegal table status transition.\", current=cur, target=status, allowed=allowed[cur])\n            _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n            return out\n\n        # If deleting, cascade soft-delete fields and records and mark index rows deleted\n        if status == \"deleted\" and cur != \"deleted\":\n            # Restrict/cascade behavior: this server uses soft deletion cascade for table delete.\n            fields_rows = _load(\"fields.json\")\n            if not isinstance(fields_rows, list):\n                fields_rows = []\n            records_rows = _load(\"records.json\")\n            if not isinstance(records_rows, list):\n                records_rows = []\n            idx_rows = _load(\"record_search_index.json\")\n            if not isinstance(idx_rows, list):\n                idx_rows = []\n\n            now = _now()\n            for f in fields_rows:\n                if f.get(\"table_id\") == table_id and f.get(\"status\") != \"deleted\":\n                    f[\"status\"] = \"deleted\"\n                    f[\"updated_at\"] = now\n            for r in records_rows:\n                if r.get(\"table_id\") == table_id and r.get(\"status\") != \"deleted\":\n                    r[\"status\"] = \"deleted\"\n                    r[\"deleted_at\"] = now\n                    r[\"updated_at\"] = now\n            for ix in idx_rows:\n                if ix.get(\"table_id\") == table_id and ix.get(\"status\") != \"deleted\":\n                    ix[\"status\"] = \"deleted\"\n                    ix[\"updated_at\"] = now\n\n            _save(\"fields.json\", fields_rows)\n            _save(\"records.json\", records_rows)\n            _save(\"record_search_index.json\", idx_rows)\n\n    # Apply updates\n    changed = False\n    now = _now()\n    if name is not None and name != table.get(\"name\"):\n        table[\"name\"] = name\n        changed = True\n    if description is not None and description != table.get(\"description\"):\n        table[\"description\"] = description\n        changed = True\n    if primary_field_id is not None and primary_field_id != table.get(\"primary_field_id\"):\n        table[\"primary_field_id\"] = primary_field_id\n        changed = True\n    if status is not None and status != table.get(\"status\"):\n        table[\"status\"] = status\n        changed = True\n\n    if not changed:\n        # No success without effect: return the existing row as \"updated\" only if real API is idempotent.\n        # For table PATCH, idempotent is acceptable: return current state.\n        out = {\"table\": table, \"id\": table.get(\"id\")}\n        _log(\"ok\")\n        return out\n\n    table[\"updated_at\"] = now\n    # schema_version increments on table/field changes? For table metadata, keep schema_version same unless primary_field changes.\n    # In Airtable-like semantics, primary field assignment affects schema; increment for primary_field_id change.\n    if primary_field_id is not None:\n        try:\n            sv = int(table.get(\"schema_version\") or 1)\n        except Exception:\n            sv = 1\n        table[\"schema_version\"] = max(1, sv + 1)\n        # mark existing index rows stale (schema change)\n        idx_rows = _load(\"record_search_index.json\")\n        if not isinstance(idx_rows, list):\n            idx_rows = []\n        for ix in idx_rows:\n            if ix.get(\"table_id\") == table_id and ix.get(\"status\") == \"fresh\":\n                ix[\"status\"] = \"stale\"\n                ix[\"updated_at\"] = now\n        _save(\"record_search_index.json\", idx_rows)\n\n    tables[tbl_idx] = table\n    _save(\"tables.json\", tables)\n    out = {\"table\": table}\n    _log(\"ok\")\n    return out\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_field",
+          "description": "Creates a new field on a table and returns the created field, optionally positioning it in the field order. Raises VALIDATION_ERROR if table_id is malformed, name/type are invalid, position is negative, or options are invalid for the selected type (including invalid select choices, link targets, lookup/formula configuration). Raises NOT_FOUND if the table does not exist, AUTHORIZATION_ERROR if you can’t modify the table, CONFLICT if a field with the same name already exists in the table, and QUOTA_EXCEEDED if schema-change limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "table_id": {
+                "type": "string",
+                "pattern": "^tbl_[0-9A-Z]{18,}$",
+                "description": "Table id in which to create the field."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Field name."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "singleLineText",
+                  "multilineText",
+                  "number",
+                  "checkbox",
+                  "singleSelect",
+                  "multipleSelects",
+                  "date",
+                  "dateTime",
+                  "email",
+                  "url",
+                  "phoneNumber",
+                  "attachment",
+                  "linkToAnotherRecord",
+                  "lookup",
+                  "formula",
+                  "createdTime",
+                  "lastModifiedTime"
+                ],
+                "description": "Field type."
+              },
+              "options": {
+                "type": "object",
+                "description": "Type-specific field options (e.g., select choices, link target table, formula config)."
+              },
+              "is_required": {
+                "type": "boolean",
+                "description": "Whether the field is required on records."
+              },
+              "is_unique": {
+                "type": "boolean",
+                "description": "Whether values in this field must be unique."
+              },
+              "is_indexed": {
+                "type": "boolean",
+                "description": "Whether to index this field for faster filtering/search."
+              },
+              "position": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Zero-based position of the field in the table's field order."
+              }
+            },
+            "required": [
+              "table_id",
+              "name",
+              "type"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_field(table_id, name, type, options=None, is_required=None, is_unique=None, is_indexed=None, position=None, **_extra):\n    import json, os, datetime, re, time, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0024000\" if __import__(\"os\").path.isdir(\"./environment_mix/0024000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _get_log_store():\n        # Prefer common filenames if present; otherwise no-ops but still try to persist if file exists.\n        candidates = [\n            \"request_logs.json\",\n            \"requests.json\",\n            \"usage.json\",\n            \"audit_logs.json\",\n            \"api_logs.json\",\n        ]\n        for fn in candidates:\n            path = os.path.join(_DB, fn)\n            if os.path.exists(path):\n                return fn\n        return None\n\n    def _log(endpoint, status, latency_ms, meta=None):\n        fn = _get_log_store()\n        if not fn:\n            return\n        rows = _load(fn)\n        if not isinstance(rows, list):\n            rows = []\n        row = {\n            \"id\": \"req_\" + secrets.token_hex(12),\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"latency_ms\": int(latency_ms),\n            \"timestamp\": _now(),\n        }\n        if meta and isinstance(meta, dict):\n            row.update({\"meta\": meta})\n        rows.append(row)\n        _save(fn, rows)\n\n    start = time.time()\n    endpoint = \"create_field\"\n\n    try:\n        if not isinstance(table_id, str) or not re.match(r\"^tbl_[0-9A-Z]{18,}$\", table_id):\n            out = _err(\"VALIDATION_ERROR\", \"Malformed table_id.\")\n            _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n            return out\n        if not isinstance(name, str) or not (1 <= len(name) <= 255):\n            out = _err(\"VALIDATION_ERROR\", \"Invalid name; must be length 1..255.\")\n            _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n            return out\n        allowed_types = [\n            \"singleLineText\", \"multilineText\", \"number\", \"checkbox\", \"singleSelect\", \"multipleSelects\",\n            \"date\", \"dateTime\", \"email\", \"url\", \"phoneNumber\", \"attachment\", \"linkToAnotherRecord\",\n            \"lookup\", \"formula\", \"createdTime\", \"lastModifiedTime\"\n        ]\n        if not isinstance(type, str) or type not in allowed_types:\n            out = _err(\"VALIDATION_ERROR\", \"Invalid field type.\")\n            _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n            return out\n        if options is None:\n            options = {}\n        if not isinstance(options, dict):\n            out = _err(\"VALIDATION_ERROR\", \"options must be a JSON object.\")\n            _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n            return out\n        if is_required is None:\n            is_required = False\n        if is_unique is None:\n            is_unique = False\n        if is_indexed is None:\n            is_indexed = False\n        if not isinstance(is_required, bool) or not isinstance(is_unique, bool) or not isinstance(is_indexed, bool):\n            out = _err(\"VALIDATION_ERROR\", \"is_required, is_unique, and is_indexed must be booleans.\")\n            _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n            return out\n        if position is None:\n            position = 0\n        if not isinstance(position, int) or position < 0:\n            out = _err(\"VALIDATION_ERROR\", \"position must be an integer >= 0.\")\n            _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n            return out\n\n        # Type/options validation rules\n        if is_unique and type not in (\"singleLineText\", \"email\", \"url\", \"phoneNumber\", \"number\"):\n            out = _err(\"VALIDATION_ERROR\", \"is_unique=true is only allowed for singleLineText, email, url, phoneNumber, number.\")\n            _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n            return out\n\n        if type in (\"singleSelect\", \"multipleSelects\"):\n            choices = options.get(\"choices\")\n            if not isinstance(choices, list) or len(choices) == 0:\n                out = _err(\"VALIDATION_ERROR\", \"options.choices must be a non-empty array for select fields.\")\n                _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n                return out\n            names = []\n            for c in choices:\n                if not isinstance(c, dict) or not isinstance(c.get(\"name\"), str) or len(c[\"name\"]) == 0:\n                    out = _err(\"VALIDATION_ERROR\", \"Each select choice must be an object with a non-empty 'name'.\")\n                    _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n                    return out\n                names.append(c[\"name\"])\n            if len(set(names)) != len(names):\n                out = _err(\"VALIDATION_ERROR\", \"Select choice names must be unique.\")\n                _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n                return out\n\n        tables = _load(\"tables.json\")\n        if not isinstance(tables, list):\n            tables = []\n        table = next((t for t in tables if t.get(\"id\") == table_id), None)\n        if not table or table.get(\"status\") == \"deleted\":\n            out = _err(\"NOT_FOUND\", \"Table not found.\")\n            _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n            return out\n\n        fields = _load(\"fields.json\")\n        if not isinstance(fields, list):\n            fields = []\n\n        # Enforce unique(table_id, name) where status != 'deleted'\n        for f in fields:\n            if f.get(\"table_id\") == table_id and f.get(\"status\") != \"deleted\" and f.get(\"name\") == name:\n                out = _err(\"CONFLICT\", \"A non-deleted field with this name already exists in the table.\")\n                _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n                return out\n\n        if type == \"linkToAnotherRecord\":\n            linked = options.get(\"linked_table_id\")\n            if not isinstance(linked, str) or not re.match(r\"^tbl_[0-9A-Z]{18,}$\", linked):\n                out = _err(\"VALIDATION_ERROR\", \"options.linked_table_id must be a valid table id for linkToAnotherRecord.\")\n                _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n                return out\n            linked_table = next((t for t in tables if t.get(\"id\") == linked and t.get(\"status\") != \"deleted\"), None)\n            if not linked_table:\n                out = _err(\"VALIDATION_ERROR\", \"options.linked_table_id references a table that does not exist.\")\n                _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n                return out\n\n        if type in (\"lookup\", \"formula\"):\n            # Minimal config checks without implementing full expressions\n            if type == \"formula\":\n                expr = options.get(\"expression\")\n                if expr is None or not isinstance(expr, str) or not expr.strip():\n                    out = _err(\"VALIDATION_ERROR\", \"options.expression must be a non-empty string for formula fields.\")\n                    _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n                    return out\n            if type == \"lookup\":\n                # typical: linked_field_id + target_field_id\n                lfid = options.get(\"linked_field_id\")\n                tfid = options.get(\"target_field_id\")\n                if not isinstance(lfid, str) or not isinstance(tfid, str):\n                    out = _err(\"VALIDATION_ERROR\", \"options.linked_field_id and options.target_field_id must be provided for lookup fields.\")\n                    _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n                    return out\n\n        # Determine new field position: schema uses 1-based \"position\"\n        active_non_deleted = [f for f in fields if f.get(\"table_id\") == table_id and f.get(\"status\") != \"deleted\"]\n        max_pos = 0\n        for f in active_non_deleted:\n            p = f.get(\"position\")\n            if isinstance(p, int) and p > max_pos:\n                max_pos = p\n        insert_at = min(position, len(active_non_deleted))  # 0-based insertion index\n        # Shift positions (1-based) for non-deleted fields at/after insertion point\n        # Sort by existing position to apply stable shift\n        active_sorted = sorted(active_non_deleted, key=lambda x: (x.get(\"position\") if isinstance(x.get(\"position\"), int) else 10**9, x.get(\"created_at\", \"\")))\n        for idx, f in enumerate(active_sorted):\n            desired = idx + 1\n            # normalize first\n            if not isinstance(f.get(\"position\"), int) or f[\"position\"] < 1:\n                f[\"position\"] = desired\n        active_sorted = sorted(active_non_deleted, key=lambda x: x.get(\"position\", 10**9))\n        for f in active_sorted:\n            if f.get(\"position\", 10**9) >= (insert_at + 1):\n                f[\"position\"] = int(f.get(\"position\", insert_at + 1)) + 1\n\n        def _new_id(prefix):\n            return prefix + \"_\" + secrets.token_hex(10).upper()\n\n        now = _now()\n        new_field = {\n            \"id\": _new_id(\"fld\"),\n            \"table_id\": table_id,\n            \"name\": name,\n            \"type\": type,\n            \"options\": options,\n            \"is_required\": bool(is_required),\n            \"is_unique\": bool(is_unique),\n            \"is_indexed\": bool(is_indexed),\n            \"position\": insert_at + 1,\n            \"status\": \"active\",\n            \"created_at\": now,\n            \"updated_at\": now,\n        }\n\n        # Persist shifted positions back into fields list\n        # (active_non_deleted references objects from fields list, so mutations already applied)\n        fields.append(new_field)\n\n        # Increment tables.schema_version and possibly set primary_field_id\n        if not isinstance(table.get(\"schema_version\"), int) or table[\"schema_version\"] < 1:\n            table[\"schema_version\"] = 1\n        table[\"schema_version\"] += 1\n        table[\"updated_at\"] = now\n\n        # If no primary_field_id, set to first writable text-like field created\n        if not table.get(\"primary_field_id\"):\n            if type in (\"singleLineText\", \"multilineText\"):\n                table[\"primary_field_id\"] = new_field[\"id\"]\n\n        # Validate primary_field_id constraint (if set) references active field in same table\n        if table.get(\"primary_field_id\"):\n            pf = next((f for f in fields if f.get(\"id\") == table[\"primary_field_id\"]), None)\n            if not pf or pf.get(\"table_id\") != table_id or pf.get(\"status\") != \"active\":\n                out = _err(\"VALIDATION_ERROR\", \"primary_field_id must reference an active field in the same table.\")\n                _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n                return out\n\n        # Mark search index rows stale due to schema change\n        rsi = _load(\"record_search_index.json\")\n        if not isinstance(rsi, list):\n            rsi = []\n        for row in rsi:\n            if row.get(\"table_id\") == table_id and row.get(\"status\") in (\"fresh\", \"stale\"):\n                row[\"status\"] = \"stale\"\n                row[\"updated_at\"] = now\n\n        _save(\"fields.json\", fields)\n        _save(\"tables.json\", tables)\n        _save(\"record_search_index.json\", rsi)\n\n        out = {\"field\": new_field}\n        _log(endpoint, \"ok\", (time.time() - start) * 1000)\n        return out\n    except Exception as e:\n        out = _err(\"VALIDATION_ERROR\", \"Unexpected error.\", detail=str(e))\n        _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n        return out\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "update_field",
+          "description": "Updates a field’s name, options, constraints, indexing, position, and/or lifecycle status and returns the updated field. Raises VALIDATION_ERROR for malformed field_id, empty name, negative position, unsupported status, or options that are incompatible with the field type. Raises NOT_FOUND if the field does not exist, AUTHORIZATION_ERROR if you can’t modify the field, and CONFLICT if the new name collides with another field in the table or if the requested status transition is not allowed.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "field_id": {
+                "type": "string",
+                "pattern": "^fld_[0-9A-Z]{18,}$",
+                "description": "Field id to update."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "New field name."
+              },
+              "options": {
+                "type": "object",
+                "description": "New type-specific options for the field."
+              },
+              "is_required": {
+                "type": "boolean",
+                "description": "Whether the field is required on records."
+              },
+              "is_unique": {
+                "type": "boolean",
+                "description": "Whether values in this field must be unique."
+              },
+              "is_indexed": {
+                "type": "boolean",
+                "description": "Whether to index this field for faster filtering/search."
+              },
+              "position": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Zero-based position of the field in the table's field order."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "hidden",
+                  "deleted"
+                ],
+                "description": "New lifecycle status for the field."
+              }
+            },
+            "required": [
+              "field_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def update_field(field_id, name=None, options=None, is_required=None, is_unique=None, is_indexed=None, position=None, status=None, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0024000\" if __import__(\"os\").path.isdir(\"./environment_mix/0024000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"update_field\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _pick_logfile():\n        for fn in (\"request_logs.json\", \"requests.json\", \"usage.json\", \"audit_logs.json\", \"api_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fn)):\n                return fn\n        return None\n\n    def _log(status_s, code=None, message=None, meta=None):\n        log_fn = _pick_logfile()\n        if not log_fn:\n            return\n        rows = _load(log_fn)\n        if not isinstance(rows, list):\n            rows = []\n        row = {\n            \"id\": \"req_\" + str(int(time.time() * 1000)),\n            \"endpoint\": endpoint,\n            \"status\": status_s,\n            \"timestamp\": _now(),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if code is not None:\n            row[\"error_code\"] = code\n        if message is not None:\n            row[\"error_message\"] = message\n        if isinstance(meta, dict) and meta:\n            row[\"meta\"] = meta\n        rows.append(row)\n        _save(log_fn, rows)\n\n    def _valid_transition(old, new):\n        transitions = {\n            \"active\": {\"hidden\", \"deleted\"},\n            \"hidden\": {\"active\", \"deleted\"},\n            \"deleted\": set(),\n        }\n        return new in transitions.get(old, set())\n\n    def _mark_table_index_stale(table_id, table_schema_version):\n        idx = _load(\"record_search_index.json\")\n        if not isinstance(idx, list):\n            return\n        changed = False\n        now = _now()\n        for row in idx:\n            if row.get(\"table_id\") != table_id:\n                continue\n            if row.get(\"status\") == \"deleted\":\n                continue\n            if row.get(\"schema_version\") != table_schema_version or row.get(\"status\") == \"fresh\":\n                # schema change makes index potentially stale\n                if row.get(\"status\") != \"stale\":\n                    row[\"status\"] = \"stale\"\n                    row[\"updated_at\"] = now\n                    changed = True\n                else:\n                    # still bump updated_at to reflect schema change\n                    row[\"updated_at\"] = now\n                    changed = True\n        if changed:\n            _save(\"record_search_index.json\", idx)\n\n    # Validate inputs\n    if not isinstance(field_id, str) or not re.match(r\"^fld_[0-9A-Z]{18,}$\", field_id):\n        _log(\"error\", \"VALIDATION_ERROR\", \"Malformed field_id.\", {\"field\": \"field_id\"})\n        return _err(\"VALIDATION_ERROR\", \"Malformed field_id.\", field=\"field_id\")\n\n    if name is not None and (not isinstance(name, str) or len(name) < 1):\n        _log(\"error\", \"VALIDATION_ERROR\", \"Empty name.\", {\"field\": \"name\"})\n        return _err(\"VALIDATION_ERROR\", \"Empty name.\", field=\"name\")\n\n    if options is not None and not isinstance(options, dict):\n        _log(\"error\", \"VALIDATION_ERROR\", \"options must be an object.\", {\"field\": \"options\"})\n        return _err(\"VALIDATION_ERROR\", \"options must be an object.\", field=\"options\")\n\n    for bname, bval in ((\"is_required\", is_required), (\"is_unique\", is_unique), (\"is_indexed\", is_indexed)):\n        if bval is not None and not isinstance(bval, bool):\n            _log(\"error\", \"VALIDATION_ERROR\", f\"{bname} must be boolean.\", {\"field\": bname})\n            return _err(\"VALIDATION_ERROR\", f\"{bname} must be boolean.\", field=bname)\n\n    if position is not None:\n        if not isinstance(position, int) or position < 0:\n            _log(\"error\", \"VALIDATION_ERROR\", \"Invalid position.\", {\"field\": \"position\"})\n            return _err(\"VALIDATION_ERROR\", \"Invalid position.\", field=\"position\")\n\n    if status is not None and status not in (\"active\", \"hidden\", \"deleted\"):\n        _log(\"error\", \"VALIDATION_ERROR\", \"Unsupported status.\", {\"field\": \"status\"})\n        return _err(\"VALIDATION_ERROR\", \"Unsupported status.\", field=\"status\")\n\n    fields_rows = _load(\"fields.json\")\n    if not isinstance(fields_rows, list):\n        fields_rows = []\n    field_row = None\n    for r in fields_rows:\n        if r.get(\"id\") == field_id:\n            field_row = r\n            break\n    if not field_row:\n        _log(\"error\", \"NOT_FOUND\", \"Field not found.\", {\"field_id\": field_id})\n        return _err(\"NOT_FOUND\", \"Field not found.\", field_id=field_id)\n\n    # Resolve table\n    tables_rows = _load(\"tables.json\")\n    if not isinstance(tables_rows, list):\n        tables_rows = []\n    table_row = None\n    table_id = field_row.get(\"table_id\")\n    for t in tables_rows:\n        if t.get(\"id\") == table_id:\n            table_row = t\n            break\n    if not table_row:\n        _log(\"error\", \"NOT_FOUND\", \"Owning table not found.\", {\"table_id\": table_id})\n        return _err(\"NOT_FOUND\", \"Owning table not found.\", table_id=table_id)\n\n    if table_row.get(\"status\") == \"deleted\":\n        _log(\"error\", \"CONFLICT\", \"Cannot modify fields in a deleted table.\", {\"table_id\": table_id})\n        return _err(\"CONFLICT\", \"Cannot modify fields in a deleted table.\", table_id=table_id)\n\n    # Uniqueness: unique(table_id, name) where status != 'deleted'\n    if name is not None:\n        for r in fields_rows:\n            if r.get(\"id\") == field_id:\n                continue\n            if r.get(\"table_id\") == table_id and r.get(\"status\") != \"deleted\" and r.get(\"name\") == name:\n                _log(\"error\", \"CONFLICT\", \"Field name already exists in table.\", {\"name\": name, \"table_id\": table_id})\n                return _err(\"CONFLICT\", \"Field name already exists in table.\", name=name, table_id=table_id)\n\n    # Status transition validation\n    if status is not None:\n        old_status = field_row.get(\"status\")\n        if status != old_status and not _valid_transition(old_status, status):\n            _log(\"error\", \"INVALID_TRANSITION\", \"Illegal lifecycle transition.\", {\"from\": old_status, \"to\": status})\n            return _err(\"INVALID_TRANSITION\", \"Illegal lifecycle transition.\", from_status=old_status, to_status=status)\n\n    # Constraint: if is_unique=true then type must be one of scalar set\n    new_is_unique = field_row.get(\"is_unique\") if is_unique is None else is_unique\n    if new_is_unique:\n        if field_row.get(\"type\") not in (\"singleLineText\", \"email\", \"url\", \"phoneNumber\", \"number\"):\n            _log(\"error\", \"VALIDATION_ERROR\", \"is_unique not supported for this field type.\", {\"field\": \"is_unique\"})\n            return _err(\"VALIDATION_ERROR\", \"is_unique not supported for this field type.\", field=\"is_unique\")\n\n    # Options compatibility checks for select/link types\n    ftype = field_row.get(\"type\")\n    new_options = field_row.get(\"options\") if options is None else options\n    if not isinstance(new_options, dict):\n        _log(\"error\", \"VALIDATION_ERROR\", \"options must be an object.\", {\"field\": \"options\"})\n        return _err(\"VALIDATION_ERROR\", \"options must be an object.\", field=\"options\")\n\n    if ftype in (\"singleSelect\", \"multipleSelects\"):\n        choices = new_options.get(\"choices\")\n        if not isinstance(choices, list) or len(choices) < 1:\n            _log(\"error\", \"VALIDATION_ERROR\", \"options.choices must be a non-empty array.\", {\"field\": \"options\"})\n            return _err(\"VALIDATION_ERROR\", \"options.choices must be a non-empty array.\", field=\"options\")\n        names = []\n        for c in choices:\n            if not isinstance(c, dict) or not isinstance(c.get(\"name\"), str) or not c.get(\"name\"):\n                _log(\"error\", \"VALIDATION_ERROR\", \"Each choice must be an object with non-empty name.\", {\"field\": \"options\"})\n                return _err(\"VALIDATION_ERROR\", \"Each choice must be an object with non-empty name.\", field=\"options\")\n            names.append(c[\"name\"])\n        if len(set(names)) != len(names):\n            _log(\"error\", \"VALIDATION_ERROR\", \"Choice names must be unique.\", {\"field\": \"options\"})\n            return _err(\"VALIDATION_ERROR\", \"Choice names must be unique.\", field=\"options\")\n\n    if ftype == \"linkToAnotherRecord\":\n        linked_table_id = new_options.get(\"linked_table_id\")\n        if not isinstance(linked_table_id, str) or not re.match(r\"^tbl_[0-9A-Z]{18,}$\", linked_table_id):\n            _log(\"error\", \"VALIDATION_ERROR\", \"options.linked_table_id must reference a table id.\", {\"field\": \"options\"})\n            return _err(\"VALIDATION_ERROR\", \"options.linked_table_id must reference a table id.\", field=\"options\")\n        ok = any(t.get(\"id\") == linked_table_id and t.get(\"status\") != \"deleted\" for t in tables_rows)\n        if not ok:\n            _log(\"error\", \"NOT_FOUND\", \"linked_table_id not found.\", {\"linked_table_id\": linked_table_id})\n            return _err(\"NOT_FOUND\", \"linked_table_id not found.\", linked_table_id=linked_table_id)\n\n    # Apply updates\n    changed = False\n    if name is not None and name != field_row.get(\"name\"):\n        field_row[\"name\"] = name\n        changed = True\n    if options is not None and options != field_row.get(\"options\"):\n        field_row[\"options\"] = options\n        changed = True\n    if is_required is not None and is_required != field_row.get(\"is_required\"):\n        field_row[\"is_required\"] = is_required\n        changed = True\n    if is_unique is not None and is_unique != field_row.get(\"is_unique\"):\n        field_row[\"is_unique\"] = is_unique\n        changed = True\n    if is_indexed is not None and is_indexed != field_row.get(\"is_indexed\"):\n        field_row[\"is_indexed\"] = is_indexed\n        changed = True\n    if position is not None and position != field_row.get(\"position\"):\n        # tool defines zero-based, store uses position>=1; convert\n        field_row[\"position\"] = int(position) + 1\n        changed = True\n    if status is not None and status != field_row.get(\"status\"):\n        field_row[\"status\"] = status\n        changed = True\n\n    if not changed:\n        # idempotent no-op should still be observable but should return the current resource\n        _log(\"ok\")\n        return {\"field\": field_row}\n\n    now = _now()\n    field_row[\"updated_at\"] = now\n\n    # Increment tables.schema_version by 1 (schema change)\n    try:\n        sv = int(table_row.get(\"schema_version\") or 0)\n    except Exception:\n        sv = 0\n    if sv < 1:\n        sv = 1\n    table_row[\"schema_version\"] = sv + 1\n    table_row[\"updated_at\"] = now\n\n    _save(\"fields.json\", fields_rows)\n    _save(\"tables.json\", tables_rows)\n\n    # Mark index rows stale for table due to schema change affecting indexed fields\n    _mark_table_index_stale(table_id, table_row[\"schema_version\"])\n\n    _log(\"ok\")\n    return {\"field\": field_row}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "list_records",
+          "description": "Lists records in a table (soft-delete aware via status) and returns results with cursor-based pagination (pass limit and the returned cursor to fetch the next page), optionally sorted using the provided sort spec. Raises VALIDATION_ERROR for malformed table_id, invalid status, limit out of range, malformed cursor, or an invalid sort specification. Raises NOT_FOUND if the table does not exist, AUTHORIZATION_ERROR if you don’t have access to the table, and QUOTA_EXCEEDED when request rate or listing limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "table_id": {
+                "type": "string",
+                "pattern": "^tbl_[0-9A-Z]{18,}$",
+                "description": "Table id whose records should be listed."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "deleted"
+                ],
+                "description": "Filter records by status (soft-delete aware)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of records to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page."
+              },
+              "sort": {
+                "type": "string",
+                "description": "Sort spec (e.g., \"created_at\" or \"-updated_at\")."
+              }
+            },
+            "required": [
+              "table_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def list_records(table_id, status=None, limit=None, cursor=None, sort=None, **_extra):\n    import json, os, datetime, re, time, secrets, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0024000\" if __import__(\"os\").path.isdir(\"./environment_mix/0024000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _get_log_store():\n        candidates = [\"request_logs.json\", \"requests.json\", \"usage.json\", \"audit_logs.json\", \"api_logs.json\"]\n        for fn in candidates:\n            if os.path.exists(os.path.join(_DB, fn)):\n                return fn\n        return None\n\n    def _log(endpoint, status_s, latency_ms, meta=None):\n        fn = _get_log_store()\n        if not fn:\n            return\n        rows = _load(fn)\n        if not isinstance(rows, list):\n            rows = []\n        row = {\n            \"id\": \"req_\" + secrets.token_hex(12),\n            \"endpoint\": endpoint,\n            \"status\": status_s,\n            \"latency_ms\": int(latency_ms),\n            \"timestamp\": _now(),\n        }\n        if meta and isinstance(meta, dict):\n            row.update({\"meta\": meta})\n        rows.append(row)\n        _save(fn, rows)\n\n    start = time.time()\n    endpoint = \"list_records\"\n\n    try:\n        if not isinstance(table_id, str) or not re.match(r\"^tbl_[0-9A-Z]{18,}$\", table_id):\n            out = _err(\"VALIDATION_ERROR\", \"Malformed table_id.\")\n            _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n            return out\n\n        if status is None:\n            status = \"active\"\n        if status not in (\"active\", \"deleted\"):\n            out = _err(\"VALIDATION_ERROR\", \"Invalid status filter.\")\n            _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n            return out\n\n        if limit is None:\n            limit = 100\n        if not isinstance(limit, int) or not (1 <= limit <= 100):\n            out = _err(\"VALIDATION_ERROR\", \"limit must be between 1 and 100.\")\n            _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n            return out\n\n        sort_key = \"created_at\"\n        sort_dir = 1\n        if sort is not None:\n            if not isinstance(sort, str) or not sort.strip():\n                out = _err(\"VALIDATION_ERROR\", \"Invalid sort specification.\")\n                _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n                return out\n            s = sort.strip()\n            if s.startswith(\"-\"):\n                sort_dir = -1\n                s = s[1:]\n            if s not in (\"created_at\", \"updated_at\", \"id\"):\n                out = _err(\"VALIDATION_ERROR\", \"Invalid sort field; allowed: created_at, updated_at, id.\")\n                _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n                return out\n            sort_key = s\n\n        tables = _load(\"tables.json\")\n        if not isinstance(tables, list):\n            tables = []\n        table = next((t for t in tables if t.get(\"id\") == table_id), None)\n        if not table or table.get(\"status\") == \"deleted\":\n            out = _err(\"NOT_FOUND\", \"Table not found.\")\n            _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n            return out\n\n        records = _load(\"records.json\")\n        if not isinstance(records, list):\n            records = []\n\n        filtered = [r for r in records if r.get(\"table_id\") == table_id and r.get(\"status\") == status]\n\n        def _val(r):\n            v = r.get(sort_key)\n            if v is None:\n                return \"\"\n            return v\n\n        filtered.sort(key=lambda r: (_val(r), r.get(\"id\", \"\")), reverse=(sort_dir == -1))\n\n        # Cursor is opaque; encode start offset + sort spec. If invalid -> VALIDATION_ERROR\n        offset = 0\n        if cursor is not None:\n            if not isinstance(cursor, str) or not cursor:\n                out = _err(\"VALIDATION_ERROR\", \"Malformed cursor.\")\n                _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n                return out\n            try:\n                raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n                payload = json.loads(raw.decode(\"utf-8\"))\n                if not isinstance(payload, dict):\n                    raise ValueError(\"bad payload\")\n                if payload.get(\"table_id\") != table_id or payload.get(\"status\") != status:\n                    raise ValueError(\"cursor context mismatch\")\n                if payload.get(\"sort_key\") != sort_key or payload.get(\"sort_dir\") != sort_dir:\n                    raise ValueError(\"cursor sort mismatch\")\n                offset = payload.get(\"offset\")\n                if not isinstance(offset, int) or offset < 0:\n                    raise ValueError(\"bad offset\")\n            except Exception:\n                out = _err(\"VALIDATION_ERROR\", \"Malformed cursor.\")\n                _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n                return out\n\n        page = filtered[offset: offset + limit]\n        next_offset = offset + len(page)\n        has_more = next_offset < len(filtered)\n        next_cursor = None\n        if has_more:\n            payload = {\"table_id\": table_id, \"status\": status, \"sort_key\": sort_key, \"sort_dir\": sort_dir, \"offset\": next_offset}\n            next_cursor = base64.urlsafe_b64encode(json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n        out = {\n            \"records\": page,\n            \"meta\": {\"total\": len(filtered), \"has_more\": has_more, \"next_cursor\": next_cursor},\n        }\n        _log(endpoint, \"ok\", (time.time() - start) * 1000)\n        return out\n    except Exception as e:\n        out = _err(\"VALIDATION_ERROR\", \"Unexpected error.\", detail=str(e))\n        _log(endpoint, \"error\", (time.time() - start) * 1000, {\"code\": out[\"error\"][\"code\"]})\n        return out\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "create_record",
+          "description": "Creates a new record in the specified table using field values keyed by field name or field id, and returns the created record with its stored field values. Raises VALIDATION_ERROR if table_id is malformed, fields is not an object, unknown fields are provided, required fields are missing, values don’t match field types/options, or uniqueness constraints would be violated. Raises NOT_FOUND if the table (or any referenced linked record target table) does not exist, AUTHORIZATION_ERROR if you can’t create records in the table, CONFLICT on unique constraint violations, and QUOTA_EXCEEDED when write limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "table_id": {
+                "type": "string",
+                "pattern": "^tbl_[0-9A-Z]{18,}$",
+                "description": "Table id in which to create the record."
+              },
+              "fields": {
+                "type": "object",
+                "description": "Record field values keyed by field name or field id, validated against the table schema."
+              }
+            },
+            "required": [
+              "table_id",
+              "fields"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def create_record(table_id, fields, **_extra):\n    import json, os, datetime, re, time, secrets\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0024000\" if __import__(\"os\").path.isdir(\"./environment_mix/0024000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"create_record\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _pick_logfile():\n        for fn in (\"request_logs.json\", \"requests.json\", \"usage.json\", \"audit_logs.json\", \"api_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fn)):\n                return fn\n        return None\n\n    def _log(status_s, code=None, message=None, meta=None):\n        log_fn = _pick_logfile()\n        if not log_fn:\n            return\n        rows = _load(log_fn)\n        if not isinstance(rows, list):\n            rows = []\n        row = {\n            \"id\": \"req_\" + str(int(time.time() * 1000)),\n            \"endpoint\": endpoint,\n            \"status\": status_s,\n            \"timestamp\": _now(),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if code is not None:\n            row[\"error_code\"] = code\n        if message is not None:\n            row[\"error_message\"] = message\n        if isinstance(meta, dict) and meta:\n            row[\"meta\"] = meta\n        rows.append(row)\n        _save(log_fn, rows)\n\n    def _new_id(prefix, n=19):\n        alphabet = \"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\"\n        return prefix + \"_\" + \"\".join(alphabet[secrets.randbelow(len(alphabet))] for _ in range(n))\n\n    def _is_read_only(ftype):\n        return ftype in (\"lookup\", \"formula\", \"createdTime\", \"lastModifiedTime\")\n\n    def _normalize_text(v):\n        return \" \".join(str(v).lower().split())\n\n    def _validate_value(field_row, value):\n        ftype = field_row.get(\"type\")\n        opts = field_row.get(\"options\") if isinstance(field_row.get(\"options\"), dict) else {}\n        if value is None:\n            return True, None\n\n        if ftype in (\"singleLineText\", \"multilineText\", \"email\", \"url\", \"phoneNumber\"):\n            return (isinstance(value, str), \"Expected string.\")\n        if ftype == \"number\":\n            return ((isinstance(value, (int, float)) and not isinstance(value, bool)), \"Expected number.\")\n        if ftype == \"checkbox\":\n            return (isinstance(value, bool), \"Expected boolean.\")\n        if ftype in (\"date\", \"dateTime\"):\n            # accept ISO strings\n            return (isinstance(value, str) and len(value) >= 4, \"Expected ISO date/time string.\")\n        if ftype == \"singleSelect\":\n            choices = opts.get(\"choices\")\n            if not isinstance(choices, list) or not choices:\n                return False, \"Field choices misconfigured.\"\n            # accept either choice name or {name:...}\n            if isinstance(value, str):\n                ok = any(isinstance(c, dict) and c.get(\"name\") == value for c in choices)\n                return ok, \"Invalid choice.\"\n            if isinstance(value, dict) and isinstance(value.get(\"name\"), str):\n                ok = any(isinstance(c, dict) and c.get(\"name\") == value.get(\"name\") for c in choices)\n                return ok, \"Invalid choice.\"\n            return False, \"Expected choice name.\"\n        if ftype == \"multipleSelects\":\n            choices = opts.get(\"choices\")\n            if not isinstance(choices, list) or not choices:\n                return False, \"Field choices misconfigured.\"\n            if not isinstance(value, list):\n                return False, \"Expected array of choices.\"\n            names = []\n            for v in value:\n                if isinstance(v, str):\n                    names.append(v)\n                elif isinstance(v, dict) and isinstance(v.get(\"name\"), str):\n                    names.append(v[\"name\"])\n                else:\n                    return False, \"Expected choice names.\"\n            for n in names:\n                if not any(isinstance(c, dict) and c.get(\"name\") == n for c in choices):\n                    return False, \"Invalid choice.\"\n            return True, None\n        if ftype == \"attachment\":\n            return (isinstance(value, list), \"Expected array of attachments.\")\n        if ftype == \"linkToAnotherRecord\":\n            if isinstance(value, list) and all(isinstance(v, str) for v in value):\n                return True, None\n            return False, \"Expected array of record ids.\"\n        # read-only types should not be writable at record level\n        if _is_read_only(ftype):\n            return False, \"Field is read-only.\"\n        # fallback: allow JSON-ish types\n        return True, None\n\n    # Validate inputs\n    if not isinstance(table_id, str) or not re.match(r\"^tbl_[0-9A-Z]{18,}$\", table_id):\n        _log(\"error\", \"VALIDATION_ERROR\", \"Malformed table_id.\", {\"field\": \"table_id\"})\n        return _err(\"VALIDATION_ERROR\", \"Malformed table_id.\", field=\"table_id\")\n    if not isinstance(fields, dict):\n        _log(\"error\", \"VALIDATION_ERROR\", \"fields must be an object.\", {\"field\": \"fields\"})\n        return _err(\"VALIDATION_ERROR\", \"fields must be an object.\", field=\"fields\")\n\n    tables_rows = _load(\"tables.json\")\n    if not isinstance(tables_rows, list):\n        tables_rows = []\n    table_row = None\n    for t in tables_rows:\n        if t.get(\"id\") == table_id:\n            table_row = t\n            break\n    if not table_row or table_row.get(\"status\") == \"deleted\":\n        _log(\"error\", \"NOT_FOUND\", \"Table not found.\", {\"table_id\": table_id})\n        return _err(\"NOT_FOUND\", \"Table not found.\", table_id=table_id)\n    if table_row.get(\"status\") != \"active\":\n        _log(\"error\", \"CONFLICT\", \"Cannot create records in a non-active table.\", {\"table_status\": table_row.get(\"status\")})\n        return _err(\"CONFLICT\", \"Cannot create records in a non-active table.\", table_status=table_row.get(\"status\"))\n\n    fields_rows = _load(\"fields.json\")\n    if not isinstance(fields_rows, list):\n        fields_rows = []\n    table_fields = [f for f in fields_rows if f.get(\"table_id\") == table_id]\n    active_fields = [f for f in table_fields if f.get(\"status\") == \"active\"]\n\n    # Build field lookup by id and by name\n    by_id = {f.get(\"id\"): f for f in table_fields if isinstance(f.get(\"id\"), str)}\n    by_name = {f.get(\"name\"): f for f in table_fields if isinstance(f.get(\"name\"), str)}\n\n    # Map input keys (name or id) -> field_id\n    mapped = {}\n    for k, v in fields.items():\n        if not isinstance(k, str):\n            _log(\"error\", \"VALIDATION_ERROR\", \"Field keys must be strings.\", {\"field\": \"fields\"})\n            return _err(\"VALIDATION_ERROR\", \"Field keys must be strings.\", field=\"fields\")\n        frow = by_id.get(k) or by_name.get(k)\n        if not frow:\n            _log(\"error\", \"VALIDATION_ERROR\", \"Unknown field.\", {\"field\": \"fields\", \"unknown_field\": k})\n            return _err(\"VALIDATION_ERROR\", \"Unknown field.\", field=\"fields\", unknown_field=k)\n        if frow.get(\"status\") != \"active\":\n            _log(\"error\", \"VALIDATION_ERROR\", \"Cannot write to non-active field.\", {\"field_id\": frow.get(\"id\")})\n            return _err(\"VALIDATION_ERROR\", \"Cannot write to non-active field.\", field_id=frow.get(\"id\"))\n        if _is_read_only(frow.get(\"type\")):\n            _log(\"error\", \"VALIDATION_ERROR\", \"Cannot write to read-only field type.\", {\"field_id\": frow.get(\"id\"), \"type\": frow.get(\"type\")})\n            return _err(\"VALIDATION_ERROR\", \"Cannot write to read-only field type.\", field_id=frow.get(\"id\"), field_type=frow.get(\"type\"))\n        mapped[frow[\"id\"]] = v\n\n    # Enforce required fields (writable types only)\n    for f in active_fields:\n        if not f.get(\"is_required\"):\n            continue\n        if _is_read_only(f.get(\"type\")):\n            continue\n        if f.get(\"id\") not in mapped or mapped.get(f.get(\"id\")) is None:\n            _log(\"error\", \"VALIDATION_ERROR\", \"Missing required field value.\", {\"field_id\": f.get(\"id\"), \"field_name\": f.get(\"name\")})\n            return _err(\"VALIDATION_ERROR\", \"Missing required field value.\", field_id=f.get(\"id\"), field_name=f.get(\"name\"))\n\n    # Validate values\n    for fid, v in mapped.items():\n        frow = by_id.get(fid)\n        ok, msg = _validate_value(frow, v)\n        if not ok:\n            _log(\"error\", \"VALIDATION_ERROR\", msg or \"Invalid field value.\", {\"field_id\": fid})\n            return _err(\"VALIDATION_ERROR\", msg or \"Invalid field value.\", field_id=fid, field_name=frow.get(\"name\"))\n\n    # Uniqueness enforcement for is_unique fields across active records\n    records_rows = _load(\"records.json\")\n    if not isinstance(records_rows, list):\n        records_rows = []\n    enforce_nulls_default = False\n    for f in active_fields:\n        if not f.get(\"is_unique\"):\n            continue\n        fid = f.get(\"id\")\n        if fid not in mapped:\n            continue\n        val = mapped.get(fid)\n        opts = f.get(\"options\") if isinstance(f.get(\"options\"), dict) else {}\n        enforce_nulls = bool(opts.get(\"enforce_unique_nulls\", enforce_nulls_default))\n        if (val is None or val == \"\" or val == []) and not enforce_nulls:\n            continue\n        # compare scalar values only; for non-scalar, skip\n        if isinstance(val, (dict, list)):\n            _log(\"error\", \"VALIDATION_ERROR\", \"Unique constraint only supported for scalar values.\", {\"field_id\": fid})\n            return _err(\"VALIDATION_ERROR\", \"Unique constraint only supported for scalar values.\", field_id=fid)\n        for r in records_rows:\n            if r.get(\"table_id\") != table_id or r.get(\"status\") != \"active\":\n                continue\n            other = (r.get(\"fields\") or {}).get(fid)\n            if other == val and not (other is None and not enforce_nulls):\n                _log(\"error\", \"CONFLICT\", \"Uniqueness constraint violated.\", {\"field_id\": fid})\n                return _err(\"CONFLICT\", \"Uniqueness constraint violated.\", field_id=fid, field_name=f.get(\"name\"))\n\n    # Create record\n    now = _now()\n    rec_id = _new_id(\"rec\")\n    # ensure uniqueness of generated id\n    existing_ids = {r.get(\"id\") for r in records_rows if isinstance(r, dict)}\n    while rec_id in existing_ids:\n        rec_id = _new_id(\"rec\")\n\n    stored_fields = dict(mapped)  # store by field_id\n    new_row = {\n        \"id\": rec_id,\n        \"table_id\": table_id,\n        \"fields\": stored_fields,\n        \"status\": \"active\",\n        \"created_at\": now,\n        \"updated_at\": now,\n        \"deleted_at\": None,\n    }\n    records_rows.append(new_row)\n    _save(\"records.json\", records_rows)\n\n    # Update/insert search index row for this record\n    idx = _load(\"record_search_index.json\")\n    if not isinstance(idx, list):\n        idx = []\n    schema_version = int(table_row.get(\"schema_version\") or 1)\n    search_text_parts = []\n    search_kv = {}\n    for f in active_fields:\n        fid = f.get(\"id\")\n        val = stored_fields.get(fid)\n        if f.get(\"is_indexed\"):\n            # text-like into search_text\n            if f.get(\"type\") in (\"singleLineText\", \"multilineText\", \"email\", \"url\", \"phoneNumber\"):\n                if val is not None:\n                    search_text_parts.append(_normalize_text(val))\n            else:\n                if val is not None:\n                    search_kv[fid] = val\n\n    search_text = \" \".join([p for p in search_text_parts if p]).strip()\n    existing = None\n    for r in idx:\n        if r.get(\"table_id\") == table_id and r.get(\"record_id\") == rec_id:\n            existing = r\n            break\n    if existing:\n        existing[\"schema_version\"] = schema_version\n        existing[\"status\"] = \"fresh\" if new_row[\"status\"] == \"active\" else \"deleted\"\n        existing[\"search_text\"] = search_text\n        existing[\"search_kv\"] = search_kv\n        existing[\"updated_at\"] = now\n    else:\n        idx.append({\n            \"id\": _new_id(\"rsi\"),\n            \"table_id\": table_id,\n            \"record_id\": rec_id,\n            \"schema_version\": schema_version,\n            \"status\": \"fresh\",\n            \"search_text\": search_text,\n            \"search_kv\": search_kv,\n            \"created_at\": now,\n            \"updated_at\": now,\n        })\n    _save(\"record_search_index.json\", idx)\n\n    _log(\"ok\")\n    return {\"record\": new_row}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "update_record",
+          "description": "Updates an existing record’s field values (partial update) and returns the updated record. Raises VALIDATION_ERROR for malformed ids, unknown fields, values that don’t match the schema, attempts to clear required fields, or updates that would violate uniqueness constraints. Raises NOT_FOUND if the table or record does not exist, AUTHORIZATION_ERROR if you can’t edit records in the table, CONFLICT on unique constraint violations, and QUOTA_EXCEEDED when write limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "table_id": {
+                "type": "string",
+                "pattern": "^tbl_[0-9A-Z]{17}$",
+                "description": "ID of the table that contains the record."
+              },
+              "record_id": {
+                "type": "string",
+                "pattern": "^rec_[0-9A-Z]{17}$",
+                "description": "ID of the record to update."
+              },
+              "fields": {
+                "type": "object",
+                "description": "Field values to update, keyed by field name or field ID, subject to the table schema constraints.",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "table_id",
+              "record_id",
+              "fields"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def update_record(table_id, record_id, fields, **_extra):\n    import json, os, datetime, re, time\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0024000\" if __import__(\"os\").path.isdir(\"./environment_mix/0024000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"update_record\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _pick_logfile():\n        for fn in (\"request_logs.json\", \"requests.json\", \"usage.json\", \"audit_logs.json\", \"api_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fn)):\n                return fn\n        return None\n\n    def _log(status_s, code=None, message=None, meta=None):\n        log_fn = _pick_logfile()\n        if not log_fn:\n            return\n        rows = _load(log_fn)\n        if not isinstance(rows, list):\n            rows = []\n        row = {\n            \"id\": \"req_\" + str(int(time.time() * 1000)),\n            \"endpoint\": endpoint,\n            \"status\": status_s,\n            \"timestamp\": _now(),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if code is not None:\n            row[\"error_code\"] = code\n        if message is not None:\n            row[\"error_message\"] = message\n        if isinstance(meta, dict) and meta:\n            row[\"meta\"] = meta\n        rows.append(row)\n        _save(log_fn, rows)\n\n    def _is_read_only(ftype):\n        return ftype in (\"lookup\", \"formula\", \"createdTime\", \"lastModifiedTime\")\n\n    def _normalize_text(v):\n        return \" \".join(str(v).lower().split())\n\n    def _validate_value(field_row, value):\n        ftype = field_row.get(\"type\")\n        opts = field_row.get(\"options\") if isinstance(field_row.get(\"options\"), dict) else {}\n        if value is None:\n            return True, None\n        if ftype in (\"singleLineText\", \"multilineText\", \"email\", \"url\", \"phoneNumber\"):\n            return (isinstance(value, str), \"Expected string.\")\n        if ftype == \"number\":\n            return ((isinstance(value, (int, float)) and not isinstance(value, bool)), \"Expected number.\")\n        if ftype == \"checkbox\":\n            return (isinstance(value, bool), \"Expected boolean.\")\n        if ftype in (\"date\", \"dateTime\"):\n            return (isinstance(value, str) and len(value) >= 4, \"Expected ISO date/time string.\")\n        if ftype == \"singleSelect\":\n            choices = opts.get(\"choices\")\n            if not isinstance(choices, list) or not choices:\n                return False, \"Field choices misconfigured.\"\n            if isinstance(value, str):\n                ok = any(isinstance(c, dict) and c.get(\"name\") == value for c in choices)\n                return ok, \"Invalid choice.\"\n            if isinstance(value, dict) and isinstance(value.get(\"name\"), str):\n                ok = any(isinstance(c, dict) and c.get(\"name\") == value.get(\"name\") for c in choices)\n                return ok, \"Invalid choice.\"\n            return False, \"Expected choice name.\"\n        if ftype == \"multipleSelects\":\n            choices = opts.get(\"choices\")\n            if not isinstance(choices, list) or not choices:\n                return False, \"Field choices misconfigured.\"\n            if not isinstance(value, list):\n                return False, \"Expected array of choices.\"\n            names = []\n            for v in value:\n                if isinstance(v, str):\n                    names.append(v)\n                elif isinstance(v, dict) and isinstance(v.get(\"name\"), str):\n                    names.append(v[\"name\"])\n                else:\n                    return False, \"Expected choice names.\"\n            for n in names:\n                if not any(isinstance(c, dict) and c.get(\"name\") == n for c in choices):\n                    return False, \"Invalid choice.\"\n            return True, None\n        if ftype == \"attachment\":\n            return (isinstance(value, list), \"Expected array of attachments.\")\n        if ftype == \"linkToAnotherRecord\":\n            if isinstance(value, list) and all(isinstance(v, str) for v in value):\n                return True, None\n            return False, \"Expected array of record ids.\"\n        if _is_read_only(ftype):\n            return False, \"Field is read-only.\"\n        return True, None\n\n    # Validate ids and fields payload\n    if not isinstance(table_id, str) or not re.match(r\"^tbl_[0-9A-Z]{17}$\", table_id):\n        _log(\"error\", \"VALIDATION_ERROR\", \"Malformed table_id.\", {\"field\": \"table_id\"})\n        return _err(\"VALIDATION_ERROR\", \"Malformed table_id.\", field=\"table_id\")\n    if not isinstance(record_id, str) or not re.match(r\"^rec_[0-9A-Z]{17}$\", record_id):\n        _log(\"error\", \"VALIDATION_ERROR\", \"Malformed record_id.\", {\"field\": \"record_id\"})\n        return _err(\"VALIDATION_ERROR\", \"Malformed record_id.\", field=\"record_id\")\n    if not isinstance(fields, dict):\n        _log(\"error\", \"VALIDATION_ERROR\", \"fields must be an object.\", {\"field\": \"fields\"})\n        return _err(\"VALIDATION_ERROR\", \"fields must be an object.\", field=\"fields\")\n\n    tables_rows = _load(\"tables.json\")\n    if not isinstance(tables_rows, list):\n        tables_rows = []\n    table_row = None\n    for t in tables_rows:\n        if t.get(\"id\") == table_id:\n            table_row = t\n            break\n    if not table_row or table_row.get(\"status\") == \"deleted\":\n        _log(\"error\", \"NOT_FOUND\", \"Table not found.\", {\"table_id\": table_id})\n        return _err(\"NOT_FOUND\", \"Table not found.\", table_id=table_id)\n    if table_row.get(\"status\") != \"active\":\n        _log(\"error\", \"CONFLICT\", \"Cannot update records in a non-active table.\", {\"table_status\": table_row.get(\"status\")})\n        return _err(\"CONFLICT\", \"Cannot update records in a non-active table.\", table_status=table_row.get(\"status\"))\n\n    records_rows = _load(\"records.json\")\n    if not isinstance(records_rows, list):\n        records_rows = []\n    rec_row = None\n    for r in records_rows:\n        if r.get(\"id\") == record_id:\n            rec_row = r\n            break\n    if not rec_row:\n        _log(\"error\", \"NOT_FOUND\", \"Record not found.\", {\"record_id\": record_id})\n        return _err(\"NOT_FOUND\", \"Record not found.\", record_id=record_id)\n    if rec_row.get(\"table_id\") != table_id:\n        _log(\"error\", \"CONFLICT\", \"Record does not belong to the specified table.\", {\"record_table_id\": rec_row.get(\"table_id\")})\n        return _err(\"CONFLICT\", \"Record does not belong to the specified table.\", record_table_id=rec_row.get(\"table_id\"))\n\n    if rec_row.get(\"status\") != \"active\":\n        _log(\"error\", \"INVALID_TRANSITION\", \"Cannot update a deleted record.\", {\"status\": rec_row.get(\"status\")})\n        return _err(\"INVALID_TRANSITION\", \"Cannot update a deleted record.\", status=rec_row.get(\"status\"))\n\n    fields_rows = _load(\"fields.json\")\n    if not isinstance(fields_rows, list):\n        fields_rows = []\n    table_fields = [f for f in fields_rows if f.get(\"table_id\") == table_id]\n    active_fields = [f for f in table_fields if f.get(\"status\") == \"active\"]\n    by_id = {f.get(\"id\"): f for f in table_fields if isinstance(f.get(\"id\"), str)}\n    by_name = {f.get(\"name\"): f for f in table_fields if isinstance(f.get(\"name\"), str)}\n\n    # Map updates\n    updates = {}\n    for k, v in fields.items():\n        if not isinstance(k, str):\n            _log(\"error\", \"VALIDATION_ERROR\", \"Field keys must be strings.\", {\"field\": \"fields\"})\n            return _err(\"VALIDATION_ERROR\", \"Field keys must be strings.\", field=\"fields\")\n        frow = by_id.get(k) or by_name.get(k)\n        if not frow:\n            _log(\"error\", \"VALIDATION_ERROR\", \"Unknown field.\", {\"unknown_field\": k})\n            return _err(\"VALIDATION_ERROR\", \"Unknown field.\", unknown_field=k)\n        if frow.get(\"status\") != \"active\":\n            _log(\"error\", \"VALIDATION_ERROR\", \"Cannot write to non-active field.\", {\"field_id\": frow.get(\"id\")})\n            return _err(\"VALIDATION_ERROR\", \"Cannot write to non-active field.\", field_id=frow.get(\"id\"))\n        if _is_read_only(frow.get(\"type\")):\n            _log(\"error\", \"VALIDATION_ERROR\", \"Cannot write to read-only field type.\", {\"field_id\": frow.get(\"id\"), \"type\": frow.get(\"type\")})\n            return _err(\"VALIDATION_ERROR\", \"Cannot write to read-only field type.\", field_id=frow.get(\"id\"), field_type=frow.get(\"type\"))\n        updates[frow[\"id\"]] = v\n\n    # Compute merged fields\n    current = rec_row.get(\"fields\") if isinstance(rec_row.get(\"fields\"), dict) else {}\n    merged = dict(current)\n    merged.update(updates)\n\n    # Enforce required fields (cannot clear)\n    for f in active_fields:\n        if not f.get(\"is_required\"):\n            continue\n        if _is_read_only(f.get(\"type\")):\n            continue\n        fid = f.get(\"id\")\n        if fid not in merged or merged.get(fid) is None:\n            _log(\"error\", \"VALIDATION_ERROR\", \"Missing required field value.\", {\"field_id\": fid, \"field_name\": f.get(\"name\")})\n            return _err(\"VALIDATION_ERROR\", \"Missing required field value.\", field_id=fid, field_name=f.get(\"name\"))\n\n    # Validate updated values only (but validate required presence above)\n    for fid, v in updates.items():\n        frow = by_id.get(fid)\n        ok, msg = _validate_value(frow, v)\n        if not ok:\n            _log(\"error\", \"VALIDATION_ERROR\", msg or \"Invalid field value.\", {\"field_id\": fid})\n            return _err(\"VALIDATION_ERROR\", msg or \"Invalid field value.\", field_id=fid, field_name=frow.get(\"name\"))\n\n    # Uniqueness check across active records excluding self\n    enforce_nulls_default = False\n    for f in active_fields:\n        if not f.get(\"is_unique\"):\n            continue\n        fid = f.get(\"id\")\n        if fid not in updates and fid not in merged:\n            continue\n        val = merged.get(fid)\n        opts = f.get(\"options\") if isinstance(f.get(\"options\"), dict) else {}\n        enforce_nulls = bool(opts.get(\"enforce_unique_nulls\", enforce_nulls_default))\n        if (val is None or val == \"\" or val == []) and not enforce_nulls:\n            continue\n        if isinstance(val, (dict, list)):\n            _log(\"error\", \"VALIDATION_ERROR\", \"Unique constraint only supported for scalar values.\", {\"field_id\": fid})\n            return _err(\"VALIDATION_ERROR\", \"Unique constraint only supported for scalar values.\", field_id=fid)\n        for r in records_rows:\n            if r.get(\"id\") == record_id:\n                continue\n            if r.get(\"table_id\") != table_id or r.get(\"status\") != \"active\":\n                continue\n            other = (r.get(\"fields\") or {}).get(fid)\n            if other == val and not (other is None and not enforce_nulls):\n                _log(\"error\", \"CONFLICT\", \"Uniqueness constraint violated.\", {\"field_id\": fid})\n                return _err(\"CONFLICT\", \"Uniqueness constraint violated.\", field_id=fid, field_name=f.get(\"name\"))\n\n    # Persist update\n    now = _now()\n    rec_row[\"fields\"] = merged\n    rec_row[\"updated_at\"] = now\n    _save(\"records.json\", records_rows)\n\n    # Update search index\n    idx = _load(\"record_search_index.json\")\n    if not isinstance(idx, list):\n        idx = []\n    schema_version = int(table_row.get(\"schema_version\") or 1)\n\n    search_text_parts = []\n    search_kv = {}\n    for f in active_fields:\n        fid = f.get(\"id\")\n        val = merged.get(fid)\n        if f.get(\"is_indexed\"):\n            if f.get(\"type\") in (\"singleLineText\", \"multilineText\", \"email\", \"url\", \"phoneNumber\"):\n                if val is not None:\n                    search_text_parts.append(_normalize_text(val))\n            else:\n                if val is not None:\n                    search_kv[fid] = val\n    search_text = \" \".join([p for p in search_text_parts if p]).strip()\n\n    existing = None\n    for r in idx:\n        if r.get(\"table_id\") == table_id and r.get(\"record_id\") == record_id:\n            existing = r\n            break\n    if existing:\n        existing[\"schema_version\"] = schema_version\n        existing[\"status\"] = \"fresh\"\n        existing[\"search_text\"] = search_text\n        existing[\"search_kv\"] = search_kv\n        existing[\"updated_at\"] = now\n    else:\n        # create missing index row\n        import secrets\n        alphabet = \"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\"\n        def _new_id(prefix, n=19):\n            return prefix + \"_\" + \"\".join(alphabet[secrets.randbelow(len(alphabet))] for _ in range(n))\n        idx.append({\n            \"id\": _new_id(\"rsi\"),\n            \"table_id\": table_id,\n            \"record_id\": record_id,\n            \"schema_version\": schema_version,\n            \"status\": \"fresh\",\n            \"search_text\": search_text,\n            \"search_kv\": search_kv,\n            \"created_at\": now,\n            \"updated_at\": now,\n        })\n    _save(\"record_search_index.json\", idx)\n\n    _log(\"ok\")\n    return {\"record\": rec_row}\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "delete_record",
+          "description": "Soft-deletes a record from a table and returns the deleted record (or a deletion confirmation) while preserving history semantics. Raises VALIDATION_ERROR for malformed ids. Raises NOT_FOUND if the table or record does not exist, AUTHORIZATION_ERROR if you can’t delete records in the table, CONFLICT if the record is already deleted or cannot be deleted due to its current state, and QUOTA_EXCEEDED when write limits are exceeded.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "table_id": {
+                "type": "string",
+                "pattern": "^tbl_[0-9A-Z]{17}$",
+                "description": "ID of the table that contains the record."
+              },
+              "record_id": {
+                "type": "string",
+                "pattern": "^rec_[0-9A-Z]{17}$",
+                "description": "ID of the record to delete."
+              }
+            },
+            "required": [
+              "table_id",
+              "record_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def delete_record(table_id, record_id, **_extra):\n    import json, os, datetime, time, secrets\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0024000\" if __import__(\"os\").path.isdir(\"./environment_mix/0024000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"delete_record\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _get_log_store():\n        for fn in (\"request_logs.json\", \"requests.json\", \"usage.json\", \"audit_logs.json\", \"api_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fn)):\n                return fn\n        return None\n\n    def _log(status_s, code=None, message=None, meta=None):\n        fn = _get_log_store()\n        if not fn:\n            return\n        rows = _load(fn)\n        if not isinstance(rows, list):\n            rows = []\n        row = {\n            \"id\": \"req_\" + secrets.token_hex(12),\n            \"endpoint\": endpoint,\n            \"status\": status_s,\n            \"timestamp\": _now(),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if code is not None:\n            row[\"error_code\"] = code\n        if message is not None:\n            row[\"error_message\"] = message\n        if isinstance(meta, dict) and meta:\n            row[\"meta\"] = meta\n        rows.append(row)\n        _save(fn, rows)\n\n    if not isinstance(table_id, str) or not table_id.startswith(\"tbl_\"):\n        out = _err(\"VALIDATION_ERROR\", \"Invalid table_id.\", field=\"table_id\")\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n    if not isinstance(record_id, str) or not record_id.startswith(\"rec_\"):\n        out = _err(\"VALIDATION_ERROR\", \"Invalid record_id.\", field=\"record_id\")\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n\n    tables = _load(\"tables.json\")\n    if not isinstance(tables, list):\n        tables = []\n    table = next((t for t in tables if t.get(\"id\") == table_id), None)\n    if not table or table.get(\"status\") == \"deleted\":\n        out = _err(\"NOT_FOUND\", \"Table not found.\", table_id=table_id)\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n    if table.get(\"status\") != \"active\":\n        out = _err(\"UNAUTHORIZED\", \"Table is not active; record mutations are not allowed.\", table_status=table.get(\"status\"))\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n\n    records = _load(\"records.json\")\n    if not isinstance(records, list):\n        records = []\n    r_idx = next((i for i, r in enumerate(records) if r.get(\"id\") == record_id), None)\n    if r_idx is None:\n        out = _err(\"NOT_FOUND\", \"Record not found.\", record_id=record_id)\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n    rec = records[r_idx]\n    if rec.get(\"table_id\") != table_id:\n        out = _err(\"NOT_FOUND\", \"Record not found in the specified table.\", table_id=table_id, record_id=record_id)\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n\n    # Idempotent delete\n    now = _now()\n    if rec.get(\"status\") == \"deleted\":\n        out = {\"record\": rec, \"deleted\": True, \"idempotent\": True}\n        _log(\"ok\")\n        return out\n\n    # Transition active -> deleted\n    rec[\"status\"] = \"deleted\"\n    rec[\"deleted_at\"] = now\n    rec[\"updated_at\"] = now\n    records[r_idx] = rec\n    _save(\"records.json\", records)\n\n    # Cascade to search index: status must be deleted\n    idx_rows = _load(\"record_search_index.json\")\n    if not isinstance(idx_rows, list):\n        idx_rows = []\n    ix = next((x for x in idx_rows if x.get(\"table_id\") == table_id and x.get(\"record_id\") == record_id), None)\n    if ix:\n        ix[\"status\"] = \"deleted\"\n        ix[\"updated_at\"] = now\n    _save(\"record_search_index.json\", idx_rows)\n\n    out = {\"record\": rec, \"deleted\": True}\n    _log(\"ok\")\n    return out\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "search_records",
+          "description": "Searches a table’s records using an optional full‑text query and/or structured indexed filters, and returns up to `limit` results with a `cursor` that can be provided to fetch the next page (omit `cursor` to start a new search). Raises `VALIDATION_ERROR` if `table_id` is invalid, `limit` is outside 1–100, `status`/`sort.direction` are not allowed values, or the request includes unknown top‑level properties; raises `NOT_FOUND` if the table does not exist. Raises `FORBIDDEN` if you don’t have access to the table/base, and `QUOTA_EXCEEDED` if the request is rate-limited or exceeds search/read quotas; `sort.field` that does not resolve to a field in the table is rejected with `VALIDATION_ERROR`.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "table_id": {
+                "type": "string",
+                "pattern": "^tbl_[0-9A-Z]{17}$",
+                "description": "ID of the table to search."
+              },
+              "query": {
+                "type": "string",
+                "description": "Full-text query string applied to the table's search index."
+              },
+              "filter": {
+                "type": "object",
+                "description": "Structured filters applied to indexed key/value pairs for the table.",
+                "additionalProperties": true
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "deleted",
+                  "all"
+                ],
+                "description": "Which record statuses to include in results."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum number of records to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page of results."
+              },
+              "sort": {
+                "type": "array",
+                "description": "Sort specification for results (applied in order).",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "field": {
+                      "type": "string",
+                      "description": "Field name or field ID to sort by."
+                    },
+                    "direction": {
+                      "type": "string",
+                      "enum": [
+                        "asc",
+                        "desc"
+                      ],
+                      "description": "Sort direction."
+                    }
+                  },
+                  "required": [
+                    "field",
+                    "direction"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "table_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def search_records(table_id, query=None, filter=None, status=None, limit=None, cursor=None, sort=None, **_extra):\n    import json, os, datetime, time, secrets, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0024000\" if __import__(\"os\").path.isdir(\"./environment_mix/0024000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"search_records\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _get_log_store():\n        for fn in (\"request_logs.json\", \"requests.json\", \"usage.json\", \"audit_logs.json\", \"api_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fn)):\n                return fn\n        return None\n\n    def _log(status_s, code=None, message=None, meta=None):\n        fn = _get_log_store()\n        if not fn:\n            return\n        rows = _load(fn)\n        if not isinstance(rows, list):\n            rows = []\n        row = {\n            \"id\": \"req_\" + secrets.token_hex(12),\n            \"endpoint\": endpoint,\n            \"status\": status_s,\n            \"timestamp\": _now(),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if code is not None:\n            row[\"error_code\"] = code\n        if message is not None:\n            row[\"error_message\"] = message\n        if isinstance(meta, dict) and meta:\n            row[\"meta\"] = meta\n        rows.append(row)\n        _save(fn, rows)\n\n    def _encode_cursor(payload):\n        raw = json.dumps(payload, separators=(\",\", \":\"), ensure_ascii=False).encode(\"utf-8\")\n        return base64.urlsafe_b64encode(raw).decode(\"ascii\").rstrip(\"=\")\n\n    def _decode_cursor(cur):\n        if cur is None:\n            return None\n        if not isinstance(cur, str) or cur == \"\":\n            return \"bad\"\n        pad = \"=\" * ((4 - (len(cur) % 4)) % 4)\n        raw = None\n        try:\n            raw = base64.urlsafe_b64decode((cur + pad).encode(\"ascii\"))\n            return json.loads(raw.decode(\"utf-8\"))\n        except Exception:\n            return \"bad\"\n\n    if not isinstance(table_id, str) or not table_id.startswith(\"tbl_\"):\n        out = _err(\"VALIDATION_ERROR\", \"Invalid table_id.\", field=\"table_id\")\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n    if query is not None and not isinstance(query, str):\n        out = _err(\"VALIDATION_ERROR\", \"query must be a string.\", field=\"query\")\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n    if filter is not None and not isinstance(filter, dict):\n        out = _err(\"VALIDATION_ERROR\", \"filter must be an object.\", field=\"filter\")\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n    if status is not None and status not in (\"active\", \"deleted\", \"all\"):\n        out = _err(\"VALIDATION_ERROR\", \"status must be one of active/deleted/all.\", field=\"status\")\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 100:\n        out = _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 100.\", field=\"limit\")\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n    if sort is not None:\n        if not isinstance(sort, list):\n            out = _err(\"VALIDATION_ERROR\", \"sort must be an array.\", field=\"sort\")\n            _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n            return out\n        for s in sort:\n            if not isinstance(s, dict) or \"field\" not in s or \"direction\" not in s or s.get(\"direction\") not in (\"asc\", \"desc\") or not isinstance(s.get(\"field\"), str):\n                out = _err(\"VALIDATION_ERROR\", \"Each sort item must have field (string) and direction (asc|desc).\", field=\"sort\")\n                _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n                return out\n\n    cur = _decode_cursor(cursor)\n    if cur == \"bad\":\n        out = _err(\"VALIDATION_ERROR\", \"cursor is invalid.\", field=\"cursor\")\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n    offset = 0\n    if isinstance(cur, dict):\n        if cur.get(\"table_id\") != table_id:\n            out = _err(\"VALIDATION_ERROR\", \"cursor does not match table_id.\", field=\"cursor\")\n            _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n            return out\n        try:\n            offset = int(cur.get(\"offset\", 0))\n        except Exception:\n            offset = 0\n        if offset < 0:\n            offset = 0\n\n    tables = _load(\"tables.json\")\n    if not isinstance(tables, list):\n        tables = []\n    table = next((t for t in tables if t.get(\"id\") == table_id), None)\n    if not table or table.get(\"status\") == \"deleted\":\n        out = _err(\"NOT_FOUND\", \"Table not found.\", table_id=table_id)\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n\n    # Prefer search index if fresh for this schema_version; else fall back to scan indexed fields\n    idx_rows = _load(\"record_search_index.json\")\n    if not isinstance(idx_rows, list):\n        idx_rows = []\n    records = _load(\"records.json\")\n    if not isinstance(records, list):\n        records = []\n    all_fields = _load(\"fields.json\")\n    if not isinstance(all_fields, list):\n        all_fields = []\n    active_fields = [f for f in all_fields if f.get(\"table_id\") == table_id and f.get(\"status\") == \"active\"]\n    field_by_id = {f.get(\"id\"): f for f in active_fields if isinstance(f.get(\"id\"), str)}\n    field_by_name = {f.get(\"name\"): f for f in active_fields if isinstance(f.get(\"name\"), str)}\n    indexed_field_ids = set([f.get(\"id\") for f in active_fields if f.get(\"is_indexed\") and isinstance(f.get(\"id\"), str)])\n\n    schema_version = int(table.get(\"schema_version\") or 1)\n    use_index = True\n    for ix in idx_rows:\n        if ix.get(\"table_id\") == table_id and ix.get(\"status\") == \"fresh\" and int(ix.get(\"schema_version\") or 0) != schema_version:\n            use_index = False\n            break\n        if ix.get(\"table_id\") == table_id and ix.get(\"status\") == \"stale\":\n            use_index = False\n            break\n\n    wanted_status = status or \"active\"\n\n    def _record_status_ok(r):\n        rs = r.get(\"status\")\n        if wanted_status == \"all\":\n            return rs in (\"active\", \"deleted\")\n        return rs == wanted_status\n\n    def _matches_filter_kv(kv, fil):\n        if not fil:\n            return True\n        for fk, fv in fil.items():\n            # allow field name or id\n            fid = fk\n            if fk in field_by_name:\n                fid = field_by_name[fk][\"id\"]\n            if fid not in indexed_field_ids:\n                return False\n            if kv.get(fid) != fv:\n                return False\n        return True\n\n    qnorm = None\n    if isinstance(query, str) and query.strip() != \"\":\n        qnorm = \" \".join(query.lower().split())\n\n    matched_ids = []\n    if use_index:\n        # Join index -> record\n        idx_for_table = [ix for ix in idx_rows if ix.get(\"table_id\") == table_id and ix.get(\"status\") != \"deleted\"]\n        # Apply filters\n        for ix in idx_for_table:\n            rid = ix.get(\"record_id\")\n            r = next((rr for rr in records if rr.get(\"id\") == rid), None)\n            if not r or r.get(\"table_id\") != table_id:\n                continue\n            if not _record_status_ok(r):\n                continue\n            if qnorm and qnorm not in (ix.get(\"search_text\") or \"\").lower():\n                continue\n            if not _matches_filter_kv(ix.get(\"search_kv\") or {}, filter or {}):\n                continue\n            matched_ids.append(rid)\n    else:\n        # Fallback scan: only indexed fields participate\n        for r in records:\n            if r.get(\"table_id\") != table_id:\n                continue\n            if not _record_status_ok(r):\n                continue\n            rf = r.get(\"fields\") or {}\n            if not isinstance(rf, dict):\n                continue\n            # filter\n            ok = True\n            if isinstance(filter, dict) and filter:\n                for fk, fv in filter.items():\n                    fid = fk\n                    if fk in field_by_name:\n                        fid = field_by_name[fk][\"id\"]\n                    if fid not in indexed_field_ids:\n                        ok = False\n                        break\n                    if rf.get(fid) != fv:\n                        ok = False\n                        break\n            if not ok:\n                continue\n            if qnorm:\n                text = []\n                for fid in indexed_field_ids:\n                    v = rf.get(fid)\n                    if v is None:\n                        continue\n                    if isinstance(v, str):\n                        text.append(v.lower())\n                    elif isinstance(v, list):\n                        text.extend([str(x).lower() for x in v])\n                    else:\n                        text.append(str(v).lower())\n                if qnorm not in \" \".join(text):\n                    continue\n            matched_ids.append(r.get(\"id\"))\n\n    # Build record list\n    matched_records = [next((r for r in records if r.get(\"id\") == rid), None) for rid in matched_ids]\n    matched_records = [r for r in matched_records if r is not None]\n\n    # Sorting\n    if sort:\n        def _sort_key_builder(spec):\n            fld = spec.get(\"field\")\n            direction = spec.get(\"direction\")\n            fid = fld\n            if fld in field_by_name:\n                fid = field_by_name[fld][\"id\"]\n            def _key(rec):\n                v = (rec.get(\"fields\") or {}).get(fid)\n                # normalize types for comparison\n                if v is None:\n                    return (1, \"\")\n                if isinstance(v, (int, float)) and not isinstance(v, bool):\n                    return (0, v)\n                return (0, str(v))\n            reverse = (direction == \"desc\")\n            return _key, reverse\n        # Apply stable sorts from last to first\n        for spec in reversed(sort):\n            key_fn, rev = _sort_key_builder(spec)\n            matched_records.sort(key=key_fn, reverse=rev)\n    else:\n        # deterministic order by created_at then id\n        matched_records.sort(key=lambda r: (r.get(\"created_at\") or \"\", r.get(\"id\") or \"\"))\n\n    total = len(matched_records)\n    page = matched_records[offset:offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = _encode_cursor({\"table_id\": table_id, \"offset\": next_offset}) if has_more else None\n\n    out = {\"records\": page, \"total\": total, \"has_more\": has_more, \"next_cursor\": next_cursor}\n    _log(\"ok\")\n    return out\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_record",
+          "description": "Retrieves a single record by ID from the specified table and returns the record payload (including its current field values and metadata); by default soft-deleted records are not returned unless `include_deleted` is true. Raises `VALIDATION_ERROR` if `table_id` or `record_id` do not match the expected ID format or if unknown properties are provided. Raises `NOT_FOUND` if the table does not exist or the record does not exist in that table, `FORBIDDEN` if you don’t have access to the table/base, and `CONFLICT` if the record is soft-deleted and `include_deleted` is false.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "table_id": {
+                "type": "string",
+                "pattern": "^tbl_[0-9A-Z]{17}$",
+                "description": "ID of the table that contains the record."
+              },
+              "record_id": {
+                "type": "string",
+                "pattern": "^rec_[0-9A-Z]{17}$",
+                "description": "ID of the record to retrieve."
+              },
+              "include_deleted": {
+                "type": "boolean",
+                "description": "Whether to allow returning a soft-deleted record."
+              }
+            },
+            "required": [
+              "table_id",
+              "record_id"
+            ],
+            "additionalProperties": false
+          },
+          "implementation": "def get_record(table_id, record_id, include_deleted=None, **_extra):\n    import json, os, datetime, time, secrets\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0024000\" if __import__(\"os\").path.isdir(\"./environment_mix/0024000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_record\"\n\n    def _now():\n        return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    def _get_log_store():\n        for fn in (\"request_logs.json\", \"requests.json\", \"usage.json\", \"audit_logs.json\", \"api_logs.json\"):\n            if os.path.exists(os.path.join(_DB, fn)):\n                return fn\n        return None\n\n    def _log(status_s, code=None, message=None, meta=None):\n        fn = _get_log_store()\n        if not fn:\n            return\n        rows = _load(fn)\n        if not isinstance(rows, list):\n            rows = []\n        row = {\n            \"id\": \"req_\" + secrets.token_hex(12),\n            \"endpoint\": endpoint,\n            \"status\": status_s,\n            \"timestamp\": _now(),\n            \"latency_ms\": int((time.time() - t0) * 1000),\n        }\n        if code is not None:\n            row[\"error_code\"] = code\n        if message is not None:\n            row[\"error_message\"] = message\n        if isinstance(meta, dict) and meta:\n            row[\"meta\"] = meta\n        rows.append(row)\n        _save(fn, rows)\n\n    if not isinstance(table_id, str) or not table_id.startswith(\"tbl_\"):\n        out = _err(\"VALIDATION_ERROR\", \"Invalid table_id.\", field=\"table_id\")\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n    if not isinstance(record_id, str) or not record_id.startswith(\"rec_\"):\n        out = _err(\"VALIDATION_ERROR\", \"Invalid record_id.\", field=\"record_id\")\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n    if include_deleted is not None and not isinstance(include_deleted, bool):\n        out = _err(\"VALIDATION_ERROR\", \"include_deleted must be boolean.\", field=\"include_deleted\")\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n\n    tables = _load(\"tables.json\")\n    if not isinstance(tables, list):\n        tables = []\n    table = next((t for t in tables if t.get(\"id\") == table_id), None)\n    if not table or table.get(\"status\") == \"deleted\":\n        out = _err(\"NOT_FOUND\", \"Table not found.\", table_id=table_id)\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n\n    records = _load(\"records.json\")\n    if not isinstance(records, list):\n        records = []\n    rec = next((r for r in records if r.get(\"id\") == record_id), None)\n    if not rec or rec.get(\"table_id\") != table_id:\n        out = _err(\"NOT_FOUND\", \"Record not found.\", table_id=table_id, record_id=record_id)\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n\n    if rec.get(\"status\") == \"deleted\" and not include_deleted:\n        out = _err(\"NOT_FOUND\", \"Record not found.\", table_id=table_id, record_id=record_id)\n        _log(\"error\", out[\"error\"][\"code\"], out[\"error\"][\"message\"])\n        return out\n\n    out = {\"record\": rec}\n    _log(\"ok\")\n    return out\n",
+          "_params_reconstructed": true,
+          "description_restored": true,
+          "params_reconstructed": true
+        },
+        {
+          "name": "get_base",
+          "description": "Fetches a single base by id and returns its current metadata and lifecycle status. Raises VALIDATION_ERROR for malformed id, NOT_FOUND if the base does not exist or is not visible to the caller, and AUTHORIZATION_ERROR if you are not permitted to view the base.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "base_id": {
+                "type": "string",
+                "pattern": "^bas_[0-9A-Z]{18,}$",
+                "description": "Base id to fetch."
+              },
+              "include_deleted": {
+                "type": "boolean",
+                "description": "If true, allows fetching a base whose status is 'deleted' (if still retained and the caller is authorized). Defaults to false."
+              }
+            },
+            "required": [
+              "base_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_base(base_id, include_deleted=None, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0024000\" if __import__(\"os\").path.isdir(\"./environment_mix/0024000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_base\"\n    status_code = \"ok\"\n    used_cred = None\n\n    def _log_and_return(payload):\n        nonlocal status_code\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": f\"req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": used_cred,\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"ts\": datetime.datetime.utcnow().isoformat() + \"Z\"\n        })\n        _save(\"request_logs.json\", logs)\n        return payload\n\n    if include_deleted is None:\n        include_deleted = False\n    if not isinstance(base_id, str) or not re.match(r\"^bas_[0-9A-Z]{18,}$\", base_id):\n        status_code = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"Malformed base_id.\", field=\"base_id\"))\n    if not isinstance(include_deleted, bool):\n        status_code = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"include_deleted must be boolean.\", field=\"include_deleted\"))\n\n    bases = _load(\"bases.json\")\n    if not isinstance(bases, list):\n        bases = []\n    base = next((b for b in bases if isinstance(b, dict) and b.get(\"id\") == base_id), None)\n    if not base:\n        status_code = \"error\"\n        return _log_and_return(_err(\"NOT_FOUND\", \"Base not found.\"))\n\n    if base.get(\"status\") == \"deleted\" and not include_deleted:\n        status_code = \"error\"\n        return _log_and_return(_err(\"NOT_FOUND\", \"Base not found.\"))\n\n    status_code = \"ok\"\n    return _log_and_return({\"base\": base})\n"
+        },
+        {
+          "name": "create_base",
+          "description": "Creates a new base owned by the caller (or an explicitly specified owner where permitted) and returns the created base. The new base is created with status='active'. Raises VALIDATION_ERROR for empty name or invalid metadata payload, and AUTHORIZATION_ERROR if you are not permitted to create a base for the requested owner.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Base name."
+              },
+              "owner_user_id": {
+                "type": "string",
+                "description": "Owner user id for the base; if omitted, defaults to the calling user. Requires authorization to set explicitly."
+              },
+              "metadata": {
+                "type": "object",
+                "description": "Optional arbitrary base metadata (opaque to the server aside from size/shape limits)."
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def create_base(name, owner_user_id=None, metadata=None, **_extra):\n    import json, os, datetime, re, time, secrets\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0024000\" if __import__(\"os\").path.isdir(\"./environment_mix/0024000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"create_base\"\n    status_code = \"ok\"\n    used_cred = None\n\n    def _log_and_return(payload):\n        nonlocal status_code\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": f\"req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": used_cred,\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"ts\": datetime.datetime.utcnow().isoformat() + \"Z\"\n        })\n        _save(\"request_logs.json\", logs)\n        return payload\n\n    if not isinstance(name, str):\n        status_code = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"name must be a string.\", field=\"name\"))\n    nm = name.strip()\n    if len(nm) < 1 or len(nm) > 255:\n        status_code = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"name length must be between 1 and 255.\", field=\"name\"))\n    if owner_user_id is not None and not isinstance(owner_user_id, str):\n        status_code = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"owner_user_id must be a string.\", field=\"owner_user_id\"))\n    if metadata is None:\n        metadata = {}\n    if not isinstance(metadata, dict):\n        status_code = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"metadata must be a JSON object.\", field=\"metadata\"))\n\n    bases = _load(\"bases.json\")\n    if not isinstance(bases, list):\n        bases = []\n\n    # Uniqueness: unique(name, owner_user_id) where status != 'deleted'\n    for b in bases:\n        if not isinstance(b, dict):\n            continue\n        if b.get(\"status\") != \"deleted\" and b.get(\"name\") == nm and b.get(\"owner_user_id\") == owner_user_id:\n            status_code = \"error\"\n            return _log_and_return(_err(\"CONFLICT\", \"A base with this name already exists for the owner.\", field=\"name\"))\n\n    now = datetime.datetime.utcnow().isoformat() + \"Z\"\n    rid = \"bas_\" + secrets.token_hex(12).upper()  # 24 hex => 24 chars, meets {18,}\n    new_base = {\n        \"id\": rid,\n        \"name\": nm,\n        \"status\": \"active\",\n        \"owner_user_id\": owner_user_id,\n        \"metadata\": metadata,\n        \"created_at\": now,\n        \"updated_at\": now\n    }\n    bases.append(new_base)\n    _save(\"bases.json\", bases)\n\n    status_code = \"ok\"\n    return _log_and_return({\"base\": new_base})\n"
+        },
+        {
+          "name": "get_table",
+          "description": "Fetches a single table by id, optionally scoped to a base, and returns its metadata including lifecycle status and schema_version. Raises VALIDATION_ERROR for malformed ids, NOT_FOUND if the table does not exist in the specified base (if provided) or is not visible, and AUTHORIZATION_ERROR if you are not permitted to view the table.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "table_id": {
+                "type": "string",
+                "pattern": "^tbl_[0-9A-Z]{18,}$",
+                "description": "Table id to fetch."
+              },
+              "base_id": {
+                "type": "string",
+                "pattern": "^bas_[0-9A-Z]{18,}$",
+                "description": "Optional base id context; if provided, the table must belong to this base."
+              },
+              "include_deleted": {
+                "type": "boolean",
+                "description": "If true, allows fetching a table whose status is 'deleted' (if still retained and the caller is authorized). Defaults to false."
+              }
+            },
+            "required": [
+              "table_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def get_table(table_id, base_id=None, include_deleted=None, **_extra):\n    import json, os, datetime, re, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0024000\" if __import__(\"os\").path.isdir(\"./environment_mix/0024000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"get_table\"\n    status_code = \"ok\"\n    used_cred = None\n\n    def _log_and_return(payload):\n        nonlocal status_code\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": f\"req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": used_cred,\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"ts\": datetime.datetime.utcnow().isoformat() + \"Z\"\n        })\n        _save(\"request_logs.json\", logs)\n        return payload\n\n    if include_deleted is None:\n        include_deleted = False\n    if not isinstance(table_id, str) or not re.match(r\"^tbl_[0-9A-Z]{18,}$\", table_id):\n        status_code = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"Malformed table_id.\", field=\"table_id\"))\n    if base_id is not None:\n        if not isinstance(base_id, str) or not re.match(r\"^bas_[0-9A-Z]{18,}$\", base_id):\n            status_code = \"error\"\n            return _log_and_return(_err(\"VALIDATION_ERROR\", \"Malformed base_id.\", field=\"base_id\"))\n    if not isinstance(include_deleted, bool):\n        status_code = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"include_deleted must be boolean.\", field=\"include_deleted\"))\n\n    tables = _load(\"tables.json\")\n    if not isinstance(tables, list):\n        tables = []\n\n    tbl = next((t for t in tables if isinstance(t, dict) and t.get(\"id\") == table_id), None)\n    if not tbl:\n        status_code = \"error\"\n        return _log_and_return(_err(\"NOT_FOUND\", \"Table not found.\"))\n\n    if base_id is not None and tbl.get(\"base_id\") != base_id:\n        status_code = \"error\"\n        return _log_and_return(_err(\"NOT_FOUND\", \"Table not found in the specified base.\"))\n\n    if tbl.get(\"status\") == \"deleted\" and not include_deleted:\n        status_code = \"error\"\n        return _log_and_return(_err(\"NOT_FOUND\", \"Table not found.\"))\n\n    status_code = \"ok\"\n    return _log_and_return({\"table\": tbl})\n"
+        },
+        {
+          "name": "list_fields",
+          "description": "Lists fields in the specified table, optionally filtered by lifecycle status, and returns results sorted as requested with cursor-based pagination. Raises VALIDATION_ERROR for invalid table_id format, invalid enum values, limit out of range, or malformed cursor. Raises NOT_FOUND if the table_id does not exist and AUTHORIZATION_ERROR if you are not permitted to view the table schema.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "table_id": {
+                "type": "string",
+                "pattern": "^tbl_[0-9A-Z]{18,}$",
+                "description": "Table id whose fields should be listed."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "hidden",
+                  "deleted"
+                ],
+                "description": "Filter fields by lifecycle status."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500,
+                "description": "Maximum number of fields to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor for the next page."
+              },
+              "sort": {
+                "type": "string",
+                "enum": [
+                  "position",
+                  "created_at",
+                  "updated_at",
+                  "name"
+                ],
+                "description": "Field to sort results by."
+              },
+              "order": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ],
+                "description": "Sort direction."
+              }
+            },
+            "required": [
+              "table_id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def list_fields(table_id, status=None, limit=None, cursor=None, sort=None, order=None, **_extra):\n    import json, os, datetime, re, time, base64\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0024000\" if __import__(\"os\").path.isdir(\"./environment_mix/0024000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    endpoint = \"list_fields\"\n    status_code = \"ok\"\n    used_cred = None\n\n    def _log_and_return(payload):\n        nonlocal status_code\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": f\"req_{int(time.time()*1000)}_{len(logs)+1}\",\n            \"endpoint\": endpoint,\n            \"credential_id\": used_cred,\n            \"status\": status_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"ts\": datetime.datetime.utcnow().isoformat() + \"Z\"\n        })\n        _save(\"request_logs.json\", logs)\n        return payload\n\n    if not isinstance(table_id, str) or not re.match(r\"^tbl_[0-9A-Z]{18,}$\", table_id):\n        status_code = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"Malformed table_id.\", field=\"table_id\"))\n\n    if status is not None:\n        if not isinstance(status, str) or status not in (\"active\", \"hidden\", \"deleted\"):\n            status_code = \"error\"\n            return _log_and_return(_err(\"VALIDATION_ERROR\", \"Invalid status filter.\", field=\"status\"))\n\n    if limit is None:\n        limit = 100\n    if not isinstance(limit, int) or limit < 1 or limit > 500:\n        status_code = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"limit must be between 1 and 500.\", field=\"limit\"))\n\n    if sort is None:\n        sort = \"position\"\n    if not isinstance(sort, str) or sort not in (\"position\", \"created_at\", \"updated_at\", \"name\"):\n        status_code = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"Invalid sort.\", field=\"sort\"))\n\n    if order is None:\n        order = \"asc\"\n    if not isinstance(order, str) or order not in (\"asc\", \"desc\"):\n        status_code = \"error\"\n        return _log_and_return(_err(\"VALIDATION_ERROR\", \"Invalid order.\", field=\"order\"))\n\n    offset = 0\n    if cursor is not None:\n        if not isinstance(cursor, str) or cursor == \"\":\n            status_code = \"error\"\n            return _log_and_return(_err(\"VALIDATION_ERROR\", \"Malformed cursor.\", field=\"cursor\"))\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\")).decode(\"utf-8\")\n            if not raw.startswith(\"off:\"):\n                status_code = \"error\"\n                return _log_and_return(_err(\"VALIDATION_ERROR\", \"Malformed cursor.\", field=\"cursor\"))\n            offset = int(raw.split(\":\", 1)[1])\n            if offset < 0:\n                raise ValueError(\"neg\")\n        except Exception:\n            status_code = \"error\"\n            return _log_and_return(_err(\"VALIDATION_ERROR\", \"Malformed cursor.\", field=\"cursor\"))\n\n    tables = _load(\"tables.json\")\n    if not isinstance(tables, list):\n        tables = []\n    table = next((t for t in tables if isinstance(t, dict) and t.get(\"id\") == table_id), None)\n    if not table:\n        status_code = \"error\"\n        return _log_and_return(_err(\"NOT_FOUND\", \"Table not found.\"))\n\n    fields = _load(\"fields.json\")\n    if not isinstance(fields, list):\n        fields = []\n\n    rows = [f for f in fields if isinstance(f, dict) and f.get(\"table_id\") == table_id]\n    if status is not None:\n        rows = [f for f in rows if f.get(\"status\") == status]\n\n    def _key(v):\n        if sort in (\"created_at\", \"updated_at\"):\n            return v.get(sort) or \"\"\n        if sort == \"position\":\n            pv = v.get(\"position\")\n            return pv if isinstance(pv, int) else 10**18\n        return (v.get(\"name\") or \"\").lower()\n\n    reverse = (order == \"desc\")\n    rows.sort(key=_key, reverse=reverse)\n\n    total = len(rows)\n    page = rows[offset:offset + limit]\n    next_off = offset + len(page)\n    has_more = next_off < total\n    next_cursor = None\n    if has_more:\n        next_cursor = base64.urlsafe_b64encode(f\"off:{next_off}\".encode(\"utf-8\")).decode(\"utf-8\")\n\n    status_code = \"ok\"\n    return _log_and_return({\n        \"fields\": page,\n        \"meta\": {\n            \"total\": total,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n            \"limit\": limit,\n            \"sort\": sort,\n            \"order\": order\n        }\n    })\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0024000",
+    "index": 24,
+    "name": "Airtable Server",
+    "description": "This backend stores Airtable-like workspaces (“bases”) containing tables with user-defined schema (fields) and row data (records). The main workflows are: discover bases/tables, mutate schema (create/update tables and fields), and CRUD/search records while preserving schema constraints and soft-dele",
+    "taxonomy": {
+      "L1_id": "L1-10",
+      "L1_name": "Data Storage & Databases",
+      "L1_name_zh": "数据存储与数据库",
+      "L2_id": "L2-25",
+      "L2_name": "Relational Databases",
+      "L2_name_zh": "关系型数据库",
+      "L3_name": "Relational-like App Platforms (Spreadsheet/Low-code DB Backends)",
+      "L3_name_zh": "类关系应用平台（表格/低代码数据库后端）"
+    },
+    "database_dir": "./environment_mix/0024000",
+    "mount_path": "/app/database",
+    "n_tools": 16,
+    "n_collections": 5,
+    "n_records": 90,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 16,
+      "loaded": 16,
+      "reads_returning_data": 5,
+      "read_operations": 5,
+      "mutations_persisted": 8,
+      "mutations_attempted": 11
+    },
+    "tools_loadable_from_database_dir": 16,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "list_bases",
+      "returned_chars": 2008
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

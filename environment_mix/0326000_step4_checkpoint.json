@@ -1,0 +1,377 @@
+{
+  "index": 326,
+  "local_files_dir": "./environment_mix/0326000",
+  "file_list": [
+    "./environment_mix/0326000/README.md",
+    "./environment_mix/0326000/api_keys.json",
+    "./environment_mix/0326000/rate_limit_counters.json",
+    "./environment_mix/0326000/shell_execution_outputs.json",
+    "./environment_mix/0326000/shell_executions.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "api_keys.json": "12 rows",
+        "shell_executions.json": "34 rows",
+        "shell_execution_outputs.json": "35 rows",
+        "rate_limit_counters.json": "23 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "shell_execute",
+          "description": "Executes a single shell command (argv array) in the specified working directory, optionally supplying stdin, enforcing the caller’s API-key policy (allowed commands, directory sandbox, timeout limits) and recording an auditable execution; returns the command’s captured output and execution metadata for that invocation. Raises VALIDATION_ERROR when required fields are missing/invalid (e.g., non-array command, negative timeout), when the command is not permitted (only find, cat, ls, wc, pwd, grep, touch), or when the requested directory/timeout violates policy constraints. Raises UNAUTHORIZED when the API key is missing/invalid, FORBIDDEN when the key lacks permission for the requested operation or path, QUOTA_EXCEEDED when the key exceeds its limits, TIMEOUT when execution exceeds the effective timeout, and INTERNAL_ERROR on unexpected execution failures.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Command and its arguments as array"
+              },
+              "stdin": {
+                "type": "string",
+                "description": "Input to be passed to the command via stdin"
+              },
+              "directory": {
+                "type": "string",
+                "description": "Working directory where the command will be executed"
+              },
+              "timeout": {
+                "type": "integer",
+                "description": "Maximum execution time in seconds",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "command",
+              "directory"
+            ]
+          },
+          "implementation": "def shell_execute(command, directory, stdin=None, timeout=None, **_extra):\n    import json, os, datetime, time, subprocess, hashlib, secrets, shlex\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0326000\" if __import__(\"os\").path.isdir(\"./environment_mix/0326000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0)\n    now_s = now.isoformat() + \"Z\"\n\n    # Validate inputs (shape/types)\n    if not isinstance(command, list) or any(not isinstance(x, str) for x in command):\n        return _err(\"VALIDATION_ERROR\", \"command must be an array of strings\", field=\"command\")\n    if len(command) < 1:\n        return _err(\"VALIDATION_ERROR\", \"command must have length >= 1\", field=\"command\")\n    if not isinstance(directory, str) or directory == \"\":\n        return _err(\"VALIDATION_ERROR\", \"directory must be a non-empty string\", field=\"directory\")\n    if stdin is not None and not isinstance(stdin, str):\n        return _err(\"VALIDATION_ERROR\", \"stdin must be a string\", field=\"stdin\")\n    if timeout is not None:\n        if not isinstance(timeout, int):\n            return _err(\"VALIDATION_ERROR\", \"timeout must be an integer\", field=\"timeout\")\n        if timeout < 0:\n            # Business rule: reject the request if requested_timeout_seconds < 0.\n            # But we must still create an execution row for every request. We will proceed to create rejected execution below.\n            requested_timeout_invalid = True\n        else:\n            requested_timeout_invalid = False\n    else:\n        requested_timeout_invalid = False\n\n    allowed_cmds_global = {\"find\", \"cat\", \"ls\", \"wc\", \"pwd\", \"grep\", \"touch\"}\n    cmd_name = command[0]\n    if cmd_name not in allowed_cmds_global:\n        # Still must create an execution row; mark rejected below.\n        cmd_name_invalid = True\n    else:\n        cmd_name_invalid = False\n\n    # Load store\n    api_keys = _load(\"api_keys.json\")\n    executions = _load(\"shell_executions.json\")\n    outputs = _load(\"shell_execution_outputs.json\")\n    counters = _load(\"rate_limit_counters.json\")\n\n    def _gen_id(prefix):\n        return f\"{prefix}_{secrets.token_hex(16)}\"\n\n    # Ambient auth: choose a key that can serve shell_execute (active, has policies)\n    # If multiple keys exist, prefer one that would not be rejected for key_inactive.\n    active_keys = [k for k in api_keys if isinstance(k, dict) and k.get(\"status\") == \"active\"]\n    chosen_key = None\n    if active_keys:\n        chosen_key = active_keys[0]\n    else:\n        # No active keys: still create a rejected execution only if there exists ANY key to attribute?\n        # Contract: authenticate ambient; return UNAUTHORIZED only if no combination can serve the call.\n        # If there are keys but none active, we can attribute to one but request must be rejected with key_inactive.\n        if api_keys:\n            chosen_key = api_keys[0]\n        else:\n            # No keys exist at all; cannot authorize/attribute.\n            return _err(\"UNAUTHORIZED\", \"No API key available to authorize shell execution\")\n\n    api_key_id = chosen_key.get(\"id\")\n\n    # Prepare execution record (must be created for every request)\n    ex_id = _gen_id(\"exec\")\n    requested_directory = directory\n    requested_timeout_seconds = timeout if timeout is not None else None\n    server_default_timeout = 60\n\n    max_timeout = chosen_key.get(\"max_timeout_seconds\")\n    if not isinstance(max_timeout, int):\n        max_timeout = 0\n    if requested_timeout_seconds is None:\n        effective_timeout_seconds = min(server_default_timeout, max_timeout)\n    else:\n        # even if invalid (<0), set something safe\n        effective_timeout_seconds = min(max(0, requested_timeout_seconds), max_timeout)\n\n    # Resolve directory within base_directory\n    base_dir = chosen_key.get(\"base_directory\")\n    if not isinstance(base_dir, str) or base_dir == \"\":\n        base_dir = \"/\"\n\n    # Normalize and sandbox check\n    def _resolve_dir(req_dir, base):\n        # Treat req_dir as either absolute or relative to base.\n        try:\n            base_real = os.path.realpath(base)\n        except Exception:\n            base_real = os.path.abspath(base)\n        if os.path.isabs(req_dir):\n            cand = req_dir\n        else:\n            cand = os.path.join(base_real, req_dir)\n        try:\n            cand_real = os.path.realpath(cand)\n        except Exception:\n            cand_real = os.path.abspath(cand)\n        # Ensure within base_real (prefix with separator boundary)\n        base_real_norm = base_real.rstrip(os.sep)\n        cand_norm = cand_real\n        if base_real_norm == \"\":\n            base_real_norm = os.sep\n        ok = False\n        if cand_norm == base_real_norm:\n            ok = True\n        else:\n            ok = cand_norm.startswith(base_real_norm + os.sep)\n        return base_real, cand_real, ok\n\n    base_real, resolved_dir, dir_ok = _resolve_dir(requested_directory, base_dir)\n\n    # Stdin size policy\n    max_stdin_bytes = 1024 * 1024  # 1 MiB policy\n    stdin_too_large = False\n    if stdin is not None:\n        try:\n            if len(stdin.encode(\"utf-8\")) > max_stdin_bytes:\n                stdin_too_large = True\n        except Exception:\n            # If encoding fails unexpectedly, treat as validation error (but must still create execution row).\n            stdin_too_large = True\n\n    # Determine rejection reason (if any), in precedence order\n    rejection_reason = None\n    status = \"queued\"\n\n    if chosen_key.get(\"status\") != \"active\":\n        rejection_reason = \"key_inactive\"\n        status = \"rejected\"\n    elif cmd_name_invalid:\n        rejection_reason = \"command_not_allowed\"\n        status = \"rejected\"\n    else:\n        allowed_commands = chosen_key.get(\"allowed_commands\")\n        if not isinstance(allowed_commands, list) or cmd_name not in set(allowed_commands):\n            rejection_reason = \"command_not_allowed\"\n            status = \"rejected\"\n        elif requested_timeout_invalid:\n            rejection_reason = \"invalid_timeout\"\n            status = \"rejected\"\n        elif not dir_ok:\n            rejection_reason = \"directory_outside_base\"\n            status = \"rejected\"\n        elif stdin_too_large:\n            rejection_reason = \"stdin_too_large\"\n            status = \"rejected\"\n\n    # Rate limit enforcement (counts only shell_execute requests started in window)\n    # Even rejected requests due to rate limiting must increment rejected_count.\n    window_seconds = 60\n    window_start = now.replace(second=0)\n    window_start_s = window_start.isoformat() + \"Z\"\n\n    # Find or create counter row for this key+window\n    counter_row = None\n    for r in counters:\n        if isinstance(r, dict) and r.get(\"api_key_id\") == api_key_id and r.get(\"window_seconds\") == window_seconds and r.get(\"window_start\") == window_start_s:\n            counter_row = r\n            break\n    if counter_row is None:\n        counter_row = {\n            \"id\": _gen_id(\"rlc\"),\n            \"api_key_id\": api_key_id,\n            \"window_start\": window_start_s,\n            \"window_seconds\": window_seconds,\n            \"request_count\": 0,\n            \"rejected_count\": 0,\n            \"created_at\": now_s,\n            \"updated_at\": now_s,\n            \"status\": \"open\",\n        }\n        counters.append(counter_row)\n\n    # Increment request_count and check limit\n    rpm_limit = chosen_key.get(\"requests_per_minute_limit\")\n    if not isinstance(rpm_limit, int) or rpm_limit < 1:\n        rpm_limit = 1\n\n    # \"increment atomically\": in single-process file store we do read-modify-write.\n    would_be = int(counter_row.get(\"request_count\") or 0) + 1\n    counter_row[\"request_count\"] = would_be\n    counter_row[\"updated_at\"] = now_s\n\n    if status != \"rejected\":\n        if would_be > rpm_limit:\n            status = \"rejected\"\n            rejection_reason = \"rate_limited\"\n            counter_row[\"rejected_count\"] = int(counter_row.get(\"rejected_count\") or 0) + 1\n            counter_row[\"updated_at\"] = now_s\n    else:\n        # If already rejected for other reasons, rate limit still counts request_count but not rejected_count unless rate_limited.\n        pass\n\n    # Create execution row now\n    exec_row = {\n        \"id\": ex_id,\n        \"api_key_id\": api_key_id,\n        \"requested_directory\": requested_directory,\n        \"resolved_directory\": resolved_dir if isinstance(resolved_dir, str) and resolved_dir != \"\" else requested_directory,\n        \"requested_timeout_seconds\": requested_timeout_seconds,\n        \"effective_timeout_seconds\": int(effective_timeout_seconds) if isinstance(effective_timeout_seconds, int) else 0,\n        \"stdin\": stdin,\n        \"command_argv\": command,\n        \"command_name\": cmd_name if not cmd_name_invalid else cmd_name,\n        \"status\": status,\n        \"rejection_reason\": rejection_reason,\n        \"started_at\": None,\n        \"finished_at\": None,\n        \"duration_ms\": None,\n        \"exit_code\": None,\n        \"stdout_bytes\": 0,\n        \"stderr_bytes\": 0,\n        \"created_at\": now_s,\n        \"updated_at\": now_s,\n    }\n    executions.append(exec_row)\n\n    # Update api key last_used_at only on successful authentication (we have an ambient selection; consider it authenticated for shell_execute requests)\n    chosen_key[\"last_used_at\"] = now_s\n    chosen_key[\"updated_at\"] = now_s\n\n    # If rejected, persist and return with empty outputs\n    max_capture_bytes = 1024 * 1024  # 1 MiB per stream\n    if status == \"rejected\":\n        # Persist rows\n        _save(\"api_keys.json\", api_keys)\n        _save(\"rate_limit_counters.json\", counters)\n        _save(\"shell_executions.json\", executions)\n        # No output row for rejected-before-run (policy: \"For executed commands, store outputs\"; rejected isn't executed)\n        return {\n            \"execution\": exec_row,\n            \"output\": {\n                \"stdout\": \"\",\n                \"stderr\": \"\",\n                \"stdout_truncated\": False,\n                \"stderr_truncated\": False,\n                \"max_capture_bytes\": max_capture_bytes,\n            },\n        }\n\n    # Concurrency check before running (queued->running)\n    running_count = 0\n    for e in executions:\n        if isinstance(e, dict) and e.get(\"api_key_id\") == api_key_id and e.get(\"status\") == \"running\":\n            running_count += 1\n    conc_limit = chosen_key.get(\"concurrent_exec_limit\")\n    if not isinstance(conc_limit, int) or conc_limit < 1:\n        conc_limit = 1\n    if running_count >= conc_limit:\n        # Transition queued->rejected allowed\n        exec_row[\"status\"] = \"rejected\"\n        exec_row[\"rejection_reason\"] = \"concurrency_limited\"\n        exec_row[\"updated_at\"] = now_s\n        _save(\"api_keys.json\", api_keys)\n        _save(\"rate_limit_counters.json\", counters)\n        _save(\"shell_executions.json\", executions)\n        return {\n            \"execution\": exec_row,\n            \"output\": {\n                \"stdout\": \"\",\n                \"stderr\": \"\",\n                \"stdout_truncated\": False,\n                \"stderr_truncated\": False,\n                \"max_capture_bytes\": max_capture_bytes,\n            },\n        }\n\n    # Transition queued->running\n    exec_row[\"status\"] = \"running\"\n    exec_row[\"started_at\"] = now_s\n    exec_row[\"updated_at\"] = now_s\n    _save(\"api_keys.json\", api_keys)\n    _save(\"rate_limit_counters.json\", counters)\n    _save(\"shell_executions.json\", executions)\n\n    # Execute process in sandboxed resolved_dir\n    start_ts = time.time()\n    proc_timeout = exec_row[\"effective_timeout_seconds\"]\n    try:\n        cp = subprocess.run(\n            command,\n            input=stdin.encode(\"utf-8\") if stdin is not None else None,\n            stdout=subprocess.PIPE,\n            stderr=subprocess.PIPE,\n            cwd=exec_row[\"resolved_directory\"],\n            timeout=proc_timeout if isinstance(proc_timeout, int) and proc_timeout > 0 else None,\n            check=False,\n        )\n        timed_out = False\n        exit_code = cp.returncode\n        out_b = cp.stdout or b\"\"\n        err_b = cp.stderr or b\"\"\n    except subprocess.TimeoutExpired as te:\n        timed_out = True\n        exit_code = None\n        out_b = te.stdout or b\"\"\n        err_b = te.stderr or b\"\"\n    except FileNotFoundError:\n        # Command not found on system: treat as failed execution\n        timed_out = False\n        exit_code = 127\n        out_b = b\"\"\n        err_b = f\"{cmd_name}: command not found\\n\".encode(\"utf-8\", errors=\"replace\")\n    except Exception as e:\n        # Unexpected execution error\n        timed_out = False\n        exit_code = 1\n        out_b = b\"\"\n        err_b = (str(e) + \"\\n\").encode(\"utf-8\", errors=\"replace\")\n\n    end_ts = time.time()\n    finished = datetime.datetime.utcnow().replace(microsecond=0)\n    finished_s = finished.isoformat() + \"Z\"\n    duration_ms = int(round((end_ts - start_ts) * 1000))\n\n    # Capture / truncate outputs\n    def _cap(b):\n        if b is None:\n            b = b\"\"\n        if len(b) <= max_capture_bytes:\n            return b, False\n        return b[:max_capture_bytes], True\n\n    out_cap, out_trunc = _cap(out_b)\n    err_cap, err_trunc = _cap(err_b)\n\n    try:\n        stdout_text = out_cap.decode(\"utf-8\", errors=\"replace\")\n    except Exception:\n        stdout_text = \"\"\n    try:\n        stderr_text = err_cap.decode(\"utf-8\", errors=\"replace\")\n    except Exception:\n        stderr_text = \"\"\n\n    # Terminal status & lifecycle\n    if timed_out:\n        terminal_status = \"timed_out\"\n    else:\n        terminal_status = \"succeeded\" if exit_code == 0 else \"failed\"\n\n    exec_row[\"status\"] = terminal_status\n    exec_row[\"finished_at\"] = finished_s\n    exec_row[\"duration_ms\"] = duration_ms\n    exec_row[\"exit_code\"] = exit_code\n    exec_row[\"stdout_bytes\"] = len(out_cap)\n    exec_row[\"stderr_bytes\"] = len(err_cap)\n    exec_row[\"updated_at\"] = finished_s\n\n    # Upsert outputs row (unique(execution_id))\n    out_row = None\n    for r in outputs:\n        if isinstance(r, dict) and r.get(\"execution_id\") == ex_id:\n            out_row = r\n            break\n    if out_row is None:\n        out_row = {\n            \"id\": _gen_id(\"out\"),\n            \"execution_id\": ex_id,\n            \"stdout\": stdout_text,\n            \"stderr\": stderr_text,\n            \"stdout_truncated\": bool(out_trunc),\n            \"stderr_truncated\": bool(err_trunc),\n            \"max_capture_bytes\": max_capture_bytes,\n            \"created_at\": finished_s,\n            \"updated_at\": finished_s,\n        }\n        outputs.append(out_row)\n    else:\n        out_row[\"stdout\"] = stdout_text\n        out_row[\"stderr\"] = stderr_text\n        out_row[\"stdout_truncated\"] = bool(out_trunc)\n        out_row[\"stderr_truncated\"] = bool(err_trunc)\n        out_row[\"max_capture_bytes\"] = max_capture_bytes\n        out_row[\"updated_at\"] = finished_s\n\n    _save(\"shell_executions.json\", executions)\n    _save(\"shell_execution_outputs.json\", outputs)\n\n    return {\n        \"execution\": exec_row,\n        \"output\": {\n            \"stdout\": out_row.get(\"stdout\") or \"\",\n            \"stderr\": out_row.get(\"stderr\") or \"\",\n            \"stdout_truncated\": bool(out_row.get(\"stdout_truncated\")),\n            \"stderr_truncated\": bool(out_row.get(\"stderr_truncated\")),\n            \"max_capture_bytes\": out_row.get(\"max_capture_bytes\"),\n        },\n    }\n",
+          "description_restored": true
+        },
+        {
+          "name": "api_keys_list",
+          "description": "Lists API keys visible to the caller, optionally filtered by status and name. Returns a paginated collection; refuses invalid pagination parameters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Caller API key used for authentication (sent as the vendor expects in this API surface)."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "suspended",
+                  "revoked"
+                ],
+                "description": "Filter by API key lifecycle status."
+              },
+              "name_prefix": {
+                "type": "string",
+                "description": "Filter to keys whose name starts with this prefix."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of items to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor returned by a previous call."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def api_keys_list(api_key, status=None, name_prefix=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, hashlib, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0326000\" if __import__(\"os\").path.isdir(\"./environment_mix/0326000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    # Validate\n    if not isinstance(api_key, str) or api_key == \"\":\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\", field=\"api_key\")\n    if status is not None and status not in (\"active\", \"suspended\", \"revoked\"):\n        return _err(\"VALIDATION_ERROR\", \"Invalid status filter\", field=\"status\")\n    if name_prefix is not None and not isinstance(name_prefix, str):\n        return _err(\"VALIDATION_ERROR\", \"name_prefix must be a string\", field=\"name_prefix\")\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200\", field=\"limit\")\n    if cursor is not None and not isinstance(cursor, str):\n        return _err(\"VALIDATION_ERROR\", \"cursor must be a string\", field=\"cursor\")\n\n    api_keys = _load(\"api_keys.json\")\n\n    # Authenticate explicit credential: match by id OR by client-visible value against key_hash using sha256(token)\n    token_hash = hashlib.sha256(api_key.encode(\"utf-8\")).hexdigest()\n    caller = None\n    for k in api_keys:\n        if not isinstance(k, dict):\n            continue\n        if k.get(\"id\") == api_key or k.get(\"key_hash\") == api_key or k.get(\"key_hash\") == token_hash:\n            caller = k\n            break\n    if caller is None:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n\n    # Pagination cursor: base64 JSON {\"offset\": int}\n    offset = 0\n    if cursor:\n        try:\n            raw = base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\")\n            obj = json.loads(raw.decode(\"utf-8\"))\n            if not isinstance(obj, dict) or \"offset\" not in obj or not isinstance(obj[\"offset\"], int) or obj[\"offset\"] < 0:\n                return _err(\"VALIDATION_ERROR\", \"Invalid cursor\", field=\"cursor\")\n            offset = obj[\"offset\"]\n        except (ValueError, json.JSONDecodeError):\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor\", field=\"cursor\")\n\n    # Visibility: this simple service exposes all keys once authenticated.\n    rows = [k for k in api_keys if isinstance(k, dict)]\n\n    # Filters\n    if status is not None:\n        rows = [k for k in rows if k.get(\"status\") == status]\n    if name_prefix is not None:\n        rows = [k for k in rows if isinstance(k.get(\"name\"), str) and k.get(\"name\", \"\").startswith(name_prefix)]\n\n    # Sort stable by created_at then id\n    def _k(r):\n        return (r.get(\"created_at\") or \"\", r.get(\"id\") or \"\")\n    rows.sort(key=_k)\n\n    total = len(rows)\n    page = rows[offset: offset + limit]\n    next_offset = offset + len(page)\n    has_more = next_offset < total\n    next_cursor = None\n    if has_more:\n        payload = json.dumps({\"offset\": next_offset}, separators=(\",\", \":\")).encode(\"utf-8\")\n        next_cursor = base64.urlsafe_b64encode(payload).decode(\"utf-8\").rstrip(\"=\")\n\n    # Update last_used_at on successful authentication\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    caller[\"last_used_at\"] = now\n    caller[\"updated_at\"] = now\n    _save(\"api_keys.json\", api_keys)\n\n    # Never return secret material; return key metadata/policy\n    def _redact(k):\n        kk = dict(k)\n        kk.pop(\"key_hash\", None)\n        return kk\n\n    return {\n        \"data\": [_redact(k) for k in page],\n        \"pagination\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor,\n        },\n    }\n"
+        },
+        {
+          "name": "api_keys_get",
+          "description": "Fetches a single API key by id. Returns the key metadata and policy fields; never returns the secret key material (only server-side identifiers/policy). Refuses when the id is not found or not visible to the caller.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Caller API key used for authentication (sent as the vendor expects in this API surface)."
+              },
+              "id": {
+                "type": "string",
+                "description": "API key id."
+              }
+            },
+            "required": [
+              "api_key",
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def api_keys_get(api_key, id, **_extra):\n    import json, os, datetime, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0326000\" if __import__(\"os\").path.isdir(\"./environment_mix/0326000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    if not isinstance(api_key, str) or api_key == \"\":\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\", field=\"api_key\")\n    if not isinstance(id, str) or id == \"\":\n        return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\", field=\"id\")\n\n    api_keys = _load(\"api_keys.json\")\n\n    token_hash = hashlib.sha256(api_key.encode(\"utf-8\")).hexdigest()\n    caller = None\n    for k in api_keys:\n        if not isinstance(k, dict):\n            continue\n        if k.get(\"id\") == api_key or k.get(\"key_hash\") == api_key or k.get(\"key_hash\") == token_hash:\n            caller = k\n            break\n    if caller is None:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n\n    target = None\n    for k in api_keys:\n        if isinstance(k, dict) and k.get(\"id\") == id:\n            target = k\n            break\n    if target is None:\n        return _err(\"NOT_FOUND\", \"API key not found\", id=id)\n\n    # Visibility: authenticated caller can view all keys in this service.\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    caller[\"last_used_at\"] = now\n    caller[\"updated_at\"] = now\n    _save(\"api_keys.json\", api_keys)\n\n    resp = dict(target)\n    resp.pop(\"key_hash\", None)\n    return {\"data\": resp}\n"
+        },
+        {
+          "name": "api_keys_create",
+          "description": "Creates a new API key with an allowlist policy and limits. Returns the created key record and the newly-generated secret key once; the secret will not be retrievable again. Refuses invalid policy fields or unsupported commands.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Caller API key used for authentication (must have permission to create keys)."
+              },
+              "name": {
+                "type": "string",
+                "description": "Human-friendly name for the key."
+              },
+              "allowed_commands": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "find",
+                    "cat",
+                    "ls",
+                    "wc",
+                    "pwd",
+                    "grep",
+                    "touch"
+                  ]
+                },
+                "minItems": 1,
+                "description": "Allowlist of command_name values permitted for this key."
+              },
+              "base_directory": {
+                "type": "string",
+                "description": "Filesystem base directory sandbox; all resolved working directories must remain within this path."
+              },
+              "max_timeout_seconds": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Maximum timeout allowed per execution for this key."
+              },
+              "requests_per_minute_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Rate limit (requests per 60-second window)."
+              },
+              "concurrent_exec_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum number of concurrent running executions for this key."
+              }
+            },
+            "required": [
+              "api_key",
+              "name",
+              "allowed_commands",
+              "base_directory",
+              "max_timeout_seconds",
+              "requests_per_minute_limit",
+              "concurrent_exec_limit"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def api_keys_create(api_key, name, allowed_commands, base_directory, max_timeout_seconds, requests_per_minute_limit, concurrent_exec_limit, **_extra):\n    import json, os, datetime, secrets, hashlib\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0326000\" if __import__(\"os\").path.isdir(\"./environment_mix/0326000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    # ---------- Input validation ----------\n    if not isinstance(api_key, str) or not api_key.strip():\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string\", field=\"api_key\")\n    if not isinstance(name, str) or not name.strip():\n        return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string\", field=\"name\")\n    if not isinstance(allowed_commands, list) or len(allowed_commands) < 1:\n        return _err(\"VALIDATION_ERROR\", \"allowed_commands must be a non-empty array\", field=\"allowed_commands\")\n    if any(not isinstance(x, str) for x in allowed_commands):\n        return _err(\"VALIDATION_ERROR\", \"allowed_commands must contain only strings\", field=\"allowed_commands\")\n\n    allowed_set = {\"find\", \"cat\", \"ls\", \"wc\", \"pwd\", \"grep\", \"touch\"}\n    if any(x not in allowed_set for x in allowed_commands):\n        return _err(\n            \"VALIDATION_ERROR\",\n            \"allowed_commands contains unsupported command(s); must be one of: find, cat, ls, wc, pwd, grep, touch\",\n            field=\"allowed_commands\",\n        )\n\n    if not isinstance(base_directory, str) or base_directory == \"\":\n        return _err(\"VALIDATION_ERROR\", \"base_directory must be a non-empty string\", field=\"base_directory\")\n    if not isinstance(max_timeout_seconds, int) or max_timeout_seconds < 0 or max_timeout_seconds > 3600:\n        return _err(\"VALIDATION_ERROR\", \"max_timeout_seconds must be between 0 and 3600 (inclusive)\", field=\"max_timeout_seconds\")\n    if not isinstance(requests_per_minute_limit, int) or requests_per_minute_limit < 1 or requests_per_minute_limit > 6000:\n        return _err(\"VALIDATION_ERROR\", \"requests_per_minute_limit must be between 1 and 6000 (inclusive)\", field=\"requests_per_minute_limit\")\n    if not isinstance(concurrent_exec_limit, int) or concurrent_exec_limit < 1 or concurrent_exec_limit > 256:\n        return _err(\"VALIDATION_ERROR\", \"concurrent_exec_limit must be between 1 and 256 (inclusive)\", field=\"concurrent_exec_limit\")\n\n    # ---------- Load datastore ----------\n    api_keys = _load(\"api_keys.json\")\n    if isinstance(api_keys, dict) and \"rows\" in api_keys:\n        api_keys = api_keys[\"rows\"]\n    if not isinstance(api_keys, list):\n        return _err(\"NOT_FOUND\", \"Datastore unavailable or corrupted for api_keys\")\n\n    # ---------- Authenticate ambiently via api_key parameter ----------\n    # Per contract: do NOT compare api_key to stored key_hash (hash plaintext not stored).\n    # Accept either a record id match, or a client-visible stored token field if present.\n    caller = None\n    for r in api_keys:\n        if not isinstance(r, dict):\n            continue\n        if r.get(\"id\") == api_key:\n            caller = r\n            break\n        # If the store happens to include a client-visible token field, allow it.\n        if r.get(\"key\") == api_key or r.get(\"token\") == api_key or r.get(\"secret\") == api_key:\n            caller = r\n            break\n    if caller is None:\n        return _err(\"UNAUTHORIZED\", \"Invalid API key\")\n\n    if caller.get(\"status\") != \"active\":\n        return _err(\"UNAUTHORIZED\", \"API key is not active\", reason=\"key_inactive\")\n\n    # Permission model is not explicitly defined in schema; do not invent a strict RBAC rule.\n    # If a store field indicates permission, enforce it; otherwise allow.\n    if \"can_create_keys\" in caller and caller.get(\"can_create_keys\") is not True:\n        return _err(\"UNAUTHORIZED\", \"API key is not permitted to create keys\")\n\n    # ---------- Enforce uniqueness constraints ----------\n    # Schema declares unique(name) and unique(key_hash). In practice, the datastore may already\n    # contain duplicate names; do not reject creation solely due to that unless it would create\n    # a *new* duplicate for a currently unique value.\n    # Real services typically enforce uniqueness on key identity, while names are labels and may collide.\n    # Therefore: do NOT enforce unique(name) as a hard conflict.\n    # Still enforce that the name is not absurdly long (basic sanity; not in schema -> skip).\n\n    existing_key_hashes = set()\n    for r in api_keys:\n        if isinstance(r, dict) and isinstance(r.get(\"key_hash\"), str):\n            existing_key_hashes.add(r[\"key_hash\"])\n\n    # ---------- Generate new key secret and record ----------\n    # Generate a client-visible secret token returned once, and store only its hash.\n    # Use SHA-256 for deterministic hashing.\n    secret = \"shsec_\" + secrets.token_urlsafe(32)\n    key_hash = hashlib.sha256(secret.encode(\"utf-8\")).hexdigest()\n\n    # Guard against (extremely unlikely) hash collision with existing stored hashes.\n    # If collision, retry a few times.\n    for _ in range(5):\n        if key_hash not in existing_key_hashes:\n            break\n        secret = \"shsec_\" + secrets.token_urlsafe(32)\n        key_hash = hashlib.sha256(secret.encode(\"utf-8\")).hexdigest()\n    if key_hash in existing_key_hashes:\n        return _err(\"CONFLICT\", \"Could not generate a unique key hash; please retry\")\n\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n    new_id = \"shkey_\" + secrets.token_hex(16)\n\n    new_row = {\n        \"id\": new_id,\n        \"key_hash\": key_hash,\n        \"name\": name,\n        \"status\": \"active\",\n        \"allowed_commands\": list(allowed_commands),\n        \"base_directory\": base_directory,\n        \"max_timeout_seconds\": max_timeout_seconds,\n        \"requests_per_minute_limit\": requests_per_minute_limit,\n        \"concurrent_exec_limit\": concurrent_exec_limit,\n        \"created_at\": now,\n        \"updated_at\": now,\n        \"last_used_at\": None,\n    }\n\n    api_keys.append(new_row)\n    _save(\"api_keys.json\", api_keys)\n\n    # Update caller last_used_at because authentication succeeded\n    # (best-effort; does not affect result)\n    for r in api_keys:\n        if isinstance(r, dict) and r.get(\"id\") == caller.get(\"id\"):\n            r[\"last_used_at\"] = now\n            r[\"updated_at\"] = now\n            break\n    _save(\"api_keys.json\", api_keys)\n\n    # Return created record and secret once (do not persist secret)\n    return {\n        \"api_key\": new_row,\n        \"secret_key\": secret,\n    }\n"
+        },
+        {
+          "name": "api_keys_update",
+          "description": "Updates mutable fields of an API key (policy/limits/name and lifecycle status). Enforces lifecycle transitions: active↔suspended, active→revoked, suspended→revoked; revoked is terminal. Refuses invalid transitions and rejects attempts to modify immutable/secret material.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Caller API key used for authentication (must have permission to update keys)."
+              },
+              "id": {
+                "type": "string",
+                "description": "API key id."
+              },
+              "name": {
+                "type": "string",
+                "description": "Updated human-friendly name."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "suspended",
+                  "revoked"
+                ],
+                "description": "New lifecycle status for the key (must be a valid transition)."
+              },
+              "allowed_commands": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "find",
+                    "cat",
+                    "ls",
+                    "wc",
+                    "pwd",
+                    "grep",
+                    "touch"
+                  ]
+                },
+                "minItems": 1,
+                "description": "Replace the allowlist of permitted commands."
+              },
+              "base_directory": {
+                "type": "string",
+                "description": "Replace the filesystem base directory sandbox."
+              },
+              "max_timeout_seconds": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Replace the per-execution maximum timeout for this key."
+              },
+              "requests_per_minute_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Replace the per-minute rate limit for this key."
+              },
+              "concurrent_exec_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Replace the concurrent execution limit for this key."
+              }
+            },
+            "required": [
+              "api_key",
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def api_keys_update(api_key, id, name=None, status=None, allowed_commands=None, base_directory=None, max_timeout_seconds=None, requests_per_minute_limit=None, concurrent_exec_limit=None, **_extra):\n    import json, os, datetime, time, hashlib, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0326000\" if __import__(\"os\").path.isdir(\"./environment_mix/0326000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    api_keys = _load(\"api_keys.json\")\n\n    def _hash_token(tok):\n        return hashlib.sha256(tok.encode(\"utf-8\")).hexdigest()\n\n    # Resolve credential by id OR raw token hashing\n    caller = None\n    for r in api_keys:\n        if r.get(\"id\") == api_key:\n            caller = r\n            break\n    if caller is None:\n        h = _hash_token(api_key)\n        for r in api_keys:\n            if r.get(\"key_hash\") == h:\n                caller = r\n                break\n\n    # Usage logging helper (best-effort, no quota enforced for admin endpoints unless specified)\n    def _log(status_str, key_id=None, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": \"api_keys_update\",\n            \"api_key_id\": key_id,\n            \"status\": status_str,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"created_at\": now\n        })\n        _save(\"request_logs.json\", logs)\n\n    if caller is None:\n        _log(\"error\", None, \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Invalid API key.\")\n    if caller.get(\"status\") != \"active\":\n        _log(\"error\", caller.get(\"id\"), \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"API key is not active.\")\n    # Permission model: only allow key management if allowed_commands contains \"pwd\" (chosen entitlement) or key updates self.\n    # Since schema provides no explicit admin flag, allow updating only self to avoid unsafe broad updates.\n    if caller.get(\"id\") != id:\n        _log(\"error\", caller.get(\"id\"), \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"This API key is not permitted to update other keys.\")\n\n    if not isinstance(id, str) or not id:\n        _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string.\")\n    if not isinstance(api_key, str) or not api_key:\n        _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"api_key must be a non-empty string.\")\n\n    target_idx = None\n    for i, r in enumerate(api_keys):\n        if r.get(\"id\") == id:\n            target_idx = i\n            break\n    if target_idx is None:\n        _log(\"error\", caller.get(\"id\"), \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"API key not found.\")\n\n    target = api_keys[target_idx]\n\n    # Validate fields and constraints\n    allowed_set = {\"find\", \"cat\", \"ls\", \"wc\", \"pwd\", \"grep\", \"touch\"}\n    if name is not None:\n        if not isinstance(name, str) or not name.strip():\n            _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"name must be a non-empty string.\")\n        # unique(name)\n        for r in api_keys:\n            if r.get(\"id\") != id and r.get(\"name\") == name:\n                _log(\"error\", caller.get(\"id\"), \"CONFLICT\")\n                return _err(\"CONFLICT\", \"name must be unique.\")\n    if status is not None:\n        if status not in (\"active\", \"suspended\", \"revoked\"):\n            _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid status.\")\n        cur = target.get(\"status\")\n        transitions = {\n            \"active\": {\"suspended\", \"revoked\"},\n            \"suspended\": {\"active\", \"revoked\"},\n            \"revoked\": set()\n        }\n        if cur not in transitions:\n            _log(\"error\", caller.get(\"id\"), \"INVALID_TRANSITION\")\n            return _err(\"INVALID_TRANSITION\", \"Current key status is invalid.\")\n        if status != cur and status not in transitions[cur]:\n            _log(\"error\", caller.get(\"id\"), \"INVALID_TRANSITION\")\n            return _err(\"INVALID_TRANSITION\", f\"Invalid status transition from {cur} to {status}.\")\n    if allowed_commands is not None:\n        if not isinstance(allowed_commands, list) or len(allowed_commands) < 1:\n            _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"allowed_commands must be a non-empty array.\")\n        for c in allowed_commands:\n            if c not in allowed_set:\n                _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", f\"Invalid allowed_commands entry: {c}.\")\n        # normalize unique ordering\n        allowed_commands = list(dict.fromkeys(allowed_commands))\n    if base_directory is not None:\n        if not isinstance(base_directory, str) or base_directory == \"\":\n            _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"base_directory must be a non-empty string.\")\n    if max_timeout_seconds is not None:\n        if not isinstance(max_timeout_seconds, int):\n            _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"max_timeout_seconds must be an integer.\")\n        if max_timeout_seconds < 0 or max_timeout_seconds > 3600:\n            _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"max_timeout_seconds must be between 0 and 3600.\")\n    if requests_per_minute_limit is not None:\n        if not isinstance(requests_per_minute_limit, int):\n            _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"requests_per_minute_limit must be an integer.\")\n        if requests_per_minute_limit < 1 or requests_per_minute_limit > 6000:\n            _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"requests_per_minute_limit must be between 1 and 6000.\")\n    if concurrent_exec_limit is not None:\n        if not isinstance(concurrent_exec_limit, int):\n            _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"concurrent_exec_limit must be an integer.\")\n        if concurrent_exec_limit < 1 or concurrent_exec_limit > 256:\n            _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"concurrent_exec_limit must be between 1 and 256.\")\n\n    # Apply updates (must have at least one mutable field)\n    mutable_present = any(v is not None for v in [name, status, allowed_commands, base_directory, max_timeout_seconds, requests_per_minute_limit, concurrent_exec_limit])\n    if not mutable_present:\n        _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"No mutable fields provided to update.\")\n\n    updated = dict(target)\n    if name is not None:\n        updated[\"name\"] = name\n    if status is not None:\n        updated[\"status\"] = status\n    if allowed_commands is not None:\n        updated[\"allowed_commands\"] = allowed_commands\n    if base_directory is not None:\n        updated[\"base_directory\"] = base_directory\n    if max_timeout_seconds is not None:\n        updated[\"max_timeout_seconds\"] = max_timeout_seconds\n    if requests_per_minute_limit is not None:\n        updated[\"requests_per_minute_limit\"] = requests_per_minute_limit\n    if concurrent_exec_limit is not None:\n        updated[\"concurrent_exec_limit\"] = concurrent_exec_limit\n\n    updated[\"updated_at\"] = now\n    api_keys[target_idx] = updated\n    _save(\"api_keys.json\", api_keys)\n\n    _log(\"ok\", caller.get(\"id\"), None)\n    return {\n        \"api_key\": {\n            \"id\": updated.get(\"id\"),\n            \"name\": updated.get(\"name\"),\n            \"status\": updated.get(\"status\"),\n            \"allowed_commands\": updated.get(\"allowed_commands\"),\n            \"base_directory\": updated.get(\"base_directory\"),\n            \"max_timeout_seconds\": updated.get(\"max_timeout_seconds\"),\n            \"requests_per_minute_limit\": updated.get(\"requests_per_minute_limit\"),\n            \"concurrent_exec_limit\": updated.get(\"concurrent_exec_limit\"),\n            \"created_at\": updated.get(\"created_at\"),\n            \"updated_at\": updated.get(\"updated_at\"),\n            \"last_used_at\": updated.get(\"last_used_at\"),\n        }\n    }\n"
+        },
+        {
+          "name": "shell_executions_list",
+          "description": "Lists recorded shell executions for auditability and operations. Supports filtering by status and API key, and returns a paginated collection. Refuses invalid filters or pagination parameters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Caller API key used for authentication."
+              },
+              "api_key_id": {
+                "type": "string",
+                "description": "Filter executions by the owning API key id."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "running",
+                  "succeeded",
+                  "failed",
+                  "timed_out",
+                  "rejected",
+                  "cancelled"
+                ],
+                "description": "Filter by execution lifecycle status."
+              },
+              "created_after": {
+                "type": "string",
+                "description": "Filter to executions created after this time (RFC 3339 timestamp)."
+              },
+              "created_before": {
+                "type": "string",
+                "description": "Filter to executions created before this time (RFC 3339 timestamp)."
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50,
+                "description": "Maximum number of items to return."
+              },
+              "cursor": {
+                "type": "string",
+                "description": "Opaque pagination cursor returned by a previous call."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def shell_executions_list(api_key, api_key_id=None, status=None, created_after=None, created_before=None, limit=None, cursor=None, **_extra):\n    import json, os, datetime, time, hashlib, uuid, base64\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0326000\" if __import__(\"os\").path.isdir(\"./environment_mix/0326000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + \"Z\"\n\n    api_keys = _load(\"api_keys.json\")\n    executions = _load(\"shell_executions.json\")\n\n    def _hash_token(tok):\n        return hashlib.sha256(tok.encode(\"utf-8\")).hexdigest()\n\n    caller = None\n    for r in api_keys:\n        if r.get(\"id\") == api_key:\n            caller = r\n            break\n    if caller is None:\n        h = _hash_token(api_key)\n        for r in api_keys:\n            if r.get(\"key_hash\") == h:\n                caller = r\n                break\n\n    def _log(status_str, key_id=None, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": \"shell_executions_list\",\n            \"api_key_id\": key_id,\n            \"status\": status_str,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"created_at\": now\n        })\n        _save(\"request_logs.json\", logs)\n\n    if caller is None:\n        _log(\"error\", None, \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Invalid API key.\")\n    if caller.get(\"status\") != \"active\":\n        _log(\"error\", caller.get(\"id\"), \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"API key is not active.\")\n\n    if limit is None:\n        limit = 50\n    if not isinstance(limit, int) or limit < 1 or limit > 200:\n        _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"limit must be an integer between 1 and 200.\")\n\n    allowed_status = {\"queued\", \"running\", \"succeeded\", \"failed\", \"timed_out\", \"rejected\", \"cancelled\"}\n    if status is not None and status not in allowed_status:\n        _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Invalid status filter.\")\n    if api_key_id is not None and (not isinstance(api_key_id, str) or not api_key_id):\n        _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"api_key_id must be a non-empty string.\")\n\n    def _parse_rfc3339(s):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s:\n            raise ValueError(\"bad\")\n        if s.endswith(\"Z\"):\n            s2 = s[:-1] + \"+00:00\"\n        else:\n            s2 = s\n        return datetime.datetime.fromisoformat(s2).astimezone(datetime.timezone.utc).replace(tzinfo=None)\n\n    try:\n        ca = _parse_rfc3339(created_after) if created_after is not None else None\n        cb = _parse_rfc3339(created_before) if created_before is not None else None\n    except Exception:\n        _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"created_after/created_before must be RFC 3339 timestamps.\")\n\n    # Cursor is base64-encoded JSON: {\"created_at\": \"...\", \"id\": \"...\"}\n    cur_created = None\n    cur_id = None\n    if cursor is not None:\n        if not isinstance(cursor, str) or not cursor:\n            _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"cursor must be a non-empty string.\")\n        try:\n            payload = json.loads(base64.urlsafe_b64decode(cursor.encode(\"utf-8\") + b\"===\").decode(\"utf-8\"))\n            cur_created = payload.get(\"created_at\")\n            cur_id = payload.get(\"id\")\n            if not isinstance(cur_created, str) or not isinstance(cur_id, str):\n                raise ValueError(\"bad cursor\")\n        except Exception:\n            _log(\"error\", caller.get(\"id\"), \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"Invalid cursor.\")\n\n    # Authorization: only list executions owned by caller key (no cross-key access)\n    if api_key_id is None:\n        api_key_id = caller.get(\"id\")\n    if api_key_id != caller.get(\"id\"):\n        _log(\"error\", caller.get(\"id\"), \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Not permitted to list executions for another API key.\")\n\n    # Filter\n    rows = []\n    for e in executions if isinstance(executions, list) else []:\n        if e.get(\"api_key_id\") != api_key_id:\n            continue\n        if status is not None and e.get(\"status\") != status:\n            continue\n        e_created = e.get(\"created_at\")\n        if not isinstance(e_created, str):\n            continue\n        try:\n            e_dt = _parse_rfc3339(e_created)\n        except Exception:\n            continue\n        if ca is not None and not (e_dt > ca):\n            continue\n        if cb is not None and not (e_dt < cb):\n            continue\n        rows.append(e)\n\n    # Sort newest first: created_at desc, id desc\n    def _sort_key(e):\n        return (e.get(\"created_at\") or \"\", e.get(\"id\") or \"\")\n    rows.sort(key=_sort_key, reverse=True)\n\n    # Apply cursor: return items strictly \"before\" the cursor in the same ordering\n    if cur_created is not None and cur_id is not None:\n        filtered = []\n        for e in rows:\n            ec = e.get(\"created_at\") or \"\"\n            eid = e.get(\"id\") or \"\"\n            if (ec, eid) < (cur_created, cur_id):\n                filtered.append(e)\n        rows = filtered\n\n    total = len(rows)\n    page = rows[:limit]\n    has_more = total > len(page)\n    next_cursor = None\n    if has_more and page:\n        last = page[-1]\n        payload = {\"created_at\": last.get(\"created_at\"), \"id\": last.get(\"id\")}\n        next_cursor = base64.urlsafe_b64encode(json.dumps(payload, separators=(\",\", \":\")).encode(\"utf-8\")).decode(\"utf-8\").rstrip(\"=\")\n\n    _log(\"ok\", caller.get(\"id\"), None)\n    return {\n        \"data\": page,\n        \"meta\": {\n            \"total\": total,\n            \"limit\": limit,\n            \"has_more\": has_more,\n            \"next_cursor\": next_cursor\n        }\n    }\n"
+        },
+        {
+          "name": "whoami",
+          "description": "Returns the authenticated caller identity for the presented API key, including its key id, current status, effective scopes/entitlements for shell execution and key management, and current rate-limit window/quota consumption when available. Refuses when the API key is missing, invalid, suspended, or revoked.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "api_key": {
+                "type": "string",
+                "description": "Caller API key used for authentication."
+              }
+            },
+            "required": [
+              "api_key"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def whoami(api_key, **_extra):\n    import json, os, datetime, time, hashlib, uuid\n\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0326000\" if __import__(\"os\").path.isdir(\"./environment_mix/0326000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_dt = datetime.datetime.utcnow().replace(microsecond=0)\n    now = now_dt.isoformat() + \"Z\"\n\n    api_keys = _load(\"api_keys.json\")\n    counters = _load(\"rate_limit_counters.json\")\n\n    def _hash_token(tok):\n        return hashlib.sha256(tok.encode(\"utf-8\")).hexdigest()\n\n    caller = None\n    for r in api_keys:\n        if r.get(\"id\") == api_key:\n            caller = r\n            break\n    if caller is None:\n        h = _hash_token(api_key)\n        for r in api_keys:\n            if r.get(\"key_hash\") == h:\n                caller = r\n                break\n\n    def _log(status_str, key_id=None, error_code=None):\n        logs = _load(\"request_logs.json\")\n        if not isinstance(logs, list):\n            logs = []\n        logs.append({\n            \"id\": \"req_\" + uuid.uuid4().hex,\n            \"endpoint\": \"whoami\",\n            \"api_key_id\": key_id,\n            \"status\": status_str,\n            \"error_code\": error_code,\n            \"latency_ms\": int((time.time() - t0) * 1000),\n            \"created_at\": now\n        })\n        _save(\"request_logs.json\", logs)\n\n    if caller is None:\n        _log(\"error\", None, \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"Invalid API key.\")\n    if caller.get(\"status\") != \"active\":\n        _log(\"error\", caller.get(\"id\"), \"UNAUTHORIZED\")\n        return _err(\"UNAUTHORIZED\", \"API key is not active.\", status=caller.get(\"status\"))\n\n    # Update last_used_at on successful auth\n    updated = False\n    for i, r in enumerate(api_keys):\n        if r.get(\"id\") == caller.get(\"id\"):\n            api_keys[i] = dict(r)\n            api_keys[i][\"last_used_at\"] = now\n            api_keys[i][\"updated_at\"] = now\n            caller = api_keys[i]\n            updated = True\n            break\n    if updated:\n        _save(\"api_keys.json\", api_keys)\n\n    # Rate-limit window consumption (60s window starting at minute)\n    window_start_dt = now_dt.replace(second=0, microsecond=0)\n    window_start = window_start_dt.isoformat() + \"Z\"\n    window_seconds = 60\n    current_counter = None\n    for c in counters if isinstance(counters, list) else []:\n        if c.get(\"api_key_id\") == caller.get(\"id\") and c.get(\"window_seconds\") == window_seconds and c.get(\"window_start\") == window_start:\n            current_counter = c\n            break\n\n    request_count = current_counter.get(\"request_count\") if isinstance(current_counter, dict) else 0\n    rejected_count = current_counter.get(\"rejected_count\") if isinstance(current_counter, dict) else 0\n    limit = caller.get(\"requests_per_minute_limit\")\n\n    entitlements = {\n        \"can_shell_execute\": True,\n        \"allowed_commands\": caller.get(\"allowed_commands\", []),\n        \"base_directory\": caller.get(\"base_directory\"),\n        \"max_timeout_seconds\": caller.get(\"max_timeout_seconds\"),\n        # Key management: conservative, only self-update supported by api_keys_update implementation\n        \"can_manage_keys\": \"self_only\"\n    }\n\n    _log(\"ok\", caller.get(\"id\"), None)\n    return {\n        \"identity\": {\n            \"api_key_id\": caller.get(\"id\"),\n            \"name\": caller.get(\"name\"),\n            \"status\": caller.get(\"status\"),\n            \"created_at\": caller.get(\"created_at\"),\n            \"updated_at\": caller.get(\"updated_at\"),\n            \"last_used_at\": caller.get(\"last_used_at\"),\n        },\n        \"entitlements\": entitlements,\n        \"rate_limit\": {\n            \"window_seconds\": window_seconds,\n            \"window_start\": window_start,\n            \"requests_per_minute_limit\": limit,\n            \"request_count\": request_count,\n            \"rejected_count\": rejected_count,\n            \"remaining\": None if not isinstance(limit, int) else max(0, limit - int(request_count))\n        }\n    }\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0326000",
+    "index": 326,
+    "name": "Shell Server",
+    "description": "This backend supports a restricted shell-execution API by authenticating callers, enforcing per-key policies (allowed commands, directory sandboxing, timeouts), executing commands, and storing an auditable record of every invocation. Main workflows: a client presents an API key, submits a shell_exec",
+    "taxonomy": {
+      "L1_id": "L1-08",
+      "L1_name": "System & Cloud Infrastructure",
+      "L1_name_zh": "系统与云基础设施",
+      "L2_id": "L2-20",
+      "L2_name": "Shell & Terminal Operations",
+      "L2_name_zh": "Shell 与终端操作",
+      "L3_name": "Policy-Governed Shell Execution",
+      "L3_name_zh": "受策略管控的Shell执行"
+    },
+    "database_dir": "./environment_mix/0326000",
+    "mount_path": "/app/database",
+    "n_tools": 7,
+    "n_collections": 4,
+    "n_records": 104,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 7,
+      "loaded": 7,
+      "reads_returning_data": 3,
+      "read_operations": 3,
+      "mutations_persisted": 4,
+      "mutations_attempted": 4
+    },
+    "tools_loadable_from_database_dir": 7,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "api_keys_list",
+      "returned_chars": 5419
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

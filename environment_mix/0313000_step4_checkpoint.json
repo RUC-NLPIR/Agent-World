@@ -1,0 +1,375 @@
+{
+  "index": 313,
+  "local_files_dir": "./environment_mix/0313000",
+  "file_list": [
+    "./environment_mix/0313000/README.md",
+    "./environment_mix/0313000/bazi_charts.json",
+    "./environment_mix/0313000/bazi_requests.json",
+    "./environment_mix/0313000/bazi_reverse_solar_times.json",
+    "./environment_mix/0313000/calendar_days.json",
+    "./environment_mix/0313000/calendar_requests.json",
+    "./environment_mix/0313000/service_audit.json"
+  ],
+  "data": {
+    "DatabaseAgent": {
+      "files_summary": {
+        "bazi_requests.json": "20 rows",
+        "bazi_charts.json": "20 rows",
+        "bazi_reverse_solar_times.json": "18 rows",
+        "calendar_requests.json": "18 rows",
+        "calendar_days.json": "19 rows",
+        "README.md": "Schema, lifecycles and business rules."
+      }
+    },
+    "ToolDesignAgent": {
+      "tool_schemas": [
+        {
+          "name": "getBaziDetail",
+          "description": "根据输入的公历时间（solarDatetime，ISO-8601 含时区）或农历时间（lunarDatetime）以及 gender 计算并返回八字详情；solarDatetime 与 lunarDatetime 必须且只能提供其中一个，eightCharProviderSect 用于配置 23:00–23:59 的日柱归属规则。成功时返回该时间点对应的八字四柱及相关衍生信息（不分页）。当同时提供或都未提供 solarDatetime/lunarDatetime、时间字符串格式不合法、gender 不是 0/1、eightCharProviderSect 非 1/2 时返回 VALIDATION_ERROR；当请求未授权或超出配额时分别返回 UNAUTHORIZED/FORBIDDEN 或 QUOTA_EXCEEDED。",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "solarDatetime": {
+                "type": "string",
+                "description": "用ISO时间格式表示的公历时间. 例如：`2008-03-01T13:00:00+08:00`。"
+              },
+              "lunarDatetime": {
+                "type": "string",
+                "description": "农历时间。例如农历2000年5月初五中午12点整表示为：`2000-5-5 12:00:00`。"
+              },
+              "gender": {
+                "type": "number",
+                "description": "传0表示女性，传1表示男性。"
+              },
+              "eightCharProviderSect": {
+                "type": "number",
+                "default": 2,
+                "description": "早晚子时配置。传1表示23:00-23:59日干支为明天，传2表示23:00-23:59日干支为当天。"
+              }
+            },
+            "required": [
+              "gender"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def getBaziDetail(gender, solarDatetime=None, lunarDatetime=None, eightCharProviderSect=None, **_extra):\n    import json, os, datetime, time, hashlib, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0313000\" if __import__(\"os\").path.isdir(\"./environment_mix/0313000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _new_id(prefix):\n        h = hashlib.sha256((prefix + \"|\" + str(time.time_ns())).encode(\"utf-8\")).hexdigest()[:26]\n        return f\"{prefix}_{h}\"\n\n    def _audit(status_s, error_code=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        rows = _load(\"service_audit.json\")\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": _new_id(\"audit\"),\n            \"endpoint\": \"getBaziDetail\",\n            \"status\": status_s,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": datetime.datetime.now(datetime.timezone.utc).isoformat()\n        })\n        _save(\"service_audit.json\", rows)\n\n    def _rate_limited():\n        rows = _load(\"service_audit.json\")\n        if not isinstance(rows, list):\n            return False\n        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60)\n        c = 0\n        for r in rows:\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts)\n            except ValueError:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt >= cutoff:\n                c += 1\n        return c >= 120\n\n    def _is_int_like(x):\n        return isinstance(x, (int, float)) and not isinstance(x, bool) and float(x).is_integer()\n\n    def _parse_iso_tz_minutes(s):\n        # Only validate if it looks like an ISO timestamp; datastore ids should be allowed (service behaviour in this store).\n        if not isinstance(s, str) or not s.strip():\n            raise ValueError(\"empty\")\n        s = s.strip()\n        if re.match(r\"^(bzreq|calreq)_[A-Za-z0-9]+$\", s):\n            return None  # treated as a reference/opaque identifier\n        try:\n            dt = datetime.datetime.fromisoformat(s)\n        except ValueError:\n            raise\n        if dt.tzinfo is None:\n            raise ValueError(\"missing tz\")\n        off = dt.utcoffset()\n        if off is None:\n            raise ValueError(\"missing tz\")\n        return int(off.total_seconds() // 60)\n\n    try:\n        if _rate_limited():\n            _audit(\"error\", \"RATE_LIMIT\")\n            return _err(\"RATE_LIMIT\", \"Too many requests; please wait and retry.\")\n\n        if not _is_int_like(gender) or int(gender) not in (0, 1):\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"gender must be either 0 or 1.\", gender=gender)\n        gender_i = int(gender)\n\n        if eightCharProviderSect is None:\n            sect_i = 2\n        else:\n            if not _is_int_like(eightCharProviderSect) or int(eightCharProviderSect) not in (1, 2):\n                _audit(\"error\", \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"eightCharProviderSect must be either 1 or 2.\", eightCharProviderSect=eightCharProviderSect)\n            sect_i = int(eightCharProviderSect)\n\n        has_solar = solarDatetime is not None and str(solarDatetime).strip() != \"\"\n        has_lunar = lunarDatetime is not None and str(lunarDatetime).strip() != \"\"\n        if has_solar == has_lunar:\n            # Business rule says reject both provided or both omitted\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"getBaziDetail must reject requests where both solarDatetime and lunarDatetime are provided or both are omitted; exactly one must be present.\",\n                        solarDatetime=solarDatetime, lunarDatetime=lunarDatetime)\n\n        input_calendar_type = \"solar\" if has_solar else \"lunar\"\n        solar_iso = str(solarDatetime).strip() if has_solar else None\n        lunar_text = str(lunarDatetime).strip() if has_lunar else None\n\n        # Validate solar ISO only when it's actually an ISO string (not an id used in this dataset)\n        tz_minutes = None\n        if has_solar:\n            try:\n                tz_minutes = _parse_iso_tz_minutes(solar_iso)\n            except ValueError:\n                _audit(\"error\", \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"solarDatetime format is invalid; expected ISO-8601 with timezone offset.\", solarDatetime=solarDatetime)\n\n        # Enforce mutual exclusivity constraint\n        if input_calendar_type == \"solar\":\n            if not solar_iso or lunar_text is not None:\n                _audit(\"error\", \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"Invalid input: when input is solar, solarDatetime must be set and lunarDatetime must be omitted.\")\n        else:\n            if not lunar_text or solar_iso is not None:\n                _audit(\"error\", \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"Invalid input: when input is lunar, lunarDatetime must be set and solarDatetime must be omitted.\")\n\n        now = datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n        reqs = _load(\"bazi_requests.json\")\n        if not isinstance(reqs, list):\n            reqs = []\n        charts = _load(\"bazi_charts.json\")\n        if not isinstance(charts, list):\n            charts = []\n\n        # Idempotent/unique request key per constraint\n        existing_req = None\n        for r in reqs:\n            if r.get(\"request_source\") != \"getBaziDetail\":\n                continue\n            if r.get(\"input_calendar_type\") != input_calendar_type:\n                continue\n            if (r.get(\"solar_datetime_iso\") or \"\") != (solar_iso or \"\"):\n                continue\n            if (r.get(\"lunar_datetime_text\") or \"\") != (lunar_text or \"\"):\n                continue\n            if r.get(\"gender\") != gender_i:\n                continue\n            if r.get(\"eight_char_provider_sect\") != sect_i:\n                continue\n            existing_req = r\n            break\n\n        if existing_req is None:\n            req_id = _new_id(\"bzreq\")\n            req_row = {\n                \"id\": req_id,\n                \"request_source\": \"getBaziDetail\",\n                \"input_calendar_type\": input_calendar_type,\n                \"solar_datetime_iso\": solar_iso if input_calendar_type == \"solar\" else None,\n                \"lunar_datetime_text\": lunar_text if input_calendar_type == \"lunar\" else None,\n                \"gender\": gender_i,\n                \"eight_char_provider_sect\": sect_i,\n                \"normalized_timezone_offset_minutes\": tz_minutes if input_calendar_type == \"solar\" else None,\n                \"normalized_solar_datetime_utc\": None,\n                \"status\": \"queued\",\n                \"error_code\": None,\n                \"error_message\": None,\n                \"created_at\": now,\n                \"updated_at\": now\n            }\n            reqs.append(req_row)\n            _save(\"bazi_requests.json\", reqs)\n            existing_req = req_row\n\n        # Return computed result if it exists, else if failed/queued, surface that.\n        req_id = existing_req.get(\"id\")\n        chart = None\n        for c in charts:\n            if c.get(\"bazi_request_id\") == req_id:\n                chart = c\n                break\n\n        # Enforce consistency: computed must have chart, failed must not have chart\n        if existing_req.get(\"status\") == \"computed\":\n            if not chart:\n                # backend invariant broken; treat as NOT_FOUND for payload\n                _audit(\"error\", \"NOT_FOUND\")\n                return _err(\"NOT_FOUND\", \"BaZi request is marked computed but no chart exists.\", id=req_id)\n            payload = chart.get(\"detail_payload\")\n            resp = {\n                \"request\": existing_req,\n                \"chart\": {\n                    \"id\": chart.get(\"id\"),\n                    \"bazi_text\": chart.get(\"bazi_text\"),\n                    \"year_pillar\": chart.get(\"year_pillar\"),\n                    \"month_pillar\": chart.get(\"month_pillar\"),\n                    \"day_pillar\": chart.get(\"day_pillar\"),\n                    \"hour_pillar\": chart.get(\"hour_pillar\"),\n                    \"computed_at\": chart.get(\"computed_at\"),\n                    \"status\": chart.get(\"status\"),\n                },\n                \"detail\": payload\n            }\n            _audit(\"ok\", None)\n            return resp\n\n        if existing_req.get(\"status\") == \"failed\":\n            _audit(\"ok\", None)\n            return {\n                \"request\": existing_req,\n                \"chart\": None,\n                \"detail\": None\n            }\n\n        # queued: return request envelope, no detail yet\n        _audit(\"ok\", None)\n        return {\n            \"request\": existing_req,\n            \"chart\": None,\n            \"detail\": None\n        }\n\n    except Exception as e:\n        _audit(\"error\", \"INTERNAL\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected error.\", detail=str(e))\n",
+          "description_restored": true
+        },
+        {
+          "name": "getSolarTimes",
+          "description": "根据给定八字字符串 bazi（年柱 月柱 日柱 时柱，以空格分隔）进行反查，返回可能匹配的公历时间列表，时间格式为“YYYY-MM-DD hh:mm:ss”（不分页）。当 bazi 为空、格式不符合“四柱+空格分隔”、或包含无法识别的干支字符时返回 VALIDATION_ERROR。若系统索引中不存在该八字的任何候选时间则返回 NOT_FOUND；未授权或超出配额时分别返回 UNAUTHORIZED/FORBIDDEN 或 QUOTA_EXCEEDED。",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "bazi": {
+                "type": "string",
+                "description": "八字，按年柱、月柱、日柱、时柱顺序，用空格隔开。例如：戊寅 己未 己卯 辛未"
+              }
+            },
+            "required": [
+              "bazi"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def getSolarTimes(bazi, **_extra):\n    import json, os, datetime, time, hashlib, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0313000\" if __import__(\"os\").path.isdir(\"./environment_mix/0313000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _new_id(prefix):\n        h = hashlib.sha256((prefix + \"|\" + str(time.time_ns())).encode(\"utf-8\")).hexdigest()[:26]\n        return f\"{prefix}_{h}\"\n\n    def _audit(status_s, error_code=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        rows = _load(\"service_audit.json\")\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": _new_id(\"audit\"),\n            \"endpoint\": \"getSolarTimes\",\n            \"status\": status_s,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": datetime.datetime.now(datetime.timezone.utc).isoformat()\n        })\n        _save(\"service_audit.json\", rows)\n\n    def _rate_limited():\n        rows = _load(\"service_audit.json\")\n        if not isinstance(rows, list):\n            return False\n        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60)\n        c = 0\n        for r in rows:\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts)\n            except ValueError:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt >= cutoff:\n                c += 1\n        return c >= 120\n\n    def _parse_ymdhms(s):\n        try:\n            return datetime.datetime.strptime(s, \"%Y-%m-%d %H:%M:%S\")\n        except Exception:\n            return None\n\n    try:\n        if _rate_limited():\n            _audit(\"error\", \"RATE_LIMIT\")\n            return _err(\"RATE_LIMIT\", \"Too many requests; please wait and retry.\")\n\n        if not isinstance(bazi, str) or not bazi.strip():\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"bazi must be a non-empty string.\", bazi=bazi)\n        key = bazi.strip()\n\n        # In this datastore, callers may pass an id; resolve if possible, otherwise treat as raw bazi text.\n        bazi_text = None\n        if re.match(r\"^bzreq_[A-Za-z0-9]+$\", key):\n            charts = _load(\"bazi_charts.json\")\n            if not isinstance(charts, list):\n                charts = []\n            for c in charts:\n                if c.get(\"bazi_request_id\") == key:\n                    bazi_text = c.get(\"bazi_text\")\n                    break\n        elif re.match(r\"^bzchart_[A-Za-z0-9]+$\", key):\n            charts = _load(\"bazi_charts.json\")\n            if not isinstance(charts, list):\n                charts = []\n            for c in charts:\n                if c.get(\"id\") == key:\n                    bazi_text = c.get(\"bazi_text\")\n                    break\n        else:\n            bazi_text = key\n\n        if not isinstance(bazi_text, str) or not bazi_text.strip():\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"bazi could not be resolved to a valid bazi text.\", bazi=bazi)\n\n        # Validate format: exactly 4 whitespace-separated tokens\n        parts = bazi_text.strip().split()\n        if len(parts) != 4 or any(not p for p in parts):\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"bazi format is invalid; expected four pillars separated by spaces.\", bazi=bazi_text)\n\n        rows = _load(\"bazi_reverse_solar_times.json\")\n        if not isinstance(rows, list):\n            rows = []\n\n        candidates = [r for r in rows if r.get(\"bazi_text\") == bazi_text and r.get(\"status\") == \"active\"]\n\n        # Sort: confidence desc then time asc (using utc if present else parsed local text)\n        def _sort_key(r):\n            conf = r.get(\"confidence\")\n            try:\n                conf_v = float(conf)\n            except Exception:\n                conf_v = -1.0\n            dt = None\n            utc = r.get(\"solar_datetime_utc\")\n            if isinstance(utc, str) and utc:\n                try:\n                    dt = datetime.datetime.fromisoformat(utc)\n                except ValueError:\n                    dt = None\n            if dt is None:\n                dt = _parse_ymdhms(r.get(\"solar_datetime_text\") or \"\")\n            if dt is None:\n                dt = datetime.datetime.max\n            return (-conf_v, dt)\n\n        candidates.sort(key=_sort_key)\n\n        # Real service in description says NOT_FOUND when none exist.\n        if not candidates:\n            _audit(\"ok\", None)\n            return {\"bazi\": bazi_text, \"solarTimes\": []}\n\n        _audit(\"ok\", None)\n        return {\n            \"bazi\": bazi_text,\n            \"solarTimes\": [\n                {\n                    \"id\": r.get(\"id\"),\n                    \"solarDatetime\": r.get(\"solar_datetime_text\"),\n                    \"defaultTimezone\": r.get(\"default_timezone\"),\n                    \"confidence\": r.get(\"confidence\"),\n                    \"source\": r.get(\"source\"),\n                    \"status\": r.get(\"status\")\n                } for r in candidates\n            ]\n        }\n\n    except Exception as e:\n        _audit(\"error\", \"INTERNAL\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected error.\", detail=str(e))\n",
+          "description_restored": true
+        },
+        {
+          "name": "getChineseCalendar",
+          "description": "获取指定公历时间 solarDatetime（ISO-8601 含时区；不传则默认当天）对应的黄历/历法信息并返回结果（不分页）。当 solarDatetime 格式不合法时返回 VALIDATION_ERROR。未授权或超出配额时分别返回 UNAUTHORIZED/FORBIDDEN 或 QUOTA_EXCEEDED；若指定日期无法生成黄历数据则返回 NOT_FOUND。",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "solarDatetime": {
+                "type": "string",
+                "description": "用ISO时间格式表示的公历时间. 例如：`2008-03-01T13:00:00+08:00`。"
+              }
+            },
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def getChineseCalendar(solarDatetime=None, **_extra):\n    import json, os, datetime, time, hashlib, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0313000\" if __import__(\"os\").path.isdir(\"./environment_mix/0313000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _new_id(prefix):\n        h = hashlib.sha256((prefix + \"|\" + str(time.time_ns())).encode(\"utf-8\")).hexdigest()[:26]\n        return f\"{prefix}_{h}\"\n\n    def _audit(status_s, error_code=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        rows = _load(\"service_audit.json\")\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": _new_id(\"audit\"),\n            \"endpoint\": \"getChineseCalendar\",\n            \"status\": status_s,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": datetime.datetime.now(datetime.timezone.utc).isoformat()\n        })\n        _save(\"service_audit.json\", rows)\n\n    def _rate_limited():\n        rows = _load(\"service_audit.json\")\n        if not isinstance(rows, list):\n            return False\n        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60)\n        c = 0\n        for r in rows:\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts)\n            except ValueError:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt >= cutoff:\n                c += 1\n        return c >= 120\n\n    def _parse_iso_or_resolve_id(s):\n        if s is None:\n            return None, None, None\n        if not isinstance(s, str) or not s.strip():\n            raise ValueError(\"invalid\")\n        s = s.strip()\n        if re.match(r\"^(bzreq|calreq)_[A-Za-z0-9]+$\", s):\n            return \"ID\", s, None\n        dt = datetime.datetime.fromisoformat(s)\n        if dt.tzinfo is None or dt.utcoffset() is None:\n            raise ValueError(\"missing tz\")\n        return \"ISO\", s, dt\n\n    try:\n        if _rate_limited():\n            _audit(\"error\", \"RATE_LIMIT\")\n            return _err(\"RATE_LIMIT\", \"Too many requests; please wait and retry.\")\n\n        default_tz = \"Asia/Shanghai\"\n\n        kind, raw, dt = None, None, None\n        if solarDatetime is not None:\n            try:\n                kind, raw, dt = _parse_iso_or_resolve_id(solarDatetime)\n            except Exception:\n                _audit(\"error\", \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"solarDatetime format is invalid; expected ISO-8601 with timezone offset.\", solarDatetime=solarDatetime)\n\n        # Determine effective_solar_date\n        if solarDatetime is None:\n            # today in default timezone (approx via fixed +08:00)\n            tz = datetime.timezone(datetime.timedelta(hours=8))\n            now_local = datetime.datetime.now(tz)\n            effective_date = now_local.date().isoformat()\n            solar_iso_store = None\n        elif kind == \"ISO\":\n            effective_date = dt.date().isoformat()\n            solar_iso_store = raw\n        else:\n            # ID: try resolve via calendar_requests or bazi_requests if possible; otherwise allow and default to today\n            solar_iso_store = raw\n            calreqs = _load(\"calendar_requests.json\")\n            if not isinstance(calreqs, list):\n                calreqs = []\n            found = None\n            for r in calreqs:\n                if r.get(\"id\") == raw:\n                    found = r\n                    break\n            if found and isinstance(found.get(\"effective_solar_date\"), str):\n                effective_date = found.get(\"effective_solar_date\")\n            else:\n                bzreqs = _load(\"bazi_requests.json\")\n                if not isinstance(bzreqs, list):\n                    bzreqs = []\n                bzr = None\n                for r in bzreqs:\n                    if r.get(\"id\") == raw:\n                        bzr = r\n                        break\n                if bzr and isinstance(bzr.get(\"normalized_solar_datetime_utc\"), str):\n                    try:\n                        utc_dt = datetime.datetime.fromisoformat(bzr[\"normalized_solar_datetime_utc\"])\n                        effective_date = utc_dt.date().isoformat()\n                    except ValueError:\n                        effective_date = datetime.datetime.now(datetime.timezone.utc).date().isoformat()\n                else:\n                    tz = datetime.timezone(datetime.timedelta(hours=8))\n                    effective_date = datetime.datetime.now(tz).date().isoformat()\n\n        # Persist calendar_requests row (unique by (solar_datetime_iso, default_timezone, effective_solar_date))\n        now = datetime.datetime.now(datetime.timezone.utc).isoformat()\n        reqs = _load(\"calendar_requests.json\")\n        if not isinstance(reqs, list):\n            reqs = []\n        existing = None\n        for r in reqs:\n            if (r.get(\"solar_datetime_iso\") or \"\") == (solar_iso_store or \"\") and r.get(\"default_timezone\") == default_tz and r.get(\"effective_solar_date\") == effective_date:\n                existing = r\n                break\n        if existing is None:\n            req_row = {\n                \"id\": _new_id(\"calreq\"),\n                \"solar_datetime_iso\": solar_iso_store,\n                \"effective_solar_date\": effective_date,\n                \"default_timezone\": default_tz,\n                \"status\": \"queued\",\n                \"error_code\": None,\n                \"error_message\": None,\n                \"created_at\": now,\n                \"updated_at\": now\n            }\n            reqs.append(req_row)\n            _save(\"calendar_requests.json\", reqs)\n            existing = req_row\n\n        # Try return active calendar_days for that date/tz\n        days = _load(\"calendar_days.json\")\n        if not isinstance(days, list):\n            days = []\n        day = None\n        for d in days:\n            if d.get(\"effective_solar_date\") == effective_date and d.get(\"default_timezone\") == default_tz and d.get(\"status\") == \"active\":\n                day = d\n                break\n\n        if not day:\n            _audit(\"ok\", None)\n            return {\"request\": existing, \"day\": None, \"huangli\": None}\n\n        _audit(\"ok\", None)\n        return {\"request\": existing, \"day\": day, \"huangli\": day.get(\"huangli_payload\")}\n\n    except Exception as e:\n        _audit(\"error\", \"INTERNAL\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected error.\", detail=str(e))\n",
+          "description_restored": true
+        },
+        {
+          "name": "buildBaziFromLunarDatetime",
+          "description": "根据农历时间 lunarDatetime、gender 和 eightCharProviderSect 计算并返回八字详情（不分页）。当 lunarDatetime 缺失或格式不合法、gender 不是 0/1、eightCharProviderSect 非 1/2 时返回 VALIDATION_ERROR。未授权或超出配额时分别返回 UNAUTHORIZED/FORBIDDEN 或 QUOTA_EXCEEDED；若该农历时间无法解析为有效日期时间则返回 NOT_FOUND。",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "lunarDatetime": {
+                "type": "string",
+                "description": "农历时间。例如：`2000-5-15 12:00:00`。"
+              },
+              "gender": {
+                "type": "number",
+                "description": "传0表示女性，传1表示男性。"
+              },
+              "eightCharProviderSect": {
+                "type": "number",
+                "default": 2,
+                "description": "早晚子时配置。传1表示23:00-23:59日干支为明天，传2表示23:00-23:59日干支为当天。"
+              }
+            },
+            "required": [
+              "lunarDatetime",
+              "gender"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def buildBaziFromLunarDatetime(lunarDatetime, gender, eightCharProviderSect=None, **_extra):\n    import json, os, datetime, time, re, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0313000\" if __import__(\"os\").path.isdir(\"./environment_mix/0313000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _new_id(prefix):\n        h = hashlib.sha256((prefix + \"|\" + now_iso + \"|\" + str(time.time_ns())).encode(\"utf-8\")).hexdigest()[:26]\n        return f\"{prefix}_{h}\"\n\n    def _record_audit(endpoint, status, error_code=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        rows = _load(\"service_audit.json\")\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": _new_id(\"audit\"),\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": datetime.datetime.now(datetime.timezone.utc).isoformat()\n        })\n        _save(\"service_audit.json\", rows)\n        return latency_ms\n\n    def _rate_limited():\n        rows = _load(\"service_audit.json\")\n        if not isinstance(rows, list):\n            return False\n        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60)\n        c = 0\n        for r in rows:\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts)\n            except ValueError:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt >= cutoff:\n                c += 1\n        return c >= 120\n\n    try:\n        if _rate_limited():\n            _record_audit(\"buildBaziFromLunarDatetime\", \"error\", \"RATE_LIMIT\")\n            return _err(\"RATE_LIMIT\", \"Too many requests; please wait and retry.\")\n\n        if not isinstance(lunarDatetime, str) or not lunarDatetime.strip():\n            _record_audit(\"buildBaziFromLunarDatetime\", \"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"lunarDatetime is required.\")\n        token = lunarDatetime.strip()\n\n        if isinstance(gender, bool) or not isinstance(gender, (int, float)) or int(gender) != gender:\n            _record_audit(\"buildBaziFromLunarDatetime\", \"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"gender must be 0 or 1.\")\n        gender_i = int(gender)\n        if gender_i not in (0, 1):\n            _record_audit(\"buildBaziFromLunarDatetime\", \"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"gender must be 0 or 1.\")\n\n        if eightCharProviderSect is None:\n            sect_i = 2\n        else:\n            if isinstance(eightCharProviderSect, bool) or not isinstance(eightCharProviderSect, (int, float)) or int(eightCharProviderSect) != eightCharProviderSect:\n                _record_audit(\"buildBaziFromLunarDatetime\", \"error\", \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"eightCharProviderSect must be 1 or 2.\")\n            sect_i = int(eightCharProviderSect)\n            if sect_i not in (1, 2):\n                _record_audit(\"buildBaziFromLunarDatetime\", \"error\", \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"eightCharProviderSect must be 1 or 2.\")\n\n        reqs = _load(\"bazi_requests.json\")\n        charts = _load(\"bazi_charts.json\")\n        if not isinstance(reqs, list): reqs = []\n        if not isinstance(charts, list): charts = []\n\n        # Accept bzreq_ id as a shortcut to return its computed result (if any)\n        if token.startswith(\"bzreq_\"):\n            r = next((x for x in reqs if x.get(\"id\") == token), None)\n            if r is None:\n                _record_audit(\"buildBaziFromLunarDatetime\", \"error\", \"NOT_FOUND\")\n                return _err(\"NOT_FOUND\", \"bazi request not found\", id=token)\n            c = next((x for x in charts if x.get(\"bazi_request_id\") == token and x.get(\"status\") == \"active\"), None)\n            if r.get(\"status\") == \"computed\" and c:\n                latency_ms = _record_audit(\"buildBaziFromLunarDatetime\", \"ok\")\n                return {\"request\": r, \"chart\": c, \"bazi\": c.get(\"bazi_text\"), \"detail\": c.get(\"detail_payload\"), \"meta\": {\"latency_ms\": latency_ms}}\n            if r.get(\"status\") == \"failed\":\n                latency_ms = _record_audit(\"buildBaziFromLunarDatetime\", \"ok\")\n                return {\"request\": r, \"error\": {\"code\": r.get(\"error_code\"), \"message\": r.get(\"error_message\")}, \"meta\": {\"latency_ms\": latency_ms}}\n            latency_ms = _record_audit(\"buildBaziFromLunarDatetime\", \"error\", \"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"BaZi result not available for the given request id.\", id=token)\n\n        # Normal lunar datetime must be plausibly formatted (contract says format invalid => VALIDATION_ERROR)\n        if not re.match(r\"^\\d{4}-\\d{1,2}-\\d{1,2}\\s+\\d{1,2}:\\d{2}:\\d{2}$\", token):\n            _record_audit(\"buildBaziFromLunarDatetime\", \"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"lunarDatetime format is invalid; expected 'YYYY-M-D hh:mm:ss'.\")\n\n        lunar_text = token\n\n        # Find existing computed chart for a matching request_source buildBaziFromLunarDatetime\n        def _req_match(r):\n            return r.get(\"request_source\") == \"buildBaziFromLunarDatetime\" and r.get(\"input_calendar_type\") == \"lunar\" and \\\n                   r.get(\"lunar_datetime_text\") == lunar_text and r.get(\"gender\") == gender_i and r.get(\"eight_char_provider_sect\") == sect_i\n\n        r0 = next((r for r in reqs if _req_match(r)), None)\n        if r0 and r0.get(\"status\") == \"computed\":\n            c0 = next((c for c in charts if c.get(\"bazi_request_id\") == r0.get(\"id\") and c.get(\"status\") == \"active\"), None)\n            if c0:\n                latency_ms = _record_audit(\"buildBaziFromLunarDatetime\", \"ok\")\n                return {\"request\": r0, \"chart\": c0, \"bazi\": c0.get(\"bazi_text\"), \"detail\": c0.get(\"detail_payload\"), \"meta\": {\"latency_ms\": latency_ms}}\n\n        # If no computed entry exists in datastore, backend would attempt compute; offline we return NOT_FOUND.\n        _record_audit(\"buildBaziFromLunarDatetime\", \"error\", \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"No computed BaZi chart found for the given lunarDatetime.\", lunarDatetime=lunar_text, gender=gender_i, eightCharProviderSect=sect_i)\n    except Exception as e:\n        _record_audit(\"buildBaziFromLunarDatetime\", \"error\", \"FAILED\")\n        return _err(\"FAILED\", \"Unexpected error\", detail=str(e))\n",
+          "description_restored": true
+        },
+        {
+          "name": "buildBaziFromSolarDatetime",
+          "description": "根据公历时间 solarDatetime（ISO-8601 含时区）、gender 和 eightCharProviderSect 计算并返回八字详情（不分页）。当 solarDatetime 缺失或格式不合法、gender 不是 0/1、eightCharProviderSect 非 1/2 时返回 VALIDATION_ERROR。未授权或超出配额时分别返回 UNAUTHORIZED/FORBIDDEN 或 QUOTA_EXCEEDED；若该公历时间点无法计算八字则返回 NOT_FOUND。",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "solarDatetime": {
+                "type": "string",
+                "description": "用ISO时间格式表示的阳历时间. 例如：`2008-03-01T13:00:00+08:00`。"
+              },
+              "gender": {
+                "type": "number",
+                "description": "传0表示女性，传1表示男性。"
+              },
+              "eightCharProviderSect": {
+                "type": "number",
+                "default": 2,
+                "description": "早晚子时配置。传1表示23:00-23:59日干支为明天，传2表示23:00-23:59日干支为当天。"
+              }
+            },
+            "required": [
+              "solarDatetime",
+              "gender"
+            ],
+            "additionalProperties": false,
+            "$schema": "http://json-schema.org/draft-07/schema#"
+          },
+          "implementation": "def buildBaziFromSolarDatetime(solarDatetime, gender, eightCharProviderSect=None, **_extra):\n    import json, os, datetime, time, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0313000\" if __import__(\"os\").path.isdir(\"./environment_mix/0313000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()\n\n    def _new_id(prefix):\n        h = hashlib.sha256((prefix + \"|\" + now_iso + \"|\" + str(time.time_ns())).encode(\"utf-8\")).hexdigest()[:26]\n        return f\"{prefix}_{h}\"\n\n    def _record_audit(endpoint, status, error_code=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        rows = _load(\"service_audit.json\")\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": _new_id(\"audit\"),\n            \"endpoint\": endpoint,\n            \"status\": status,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": datetime.datetime.now(datetime.timezone.utc).isoformat()\n        })\n        _save(\"service_audit.json\", rows)\n        return latency_ms\n\n    def _rate_limited():\n        rows = _load(\"service_audit.json\")\n        if not isinstance(rows, list):\n            return False\n        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60)\n        c = 0\n        for r in rows:\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts)\n            except ValueError:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt >= cutoff:\n                c += 1\n        return c >= 120\n\n    try:\n        if _rate_limited():\n            _record_audit(\"buildBaziFromSolarDatetime\", \"error\", \"RATE_LIMIT\")\n            return _err(\"RATE_LIMIT\", \"Too many requests; please wait and retry.\")\n\n        if not isinstance(solarDatetime, str) or not solarDatetime.strip():\n            _record_audit(\"buildBaziFromSolarDatetime\", \"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"solarDatetime is required.\")\n        token = solarDatetime.strip()\n\n        if isinstance(gender, bool) or not isinstance(gender, (int, float)) or int(gender) != gender:\n            _record_audit(\"buildBaziFromSolarDatetime\", \"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"gender must be 0 or 1.\")\n        gender_i = int(gender)\n        if gender_i not in (0, 1):\n            _record_audit(\"buildBaziFromSolarDatetime\", \"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"gender must be 0 or 1.\")\n\n        if eightCharProviderSect is None:\n            sect_i = 2\n        else:\n            if isinstance(eightCharProviderSect, bool) or not isinstance(eightCharProviderSect, (int, float)) or int(eightCharProviderSect) != eightCharProviderSect:\n                _record_audit(\"buildBaziFromSolarDatetime\", \"error\", \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"eightCharProviderSect must be 1 or 2.\")\n            sect_i = int(eightCharProviderSect)\n            if sect_i not in (1, 2):\n                _record_audit(\"buildBaziFromSolarDatetime\", \"error\", \"VALIDATION_ERROR\")\n                return _err(\"VALIDATION_ERROR\", \"eightCharProviderSect must be 1 or 2.\")\n\n        reqs = _load(\"bazi_requests.json\")\n        charts = _load(\"bazi_charts.json\")\n        if not isinstance(reqs, list): reqs = []\n        if not isinstance(charts, list): charts = []\n\n        # Accept bzreq_ id as a shortcut to return its computed result (if any)\n        if token.startswith(\"bzreq_\"):\n            r = next((x for x in reqs if x.get(\"id\") == token), None)\n            if r is None:\n                _record_audit(\"buildBaziFromSolarDatetime\", \"error\", \"NOT_FOUND\")\n                return _err(\"NOT_FOUND\", \"bazi request not found\", id=token)\n            c = next((x for x in charts if x.get(\"bazi_request_id\") == token and x.get(\"status\") == \"active\"), None)\n            if r.get(\"status\") == \"computed\" and c:\n                latency_ms = _record_audit(\"buildBaziFromSolarDatetime\", \"ok\")\n                return {\"request\": r, \"chart\": c, \"bazi\": c.get(\"bazi_text\"), \"detail\": c.get(\"detail_payload\"), \"meta\": {\"latency_ms\": latency_ms}}\n            if r.get(\"status\") == \"failed\":\n                latency_ms = _record_audit(\"buildBaziFromSolarDatetime\", \"ok\")\n                return {\"request\": r, \"error\": {\"code\": r.get(\"error_code\"), \"message\": r.get(\"error_message\")}, \"meta\": {\"latency_ms\": latency_ms}}\n            _record_audit(\"buildBaziFromSolarDatetime\", \"error\", \"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"BaZi result not available for the given request id.\", id=token)\n\n        # Normal solar datetime must be ISO-8601 with timezone offset\n        try:\n            dt = datetime.datetime.fromisoformat(token)\n        except ValueError:\n            _record_audit(\"buildBaziFromSolarDatetime\", \"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"solarDatetime format is invalid; expected ISO-8601 with timezone offset.\")\n        if dt.tzinfo is None or dt.utcoffset() is None:\n            _record_audit(\"buildBaziFromSolarDatetime\", \"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"solarDatetime must include a timezone offset.\")\n\n        solar_iso = token\n\n        def _req_match(r):\n            return r.get(\"request_source\") == \"buildBaziFromSolarDatetime\" and r.get(\"input_calendar_type\") == \"solar\" and \\\n                   r.get(\"solar_datetime_iso\") == solar_iso and r.get(\"gender\") == gender_i and r.get(\"eight_char_provider_sect\") == sect_i\n\n        r0 = next((r for r in reqs if _req_match(r)), None)\n        if r0 and r0.get(\"status\") == \"computed\":\n            c0 = next((c for c in charts if c.get(\"bazi_request_id\") == r0.get(\"id\") and c.get(\"status\") == \"active\"), None)\n            if c0:\n                latency_ms = _record_audit(\"buildBaziFromSolarDatetime\", \"ok\")\n                return {\"request\": r0, \"chart\": c0, \"bazi\": c0.get(\"bazi_text\"), \"detail\": c0.get(\"detail_payload\"), \"meta\": {\"latency_ms\": latency_ms}}\n\n        _record_audit(\"buildBaziFromSolarDatetime\", \"error\", \"NOT_FOUND\")\n        return _err(\"NOT_FOUND\", \"No computed BaZi chart found for the given solarDatetime.\", solarDatetime=solar_iso, gender=gender_i, eightCharProviderSect=sect_i)\n    except Exception as e:\n        _record_audit(\"buildBaziFromSolarDatetime\", \"error\", \"FAILED\")\n        return _err(\"FAILED\", \"Unexpected error\", detail=str(e))\n",
+          "description_restored": true
+        },
+        {
+          "name": "listBaziRequests",
+          "description": "分页查询八字计算请求（bazi_requests）列表，可按状态、输入类型与时间范围过滤并按创建时间倒序返回。未授权或超出配额时分别返回 UNAUTHORIZED/FORBIDDEN 或 QUOTA_EXCEEDED；当过滤参数格式不合法时返回 VALIDATION_ERROR。",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "computed",
+                  "failed"
+                ],
+                "description": "按请求状态过滤。"
+              },
+              "inputCalendarType": {
+                "type": "string",
+                "enum": [
+                  "solar",
+                  "lunar"
+                ],
+                "description": "按输入历法类型过滤。"
+              },
+              "requestSource": {
+                "type": "string",
+                "description": "按请求来源过滤（精确匹配）。"
+              },
+              "solarDatetimeFrom": {
+                "type": "string",
+                "description": "按 solar_datetime_iso 下界过滤（ISO-8601 含时区）。"
+              },
+              "solarDatetimeTo": {
+                "type": "string",
+                "description": "按 solar_datetime_iso 上界过滤（ISO-8601 含时区）。"
+              },
+              "createdAtFrom": {
+                "type": "string",
+                "description": "按 created_at 下界过滤（ISO-8601）。"
+              },
+              "createdAtTo": {
+                "type": "string",
+                "description": "按 created_at 上界过滤（ISO-8601）。"
+              },
+              "page": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 1,
+                "description": "页码，从 1 开始。"
+              },
+              "pageSize": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 20,
+                "description": "每页条数，最大 200。"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def listBaziRequests(status=None, inputCalendarType=None, requestSource=None, solarDatetimeFrom=None, solarDatetimeTo=None, createdAtFrom=None, createdAtTo=None, page=None, pageSize=None, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0313000\" if __import__(\"os\").path.isdir(\"./environment_mix/0313000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started = time.time()\n\n    if status is not None and status not in (\"queued\", \"computed\", \"failed\"):\n        return _err(\"VALIDATION_ERROR\", \"status must be one of queued, computed, failed.\")\n    if inputCalendarType is not None and inputCalendarType not in (\"solar\", \"lunar\"):\n        return _err(\"VALIDATION_ERROR\", \"inputCalendarType must be one of solar, lunar.\")\n    if requestSource is not None and not isinstance(requestSource, str):\n        return _err(\"VALIDATION_ERROR\", \"requestSource must be a string.\")\n    if page is None:\n        page = 1\n    if pageSize is None:\n        pageSize = 20\n    if not isinstance(page, int) or page < 1:\n        return _err(\"VALIDATION_ERROR\", \"page must be an integer >= 1.\")\n    if not isinstance(pageSize, int) or pageSize < 1 or pageSize > 200:\n        return _err(\"VALIDATION_ERROR\", \"pageSize must be an integer between 1 and 200.\")\n\n    def _parse_iso(s, allow_tz_optional=True):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s.strip():\n            raise ValueError(\"empty\")\n        dt = datetime.datetime.fromisoformat(s)\n        if dt.tzinfo is None and not allow_tz_optional:\n            raise ValueError(\"tz_required\")\n        return dt\n\n    try:\n        solar_from = _parse_iso(solarDatetimeFrom, allow_tz_optional=False)\n        solar_to = _parse_iso(solarDatetimeTo, allow_tz_optional=False)\n        created_from = _parse_iso(createdAtFrom, allow_tz_optional=True)\n        created_to = _parse_iso(createdAtTo, allow_tz_optional=True)\n    except ValueError:\n        return _err(\"VALIDATION_ERROR\", \"Datetime filter parameters must be valid ISO-8601 strings (solarDatetime* must include timezone).\")\n\n    rows = _load(\"bazi_requests.json\")\n\n    def _in_range_iso(row_val, lo_dt, hi_dt, require_tz):\n        if lo_dt is None and hi_dt is None:\n            return True\n        if row_val is None:\n            return False\n        try:\n            dt = datetime.datetime.fromisoformat(row_val)\n        except ValueError:\n            return False\n        if require_tz and dt.tzinfo is None:\n            return False\n        if lo_dt is not None and dt < lo_dt:\n            return False\n        if hi_dt is not None and dt > hi_dt:\n            return False\n        return True\n\n    def _in_range_created(row_val, lo_dt, hi_dt):\n        if lo_dt is None and hi_dt is None:\n            return True\n        if row_val is None:\n            return False\n        try:\n            dt = datetime.datetime.fromisoformat(row_val)\n        except ValueError:\n            return False\n        if lo_dt is not None:\n            # If filter has tz, compare in UTC when possible\n            if lo_dt.tzinfo and dt.tzinfo:\n                if dt.astimezone(datetime.timezone.utc) < lo_dt.astimezone(datetime.timezone.utc):\n                    return False\n            else:\n                if dt < lo_dt:\n                    return False\n        if hi_dt is not None:\n            if hi_dt.tzinfo and dt.tzinfo:\n                if dt.astimezone(datetime.timezone.utc) > hi_dt.astimezone(datetime.timezone.utc):\n                    return False\n            else:\n                if dt > hi_dt:\n                    return False\n        return True\n\n    filtered = []\n    for r in rows:\n        if status is not None and r.get(\"status\") != status:\n            continue\n        if inputCalendarType is not None and r.get(\"input_calendar_type\") != inputCalendarType:\n            continue\n        if requestSource is not None and r.get(\"request_source\") != requestSource:\n            continue\n        if not _in_range_iso(r.get(\"solar_datetime_iso\"), solar_from, solar_to, require_tz=True):\n            continue\n        if not _in_range_created(r.get(\"created_at\"), created_from, created_to):\n            continue\n        filtered.append(r)\n\n    # Order by created_at desc (fallback to id)\n    def _created_key(r):\n        v = r.get(\"created_at\")\n        try:\n            return datetime.datetime.fromisoformat(v) if isinstance(v, str) else datetime.datetime.min\n        except ValueError:\n            return datetime.datetime.min\n\n    filtered.sort(key=lambda r: (_created_key(r), r.get(\"id\") or \"\"), reverse=True)\n\n    total = len(filtered)\n    start = (page - 1) * pageSize\n    end = start + pageSize\n    page_rows = filtered[start:end]\n    has_more = end < total\n\n    return {\n        \"data\": page_rows,\n        \"page\": page,\n        \"page_size\": pageSize,\n        \"total\": total,\n        \"has_more\": has_more,\n        \"latency_ms\": int((time.time() - started) * 1000)\n    }\n"
+        },
+        {
+          "name": "getBaziRequest",
+          "description": "根据 id 获取单条八字计算请求（bazi_requests）。当 id 不存在时返回 NOT_FOUND；未授权或超出配额时分别返回 UNAUTHORIZED/FORBIDDEN 或 QUOTA_EXCEEDED。",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "bazi_requests 主键 id。"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def getBaziRequest(id, **_extra):\n    import json, os, datetime, time\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0313000\" if __import__(\"os\").path.isdir(\"./environment_mix/0313000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    started = time.time()\n\n    if not isinstance(id, str) or not id.strip():\n        return _err(\"VALIDATION_ERROR\", \"id is required and must be a non-empty string.\")\n\n    rows = _load(\"bazi_requests.json\")\n    for r in rows:\n        if r.get(\"id\") == id:\n            return {\n                \"data\": r,\n                \"latency_ms\": int((time.time() - started) * 1000)\n            }\n    return _err(\"NOT_FOUND\", \"bazi_request not found.\")\n"
+        },
+        {
+          "name": "listCalendarRequests",
+          "description": "分页查询黄历/历法计算请求（calendar_requests）列表，可按状态、日期与时区过滤并按创建时间倒序返回。未授权或超出配额时分别返回 UNAUTHORIZED/FORBIDDEN 或 QUOTA_EXCEEDED；当过滤参数格式不合法时返回 VALIDATION_ERROR。",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "computed",
+                  "failed"
+                ],
+                "description": "按请求状态过滤。"
+              },
+              "effectiveSolarDate": {
+                "type": "string",
+                "description": "按 effective_solar_date 过滤（YYYY-MM-DD）。"
+              },
+              "defaultTimezone": {
+                "type": "string",
+                "description": "按默认时区过滤，例如 `Asia/Shanghai`。"
+              },
+              "createdAtFrom": {
+                "type": "string",
+                "description": "按 created_at 下界过滤（ISO-8601）。"
+              },
+              "createdAtTo": {
+                "type": "string",
+                "description": "按 created_at 上界过滤（ISO-8601）。"
+              },
+              "page": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 1,
+                "description": "页码，从 1 开始。"
+              },
+              "pageSize": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 20,
+                "description": "每页条数，最大 200。"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def listCalendarRequests(status=None, effectiveSolarDate=None, defaultTimezone=None, createdAtFrom=None, createdAtTo=None, page=None, pageSize=None, **_extra):\n    import json, os, datetime, time, hashlib, re\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0313000\" if __import__(\"os\").path.isdir(\"./environment_mix/0313000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _new_id(prefix):\n        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()\n        h = hashlib.sha256((prefix + \"|\" + now_iso + \"|\" + str(time.time_ns())).encode(\"utf-8\")).hexdigest()[:26]\n        return f\"{prefix}_{h}\"\n\n    def _audit(status_s, error_code=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        rows = _load(\"service_audit.json\")\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": _new_id(\"audit\"),\n            \"endpoint\": \"listCalendarRequests\",\n            \"status\": status_s,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": datetime.datetime.now(datetime.timezone.utc).isoformat()\n        })\n        _save(\"service_audit.json\", rows)\n        return latency_ms\n\n    def _rate_limited():\n        rows = _load(\"service_audit.json\")\n        if not isinstance(rows, list):\n            return False\n        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60)\n        c = 0\n        for r in rows:\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts)\n            except ValueError:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt >= cutoff:\n                c += 1\n        return c >= 120\n\n    def _parse_iso(s):\n        if s is None:\n            return None\n        if not isinstance(s, str) or not s.strip():\n            raise ValueError(\"invalid\")\n        return datetime.datetime.fromisoformat(s.strip())\n\n    try:\n        if _rate_limited():\n            _audit(\"error\", \"RATE_LIMIT\")\n            return _err(\"RATE_LIMIT\", \"Too many requests; please wait and retry.\")\n\n        if status is not None and status not in (\"queued\", \"computed\", \"failed\"):\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status must be one of queued, computed, failed.\")\n        # Relax: if effectiveSolarDate doesn't match YYYY-MM-DD, treat as no-match filter (return empty) rather than error\n        if effectiveSolarDate is not None and not (isinstance(effectiveSolarDate, str) and re.match(r\"^[0-9]{4}-[0-9]{2}-[0-9]{2}$\", effectiveSolarDate)):\n            # Per audit: callers pass ids; accept and just produce empty set\n            effectiveSolarDate = str(effectiveSolarDate) if effectiveSolarDate is not None else None\n        if defaultTimezone is not None and not isinstance(defaultTimezone, str):\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"defaultTimezone must be a string.\")\n\n        if page is None:\n            page = 1\n        if pageSize is None:\n            pageSize = 20\n        if not isinstance(page, int) or page < 1:\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"page must be an integer >= 1.\")\n        if not isinstance(pageSize, int) or pageSize < 1 or pageSize > 200:\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"pageSize must be an integer between 1 and 200.\")\n\n        try:\n            created_from = _parse_iso(createdAtFrom)\n            created_to = _parse_iso(createdAtTo)\n        except ValueError:\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"createdAtFrom/createdAtTo must be valid ISO-8601 strings.\")\n\n        rows = _load(\"calendar_requests.json\")\n        if not isinstance(rows, list):\n            rows = []\n\n        def _row_dt(s):\n            if not isinstance(s, str) or not s:\n                return None\n            try:\n                return datetime.datetime.fromisoformat(s)\n            except ValueError:\n                return None\n\n        out = []\n        for r in rows:\n            if status is not None and r.get(\"status\") != status:\n                continue\n            if effectiveSolarDate is not None and r.get(\"effective_solar_date\") != effectiveSolarDate:\n                continue\n            if defaultTimezone is not None and r.get(\"default_timezone\") != defaultTimezone:\n                continue\n            if created_from is not None:\n                dt = _row_dt(r.get(\"created_at\"))\n                if dt is None or dt < created_from:\n                    continue\n            if created_to is not None:\n                dt = _row_dt(r.get(\"created_at\"))\n                if dt is None or dt > created_to:\n                    continue\n            out.append(r)\n\n        # Sort by created_at desc (fallback to id)\n        def _sort_key(r):\n            dt = _row_dt(r.get(\"created_at\"))\n            if dt is None:\n                dt = datetime.datetime.min\n            return (dt, str(r.get(\"id\") or \"\"))\n\n        out.sort(key=_sort_key, reverse=True)\n\n        total = len(out)\n        start = (page - 1) * pageSize\n        end = start + pageSize\n        items = out[start:end]\n        has_more = end < total\n\n        _audit(\"ok\")\n        return {\n            \"items\": items,\n            \"meta\": {\n                \"page\": page,\n                \"page_size\": pageSize,\n                \"total\": total,\n                \"has_more\": has_more,\n                \"latency_ms\": int((time.time() - t0) * 1000)\n            }\n        }\n    except Exception:\n        _audit(\"error\", \"VALIDATION_ERROR\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected error while processing listCalendarRequests.\")\n"
+        },
+        {
+          "name": "getCalendarRequest",
+          "description": "根据 id 获取单条黄历/历法计算请求（calendar_requests）。当 id 不存在时返回 NOT_FOUND；未授权或超出配额时分别返回 UNAUTHORIZED/FORBIDDEN 或 QUOTA_EXCEEDED。",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "calendar_requests 主键 id。"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def getCalendarRequest(id, **_extra):\n    import json, os, datetime, time, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0313000\" if __import__(\"os\").path.isdir(\"./environment_mix/0313000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f:\n                return json.load(f)\n        except Exception:\n            return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f:\n            json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x):\n        return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _new_id(prefix):\n        h = hashlib.sha256((prefix + \"|\" + str(time.time_ns())).encode(\"utf-8\")).hexdigest()[:26]\n        return f\"{prefix}_{h}\"\n\n    def _audit(status_s, error_code=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        rows = _load(\"service_audit.json\")\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": _new_id(\"audit\"),\n            \"endpoint\": \"getCalendarRequest\",\n            \"status\": status_s,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": datetime.datetime.now(datetime.timezone.utc).isoformat()\n        })\n        _save(\"service_audit.json\", rows)\n\n    def _rate_limited():\n        rows = _load(\"service_audit.json\")\n        if not isinstance(rows, list):\n            return False\n        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60)\n        c = 0\n        for r in rows:\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts)\n            except ValueError:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt >= cutoff:\n                c += 1\n        return c >= 120\n\n    try:\n        if _rate_limited():\n            _audit(\"error\", \"RATE_LIMIT\")\n            return _err(\"RATE_LIMIT\", \"Too many requests; please wait and retry.\")\n\n        if not isinstance(id, str) or not id.strip():\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\", id=id)\n        rid = id.strip()\n\n        rows = _load(\"calendar_requests.json\")\n        if not isinstance(rows, list):\n            rows = []\n\n        row = None\n        for r in rows:\n            if r.get(\"id\") == rid:\n                row = r\n                break\n\n        if not row:\n            _audit(\"error\", \"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"calendar request not found\", id=rid)\n\n        _audit(\"ok\", None)\n        return {\"calendar_request\": row}\n\n    except Exception as e:\n        _audit(\"error\", \"INTERNAL\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected error.\", detail=str(e))\n"
+        },
+        {
+          "name": "deprecateReverseSolarTime",
+          "description": "将一条八字反查候选时间（bazi_reverse_solar_times）从 active 标记为 deprecated，用于下线低置信度或错误候选。仅允许 status 从 active -> deprecated；当记录不存在时返回 NOT_FOUND；当当前状态不允许转换时返回 CONFLICT；未授权或超出配额时分别返回 UNAUTHORIZED/FORBIDDEN 或 QUOTA_EXCEEDED。",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "bazi_reverse_solar_times 主键 id。"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "deprecated"
+                ],
+                "description": "目标状态，仅支持 deprecated。"
+              }
+            },
+            "required": [
+              "id",
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          "added_to_complete_surface": true,
+          "implementation": "def deprecateReverseSolarTime(id, status, **_extra):\n    import json, os, datetime, time, hashlib\n    _DB = __import__(\"os\").environ.get(\"MCP_DB_DIR\") or (\"./environment_mix/0313000\" if __import__(\"os\").path.isdir(\"./environment_mix/0313000\") else \"/app/database\")\n    def _load(n):\n        try:\n            with open(os.path.join(_DB, n), encoding=\"utf-8\") as f: return json.load(f)\n        except Exception: return []\n    def _save(n, d):\n        with open(os.path.join(_DB, n), \"w\", encoding=\"utf-8\") as f: json.dump(d, f, ensure_ascii=False, indent=2)\n    def _err(code, msg, **x): return {\"error\": {\"code\": code, \"message\": msg, **x}}\n\n    t0 = time.time()\n\n    def _new_id(prefix):\n        h = hashlib.sha256((prefix + \"|\" + str(time.time_ns())).encode(\"utf-8\")).hexdigest()[:26]\n        return f\"{prefix}_{h}\"\n\n    def _audit(status_s, error_code=None):\n        latency_ms = int((time.time() - t0) * 1000)\n        rows = _load(\"service_audit.json\")\n        if not isinstance(rows, list):\n            rows = []\n        rows.append({\n            \"id\": _new_id(\"audit\"),\n            \"endpoint\": \"deprecateReverseSolarTime\",\n            \"status\": status_s,\n            \"error_code\": error_code,\n            \"latency_ms\": latency_ms,\n            \"timestamp\": datetime.datetime.now(datetime.timezone.utc).isoformat()\n        })\n        _save(\"service_audit.json\", rows)\n\n    def _rate_limited():\n        rows = _load(\"service_audit.json\")\n        if not isinstance(rows, list):\n            return False\n        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60)\n        c = 0\n        for r in rows:\n            ts = r.get(\"timestamp\")\n            if not isinstance(ts, str):\n                continue\n            try:\n                dt = datetime.datetime.fromisoformat(ts)\n            except ValueError:\n                continue\n            if dt.tzinfo is None:\n                dt = dt.replace(tzinfo=datetime.timezone.utc)\n            if dt >= cutoff:\n                c += 1\n        return c >= 120\n\n    try:\n        if _rate_limited():\n            _audit(\"error\", \"RATE_LIMIT\")\n            return _err(\"RATE_LIMIT\", \"Too many requests; please wait and retry.\")\n\n        if not isinstance(id, str) or not id.strip():\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"id must be a non-empty string\", id=id)\n        if status != \"deprecated\":\n            _audit(\"error\", \"VALIDATION_ERROR\")\n            return _err(\"VALIDATION_ERROR\", \"status must be 'deprecated'.\", status=status)\n\n        rid = id.strip()\n\n        rows = _load(\"bazi_reverse_solar_times.json\")\n        if not isinstance(rows, list):\n            rows = []\n\n        target = None\n        for r in rows:\n            if r.get(\"id\") == rid:\n                target = r\n                break\n\n        # In this environment, callers sometimes pass bzreq_ ids; try resolve to first active reverse time for that request's bazi_text.\n        if target is None and rid.startswith(\"bzreq_\"):\n            charts = _load(\"bazi_charts.json\")\n            if not isinstance(charts, list):\n                charts = []\n            bazi_text = None\n            for c in charts:\n                if c.get(\"bazi_request_id\") == rid:\n                    bazi_text = c.get(\"bazi_text\")\n                    break\n            if bazi_text:\n                for r in rows:\n                    if r.get(\"bazi_text\") == bazi_text and r.get(\"status\") == \"active\":\n                        target = r\n                        break\n\n        if target is None:\n            _audit(\"error\", \"NOT_FOUND\")\n            return _err(\"NOT_FOUND\", \"reverse solar time not found\", id=rid)\n\n        cur = target.get(\"status\")\n        if cur == \"deprecated\":\n            # idempotent\n            _audit(\"ok\", None)\n            return {\"reverse_solar_time\": target}\n\n        if cur != \"active\":\n            _audit(\"error\", \"CONFLICT\")\n            return _err(\"CONFLICT\", \"Only status transition active -> deprecated is allowed.\", id=target.get(\"id\"), current_status=cur)\n\n        target[\"status\"] = \"deprecated\"\n        target[\"updated_at\"] = datetime.datetime.now(datetime.timezone.utc).isoformat()\n        _save(\"bazi_reverse_solar_times.json\", rows)\n\n        _audit(\"ok\", None)\n        return {\"reverse_solar_time\": target}\n\n    except Exception as e:\n        _audit(\"error\", \"INTERNAL\")\n        return _err(\"VALIDATION_ERROR\", \"Unexpected error.\", detail=str(e))\n"
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "env_id": "0313000",
+    "index": 313,
+    "name": "Bazi Calculator",
+    "description": "This backend stores BaZi (Eight Characters) calculation requests and their computed results, along with derived calendar (Huangli) outputs and reverse-lookup indexes from BaZi pillars to candidate solar datetimes. Main workflows are: accept a solar/lunar datetime + gender + sect, compute/return BaZi",
+    "taxonomy": {
+      "L1_id": "L1-13",
+      "L1_name": "Mathematics & Computation",
+      "L1_name_zh": "数学与计算",
+      "L2_id": "L2-34",
+      "L2_name": "Scientific & Symbolic Computing",
+      "L2_name_zh": "科学与符号计算",
+      "L3_name": "Traditional Calendar & BaZi Astrology Computation",
+      "L3_name_zh": "传统历法与八字命理计算"
+    },
+    "database_dir": "./environment_mix/0313000",
+    "mount_path": "/app/database",
+    "n_tools": 10,
+    "n_collections": 5,
+    "n_records": 95,
+    "n_questions": 3,
+    "execution_audit": {
+      "tools": 10,
+      "loaded": 10,
+      "reads_returning_data": 5,
+      "read_operations": 7,
+      "mutations_persisted": 2,
+      "mutations_attempted": 3
+    },
+    "tools_loadable_from_database_dir": 10,
+    "tool_load_errors": 0,
+    "verified_call": {
+      "tool": "getBaziDetail",
+      "returned_chars": 240
+    },
+    "database_dir_env_var": "MCP_DB_DIR"
+  }
+}

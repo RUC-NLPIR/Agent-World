@@ -44,6 +44,9 @@ Rubrics include objective success criteria and a verified tool chain.
 ## SFT corpus
 
 - Records: 65,287
+- Original paper trajectories: approximately 40,000
+- Continuously synthesized post-paper updates: 25,287
+- Expanded synthesis pool: approximately 2,500 environments
 - JSON shards: 131
 - Messages: 1,462,197
 - Average messages per record: 22.4
@@ -55,10 +58,16 @@ Git because it is planned for separate distribution through Hugging Face Dataset
 
 ## Provenance
 
-The 563-environment release combines 500 themes selected from high-usage MCP servers listed
-by [Smithery](https://smithery.ai/servers) and 63 environments derived from industrial PRDs.
-Environment databases are offline research artifacts constructed for tool-use training and
-verification.
+The 563-environment release combines 500 high-quality themes selected from high-usage MCP
+servers listed by [Smithery](https://smithery.ai/servers) and 63 environments derived from
+industrial PRDs and real-world tool documentation. Selection prioritizes widely used servers
+with meaningful workflows and excludes low-usage or low-signal themes.
+
+The paper reports an original corpus of 1,978 environments. Continued synthesis after the
+paper expanded the pool used to produce SFT trajectories to approximately 2,500
+environments. This Git release contains the selected 563 environment artifacts, not the
+entire expanded synthesis pool. Environment databases are offline research artifacts
+constructed for tool-use training and verification.
 
 ## Intended uses
 

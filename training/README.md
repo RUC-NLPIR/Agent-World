@@ -2,7 +2,10 @@
 
 ## SFT with LlamaFactory
 
-The forthcoming SFT corpus contains 65,287 JSON records in 131 shards:
+The forthcoming SFT corpus contains 65,287 JSON records in 131 shards. It combines the
+original 40K Agent-World SFT trajectories reported in the paper with 25,287 trajectories
+from continuous post-paper synthesis over an ecosystem expanded to approximately 2.5K
+environments:
 
 ```json
 {

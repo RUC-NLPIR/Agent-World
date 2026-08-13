@@ -1,46 +1,81 @@
-# Agent-World
+<div align="center">
+  <img src="assets/agent-world-banner.svg" width="100%" alt="Agent-World"/>
 
-> 面向通用智能体持续进化的大规模真实世界环境合成
+  <h1>🌐 Agent-World</h1>
+  <h3>真实环境 · 可验证任务 · 持续进化智能体</h3>
 
-[论文](https://arxiv.org/abs/2604.18292) ·
-[项目主页](https://agent-tars-world.github.io/-/) ·
-[代码](https://github.com/RUC-NLPIR/Agent-World) ·
-[Hugging Face Paper](https://huggingface.co/papers/2604.18292) ·
-[机器之心](https://www.163.com/dy/article/KS8DOH8L0511AQHO.html) ·
-[English](README.md)
+  <a href="https://arxiv.org/abs/2604.18292"><img src="https://img.shields.io/badge/论文-ARXIV-B31B1B?style=for-the-badge&logo=arxiv" alt="论文"/></a>
+  <a href="https://github.com/RUC-NLPIR/Agent-World"><img src="https://img.shields.io/badge/代码-GITHUB-181717?style=for-the-badge&logo=github" alt="代码"/></a>
+  <a href="https://agent-tars-world.github.io/-/"><img src="https://img.shields.io/badge/项目主页-LIVE-14B8A6?style=for-the-badge&logo=googlechrome" alt="项目主页"/></a>
+  <a href="https://huggingface.co/papers/2604.18292"><img src="https://img.shields.io/badge/HUGGING_FACE-PAPER-FFD21E?style=for-the-badge&logo=huggingface&logoColor=black" alt="Hugging Face"/></a>
+  <a href="https://www.163.com/dy/article/KS8DOH8L0511AQHO.html"><img src="https://img.shields.io/badge/媒体-机器之心-7C3AED?style=for-the-badge" alt="机器之心"/></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/许可证-MIT-2563EB?style=for-the-badge" alt="MIT"/></a>
 
-Agent-World 是一个把可扩展、有状态的工具环境、可验证任务合成与持续智能体训练连接起来的自进化训练场。本仓库发布首批可复现环境、图式 query/rubric 合成代码、Qwen3-14B 生成示例，以及后续 Agent-World SFT 数据的登记模板。
+  <p><a href="README.md">English</a> | <strong>简体中文</strong></p>
 
-## Demo
+  <p><em>把真实世界工具生态变成有状态、可执行的环境，再把环境变成可验证的智能体经验。</em></p>
+</div>
+
+<table align="center">
+  <tr>
+    <td align="center"><strong>563</strong><br/>精选环境</td>
+    <td align="center"><strong>8,927</strong><br/>可执行工具</td>
+    <td align="center"><strong>67,096</strong><br/>数据库记录</td>
+    <td align="center"><strong>1,432</strong><br/>可验证任务</td>
+    <td align="center"><strong>65,287</strong><br/>SFT 轨迹</td>
+  </tr>
+</table>
+
+> [!TIP]
+> 不下载模型即可检查全部公开环境：`bash run.sh --check`
+
+## 🎬 智能体 Demo
+
+<div align="center">
+  <video src="https://agent-tars-world.github.io/-/agent-demo/agent_demo.mp4" controls width="100%"></video>
+</div>
 
 [机票与住宿](https://agent-tars-world.github.io/-/agent-demo/demo_flight.mp4) ·
 [电商](https://agent-tars-world.github.io/-/agent-demo/demo_ecomm.mp4) ·
 [Notion](https://agent-tars-world.github.io/-/agent-demo/demo_notion.mp4) ·
 [Slack](https://agent-tars-world.github.io/-/agent-demo/demo_slack.mp4) ·
+[通信](https://agent-tars-world.github.io/-/agent-demo/demo_telecom.mp4) ·
 [GitHub](https://agent-tars-world.github.io/-/agent-demo/demo_github.mp4) ·
 [文档操作](https://agent-tars-world.github.io/-/agent-demo/demo_document.mp4)
 
 更多案例见[项目主页](https://agent-tars-world.github.io/-/#demos)。
-环境构造还可参考 EnvScaler 的
-[环境/用户交互](https://github.com/user-attachments/assets/613b46fd-63db-4050-91d2-f7aca2a766e3)、
-[智能体交互](https://github.com/user-attachments/assets/b8186257-a22d-4ec1-9ccf-82f6bd23a4b5)和
-[从零构建环境](https://github.com/user-attachments/assets/fd947e46-014a-41cd-87bb-6744c3dd5b32)视频。
 
-## 本次发布规模
+## ✨ 本次开源内容
 
-论文中的完整 Agent-World 包含 **1,978 个环境、19,822 个工具**。本仓库公开的是首批子集：
+### 563 个高质量可执行环境
 
-- **563 个可执行环境**：由 [Smithery](https://smithery.ai/servers) 中 500 个高使用量 MCP Server 主题和 63 个行业 PRD 环境组成；
-- **8,927 个可执行工具**，均包含 schema 和 Python implementation；
-- **67,096 条数据库记录**，分布在 2,635 个集合中；
-- 三级分类体系：**20 个 L1、46 个 L2、245 个 L3**；
-- **1,432 条 question/answer/rubric 示例**，覆盖 530 个环境；
-- **65,287 条多轮 SFT 数据**，分为 131 个 JSON 分片，后续通过 Hugging Face
-  Datasets 独立发布，不存放在当前 Git 仓库。
+这 563 个环境是经过质量筛选的公开子集，而不是从完整语料中任意截取：
 
-以上数字均直接从当前发布文件统计得到。
+- 从 [Smithery](https://smithery.ai/servers) 的高使用量 MCP Server 中筛选出 **500
+  个高质量主题**，优先保留使用广泛、工作流明确、工具价值较高的环境，过滤低使用量和低信息量环境；
+- 从行业 PRD 与真实 Tool Documentation 中构建另外 **63 个环境**，补充公开 MCP
+  生态之外的业务流程与工具场景。
 
-可在本地重新统计：
+它们共包含 **8,927 个可执行工具、67,096 条数据库记录、2,635 个集合**，覆盖
+**20 个 L1 / 46 个 L2 / 245 个 L3** 分类，并提供覆盖 530 个环境的 **1,432 条
+question/answer/rubric 示例**。
+
+论文实验使用的原始完整语料包含 **1,978 个环境和 19,822 个工具**；当前 Git
+仓库发布的是其中精选的 563 个环境及其数据库、工具代码和题目样例。
+
+### 65,287 条持续扩展的 SFT 轨迹
+
+**65,287 条 Agent-World SFT 数据**由两部分组成：
+
+- 论文中报告的原始 **40K Agent-World SFT trajectories**；
+- 论文发布后持续更新合成的 **25,287 条新增轨迹**。
+
+论文发布后，我们继续扩展环境合成体系，目前已扩展到约 **2.5K 个环境**，覆盖更丰富的领域、业务流程、工具组合和任务场景。2.5K 指持续更新后的 SFT 合成环境池；当前 Git 仓库实际公开的环境资产仍为上面的精选 563 个。
+
+SFT 分片后续通过 Hugging Face Datasets 独立发布；当前仓库已经提供 LlamaFactory
+登记模板与训练说明。
+
+环境和 question/rubric 统计可在本地复算：
 
 ```bash
 python3 dataset_stats.py
@@ -61,7 +96,7 @@ python3 dataset_stats.py
 ├── graph_syth.py                         # 兼容早期发布包的实现文件
 ├── prepare_git_release.py                # 移除与数据库重复的 checkpoint 载荷
 ├── run.sh                                # Qwen3-14B + vLLM 示例脚本
-├── graph_readme.md                       # Graph 链路详细说明
+├── GRAPH_SYNTHESIS.md                    # Graph 链路详细说明
 ├── DATA_CARD.md                          # 数据来源、统计、限制与安全说明
 ├── THIRD_PARTY_NOTICES.md                # 第三方项目与再分发提示
 ├── requirements-vllm.txt                 # 已验证的模型服务依赖
@@ -122,7 +157,7 @@ data
 
 Graph 链路会分析工具依赖、构图并随机游走，在环境数据库的私有副本上执行工具链，再让本地模型根据真实 observation 编写 query、答案和 rubric，最后在干净副本中重放链路，过滤时间戳和随机 ID 等不稳定值。
 
-七阶段设计、输出格式和参数见 [graph_readme.md](graph_readme.md)。
+七阶段设计、输出格式和参数见 [GRAPH_SYNTHESIS.md](GRAPH_SYNTHESIS.md)。
 
 使用本地 Qwen3-14B 与 vLLM：
 
@@ -137,7 +172,7 @@ bash run.sh 1000 --no-serve
 
 ## SFT
 
-后续发布的 SFT 数据共 **65,287 条**，每条只有一个 OpenAI 风格的 `messages` 字段，角色为 `system`、`user`、`assistant`。总计 1,462,197 条 message，平均每个样本 22.4 条。
+后续发布的 SFT 数据共 **65,287 条**：包括论文中的原始 **40K 条轨迹**，以及基于扩展到约 **2.5K 个环境**的持续合成体系新增的 **25,287 条轨迹**。每条只有一个 OpenAI 风格的 `messages` 字段，角色为 `system`、`user`、`assistant`。总计 1,462,197 条 message，平均每个样本 22.4 条。
 
 使用 [LlamaFactory](https://github.com/hiyouga/LlamaFactory) 时，把 SFT 目录复制或软链接到 `LlamaFactory/data/`，再将 [`training/dataset_info.json`](training/dataset_info.json) 中的登记项合并到 `LlamaFactory/data/dataset_info.json`。具体配置见 [training/README.md](training/README.md)。
 
@@ -157,7 +192,7 @@ bash run.sh 1000 --no-serve
 
 ## 数据来源与安全
 
-环境主题来自公开 MCP Server 规范和行业 PRD。发布数据库是离线研究环境状态，默认不会连接对应的真实线上服务。
+环境主题来自高使用量公开 MCP Server 规范、行业 PRD 与真实 Tool Documentation。发布数据库是离线研究环境状态，默认不会连接对应的真实线上服务。
 
 部分环境会模拟认证、凭证、安全操作或用户内容，其中类似 token 的值可能是合成 fixture 或公共代码示例文本。重新分发或部署前请按自身安全与内容政策复核数据，禁止向工具 implementation 提供生产凭证。
 

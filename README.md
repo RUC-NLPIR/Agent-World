@@ -1,55 +1,93 @@
-# Agent-World
+<div align="center">
+  <img src="assets/agent-world-banner.svg" width="100%" alt="Agent-World banner"/>
 
-> Scaling Real-World Environment Synthesis for Evolving General Agent Intelligence
+  <h1>🌐 Agent-World</h1>
+  <h3>Real Environments. Verifiable Tasks. Evolving Agents.</h3>
 
-[Paper](https://arxiv.org/abs/2604.18292) ·
-[Project Page](https://agent-tars-world.github.io/-/) ·
-[Code](https://github.com/RUC-NLPIR/Agent-World) ·
-[Hugging Face Paper](https://huggingface.co/papers/2604.18292) ·
-[机器之心](https://www.163.com/dy/article/KS8DOH8L0511AQHO.html) ·
-[中文说明](README_zh.md)
+  <a href="https://arxiv.org/abs/2604.18292"><img src="https://img.shields.io/badge/PAPER-ARXIV-B31B1B?style=for-the-badge&logo=arxiv" alt="Paper"/></a>
+  <a href="https://github.com/RUC-NLPIR/Agent-World"><img src="https://img.shields.io/badge/CODE-GITHUB-181717?style=for-the-badge&logo=github" alt="Code"/></a>
+  <a href="https://agent-tars-world.github.io/-/"><img src="https://img.shields.io/badge/PROJECT_PAGE-LIVE-14B8A6?style=for-the-badge&logo=googlechrome" alt="Project page"/></a>
+  <a href="https://huggingface.co/papers/2604.18292"><img src="https://img.shields.io/badge/HUGGING_FACE-PAPER-FFD21E?style=for-the-badge&logo=huggingface&logoColor=black" alt="Hugging Face Paper"/></a>
+  <a href="https://www.163.com/dy/article/KS8DOH8L0511AQHO.html"><img src="https://img.shields.io/badge/MEDIA-机器之心-7C3AED?style=for-the-badge" alt="Media"/></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/LICENSE-MIT-2563EB?style=for-the-badge" alt="MIT License"/></a>
 
-Agent-World is a self-evolving training arena that connects scalable, stateful tool
-environments with verifiable task synthesis and continuous agent training. This repository
-releases a reproducible environment subset, graph-based query/rubric synthesis code, a
-Qwen3-14B generation example, and the registration template for the forthcoming Agent-World
-supervised fine-tuning dataset.
+  <p><strong>English</strong> | <a href="README_zh.md">简体中文</a></p>
 
-## Demos
+  <p><em>A self-evolving training arena that turns real-world tool ecosystems into stateful,
+  executable environments—and turns those environments into verifiable agent experience.</em></p>
+</div>
 
-[Flight and stay search](https://agent-tars-world.github.io/-/agent-demo/demo_flight.mp4) ·
+<table align="center">
+  <tr>
+    <td align="center"><strong>563</strong><br/>Selected Environments</td>
+    <td align="center"><strong>8,927</strong><br/>Executable Tools</td>
+    <td align="center"><strong>67,096</strong><br/>Database Records</td>
+    <td align="center"><strong>1,432</strong><br/>Verified Tasks</td>
+    <td align="center"><strong>65,287</strong><br/>SFT Trajectories</td>
+  </tr>
+</table>
+
+> [!TIP]
+> Validate all released environments without downloading a model:
+> `bash run.sh --check`
+
+## 🎬 Agent demos
+
+<div align="center">
+  <video src="https://agent-tars-world.github.io/-/agent-demo/agent_demo.mp4" controls width="100%"></video>
+</div>
+
+**Explore individual cases:**
+[Flight & Stay](https://agent-tars-world.github.io/-/agent-demo/demo_flight.mp4) ·
 [E-commerce](https://agent-tars-world.github.io/-/agent-demo/demo_ecomm.mp4) ·
 [Notion](https://agent-tars-world.github.io/-/agent-demo/demo_notion.mp4) ·
 [Slack](https://agent-tars-world.github.io/-/agent-demo/demo_slack.mp4) ·
+[Telecom](https://agent-tars-world.github.io/-/agent-demo/demo_telecom.mp4) ·
 [GitHub](https://agent-tars-world.github.io/-/agent-demo/demo_github.mp4) ·
-[Document operations](https://agent-tars-world.github.io/-/agent-demo/demo_document.mp4)
+[Document Operations](https://agent-tars-world.github.io/-/agent-demo/demo_document.mp4)
 
 More interactive cases are available on the
-[project page](https://agent-tars-world.github.io/-/#demos).
-For environment-synthesis references, see EnvScaler's
-[environment/user interaction](https://github.com/user-attachments/assets/613b46fd-63db-4050-91d2-f7aca2a766e3),
-[agent interaction](https://github.com/user-attachments/assets/b8186257-a22d-4ec1-9ccf-82f6bd23a4b5), and
-[environment construction](https://github.com/user-attachments/assets/fd947e46-014a-41cd-87bb-6744c3dd5b32)
-demos.
+[Agent-World project page](https://agent-tars-world.github.io/-/#demos).
 
-## Release snapshot
+## ✨ What's in this release
 
-The paper reports the complete Agent-World collection of **1,978 environments** and
-**19,822 tools**. This repository contains the first public subset:
+### 563 high-quality, executable environments
 
-- **563 executable environments**, combining 500 top-used MCP server themes collected from
-  [Smithery](https://smithery.ai/servers) with 63 environments derived from industrial PRDs;
-- **8,927 executable tools**, each shipped with its schema and Python implementation;
-- **67,096 database records** across 2,635 collections;
-- a three-level taxonomy with **20 L1 categories, 46 L2 categories, and 245 L3 leaves**;
-- **1,432 example tasks with answers and rubrics**, covering 530 environments;
-- **65,287 multi-turn SFT examples** in 131 JSON shards, planned for a separate Hugging Face
-  Datasets release and not stored in this Git repository.
+This is a **quality-filtered release**, not an arbitrary slice of the corpus:
 
-All numbers above are computed from the files in this release rather than copied from the
-paper.
+- **500 environments** were selected from high-usage MCP servers on
+  [Smithery](https://smithery.ai/servers). We prioritize widely used server themes with
+  meaningful workflows and omit low-usage or low-signal environments.
+- **63 environments** were constructed from industrial PRDs and real-world tool
+  documentation, extending coverage beyond the public MCP ecosystem.
 
-Recompute them locally with:
+Together they provide **8,927 executable tools**, **67,096 database records** across 2,635
+collections, and a three-level taxonomy with **20 L1 / 46 L2 / 245 L3** categories. The
+release also includes **1,432 verified question/answer/rubric examples** covering 530
+environments.
+
+The paper reports the original full research corpus of **1,978 environments and 19,822
+tools**. The 563 environments here are the selected public subset whose database and tool
+artifacts are released in this repository.
+
+### 65,287 continuously expanded SFT trajectories
+
+The **65,287-example Agent-World SFT dataset** combines:
+
+- the original **40K Agent-World SFT trajectories** reported in the paper; and
+- **25,287 additional trajectories** synthesized through continuous post-paper updates.
+
+After the paper release, we continued scaling the synthesis ecosystem to approximately
+**2.5K environments**, covering broader domains, workflows, tool combinations, and task
+scenarios. The 2.5K figure describes the expanded synthesis pool; this Git repository
+currently publishes the selected 563 environment artifacts above.
+
+The SFT shards will be distributed separately through Hugging Face Datasets. This repository
+already includes the LlamaFactory registration template and training instructions.
+
+### Release statistics
+
+Environment and question statistics can be recomputed locally:
 
 ```bash
 python3 dataset_stats.py
@@ -70,7 +108,7 @@ python3 dataset_stats.py
 ├── graph_syth.py                         # compatibility implementation for early bundles
 ├── prepare_git_release.py                # remove checkpoint payloads duplicated by databases
 ├── run.sh                                # Qwen3-14B + vLLM reproduction script
-├── graph_readme.md                       # detailed synthesis design
+├── GRAPH_SYNTHESIS.md                    # detailed synthesis design
 ├── DATA_CARD.md                          # provenance, statistics, limitations, and safety
 ├── THIRD_PARTY_NOTICES.md                # upstream projects and redistribution notice
 ├── requirements-vllm.txt                 # verified model-service dependencies
@@ -180,7 +218,7 @@ executes each walk against a private copy of the environment database, asks a lo
 write a natural user query, derives an answer and rubric from the observations, and replays
 the chain in a clean copy to remove volatile values.
 
-Read [graph_readme.md](graph_readme.md) for the seven-stage design and output schema.
+Read [GRAPH_SYNTHESIS.md](GRAPH_SYNTHESIS.md) for the seven-stage design and output schema.
 
 ### Reproduce with Qwen3-14B
 
@@ -196,11 +234,13 @@ bash run.sh 1000 --no-serve
 
 Outputs are written to `output/questions_graph.json`; logs go to `output/logs/`. Every path
 can be overridden through the environment variables documented in
-[graph_readme.md](graph_readme.md). The model weights are not included in this repository.
+[GRAPH_SYNTHESIS.md](GRAPH_SYNTHESIS.md). The model weights are not included in this repository.
 
 ## Supervised fine-tuning
 
-The forthcoming SFT release contains **65,287** records. Every record has one `messages` field using
+The forthcoming SFT release contains **65,287** records: the original **40K trajectories**
+reported in the paper plus **25,287 continuously synthesized updates** from an ecosystem
+expanded to approximately **2.5K environments**. Every record has one `messages` field using
 OpenAI-style `system`, `user`, and `assistant` roles. The corpus contains 1,462,197 messages
 in total and averages 22.4 messages per example.
 
@@ -233,9 +273,10 @@ For an agentic RL codebase and README organization close to this release, see
 
 ## Data provenance and safety
 
-Environment themes were selected from public MCP server specifications and industrial PRDs.
-The released databases are offline environment state used for research; they do not connect
-to the corresponding production services by default.
+Environment themes were selected from high-usage public MCP server specifications,
+industrial PRDs, and real-world tool documentation. The released databases are offline
+environment state used for research; they do not connect to the corresponding production
+services by default.
 
 Some environments model authentication, credentials, security operations, or user-generated
 content. Values resembling tokens can be synthetic fixtures or text copied from public tool

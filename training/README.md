@@ -2,7 +2,8 @@
 
 ## SFT with LlamaFactory
 
-The forthcoming SFT corpus contains 65,287 JSON records in 131 shards. It combines the
+The [Agent-World-SFT-65K](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-65K)
+corpus contains 65,287 JSON records in 131 shards. It combines the
 original 40K Agent-World SFT trajectories reported in the paper with 25,287 trajectories
 from continuous post-paper synthesis over an ecosystem expanded to approximately 2.5K
 environments:
@@ -18,8 +19,7 @@ environments:
 ```
 
 It contains 1,462,197 messages in total. Every shard is a JSON array and all records use the
-same schema. The shards are not stored in this Git repository; these instructions become
-directly usable after the separate Hugging Face Datasets release is downloaded.
+same schema. The shards are hosted on Hugging Face rather than stored in this Git repository.
 
 ### 1. Install LlamaFactory
 
@@ -32,18 +32,11 @@ cd LlamaFactory
 pip install -e .
 ```
 
-### 2. Expose the data to LlamaFactory
-
-Copy the directory or create a symbolic link under `LlamaFactory/data/`:
-
-```bash
-ln -s /path/to/agent-world/sft_merged_all_sources_messages_only_shards_clean_v2 \
-  data/sft_merged_all_sources_messages_only_shards_clean_v2
-```
+### 2. Register the Hugging Face dataset
 
 Merge the `agent_world_sft` object from this repository's `training/dataset_info.json` into
-`LlamaFactory/data/dataset_info.json`. LlamaFactory accepts a directory in `file_name` and
-loads its JSON shards as one dataset.
+`LlamaFactory/data/dataset_info.json`. Its `hf_hub_url` points to
+`dongguanting/Agent-World-SFT-65K`, so no manual shard copy is required.
 
 ### 3. Configure training
 

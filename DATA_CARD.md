@@ -4,8 +4,9 @@
 
 This repository is the first public subset of the environments used by Agent-World. It
 contains stateful offline databases, executable tool interfaces, and verified
-question/rubric examples. Statistics and loading metadata for the forthcoming SFT dataset
-are documented here, but its shards are distributed separately.
+question/rubric examples. Statistics and loading metadata for the
+[Agent-World-SFT-65K](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-65K)
+dataset are documented here, while its shards are distributed through Hugging Face.
 
 The paper reports 1,978 environments and 19,822 tools. This release contains 563 environments
 and 8,927 tools.
@@ -54,7 +55,8 @@ Rubrics include objective success criteria and a verified tool chain.
 - Uncompressed size: approximately 3.0 GiB
 
 Every SFT record has one OpenAI-style `messages` array. The SFT directory is excluded from
-Git because it is planned for separate distribution through Hugging Face Datasets.
+Git because it is distributed separately through
+[Hugging Face Datasets](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-65K).
 
 ## Provenance
 

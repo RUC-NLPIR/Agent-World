@@ -17,16 +17,6 @@
   <p><em>把真实世界工具生态变成有状态、可执行的环境，再把环境变成可验证的智能体经验。</em></p>
 </div>
 
-<table align="center">
-  <tr>
-    <td align="center"><strong>563</strong><br/>精选环境</td>
-    <td align="center"><strong>8,927</strong><br/>可执行工具</td>
-    <td align="center"><strong>67,096</strong><br/>数据库记录</td>
-    <td align="center"><strong>1,432</strong><br/>可验证任务</td>
-    <td align="center"><strong>65,287</strong><br/>SFT 轨迹</td>
-  </tr>
-</table>
-
 > [!TIP]
 > 不下载模型即可检查全部公开环境：`bash run.sh --check`
 

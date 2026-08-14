@@ -18,16 +18,6 @@
   executable environments—and turns those environments into verifiable agent experience.</em></p>
 </div>
 
-<table align="center">
-  <tr>
-    <td align="center"><strong>563</strong><br/>Selected Environments</td>
-    <td align="center"><strong>8,927</strong><br/>Executable Tools</td>
-    <td align="center"><strong>67,096</strong><br/>Database Records</td>
-    <td align="center"><strong>1,432</strong><br/>Verified Tasks</td>
-    <td align="center"><strong>65,287</strong><br/>SFT Trajectories</td>
-  </tr>
-</table>
-
 > [!TIP]
 > Validate all released environments without downloading a model:
 > `bash run.sh --check`

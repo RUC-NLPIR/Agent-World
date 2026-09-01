@@ -165,31 +165,31 @@ def bind(tools, db):
 
 # ------------------------------------------------------------------------------ stage 1: what each tool is
 
-ANALYZE_SYS = """你是一名【函数依赖与数据库操作分析器】。
+ANALYZE_SYS = """You are a function dependency and database operation analyzer.
 
-给定一组工具的 schema、Python 实现代码，以及数据库文件概览，你要对每个函数做**确定性、可验证的静态分析**。
-所有结论必须能直接从给定信息推导，不得推测、补全或假设。
+Given a set of tool schemas, Python implementations, and an overview of the database files, perform a deterministic and verifiable static analysis of every function.
+Every conclusion must follow directly from the provided information. Do not speculate, fill in missing details, or make assumptions.
 
-对每个函数给出：
+For each function, provide:
 
-1. operation_type：只能是以下三者之一
-- query：只读数据库，不改变任何状态
-- mutation-only：写数据库（增/改/删），不返回有意义的数据
-- mutation+query：既改状态，又返回查询结果或派生数据
+1. operation_type: exactly one of the following values
+- query: reads the database without changing any state
+- mutation-only: writes to the database (create/update/delete) without returning meaningful data
+- mutation+query: changes state and also returns query results or derived data
 
-2. input_arguments：函数定义中的全部入参名，必须与代码/schema 完全一致；无入参则为 []
+2. input_arguments: all parameter names from the function definition, matching the code/schema exactly; use [] when there are no parameters
 
-3. output_arguments：函数**显式返回**的字段名。返回一个 dict 时列出它的键；不返回有意义内容则为 []。
-不得臆造隐式输出。
+3. output_arguments: field names explicitly returned by the function. If it returns a dict, list its keys; use [] when it returns no meaningful content.
+Do not invent implicit outputs.
 
-4. dependent_function：本函数的入参依赖哪些其他函数的输出。
-仅当同时满足以下条件才算依赖：某入参 a 的取值来源于函数 B 的某个输出字段 b，且 a 与 b 在语义上确为同一实体
-（同一 id、同一条记录、同一字段值）。
-依赖类型：
-- strong：该入参**只能**来自 B 的输出，无法通过查库或常量获得；不先调用 B 就无法合法调用本函数
-- weak：该入参可以来自 B 的输出，也可以通过查库或常量获得
+4. dependent_function: other functions whose outputs supply this function's inputs.
+Record a dependency only when an input argument a receives its value from an output field b of function B and a and b semantically refer to the same entity
+(the same ID, record, or field value).
+Dependency types:
+- strong: the input can only be obtained from B's output and cannot be obtained from the database or a constant; this function cannot be called validly before B
+- weak: the input can be obtained either from B's output or from the database or a constant
 
-只输出 JSON，不要任何解释：
+Output JSON only, with no explanation:
 {"tools": [{"function_name": "...", "operation_type": "query",
 "input_arguments": ["..."], "output_arguments": ["..."],
 "dependent_function": [{"function_name": "...", "dependent_type": "strong",
@@ -218,9 +218,9 @@ def analyse(model, tools, files, batch=12):
         chunk = tools[i: i + batch]
         here = {t["name"] for t in chunk}
         others = [t["name"] for t in tools if t["name"] not in here][:60]
-        user = (f"## 数据库文件概览\n{json.dumps(summary, ensure_ascii=False)}\n\n"
-                f"## 工具（共 {len(chunk)} 个）\n" + "\n\n".join(tool_brief(t) for t in chunk) +
-                f"\n\n此外，本环境中还存在这些工具，依赖分析时可以引用它们的名字：{others}")
+        user = (f"## Database File Overview\n{json.dumps(summary, ensure_ascii=False)}\n\n"
+                f"## Tools ({len(chunk)} total)\n" + "\n\n".join(tool_brief(t) for t in chunk) +
+                f"\n\nThe following tools also exist in this environment; you may reference their names when analyzing dependencies: {others}")
         try:
             got = model.chat_json(ANALYZE_SYS, user, max_tokens=6000)
         except Exception:
@@ -626,63 +626,60 @@ def replay(env_dir, env_id, tools, steps, keep_ratio=0.6):
 
 # ------------------------------------------------------------------------- stages 2 and 3: task, answer
 
-TASK_SYS = """你是一名【任务设计专家】。
+TASK_SYS = """You are a task design expert.
 
-根据给定的工具定义、已执行的工具调用链及其执行结果，设计一个自然、真实、需要复杂推理或计算的用户任务。
-你设计的是"用户会问的问题"，不是操作说明或解题步骤。
+Using the provided tool definitions, executed tool-call chain, and execution results, design a natural and realistic user task that requires complex reasoning or calculation.
+Design a question that a user would ask, not operating instructions or solution steps.
 
-必须遵守：
+You must follow these rules:
 
-1. 充分利用整条工具链：任务的隐含解决路径应与调用顺序一致，每一步的输出都要在任务中有意义。
+1. Make full use of the entire tool chain: the task's implicit solution path must match the call order, and every step's output must meaningfully contribute to the task.
 
-2. 必须需要复杂推理或计算，不能是简单的"查一下并返回"。至少包含以下之一：多步筛选与对比、数值计算
-   （汇总/平均/比例/排名）、条件判断、跨多个结果的数据整合。最终答案必须依赖多个工具的输出才能得出。
+2. Require complex reasoning or calculation rather than a simple lookup-and-return operation. Include at least one of the following: multi-step filtering and comparison, numerical calculation
+   (aggregation/average/ratio/ranking), conditional judgment, or integration of data across multiple results. The final answer must depend on outputs from multiple tools.
 
-3. 任务条件清晰、结果确定唯一，不存在多解。
+3. State clear conditions and ensure there is exactly one determinate result, with no multiple valid answers.
 
-4. **绝对不能出现执行结果里的具体取值**（设计任务时不该知道结果）。可以使用调用的输入参数值，因为它们是条件。
+4. Never include concrete values from the execution results; those results should not be known when designing the task. Input argument values from the calls may be used because they are task conditions.
 
-5. 像真实用户一样用一段话提问，有业务场景，目标导向。不要提字段名、工具名、schema 等技术细节。
-   不要列步骤（"先……再……"），不要描述解题过程。
+5. Ask the question as one goal-oriented paragraph in a realistic business context. Do not mention field names, tool names, schemas, or other technical details.
+   Do not list steps or describe the solution process.
 
-6. 必须说明期望的输出格式及每个字段含义，且要简单可校验：字段不超过 5 个，优先单个值，其次 2-4 个字段的
-   简单对象，再次结构简单的列表。不要复杂嵌套。
+6. Specify the expected output format and the meaning of each field, keeping it simple and easy to verify: use no more than five fields. Prefer a single value, then a simple object with two to four fields, then a simply structured list. Avoid complex nesting.
 
-7. 只能围绕执行结果里**真实存在的字段**提问。不要引入执行结果之外的判断维度（是否被引用、是否流行、是否推荐
-   这类无从判定的属性），否则答案只能靠猜。
+7. Ask only about fields that actually exist in the execution results. Do not introduce dimensions that cannot be determined from those results, such as whether something is cited, popular, or recommended; otherwise the answer would require guessing.
 
-只输出任务描述本身，不要任何前后缀、标题或解释。"""
+Output only the task description, with no prefix, title, suffix, or explanation."""
 
-ANSWER_SYS = """你是一名【基于工具执行轨迹的任务求解器 + 评分细则生成器】。
+ANSWER_SYS = """You are a task solver and rubric generator based on tool execution traces.
 
-给定工具定义、任务定义，以及**已真实执行**的工具调用链及其执行结果，你要：
-1. 严格依据执行结果计算出任务要求的答案（final_answer）。执行结果是唯一事实来源，禁止臆造数据。
-2. 生成一份可客观评估的评分细则（rubrics），用于比较候选答案与标准答案。
+Given the tool definitions, task definition, and the tool-call chain and results that were actually executed, you must:
+1. Calculate the answer required by the task (final_answer) strictly from the execution results. The results are the sole source of truth; do not invent data.
+2. Generate an objectively assessable rubric (rubrics) for comparing a candidate answer with the reference answer.
 
-只输出一个 JSON 对象，仅含 final_answer 与 rubrics 两个顶层字段，不得输出推理过程：
+Output exactly one JSON object containing only the top-level fields final_answer and rubrics. Do not output any reasoning:
 
-{"final_answer": <严格符合任务定义输出格式的答案>,
+{"final_answer": <an answer that strictly follows the output format defined by the task>,
  "rubrics": {
    "version": "1.0", "total_points": 100, "pass_threshold": 90,
-   "evaluation_procedure": ["自然语言描述评估顺序，但必须可落实为检查项"],
-   "checks": [{"id": "C1", "name": "检查项名称", "points": 10, "type": "hard",
-               "how_to_judge": "如何客观比较候选答案与标准答案",
-               "pass_condition": "通过条件（布尔判定）",
-               "fail_examples": ["典型失败示例"]}],
-   "notes": ["必要补充，必须客观"]}}
+   "evaluation_procedure": ["Describe the evaluation order in natural language, but make every step implementable as a concrete check"],
+   "checks": [{"id": "C1", "name": "Check name", "points": 10, "type": "hard",
+               "how_to_judge": "How to compare the candidate answer with the reference answer objectively",
+               "pass_condition": "Passing condition as a Boolean decision",
+               "fail_examples": ["Representative failure example"]}],
+   "notes": ["Any necessary addition, stated objectively"]}}
 
-checks 至少覆盖这些维度：
-A) 字段集合一致性（hard）：字段齐全、无多余字段
-B) 字段类型与取值合法性（hard）：类型匹配，枚举值在允许集合内，数值范围合理
-C) 与标准答案的值一致性（hard 为主）
+The checks must cover at least these dimensions:
+A) Field-set consistency (hard): all required fields are present and there are no extra fields
+B) Field types and value validity (hard): types match, enum values belong to the allowed set, and numeric values fall within a reasonable range
+C) Value consistency with the reference answer (primarily hard checks)
 
-数值容差要求（重要）：数值比较不能过于严格，精确到小数点后一位甚至个位即可，不要求 1e-6 这类高精度。
-例如标准答案 57.00、候选答案 56.97 应判为正确。非数值字段则要求严格相等。
+Numeric tolerance requirement (important): numeric comparisons must not be excessively strict. Precision to one decimal place or even the nearest integer is sufficient; do not require high precision such as 1e-6.
+For example, if the reference answer is 57.00, a candidate answer of 56.97 should be accepted. Nonnumeric fields must match exactly.
 
-判定：所有 hard 检查通过且总分 ≥ pass_threshold 时，候选答案正确。
+Decision rule: a candidate answer is correct when all hard checks pass and the total score is at least pass_threshold.
 
-例外：如果执行结果不足以严格算出任务要求的答案——缺少必需的数据、需要猜测、或者任务问的东西这条调用链
-根本没取到——只输出 {"unanswerable": true}，不要用常识或文档描述去补。编造的标准答案比没有答案更糟。"""
+Exception: if the execution results are insufficient to calculate the required answer exactly—because required data is missing, guessing would be necessary, or the call chain never retrieved what the task asks for—output only {"unanswerable": true}. Do not fill gaps with general knowledge or documentation. An invented reference answer is worse than no answer."""
 
 
 def chain_view(steps):
@@ -692,8 +689,8 @@ def chain_view(steps):
 
 
 def design_task(model, tools_used, steps):
-    user = (f"## 工具定义\n" + "\n\n".join(tool_brief(t, with_impl=False) for t in tools_used) +
-            f"\n\n## 已执行的工具调用链\n{chain_view(steps)}")
+    user = (f"## Tool Definitions\n" + "\n\n".join(tool_brief(t, with_impl=False) for t in tools_used) +
+            f"\n\n## Executed Tool-Call Chain\n{chain_view(steps)}")
     return model.chat(TASK_SYS, user, max_tokens=1200, temperature=0.7).strip()
 
 
@@ -712,8 +709,8 @@ def answer_holds(ans):
 
 
 def answer_and_rubric(model, tools_used, task, steps):
-    user = (f"## 工具定义\n" + "\n\n".join(tool_brief(t, with_impl=False) for t in tools_used) +
-            f"\n\n## 任务定义\n{task}\n\n## 工具调用链和执行结果\n{chain_view(steps)}")
+    user = (f"## Tool Definitions\n" + "\n\n".join(tool_brief(t, with_impl=False) for t in tools_used) +
+            f"\n\n## Task Definition\n{task}\n\n## Tool-Call Chain and Execution Results\n{chain_view(steps)}")
     got = model.chat_json(ANSWER_SYS, user, max_tokens=4000)
     if got.get("unanswerable"):
         raise ValueError("the chain does not answer the task it was given")

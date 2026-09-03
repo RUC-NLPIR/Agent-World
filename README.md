@@ -41,21 +41,17 @@
 
 ## 🎬 Agent demos
 
-<details open>
-<summary><strong>1. Agent-World overview</strong></summary>
-<br/>
+### 1. Agent-World overview
+
 https://github.com/user-attachments/assets/6046b0dc-7e0e-4b74-aa69-295709381aef
 <p><a href="https://github.com/user-attachments/assets/6046b0dc-7e0e-4b74-aa69-295709381aef">Open the overview video directly</a> (use this link if inline playback is unavailable).</p>
 <p>Agents plan, call executable tools, observe state changes, and solve verifiable tasks across diverse real-world environments.</p>
-</details>
 
-<details open>
-<summary><strong>2. Flight and stay search</strong></summary>
-<br/>
+### 2. Flight and stay search
+
 https://github.com/user-attachments/assets/862b13ed-2cc3-4df8-bb1c-b6bf60fc107c
 <p><a href="https://github.com/user-attachments/assets/862b13ed-2cc3-4df8-bb1c-b6bf60fc107c">Open the flight and stay search video directly</a> (use this link if inline playback is unavailable).</p>
 <p>A long-horizon travel workflow combining inventory search, filtering, comparison, and booking-related tool interactions.</p>
-</details>
 
 <details>
 <summary><strong>3. More environment cases</strong></summary>

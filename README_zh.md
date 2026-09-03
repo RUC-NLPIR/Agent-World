@@ -43,10 +43,10 @@
 <summary><strong>1. Agent-World 综合展示</strong></summary>
 <br/>
 <video controls preload="metadata" width="100%">
-  <source src="https://agent-tars-world.github.io/-/agent-demo/agent_demo.mp4" type="video/mp4" />
-  Your browser does not support embedded video. [观看 Agent-World 综合展示](https://agent-tars-world.github.io/-/agent-demo/agent_demo.mp4)。
+  <source src="assets/demos/agent_demo.mp4" type="video/mp4" />
+  Your browser does not support embedded video. [观看 Agent-World 综合展示](assets/demos/agent_demo.mp4)。
 </video>
-<p><a href="https://agent-tars-world.github.io/-/agent-demo/agent_demo.mp4">直接打开综合展示视频</a>（如果无法内嵌播放，请使用此链接）。</p>
+<p><a href="assets/demos/agent_demo.mp4">直接打开综合展示视频</a>（如果无法内嵌播放，请使用此链接）。</p>
 <p>智能体在多样真实世界环境中规划、调用可执行工具、观察状态变化并完成可验证任务。</p>
 </details>
 
@@ -54,10 +54,10 @@
 <summary><strong>2. 机票与住宿搜索</strong></summary>
 <br/>
 <video controls preload="metadata" width="100%">
-  <source src="https://agent-tars-world.github.io/-/agent-demo/demo_flight.mp4" type="video/mp4" />
-  Your browser does not support embedded video. [观看机票与住宿搜索 Demo](https://agent-tars-world.github.io/-/agent-demo/demo_flight.mp4)。
+  <source src="assets/demos/demo_flight.mp4" type="video/mp4" />
+  Your browser does not support embedded video. [观看机票与住宿搜索 Demo](assets/demos/demo_flight.mp4)。
 </video>
-<p><a href="https://agent-tars-world.github.io/-/agent-demo/demo_flight.mp4">直接打开机票与住宿搜索视频</a>（如果无法内嵌播放，请使用此链接）。</p>
+<p><a href="assets/demos/demo_flight.mp4">直接打开机票与住宿搜索视频</a>（如果无法内嵌播放，请使用此链接）。</p>
 <p>结合库存搜索、条件筛选、方案对比与预订相关工具交互的长程旅游任务。</p>
 </details>
 
@@ -65,14 +65,14 @@
 <summary><strong>3. 更多环境案例</strong></summary>
 <br/>
 
-[电商](https://agent-tars-world.github.io/-/agent-demo/demo_ecomm.mp4) ·
-[Notion](https://agent-tars-world.github.io/-/agent-demo/demo_notion.mp4) ·
-[Slack](https://agent-tars-world.github.io/-/agent-demo/demo_slack.mp4) ·
-[通信](https://agent-tars-world.github.io/-/agent-demo/demo_telecom.mp4) ·
-[GitHub](https://agent-tars-world.github.io/-/agent-demo/demo_github.mp4) ·
-[文档操作](https://agent-tars-world.github.io/-/agent-demo/demo_document.mp4) ·
-[人口数据](https://agent-tars-world.github.io/-/agent-demo/demo_population.mp4) ·
-[Twitter](https://agent-tars-world.github.io/-/agent-demo/demo_twitter.mp4)
+[电商](assets/demos/demo_ecomm.mp4) ·
+[Notion](assets/demos/demo_notion.mp4) ·
+[Slack](assets/demos/demo_slack.mp4) ·
+[通信](assets/demos/demo_telecom.mp4) ·
+[GitHub](assets/demos/demo_github.mp4) ·
+[文档操作](assets/demos/demo_document.mp4) ·
+[人口数据](assets/demos/demo_population.mp4) ·
+[Twitter](assets/demos/demo_twitter.mp4)
 </details>
 
 更多案例见[项目主页](https://agent-tars-world.github.io/-/#demos)。
@@ -101,7 +101,7 @@ question/answer/rubric 示例**。
 
 当前 **Agent-World SFT 数据约有 48K 条**，这是更新后的数据集版本；具体 split 和样本数以 Hugging Face 数据集页面为准。
 
-论文发布后，我们继续扩展环境合成体系，目前已扩展到约 **2.5K 个环境**，覆盖更丰富的领域、业务流程、工具组合和任务场景。2.5K 指持续更新后的 SFT 合成环境池；当前 Git 仓库实际公开的环境资产仍为上面的精选 563 个。
+论文中报告的原始 SFT 数据为 **40K 条轨迹**。论文发布后，我们继续进行数据合成，新增约 **8K 条轨迹**，使更新后的数据集达到约 **48K 条**。当前 Git 仓库实际公开的环境资产仍为上面的精选 563 个。
 
 SFT 数据已发布至
 [dongguanting/Agent-World-SFT-48K](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-48K)；

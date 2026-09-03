@@ -45,10 +45,10 @@
 <summary><strong>1. Agent-World overview</strong></summary>
 <br/>
 <video controls preload="metadata" width="100%">
-  <source src="https://agent-tars-world.github.io/-/agent-demo/agent_demo.mp4" type="video/mp4" />
-  Your browser does not support embedded video. [Watch the Agent-World overview](https://agent-tars-world.github.io/-/agent-demo/agent_demo.mp4).
+  <source src="assets/demos/agent_demo.mp4" type="video/mp4" />
+  Your browser does not support embedded video. [Watch the Agent-World overview](assets/demos/agent_demo.mp4).
 </video>
-<p><a href="https://agent-tars-world.github.io/-/agent-demo/agent_demo.mp4">Open the overview video directly</a> (use this link if inline playback is unavailable).</p>
+<p><a href="assets/demos/agent_demo.mp4">Open the overview video directly</a> (use this link if inline playback is unavailable).</p>
 <p>Agents plan, call executable tools, observe state changes, and solve verifiable tasks across diverse real-world environments.</p>
 </details>
 
@@ -56,10 +56,10 @@
 <summary><strong>2. Flight and stay search</strong></summary>
 <br/>
 <video controls preload="metadata" width="100%">
-  <source src="https://agent-tars-world.github.io/-/agent-demo/demo_flight.mp4" type="video/mp4" />
-  Your browser does not support embedded video. [Watch the flight and stay search demo](https://agent-tars-world.github.io/-/agent-demo/demo_flight.mp4).
+  <source src="assets/demos/demo_flight.mp4" type="video/mp4" />
+  Your browser does not support embedded video. [Watch the flight and stay search demo](assets/demos/demo_flight.mp4).
 </video>
-<p><a href="https://agent-tars-world.github.io/-/agent-demo/demo_flight.mp4">Open the flight and stay search video directly</a> (use this link if inline playback is unavailable).</p>
+<p><a href="assets/demos/demo_flight.mp4">Open the flight and stay search video directly</a> (use this link if inline playback is unavailable).</p>
 <p>A long-horizon travel workflow combining inventory search, filtering, comparison, and booking-related tool interactions.</p>
 </details>
 
@@ -67,14 +67,14 @@
 <summary><strong>3. More environment cases</strong></summary>
 <br/>
 
-[E-commerce](https://agent-tars-world.github.io/-/agent-demo/demo_ecomm.mp4) ·
-[Notion](https://agent-tars-world.github.io/-/agent-demo/demo_notion.mp4) ·
-[Slack](https://agent-tars-world.github.io/-/agent-demo/demo_slack.mp4) ·
-[Telecom](https://agent-tars-world.github.io/-/agent-demo/demo_telecom.mp4) ·
-[GitHub](https://agent-tars-world.github.io/-/agent-demo/demo_github.mp4) ·
-[Document Operations](https://agent-tars-world.github.io/-/agent-demo/demo_document.mp4) ·
-[Population Data](https://agent-tars-world.github.io/-/agent-demo/demo_population.mp4) ·
-[Twitter](https://agent-tars-world.github.io/-/agent-demo/demo_twitter.mp4)
+[E-commerce](assets/demos/demo_ecomm.mp4) ·
+[Notion](assets/demos/demo_notion.mp4) ·
+[Slack](assets/demos/demo_slack.mp4) ·
+[Telecom](assets/demos/demo_telecom.mp4) ·
+[GitHub](assets/demos/demo_github.mp4) ·
+[Document Operations](assets/demos/demo_document.mp4) ·
+[Population Data](assets/demos/demo_population.mp4) ·
+[Twitter](assets/demos/demo_twitter.mp4)
 </details>
 
 More interactive cases are available on the
@@ -110,10 +110,10 @@ The current **Agent-World SFT dataset contains approximately 48K examples**. It 
 updated release; please use the Hugging Face dataset below as the source of truth for the
 current revision and split sizes.
 
-After the paper release, we continued scaling the synthesis ecosystem to approximately
-**2.5K environments**, covering broader domains, workflows, tool combinations, and task
-scenarios. The 2.5K figure describes the expanded synthesis pool; this Git repository
-currently publishes the selected 563 environment artifacts above.
+The paper reported **40K SFT trajectories**. After the paper release, we continued the
+synthesis process and added approximately **8K trajectories**, bringing the updated
+dataset to about **48K examples**. This Git repository currently publishes the selected
+563 environment artifacts described above.
 
 The SFT dataset is available at
 [dongguanting/Agent-World-SFT-48K](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-48K).

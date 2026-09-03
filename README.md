@@ -331,6 +331,13 @@ redistributing the corpus.
   year    = {2026},
   url     = {https://arxiv.org/abs/2604.18292}
 }
+
+@article{song2026envscaler,
+  title={EnvScaler: Scaling Tool-Interactive Environments for LLM Agent via Programmatic Synthesis},
+  author={Song, Xiaoshuai and Chang, Haofei and Dong, Guanting and Zhu, Yutao and Dou, Zhicheng and Wen, Ji-Rong},
+  journal={arXiv preprint arXiv:2601.05808},
+  year={2026}
+}
 ```
 
 ## Acknowledgments

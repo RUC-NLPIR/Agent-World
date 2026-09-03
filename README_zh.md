@@ -42,22 +42,16 @@
 <details open>
 <summary><strong>1. Agent-World 综合展示</strong></summary>
 <br/>
-<video controls preload="metadata" width="100%">
-  <source src="assets/demos/agent_demo.mp4" type="video/mp4" />
-  Your browser does not support embedded video. [观看 Agent-World 综合展示](assets/demos/agent_demo.mp4)。
-</video>
-<p><a href="assets/demos/agent_demo.mp4">直接打开综合展示视频</a>（如果无法内嵌播放，请使用此链接）。</p>
+https://github.com/user-attachments/assets/6046b0dc-7e0e-4b74-aa69-295709381aef
+<p><a href="https://github.com/user-attachments/assets/6046b0dc-7e0e-4b74-aa69-295709381aef">直接打开综合展示视频</a>（如果无法内嵌播放，请使用此链接）。</p>
 <p>智能体在多样真实世界环境中规划、调用可执行工具、观察状态变化并完成可验证任务。</p>
 </details>
 
 <details open>
 <summary><strong>2. 机票与住宿搜索</strong></summary>
 <br/>
-<video controls preload="metadata" width="100%">
-  <source src="assets/demos/demo_flight.mp4" type="video/mp4" />
-  Your browser does not support embedded video. [观看机票与住宿搜索 Demo](assets/demos/demo_flight.mp4)。
-</video>
-<p><a href="assets/demos/demo_flight.mp4">直接打开机票与住宿搜索视频</a>（如果无法内嵌播放，请使用此链接）。</p>
+https://github.com/user-attachments/assets/862b13ed-2cc3-4df8-bb1c-b6bf60fc107c
+<p><a href="https://github.com/user-attachments/assets/862b13ed-2cc3-4df8-bb1c-b6bf60fc107c">直接打开机票与住宿搜索视频</a>（如果无法内嵌播放，请使用此链接）。</p>
 <p>结合库存搜索、条件筛选、方案对比与预订相关工具交互的长程旅游任务。</p>
 </details>
 
@@ -65,14 +59,14 @@
 <summary><strong>3. 更多环境案例</strong></summary>
 <br/>
 
-[电商](assets/demos/demo_ecomm.mp4) ·
-[Notion](assets/demos/demo_notion.mp4) ·
-[Slack](assets/demos/demo_slack.mp4) ·
-[通信](assets/demos/demo_telecom.mp4) ·
-[GitHub](assets/demos/demo_github.mp4) ·
-[文档操作](assets/demos/demo_document.mp4) ·
-[人口数据](assets/demos/demo_population.mp4) ·
-[Twitter](assets/demos/demo_twitter.mp4)
+[电商](https://github.com/user-attachments/assets/522d97c5-788c-4f8e-82b8-5167045f3b00) ·
+[Notion](https://github.com/user-attachments/assets/3ad98e8b-b08a-4004-ba14-830db491ca3a) ·
+[Slack](https://github.com/user-attachments/assets/ab4f1c38-f991-4970-a8fc-792922af25d) ·
+[通信](https://github.com/user-attachments/assets/fd3f4eed-b61d-40a6-859d-3a322c2a4965) ·
+[GitHub](https://github.com/user-attachments/assets/78b1082d-cc6e-4fb9-82be-2dd66cebb92a) ·
+[文档操作](https://github.com/user-attachments/assets/93a35cad-75ea-4d16-88bf-288bd1486f2f) ·
+[人口数据](https://github.com/user-attachments/assets/d95fcbcf-209c-4a31-8333-1d333c1604ec) ·
+[Twitter](https://github.com/user-attachments/assets/f14a3d8a-4592-4bb8-9f9d-a14f926bf35c)
 </details>
 
 更多案例见[项目主页](https://agent-tars-world.github.io/-/#demos)。

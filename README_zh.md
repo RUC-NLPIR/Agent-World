@@ -67,16 +67,16 @@ https://github.com/user-attachments/assets/862b13ed-2cc3-4fd8-bb1c-b6bf60fc107c
 
 ## 📣 News
 
-- **2026-09-03 · SFT 与 Demo 更新**：将公开的
+- [2026-09-03] 📦 将公开的
   [Agent-World SFT 数据集](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-48K)
   更新为约 **48K 条轨迹**（论文发布时为 40K 条，之后新增约 8K 条），并加入可播放的环境
   Demo。
-- **2026-08-10 · 代码开源**：公开 Agent-World GitHub 仓库，包含精选环境数据库、可执行工具、
-  验证样例和复现脚本。
-- **2026-05-05 · 媒体报道**：Agent-World 获
-  [机器之心](https://www.163.com/dy/article/KS8DOH8L0511AQHO.html) 报道，并登上
-  Hugging Face **Paper of the Day 第 2 名**。
-- **2026-04-20 · 论文发布**：论文发表于
+- [2026-08-10] 💻 公开 Agent-World GitHub 仓库，包含精选环境数据库、可执行工具、验证样例和
+  复现脚本。
+- [2026-05-05] 📰 Agent-World 获
+  [机器之心](https://www.163.com/dy/article/KS8DOH8L0511AQHO.html) 报道，并登上 Hugging
+  Face **Paper of the Day 第 2 名**。
+- [2026-04-20] 📄 论文发表于
   [arXiv](https://arxiv.org/abs/2604.18292) 和
   [Hugging Face Daily Papers](https://huggingface.co/papers/2604.18292)。
 

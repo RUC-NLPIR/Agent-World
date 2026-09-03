@@ -70,15 +70,18 @@ More interactive cases are available on the
 
 ## 📣 News
 
-- **SFT update** — The released Agent-World SFT collection is now approximately **48K
-  trajectories** (the paper release contained 40K, followed by approximately 8K additional
-  trajectories).
-- **Public environment release** — We released **563 Top-Used, quality-filtered
-  environments** selected from the original 1,978-environment corpus, together with their
-  executable tools, databases, and verification examples.
-- **Interactive demos** — Added playable Agent-World environment demonstrations covering
-  overview, flight and stay search, e-commerce, Notion, Slack, telecom, GitHub, document
-  operations, population data, and Twitter workflows.
+- **2026-09-03 · SFT and demos updated** — Updated the public
+  [Agent-World SFT collection](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-48K)
+  to approximately **48K trajectories** (40K in the paper release plus approximately 8K
+  additional trajectories) and added playable environment demonstrations.
+- **2026-08-10 · Code released** — Opened the Agent-World GitHub repository with the selected
+  environment databases, executable tools, verification examples, and reproduction scripts.
+- **2026-05-05 · Featured coverage** — Agent-World was featured by
+  [机器之心 (Jiqizhixin)](https://www.163.com/dy/article/KS8DOH8L0511AQHO.html), and was
+  ranked **#2 Paper of the Day** on Hugging Face.
+- **2026-04-20 · Paper published** — The paper was released on
+  [arXiv](https://arxiv.org/abs/2604.18292) and the
+  [Hugging Face Daily Papers](https://huggingface.co/papers/2604.18292).
 
 ## ✨ What's in this release
 

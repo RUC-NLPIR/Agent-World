@@ -42,13 +42,11 @@
 ### 1. Agent-World 综合展示
 
 https://github.com/user-attachments/assets/6046b0dc-7e0e-4b74-aa69-295709381aef
-<p><a href="https://github.com/user-attachments/assets/6046b0dc-7e0e-4b74-aa69-295709381aef">直接打开综合展示视频</a>（如果无法内嵌播放，请使用此链接）。</p>
 <p>智能体在多样真实世界环境中规划、调用可执行工具、观察状态变化并完成可验证任务。</p>
 
 ### 2. 机票与住宿搜索
 
 https://github.com/user-attachments/assets/862b13ed-2cc3-4df8-bb1c-b6bf60fc107c
-<p><a href="https://github.com/user-attachments/assets/862b13ed-2cc3-4df8-bb1c-b6bf60fc107c">直接打开机票与住宿搜索视频</a>（如果无法内嵌播放，请使用此链接）。</p>
 <p>结合库存搜索、条件筛选、方案对比与预订相关工具交互的长程旅游任务。</p>
 
 <details>
@@ -66,6 +64,15 @@ https://github.com/user-attachments/assets/862b13ed-2cc3-4df8-bb1c-b6bf60fc107c
 </details>
 
 更多案例见[项目主页](https://agent-tars-world.github.io/-/#demos)。
+
+## 📣 News
+
+- **SFT 数据更新**：当前发布的 Agent-World SFT 数据约 **48K 条轨迹**（论文发布时为
+  40K 条，之后新增约 8K 条）。
+- **公开环境发布**：从原始 1,978 个环境中筛选并发布 **563 个 Top-Used、经过质量筛选的
+  高质量环境**，同时提供可执行工具、数据库和验证样例。
+- **交互式 Demo**：新增综合展示、机票与住宿搜索、电商、Notion、Slack、通信、GitHub、
+  文档操作、人口数据和 Twitter 等环境 Demo。
 
 ## ✨ 本次开源内容
 

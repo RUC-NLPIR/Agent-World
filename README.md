@@ -44,13 +44,11 @@
 ### 1. Agent-World overview
 
 https://github.com/user-attachments/assets/6046b0dc-7e0e-4b74-aa69-295709381aef
-<p><a href="https://github.com/user-attachments/assets/6046b0dc-7e0e-4b74-aa69-295709381aef">Open the overview video directly</a> (use this link if inline playback is unavailable).</p>
 <p>Agents plan, call executable tools, observe state changes, and solve verifiable tasks across diverse real-world environments.</p>
 
 ### 2. Flight and stay search
 
 https://github.com/user-attachments/assets/862b13ed-2cc3-4df8-bb1c-b6bf60fc107c
-<p><a href="https://github.com/user-attachments/assets/862b13ed-2cc3-4df8-bb1c-b6bf60fc107c">Open the flight and stay search video directly</a> (use this link if inline playback is unavailable).</p>
 <p>A long-horizon travel workflow combining inventory search, filtering, comparison, and booking-related tool interactions.</p>
 
 <details>
@@ -69,6 +67,18 @@ https://github.com/user-attachments/assets/862b13ed-2cc3-4df8-bb1c-b6bf60fc107c
 
 More interactive cases are available on the
 [Agent-World project page](https://agent-tars-world.github.io/-/#demos).
+
+## 📣 News
+
+- **SFT update** — The released Agent-World SFT collection is now approximately **48K
+  trajectories** (the paper release contained 40K, followed by approximately 8K additional
+  trajectories).
+- **Public environment release** — We released **563 Top-Used, quality-filtered
+  environments** selected from the original 1,978-environment corpus, together with their
+  executable tools, databases, and verification examples.
+- **Interactive demos** — Added playable Agent-World environment demonstrations covering
+  overview, flight and stay search, e-commerce, Notion, Slack, telecom, GitHub, document
+  operations, population data, and Twitter workflows.
 
 ## ✨ What's in this release
 

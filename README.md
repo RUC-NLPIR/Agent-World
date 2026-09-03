@@ -48,7 +48,7 @@ https://github.com/user-attachments/assets/6046b0dc-7e0e-4b74-aa69-295709381aef
 
 ### 2. Flight and stay search
 
-https://github.com/user-attachments/assets/862b13ed-2cc3-4df8-bb1c-b6bf60fc107c
+https://github.com/user-attachments/assets/862b13ed-2cc3-4fd8-bb1c-b6bf60fc107c
 <p>A long-horizon travel workflow combining inventory search, filtering, comparison, and booking-related tool interactions.</p>
 
 <details>
@@ -56,12 +56,12 @@ https://github.com/user-attachments/assets/862b13ed-2cc3-4df8-bb1c-b6bf60fc107c
 <br/>
 
 [E-commerce](https://github.com/user-attachments/assets/522d97c5-788c-4f8e-82b8-5167045f3b00) ·
-[Notion](https://github.com/user-attachments/assets/3ad98e8b-b08a-4004-ba14-830db491ca3a) ·
-[Slack](https://github.com/user-attachments/assets/ab4f1c38-f991-4970-a8fc-792922af25d) ·
-[Telecom](https://github.com/user-attachments/assets/fd3f4eed-b61d-40a6-859d-3a322c2a4965) ·
-[GitHub](https://github.com/user-attachments/assets/78b1082d-cc6e-4fb9-82be-2dd66cebb92a) ·
-[Document Operations](https://github.com/user-attachments/assets/93a35cad-75ea-4d16-88bf-288bd1486f2f) ·
-[Population Data](https://github.com/user-attachments/assets/d95fcbcf-209c-4a31-8333-1d333c1604ec) ·
+[Notion](https://github.com/user-attachments/assets/3ad98e08-b08a-4004-ba14-830db491ca3a) ·
+[Slack](https://github.com/user-attachments/assets/ab4f1c38-f991-4970-a8fc-792a922af25d) ·
+[Telecom](https://github.com/user-attachments/assets/1d3f4eed-6b1d-40a6-859d-3a322c2a4965) ·
+[GitHub](https://github.com/user-attachments/assets/78b1082c-b6ce-4bf9-82be-2dd66cebb92a) ·
+[Document Operations](https://github.com/user-attachments/assets/93a35cad-75ea-4d16-8d4f-28b8d1486f2f) ·
+[Population Data](https://github.com/user-attachments/assets/df95cbcf-209c-4a31-941b-13323c1604ec) ·
 [Twitter](https://github.com/user-attachments/assets/f14a3d8a-4592-4bb8-9f9d-a14f926bf35c)
 </details>
 

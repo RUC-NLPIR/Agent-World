@@ -8,7 +8,7 @@
   <a href="https://github.com/RUC-NLPIR/Agent-World"><img src="https://img.shields.io/badge/代码-GITHUB-181717?style=for-the-badge&logo=github" alt="代码"/></a>
   <a href="https://agent-tars-world.github.io/-/"><img src="https://img.shields.io/badge/项目主页-LIVE-14B8A6?style=for-the-badge&logo=googlechrome" alt="项目主页"/></a>
   <a href="https://huggingface.co/papers/2604.18292"><img src="https://img.shields.io/badge/HUGGING_FACE-PAPER-FFD21E?style=for-the-badge&logo=huggingface&logoColor=black" alt="Hugging Face"/></a>
-  <a href="https://huggingface.co/datasets/dongguanting/Agent-World-SFT-65K"><img src="https://img.shields.io/badge/SFT_数据-65K-FF9D00?style=for-the-badge&logo=huggingface&logoColor=black" alt="SFT 数据"/></a>
+  <a href="https://huggingface.co/datasets/dongguanting/Agent-World-SFT-48K"><img src="https://img.shields.io/badge/SFT_数据-48K-FF9D00?style=for-the-badge&logo=huggingface&logoColor=black" alt="SFT 数据"/></a>
   <a href="https://www.163.com/dy/article/KS8DOH8L0511AQHO.html"><img src="https://img.shields.io/badge/媒体-机器之心-7C3AED?style=for-the-badge" alt="机器之心"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/许可证-MIT-2563EB?style=for-the-badge" alt="MIT"/></a>
 
@@ -17,22 +17,47 @@
   <p><em>把真实世界工具生态变成有状态、可执行的环境，再把环境变成可验证的智能体经验。</em></p>
 </div>
 
+<p align="center">
+  <a href="#智能体-demo">Demo</a> ·
+  <a href="#本次开源内容">开源内容</a> ·
+  <a href="#不下载模型先检查">快速校验</a> ·
+  <a href="#sft">SFT</a> ·
+  <a href="#引用">引用</a>
+</p>
+
 > [!TIP]
 > 不下载模型即可检查全部公开环境：`bash run.sh --check`
+
+<table>
+  <tr>
+    <td align="center"><strong>563</strong><br/>个公开环境</td>
+    <td align="center"><strong>8,927</strong><br/>个可执行工具</td>
+    <td align="center"><strong>67,096</strong><br/>条数据库记录</td>
+    <td align="center"><strong>约 48K</strong><br/>条 SFT 数据</td>
+  </tr>
+</table>
 
 ## 🎬 智能体 Demo
 
 <details open>
 <summary><strong>1. Agent-World 综合展示</strong></summary>
 <br/>
-<video src="https://agent-tars-world.github.io/-/agent-demo/agent_demo.mp4" controls width="100%"></video>
+<video controls preload="metadata" width="100%">
+  <source src="https://agent-tars-world.github.io/-/agent-demo/agent_demo.mp4" type="video/mp4" />
+  Your browser does not support embedded video. [观看 Agent-World 综合展示](https://agent-tars-world.github.io/-/agent-demo/agent_demo.mp4)。
+</video>
+<p><a href="https://agent-tars-world.github.io/-/agent-demo/agent_demo.mp4">直接打开综合展示视频</a>（如果无法内嵌播放，请使用此链接）。</p>
 <p>智能体在多样真实世界环境中规划、调用可执行工具、观察状态变化并完成可验证任务。</p>
 </details>
 
 <details open>
 <summary><strong>2. 机票与住宿搜索</strong></summary>
 <br/>
-<video src="https://agent-tars-world.github.io/-/agent-demo/demo_flight.mp4" controls width="100%"></video>
+<video controls preload="metadata" width="100%">
+  <source src="https://agent-tars-world.github.io/-/agent-demo/demo_flight.mp4" type="video/mp4" />
+  Your browser does not support embedded video. [观看机票与住宿搜索 Demo](https://agent-tars-world.github.io/-/agent-demo/demo_flight.mp4)。
+</video>
+<p><a href="https://agent-tars-world.github.io/-/agent-demo/demo_flight.mp4">直接打开机票与住宿搜索视频</a>（如果无法内嵌播放，请使用此链接）。</p>
 <p>结合库存搜索、条件筛选、方案对比与预订相关工具交互的长程旅游任务。</p>
 </details>
 
@@ -45,16 +70,20 @@
 [Slack](https://agent-tars-world.github.io/-/agent-demo/demo_slack.mp4) ·
 [通信](https://agent-tars-world.github.io/-/agent-demo/demo_telecom.mp4) ·
 [GitHub](https://agent-tars-world.github.io/-/agent-demo/demo_github.mp4) ·
-[文档操作](https://agent-tars-world.github.io/-/agent-demo/demo_document.mp4)
+[文档操作](https://agent-tars-world.github.io/-/agent-demo/demo_document.mp4) ·
+[人口数据](https://agent-tars-world.github.io/-/agent-demo/demo_population.mp4) ·
+[Twitter](https://agent-tars-world.github.io/-/agent-demo/demo_twitter.mp4)
 </details>
 
 更多案例见[项目主页](https://agent-tars-world.github.io/-/#demos)。
 
 ## ✨ 本次开源内容
 
-### 563 个高质量可执行环境
+### 563 个高质量可执行环境（从 1,978 个环境中筛选）
 
-这 563 个环境是经过质量筛选的公开子集，而不是从完整语料中任意截取：
+由于每个环境都保存了丰富、真实的环境底层数据文件，**1,978 个环境**的全量原始数据规模过大，
+当前仓库发布的是从中筛选出的 **Top-Used 子集**，并进一步经过质量筛选的高质量公开子集，
+让数据更易于下载、检查和复现。
 
 - 从 [Smithery](https://smithery.ai/servers) 的高使用量 MCP Server 中筛选出 **500
   个高质量主题**，优先保留使用广泛、工作流明确、工具价值较高的环境，过滤低使用量和低信息量环境；
@@ -68,17 +97,14 @@ question/answer/rubric 示例**。
 论文实验使用的原始完整语料包含 **1,978 个环境和 19,822 个工具**；当前 Git
 仓库发布的是其中精选的 563 个环境及其数据库、工具代码和题目样例。
 
-### 65,287 条持续扩展的 SFT 轨迹
+### 约 48K 条 SFT 轨迹
 
-**65,287 条 Agent-World SFT 数据**由两部分组成：
-
-- 论文中报告的原始 **40K Agent-World SFT trajectories**；
-- 论文发布后持续更新合成的 **25,287 条新增轨迹**。
+当前 **Agent-World SFT 数据约有 48K 条**，这是更新后的数据集版本；具体 split 和样本数以 Hugging Face 数据集页面为准。
 
 论文发布后，我们继续扩展环境合成体系，目前已扩展到约 **2.5K 个环境**，覆盖更丰富的领域、业务流程、工具组合和任务场景。2.5K 指持续更新后的 SFT 合成环境池；当前 Git 仓库实际公开的环境资产仍为上面的精选 563 个。
 
 SFT 数据已发布至
-[dongguanting/Agent-World-SFT-65K](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-65K)；
+[dongguanting/Agent-World-SFT-48K](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-48K)；
 当前仓库已经提供对应的 LlamaFactory 登记与训练说明。
 
 环境和 question/rubric 统计可在本地复算：
@@ -157,7 +183,7 @@ data
 - `grading_rubric.success_criteria`：客观评分条件；
 - `grading_rubric.verified_tool_chain`：验证该任务的工具及参数。
 
-这些是 question/rubric 数据格式示例，与下面的 65,287 条 SFT 语料不是同一批数据。
+这些是 question/rubric 数据格式示例，与下面约 48K 条 SFT 语料不是同一批数据。
 
 ## Graph 造题链路
 
@@ -178,10 +204,10 @@ bash run.sh 1000 --no-serve
 
 ## SFT
 
-已发布的 SFT 数据共 **65,287 条**：包括论文中的原始 **40K 条轨迹**，以及基于扩展到约 **2.5K 个环境**的持续合成体系新增的 **25,287 条轨迹**。每条只有一个 OpenAI 风格的 `messages` 字段，角色为 `system`、`user`、`assistant`。总计 1,462,197 条 message，平均每个样本 22.4 条。
+已发布的 SFT 数据约 **48K 条**。每条只有一个 OpenAI 风格的 `messages` 字段，角色为 `system`、`user`、`assistant`；最新的 message 统计和数据划分请以 Hugging Face 数据集卡片为准。
 
 数据集地址：
-[dongguanting/Agent-World-SFT-65K](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-65K)。
+[dongguanting/Agent-World-SFT-48K](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-48K)。
 使用 [LlamaFactory](https://github.com/hiyouga/LlamaFactory) 时，将
 [`training/dataset_info.json`](training/dataset_info.json) 中的登记项合并到
 `LlamaFactory/data/dataset_info.json`，即可从 Hugging Face 直接加载。具体配置见

@@ -8,7 +8,7 @@
   <a href="https://github.com/RUC-NLPIR/Agent-World"><img src="https://img.shields.io/badge/CODE-GITHUB-181717?style=for-the-badge&logo=github" alt="Code"/></a>
   <a href="https://agent-tars-world.github.io/-/"><img src="https://img.shields.io/badge/PROJECT_PAGE-LIVE-14B8A6?style=for-the-badge&logo=googlechrome" alt="Project page"/></a>
   <a href="https://huggingface.co/papers/2604.18292"><img src="https://img.shields.io/badge/HUGGING_FACE-PAPER-FFD21E?style=for-the-badge&logo=huggingface&logoColor=black" alt="Hugging Face Paper"/></a>
-  <a href="https://huggingface.co/datasets/dongguanting/Agent-World-SFT-65K"><img src="https://img.shields.io/badge/SFT_DATA-65K-FF9D00?style=for-the-badge&logo=huggingface&logoColor=black" alt="SFT Dataset"/></a>
+  <a href="https://huggingface.co/datasets/dongguanting/Agent-World-SFT-48K"><img src="https://img.shields.io/badge/SFT_DATA-48K-FF9D00?style=for-the-badge&logo=huggingface&logoColor=black" alt="SFT Dataset"/></a>
   <a href="https://www.163.com/dy/article/KS8DOH8L0511AQHO.html"><img src="https://img.shields.io/badge/MEDIA-机器之心-7C3AED?style=for-the-badge" alt="Media"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/LICENSE-MIT-2563EB?style=for-the-badge" alt="MIT License"/></a>
 
@@ -18,23 +18,48 @@
   executable environments—and turns those environments into verifiable agent experience.</em></p>
 </div>
 
+<p align="center">
+  <a href="#agent-demos">Demos</a> ·
+  <a href="#whats-in-this-release">Release</a> ·
+  <a href="#quick-validation">Validation</a> ·
+  <a href="#supervised-fine-tuning">SFT</a> ·
+  <a href="#citation">Citation</a>
+</p>
+
 > [!TIP]
 > Validate all released environments without downloading a model:
 > `bash run.sh --check`
+
+<table>
+  <tr>
+    <td align="center"><strong>563</strong><br/>released environments</td>
+    <td align="center"><strong>8,927</strong><br/>executable tools</td>
+    <td align="center"><strong>67,096</strong><br/>database records</td>
+    <td align="center"><strong>~48K</strong><br/>SFT examples</td>
+  </tr>
+</table>
 
 ## 🎬 Agent demos
 
 <details open>
 <summary><strong>1. Agent-World overview</strong></summary>
 <br/>
-<video src="https://agent-tars-world.github.io/-/agent-demo/agent_demo.mp4" controls width="100%"></video>
+<video controls preload="metadata" width="100%">
+  <source src="https://agent-tars-world.github.io/-/agent-demo/agent_demo.mp4" type="video/mp4" />
+  Your browser does not support embedded video. [Watch the Agent-World overview](https://agent-tars-world.github.io/-/agent-demo/agent_demo.mp4).
+</video>
+<p><a href="https://agent-tars-world.github.io/-/agent-demo/agent_demo.mp4">Open the overview video directly</a> (use this link if inline playback is unavailable).</p>
 <p>Agents plan, call executable tools, observe state changes, and solve verifiable tasks across diverse real-world environments.</p>
 </details>
 
 <details open>
 <summary><strong>2. Flight and stay search</strong></summary>
 <br/>
-<video src="https://agent-tars-world.github.io/-/agent-demo/demo_flight.mp4" controls width="100%"></video>
+<video controls preload="metadata" width="100%">
+  <source src="https://agent-tars-world.github.io/-/agent-demo/demo_flight.mp4" type="video/mp4" />
+  Your browser does not support embedded video. [Watch the flight and stay search demo](https://agent-tars-world.github.io/-/agent-demo/demo_flight.mp4).
+</video>
+<p><a href="https://agent-tars-world.github.io/-/agent-demo/demo_flight.mp4">Open the flight and stay search video directly</a> (use this link if inline playback is unavailable).</p>
 <p>A long-horizon travel workflow combining inventory search, filtering, comparison, and booking-related tool interactions.</p>
 </details>
 
@@ -47,7 +72,9 @@
 [Slack](https://agent-tars-world.github.io/-/agent-demo/demo_slack.mp4) ·
 [Telecom](https://agent-tars-world.github.io/-/agent-demo/demo_telecom.mp4) ·
 [GitHub](https://agent-tars-world.github.io/-/agent-demo/demo_github.mp4) ·
-[Document Operations](https://agent-tars-world.github.io/-/agent-demo/demo_document.mp4)
+[Document Operations](https://agent-tars-world.github.io/-/agent-demo/demo_document.mp4) ·
+[Population Data](https://agent-tars-world.github.io/-/agent-demo/demo_population.mp4) ·
+[Twitter](https://agent-tars-world.github.io/-/agent-demo/demo_twitter.mp4)
 </details>
 
 More interactive cases are available on the
@@ -55,9 +82,12 @@ More interactive cases are available on the
 
 ## ✨ What's in this release
 
-### 563 high-quality, executable environments
+### 563 high-quality, executable environments (selected from 1,978)
 
-This is a **quality-filtered release**, not an arbitrary slice of the corpus:
+Because each environment preserves rich, realistic underlying data files, the full raw
+data for all **1,978 environments** is too large to distribute as one repository snapshot.
+We therefore release a **Top-Used subset** that has also passed quality filtering, keeping
+the package practical to download, inspect, and reproduce.
 
 - **500 environments** were selected from high-usage MCP servers on
   [Smithery](https://smithery.ai/servers). We prioritize widely used server themes with
@@ -74,12 +104,11 @@ The paper reports the original full research corpus of **1,978 environments and 
 tools**. The 563 environments here are the selected public subset whose database and tool
 artifacts are released in this repository.
 
-### 65,287 continuously expanded SFT trajectories
+### Approximately 48K SFT trajectories
 
-The **65,287-example Agent-World SFT dataset** combines:
-
-- the original **40K Agent-World SFT trajectories** reported in the paper; and
-- **25,287 additional trajectories** synthesized through continuous post-paper updates.
+The current **Agent-World SFT dataset contains approximately 48K examples**. It is the
+updated release; please use the Hugging Face dataset below as the source of truth for the
+current revision and split sizes.
 
 After the paper release, we continued scaling the synthesis ecosystem to approximately
 **2.5K environments**, covering broader domains, workflows, tool combinations, and task
@@ -87,7 +116,7 @@ scenarios. The 2.5K figure describes the expanded synthesis pool; this Git repos
 currently publishes the selected 563 environment artifacts above.
 
 The SFT dataset is available at
-[dongguanting/Agent-World-SFT-65K](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-65K).
+[dongguanting/Agent-World-SFT-48K](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-48K).
 This repository includes the matching LlamaFactory registration and training instructions.
 
 ### Release statistics
@@ -213,7 +242,7 @@ as readable JSON under `environment_mix/questions/`. Each example contains:
 - `grading_rubric.success_criteria`: objective grading conditions;
 - `grading_rubric.verified_tool_chain`: the tools and arguments used to verify the task.
 
-These examples demonstrate the data contract. They are distinct from the 65,287-example SFT
+These examples demonstrate the data contract. They are distinct from the approximately 48K-example SFT
 corpus described below.
 
 ## Graph-based query and rubric synthesis
@@ -243,14 +272,12 @@ can be overridden through the environment variables documented in
 
 ## Supervised fine-tuning
 
-The released SFT dataset contains **65,287** records: the original **40K trajectories**
-reported in the paper plus **25,287 continuously synthesized updates** from an ecosystem
-expanded to approximately **2.5K environments**. Every record has one `messages` field using
-OpenAI-style `system`, `user`, and `assistant` roles. The corpus contains 1,462,197 messages
-in total and averages 22.4 messages per example.
+The released SFT dataset contains **approximately 48K records**. Every record has one
+`messages` field using OpenAI-style `system`, `user`, and `assistant` roles. Consult the
+Hugging Face dataset card for the current message counts and splits.
 
 The dataset is hosted at
-[dongguanting/Agent-World-SFT-65K](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-65K).
+[dongguanting/Agent-World-SFT-48K](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-48K).
 For [LlamaFactory](https://github.com/hiyouga/LlamaFactory), merge the provided
 [`training/dataset_info.json`](training/dataset_info.json) entry into
 `LlamaFactory/data/dataset_info.json`; LlamaFactory will load it directly from Hugging Face.

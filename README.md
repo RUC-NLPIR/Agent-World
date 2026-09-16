@@ -35,7 +35,7 @@
     <td align="center"><strong>563</strong><br/>released environments</td>
     <td align="center"><strong>8,927</strong><br/>executable tools</td>
     <td align="center"><strong>67,096</strong><br/>database records</td>
-    <td align="center"><strong>~48K</strong><br/>SFT examples</td>
+    <td align="center"><strong>~44K</strong><br/>SFT examples</td>
   </tr>
 </table>
 
@@ -72,7 +72,7 @@ More interactive cases are available on the
 
 - [2026-09-03] 📦 Updated the public
   [Agent-World SFT collection](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-48K)
-  to approximately **48K trajectories** (40K in the paper release plus approximately 8K
+  to approximately **44K trajectories** (40K in the paper release plus approximately 8K
   additional trajectories), and added playable environment demonstrations.
 - [2026-08-10] 💻 Opened the Agent-World GitHub repository with selected environment databases,
   executable tools, verification examples, and reproduction scripts.
@@ -107,15 +107,15 @@ The paper reports the original full research corpus of **1,978 environments and 
 tools**. The 563 environments here are the selected public subset whose database and tool
 artifacts are released in this repository.
 
-### Approximately 48K SFT trajectories
+### Approximately 44K SFT trajectories
 
-The current **Agent-World SFT dataset contains approximately 48K examples**. It is the
+The current **Agent-World SFT dataset contains approximately 44K examples**. It is the
 updated release; please use the Hugging Face dataset below as the source of truth for the
 current revision and split sizes.
 
 The paper reported **40K SFT trajectories**. After the paper release, we continued the
 synthesis process and added approximately **8K trajectories**, bringing the updated
-dataset to about **48K examples**. This Git repository currently publishes the selected
+dataset to about **44K examples**. This Git repository currently publishes the selected
 563 environment artifacts described above.
 
 The SFT dataset is available at

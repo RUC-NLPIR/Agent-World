@@ -8,7 +8,7 @@
   <a href="https://github.com/RUC-NLPIR/Agent-World"><img src="https://img.shields.io/badge/CODE-GITHUB-181717?style=for-the-badge&logo=github" alt="Code"/></a>
   <a href="https://agent-tars-world.github.io/-/"><img src="https://img.shields.io/badge/PROJECT_PAGE-LIVE-14B8A6?style=for-the-badge&logo=googlechrome" alt="Project page"/></a>
   <a href="https://huggingface.co/papers/2604.18292"><img src="https://img.shields.io/badge/HUGGING_FACE-PAPER-FFD21E?style=for-the-badge&logo=huggingface&logoColor=black" alt="Hugging Face Paper"/></a>
-  <a href="https://huggingface.co/datasets/dongguanting/Agent-World-SFT-48K"><img src="https://img.shields.io/badge/SFT_DATA-48K-FF9D00?style=for-the-badge&logo=huggingface&logoColor=black" alt="SFT Dataset"/></a>
+  <a href="https://huggingface.co/datasets/dongguanting/Agent-World-SFT-44K"><img src="https://img.shields.io/badge/SFT_DATA-44K-FF9D00?style=for-the-badge&logo=huggingface&logoColor=black" alt="SFT Dataset"/></a>
   <a href="https://www.163.com/dy/article/KS8DOH8L0511AQHO.html"><img src="https://img.shields.io/badge/MEDIA-机器之心-7C3AED?style=for-the-badge" alt="Media"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/LICENSE-MIT-2563EB?style=for-the-badge" alt="MIT License"/></a>
 
@@ -60,7 +60,7 @@ https://github.com/user-attachments/assets/862b13ed-2cc3-4fd8-bb1c-b6bf60fc107c
 [Slack](https://github.com/user-attachments/assets/ab4f1c38-f991-4970-a8fc-792a922af25d) ·
 [Telecom](https://github.com/user-attachments/assets/1d3f4eed-6b1d-40a6-859d-3a322c2a4965) ·
 [GitHub](https://github.com/user-attachments/assets/78b1082c-b6ce-4bf9-82be-2dd66cebb92a) ·
-[Document Operations](https://github.com/user-attachments/assets/93a35cad-75ea-4d16-8d4f-28b8d1486f2f) ·
+[Document Operations](https://github.com/user-attachments/assets/93a35cad-75ea-4d16-8d4f-28b8d1446f2f) ·
 [Population Data](https://github.com/user-attachments/assets/df95cbcf-209c-4a31-941b-13323c1604ec) ·
 [Twitter](https://github.com/user-attachments/assets/f14a3d8a-4592-4bb8-9f9d-a14f926bf35c)
 </details>
@@ -71,7 +71,7 @@ More interactive cases are available on the
 ## 📣 News
 
 - [2026-09-03] 📦 Updated the public
-  [Agent-World SFT collection](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-48K)
+  [Agent-World SFT collection](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-44K)
   to approximately **44K trajectories** (40K in the paper release plus approximately 8K
   additional trajectories), and added playable environment demonstrations.
 - [2026-08-10] 💻 Opened the Agent-World GitHub repository with selected environment databases,
@@ -119,7 +119,7 @@ dataset to about **44K examples**. This Git repository currently publishes the s
 563 environment artifacts described above.
 
 The SFT dataset is available at
-[dongguanting/Agent-World-SFT-48K](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-48K).
+[dongguanting/Agent-World-SFT-44K](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-44K).
 This repository includes the matching LlamaFactory registration and training instructions.
 
 ### Release statistics
@@ -245,7 +245,7 @@ as readable JSON under `environment_mix/questions/`. Each example contains:
 - `grading_rubric.success_criteria`: objective grading conditions;
 - `grading_rubric.verified_tool_chain`: the tools and arguments used to verify the task.
 
-These examples demonstrate the data contract. They are distinct from the approximately 48K-example SFT
+These examples demonstrate the data contract. They are distinct from the approximately 44K-example SFT
 corpus described below.
 
 ## Graph-based query and rubric synthesis
@@ -275,12 +275,12 @@ can be overridden through the environment variables documented in
 
 ## Supervised fine-tuning
 
-The released SFT dataset contains **approximately 48K records**. Every record has one
+The released SFT dataset contains **approximately 44K records**. Every record has one
 `messages` field using OpenAI-style `system`, `user`, and `assistant` roles. Consult the
 Hugging Face dataset card for the current message counts and splits.
 
 The dataset is hosted at
-[dongguanting/Agent-World-SFT-48K](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-48K).
+[dongguanting/Agent-World-SFT-44K](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-44K).
 For [LlamaFactory](https://github.com/hiyouga/LlamaFactory), merge the provided
 [`training/dataset_info.json`](training/dataset_info.json) entry into
 `LlamaFactory/data/dataset_info.json`; LlamaFactory will load it directly from Hugging Face.

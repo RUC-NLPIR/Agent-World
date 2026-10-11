@@ -39,6 +39,23 @@
   </tr>
 </table>
 
+## 📣 News
+
+- [Oct 12, 2026]: 🚀 We released Agent-Reflex, teaching language agents to act reflectively under noisy environments. See the [GitHub](https://github.com/RUC-NLPIR/Agent-Reflex).
+- [2026-09-03] 📦 Updated the public
+  [Agent-World SFT collection](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-44K)
+  to approximately **44K trajectories** (40K in the paper release plus approximately 8K
+  additional trajectories), and added playable environment demonstrations.
+- [2026-08-10] 💻 Opened the Agent-World GitHub repository with selected environment databases,
+  executable tools, verification examples, and reproduction scripts.
+- [2026-05-05] 📰 Agent-World was featured by
+  [机器之心 (Jiqizhixin)](https://www.163.com/dy/article/KS8DOH8L0511AQHO.html) and ranked
+  **#2 Paper of the Day** on Hugging Face.
+- [2026-04-20] 📄 The paper was released on
+  [arXiv](https://arxiv.org/abs/2604.18292) and the
+  [Hugging Face Daily Papers](https://huggingface.co/papers/2604.18292).
+
+
 ## 🎬 Agent demos
 
 ### 1. Agent-World overview
@@ -68,21 +85,6 @@ https://github.com/user-attachments/assets/862b13ed-2cc3-4fd8-bb1c-b6bf60fc107c
 More interactive cases are available on the
 [Agent-World project page](https://agent-tars-world.github.io/-/#demos).
 
-## 📣 News
-
-- [Oct 12, 2026]: 🚀 We released Agent-Reflex, teaching language agents to act reflectively under noisy environments. See the [GitHub](https://github.com/RUC-NLPIR/Agent-Reflex).
-- [2026-09-03] 📦 Updated the public
-  [Agent-World SFT collection](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-44K)
-  to approximately **44K trajectories** (40K in the paper release plus approximately 8K
-  additional trajectories), and added playable environment demonstrations.
-- [2026-08-10] 💻 Opened the Agent-World GitHub repository with selected environment databases,
-  executable tools, verification examples, and reproduction scripts.
-- [2026-05-05] 📰 Agent-World was featured by
-  [机器之心 (Jiqizhixin)](https://www.163.com/dy/article/KS8DOH8L0511AQHO.html) and ranked
-  **#2 Paper of the Day** on Hugging Face.
-- [2026-04-20] 📄 The paper was released on
-  [arXiv](https://arxiv.org/abs/2604.18292) and the
-  [Hugging Face Daily Papers](https://huggingface.co/papers/2604.18292).
 
 ## ✨ What's in this release
 

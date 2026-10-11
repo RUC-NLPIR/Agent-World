@@ -70,6 +70,7 @@ More interactive cases are available on the
 
 ## 📣 News
 
+- [Oct 12, 2026]: 🚀 We released Agent-Reflex, teaching language agents to act reflectively under noisy environments. See the [GitHub](https://github.com/RUC-NLPIR/Agent-Reflex).
 - [2026-09-03] 📦 Updated the public
   [Agent-World SFT collection](https://huggingface.co/datasets/dongguanting/Agent-World-SFT-44K)
   to approximately **44K trajectories** (40K in the paper release plus approximately 8K
